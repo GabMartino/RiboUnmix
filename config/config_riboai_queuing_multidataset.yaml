@@ -1,0 +1,121 @@
+defaults:
+  - dataset_config: preprocessed_datasets_ribo_only
+  - _self_
+
+# -------------------------
+# Experiment
+# -------------------------
+experiment:
+  from_checkpoint: false
+  train: true
+  predict: false
+  dataset: ["kutay_2021", "grimson_2019", "iwasaki_2020"]
+  seed: 42
+  split_size: 0.9
+
+# -------------------------
+# Paths
+# -------------------------
+paths:
+  sequences_path: "./Datasets/data/sequence/sequence_embeddings_with_css.parquet"
+  css_split: "./Datasets/data/sequence/css_split.json"
+  checkpoints: "./checkpoints/riboai_queueing"
+  logs: "./logs/riboai_queueing"
+  results: "./results/riboai_queueing"
+  encodings:
+    nt: "Datasets/encodings/nt_encoding.yaml"
+    codon_to_aa: "Datasets/encodings/codon2aa.yaml"
+    codon: "Datasets/encodings/codon_encoding.yaml"
+    aa: "Datasets/encodings/aa_encoding.yaml"
+
+# -------------------------
+# Data
+# -------------------------
+data:
+  batch_size: 32
+  num_workers: 4
+
+# -------------------------
+# Model
+# -------------------------
+model:
+  input_size: 97
+  hidden_dims: 256
+  num_layers: 2
+  dropout: 0.2
+  bidirectional: true
+  w_temperature: 1.0
+  rho_eps: 1e-6
+  sigma_min: 0.1
+  sigma_max: 1.0
+
+sigma:
+  freeze_epochs: 0
+
+# -------------------------
+# Loss
+# -------------------------
+loss:
+  eps: 1e-6
+  censor_threshold: 0.0000001
+  lambda_reg: 0.0
+  lambda_smooth: 0.0
+  warmup_epochs: 1
+  lambda_g_reg: 1e-3
+  lambda_u_reg: 1e-4
+  lambda_g_smooth: 5e-3
+  lambda_log_phi_reg: 1e-4
+  lambda_pi_bias_reg: 1e-4
+  lambda_rho_cons: 1e-2
+  lambda_w_cons: 1e-2
+
+# -------------------------
+# Metric/targets
+# -------------------------
+metrics:
+  S_quantile: 0.99
+  S_eps: 1e-6
+  S_use_nonzero_only: true
+  S_use_censor_threshold: true
+  use_mu_total_for_metrics: true
+  w_target_use_censor_threshold: false
+  w_target_use_nonzero_only: false
+
+# -------------------------
+# Optimizer / LR schedule
+# -------------------------
+optim:
+  lr: 1e-3
+  weight_decay: 1e-3
+  scheduler:
+    name: reduce_on_plateau
+    monitor: val_loss_epoch
+    mode: min
+    factor: 0.9
+    patience: 1
+    min_lr: 1e-6
+
+# -------------------------
+# Trainer
+# -------------------------
+trainer:
+  devices: [0]
+  accelerator: gpu
+  precision: bf16-mixed
+  accumulate_grad_batches: 2
+  max_epochs: 300
+  log_every_n_steps: 1
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+
+# -------------------------
+# Callbacks
+# -------------------------
+callbacks:
+  early_stopping_patience: 15
+
+# -------------------------
+# Prediction
+# -------------------------
+predict:
+  example_idx: 0

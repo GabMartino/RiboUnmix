@@ -1,0 +1,43 @@
+
+_name_: preprocessed_datasets
+
+dataset_path:
+  green_2020: "Datasets/data/raw_datasets_with_css/green_2020.parquet"
+  ingolia_2014: "Datasets/data/raw_datasets_with_css/ingolia_2014.parquet"
+  kulakovskiy_2024: "Datasets/data/raw_datasets_with_css/kulakovskiy_2024.parquet"
+  kutay_2021: "Datasets/data/raw_datasets_with_css/kutay_2021.parquet"
+  sauer_2019: "Datasets/data/raw_datasets_with_css/sauer_2019.parquet"
+  tsvetanova_2025: "Datasets/data/raw_datasets_with_css/tsvetanova_2025.parquet"
+  wakigawa_2025: "Datasets/data/raw_datasets_with_css/wakigawa_2025.parquet"
+  wan_2019: "Datasets/data/raw_datasets_with_css/wan_2019.parquet"
+  wang_2016: "Datasets/data/raw_datasets_with_css/wang_2016.parquet"
+  wangHEK_2022: "Datasets/data/raw_datasets_with_css/wangHEK_2022.parquet"
+  weber_2022: "Datasets/data/raw_datasets_with_css/weber_2022.parquet"
+  weber_2024: "Datasets/data/raw_datasets_with_css/weber_2024.parquet"
+  wu_2019: "Datasets/data/raw_datasets_with_css/wu_2019.parquet"
+  wu_2020: "Datasets/data/raw_datasets_with_css/wu_2020.parquet"
+  gillen_2019: "Datasets/data/raw_datasets_with_css/gillen_2019.parquet"
+  grimson_2019: "Datasets/data/raw_datasets_with_css/grimson_2019.parquet"
+  iwasaki_2014: "Datasets/data/raw_datasets_with_css/iwasaki_2014.parquet"
+  iwasaki_2021: "Datasets/data/raw_datasets_with_css/iwasaki_2021.parquet"
+  kito_2023: "Datasets/data/raw_datasets_with_css/kito_2023.parquet"
+  kulakovskiy_2019:  "Datasets/data/raw_datasets_with_css/kulakovskiy_2019.parquet"
+  weber_2020:  "Datasets/data/raw_datasets_with_css/weber_2020.parquet"
+  riepe_2018:  "Datasets/data/raw_datasets_with_css/riepe_2018.parquet"
+  sako_2020:  "Datasets/data/raw_datasets_with_css/sako_2020.parquet"
+  cui_2024:  "Datasets/data/raw_datasets_with_css/cui_2024.parquet"
+  ichihara_2021:  "Datasets/data/raw_datasets_with_css/ichihara_2021.parquet"
+  iwasaki_2018:  "Datasets/data/raw_datasets_with_css/iwasaki_2018.parquet"
+  iwasaki_2019:  "Datasets/data/raw_datasets_with_css/iwasaki_2019.parquet"
+  martinez_2019:  "Datasets/data/raw_datasets_with_css/martinez_2019.parquet"
+  sidrauski_2015:  "Datasets/data/raw_datasets_with_css/sidrauski_2015.parquet"
+  song_2019:  "Datasets/data/raw_datasets_with_css/song_2019.parquet"
+  volegova_2018:  "Datasets/data/raw_datasets_with_css/volegova_2018.parquet"
+  iwasaki_2020: "./Datasets/data/raw_datasets_with_css/iwasaki_2020.parquet"
+
+  aggregated_mean: "./Datasets/data/raw_datasets_with_css/aggregated_mean.parquet"
+  aggregated_median: "./Datasets/data/raw_datasets_with_css/aggregated_median.parquet"
+  aggregated_sum: "./Datasets/data/raw_datasets_with_css/aggregated_sum.parquet"
+
+
+

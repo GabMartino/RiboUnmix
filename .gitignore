@@ -1,0 +1,7 @@
+/.venv/
+/checkpoints/
+/Datasets/conserved_stalling_sites/
+/Datasets/data/
+/outputs/
+/logs/
+/.idea
