@@ -357,6 +357,28 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         self.w_train_epoch.reset()
         self.kl_w_train_epoch.reset()
 
+    def predict_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0) -> dict[str, torch.Tensor]:
+        """
+        Surgically extracts the core biological and technical parameters for downstream
+        Metagene and Motif analysis. Offloads to CPU to prevent CUDA OOM.
+        """
+        # Unpack the batch exactly like _shared_step
+        ids_datasets_sorted, ids, packed_sequence, profiles_target, lengths, mask, css = batch
+
+        y = profiles_target.to(torch.float32)
+
+        # Run the forward pass
+        mu_obs, pi, sigma, extras = self.model(packed_sequence, ids_datasets_sorted, y)
+        rho, w_prob, J, transcript_scale_S, log_transcript_scale, total_scale, a, b, log_sigma = extras
+
+        # We only return what is strictly necessary for the biological validation plots
+        return {
+            "w_prob": w_prob.detach().cpu(),  # The pure biological shape
+            "b_offset": b.detach().cpu(),  # The technical RNase shift
+            "lengths": lengths.detach().cpu(),  # Needed to un-pad the arrays later
+            "dataset_id": ids_datasets_sorted.detach().cpu(),  # To split by dataset
+        }
+
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
             self.model.parameters(),

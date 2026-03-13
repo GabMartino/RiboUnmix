@@ -148,6 +148,9 @@ def main(cfg: DictConfig):
         trainer.fit(lit_model, datamodule=datamodule)
 
     if do_predict:
+        import matplotlib.pyplot as plt
+        import numpy as np
+
         out_dir = paths_results
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -156,19 +159,57 @@ def main(cfg: DictConfig):
             ckpt_found = find_checkpoint(ckpt_dir, prefer="best")
             ckpt_to_use = str(ckpt_found) if ckpt_found is not None else None
 
+        # 1. Run the targeted inference
+        print("Running biological inference extraction...")
         preds = trainer.predict(lit_model, datamodule=datamodule, ckpt_path=ckpt_to_use)
-        rows = flatten_predictions(preds)
-        if len(rows) == 0:
-            raise RuntimeError("trainer.predict returned no dict rows. Check predict_step output.")
 
-        parquet_path = save_predictions_parquet(rows, out_dir / "results.parquet")
+        if len(preds) == 0:
+            raise RuntimeError("trainer.predict returned empty results.")
 
-        df = pd.DataFrame(rows)
-        example_idx = cfg.predict.example_idx
-        fig_path = plot_example_profile(df, out_dir=out_dir, example_idx=example_idx)
+        # 2. Extract and Align the Start Codons
+        window_size = 50
+        start_codon_profiles = []
 
-        print("Saved:", parquet_path)
-        print("Saved plot:", fig_path)
+        print("Aligning transcripts at the Start Codon...")
+        for batch in preds:
+            w_probs = batch["w_prob"]  # [B, T]
+            lengths = batch["lengths"]  # [B]
+
+            for i in range(len(lengths)):
+                L = int(lengths[i].item())
+                # Only use transcripts long enough to fit the window
+                if L >= window_size:
+                    # Slice the first 50 codons (un-padded pure biology)
+                    w_start = w_probs[i, :window_size].numpy()
+                    start_codon_profiles.append(w_start)
+
+        # 3. Calculate the Global Biological Traffic Jam
+        start_codon_matrix = np.stack(start_codon_profiles)
+        # We use median to prevent a few crazy outliers from skewing the biological consensus
+        metagene_profile = np.median(start_codon_matrix, axis=0)
+
+        # 4. Generate the Proof
+        print(f"Aggregated {len(start_codon_profiles)} transcripts. Generating Metagene plot...")
+        plt.figure(figsize=(12, 5))
+        plt.plot(metagene_profile, color='indigo', linewidth=2.5)
+
+        # Highlight the Start Codon (Index 0)
+        plt.axvline(x=0, color='red', linestyle='--', alpha=0.7, label='Start Codon')
+
+        plt.title("w_prob Metagene Alignment (Pure Elongation Velocity)", fontsize=14)
+        plt.xlabel("Codon Position (0 = Start Codon)", fontsize=12)
+        plt.ylabel("Median w_prob (Predicted Dwell Time)", fontsize=12)
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+
+        metagene_path = out_dir / "metagene_start_codon_proof.png"
+        plt.savefig(metagene_path, dpi=300)
+        plt.close()
+
+        print("==================================================")
+        print(f"Biological Validation Saved: {metagene_path}")
+        print("==================================================")
 
 
 if __name__ == "__main__":
