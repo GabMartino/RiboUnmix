@@ -407,12 +407,13 @@ class RiboQueuingModel(nn.Module):
 
         # predicts log_sigma, then sigma = exp(log_sigma)
         self.ff_log_sigma = nn.Sequential(
-            nn.Linear(feat_dim + self.dataset_emb_dim, hidden_size),
+            nn.Linear(feat_dim + self.dataset_emb_dim, feat_dim),
             nn.GELU(),
             nn.Dropout(p=dropout),
-            nn.Linear(hidden_size, hidden_size),
+            nn.Linear(feat_dim, feat_dim),
             nn.GELU(),
-            nn.Linear(hidden_size, 1),
+            nn.Dropout(p=dropout),
+            nn.Linear(feat_dim, 1),
         )
 
         self.ff_J_conditioned = nn.Sequential(
@@ -433,6 +434,9 @@ class RiboQueuingModel(nn.Module):
             nn.GELU(),
             nn.Dropout(p=dropout),
             nn.Linear(h_dim, h_dim),
+            nn.GELU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(h_dim, h_dim),  # <-- The new expansion layer
             nn.GELU(),
             nn.Linear(h_dim, 2),
         )

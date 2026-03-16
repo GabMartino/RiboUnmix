@@ -84,7 +84,7 @@ class SortedLengthBatchSampler(BatchSampler):
         return (n + self.batch_size - 1) // self.batch_size
 
 
-class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
+class RiboAIQueuingDatamoduleMultiDatasetMultiEmbeddings(pl.LightningDataModule):
     def __init__(
         self,
         sequences_path: str,

@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torchmetrics
 
+from Dataloaders.RiboAIQueuingMultiDataset.RiboAIQueuingDatamoduleMultiDataset import open_file
 from Models.losses.zi_lognormal import ScaledZeroInflatedLogNormalLoss
 from Models.RiboQueuingModel.targets import mu_total_from_median_lognormal
 from Models.utils.log_plot import log_plot_validation
@@ -71,7 +72,7 @@ def masked_variance(tensor: torch.Tensor, mask_b: torch.Tensor) -> torch.Tensor:
 
 
 
-class RiboQueuingModelLightningModule(pl.LightningModule):
+class RiboQueuingModelMultiEmbeddingsLightningModule(pl.LightningModule):
     def __init__(self, torch_model: nn.Module, *, config: Any):
         super().__init__()
         self.model = torch_model
@@ -101,30 +102,29 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
         self._val_plot_logged_this_epoch = False
 
-        self.num_datasets = int(self.model.num_datasets)
 
-        dataset_names = getattr(self.config.experiment, "dataset", None)
-        if dataset_names is None:
-            self.dataset_names = [f"ds_{i}" for i in range(self.num_datasets)]
-        else:
-            self.dataset_names = [str(x) for x in dataset_names]
-            if len(self.dataset_names) != self.num_datasets:
-                self.dataset_names = [f"ds_{i}" for i in range(self.num_datasets)]
+
+
+        self.dataset_encoding = open_file(self.config.paths.encodings.datasets)
+        self.idx_to_dataset_enc = {v: k for k, v in self.dataset_encoding.items()}
+
+        self.used_datasets_names = list(self.config.experiment.dataset)
+        self.num_used_datasets = len(self.used_datasets_names)
 
         self.val_loss_per_dataset = nn.ModuleList(
-            [torchmetrics.MeanMetric() for _ in range(self.num_datasets)]
+            [torchmetrics.MeanMetric() for _ in range(self.num_used_datasets)]
         )
         self.val_mu_pcc_per_dataset = nn.ModuleList(
-            [torchmetrics.MeanMetric() for _ in range(self.num_datasets)]
+            [torchmetrics.MeanMetric() for _ in range(self.num_used_datasets)]
         )
         self.val_rho_pcc_per_dataset = nn.ModuleList(
-            [torchmetrics.MeanMetric() for _ in range(self.num_datasets)]
+            [torchmetrics.MeanMetric() for _ in range(self.num_used_datasets)]
         )
         self.val_w_pcc_per_dataset = nn.ModuleList(
-            [torchmetrics.MeanMetric() for _ in range(self.num_datasets)]
+            [torchmetrics.MeanMetric() for _ in range(self.num_used_datasets)]
         )
         self.val_w_kl_per_dataset = nn.ModuleList(
-            [torchmetrics.MeanMetric() for _ in range(self.num_datasets)]
+            [torchmetrics.MeanMetric() for _ in range(self.num_used_datasets)]
         )
 
     def _set_sigma_frozen(self, frozen: bool) -> None:
@@ -139,16 +139,30 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         self._val_plot_logged_this_epoch = False
 
     def on_train_epoch_start(self) -> None:
+        # Existing sigma freeze logic
         should_freeze = self.current_epoch < self.config.sigma.freeze_epochs
         if should_freeze != self._sigma_is_frozen:
             self._set_sigma_frozen(should_freeze)
+
+        # NEW: Dynamic Temperature Annealing
+        # Starts at initial w_temperature (e.g., 2.0) and linearly decays to 0.5
+        start_temp = self.config.model.w_temperature
+        min_temp = 0.5
+        progress = self.current_epoch / max(1, self.config.trainer.max_epochs)
+
+        # Calculate current decayed temperature
+        current_temp = start_temp - (start_temp - min_temp) * progress
+
+        # Update the model's physical temperature parameter
+        self.model.w_temperature = max(current_temp, min_temp)
+        self.log("train_w_temperature", self.model.w_temperature, on_step=False, on_epoch=True , sync_dist=True)
 
     def on_train_batch_start(self, batch: Any, batch_idx: int) -> None:
         if self.current_epoch < self.config.sigma.freeze_epochs:
             self.model.ff_delta_sigma.eval()
 
     def _shared_step(self, batch: Any, stage: str, batch_idx: int) -> torch.Tensor:
-        ids_datasets_sorted, ids, packed_sequence, profiles_target, lengths, mask, css = batch
+        ids_datasets_sorted, ids, packed_sequence, profiles_target, lengths, mask, css, batch_embeddings = batch
         batch_size = profiles_target.shape[0]
 
         y = profiles_target.to(torch.float32)
@@ -156,7 +170,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         mask_f = mask_b.float()
         eps = 1e-8
 
-        mu_obs, pi, sigma, extras = self.model(packed_sequence, ids_datasets_sorted, y)
+        mu_obs, pi, sigma, extras = self.model(packed_sequence, ids_datasets_sorted, y, batch_embeddings)
         rho, w_prob, J, transcript_scale_S, log_transcript_scale, total_scale, a, b, log_sigma = extras
 
         loss_per_sample = self.loss_fn(mu_obs, pi, sigma, y, mask_b, return_per_sample=True)
@@ -258,42 +272,53 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                          batch_size=batch_size)
                 self.log("train_J_mean", J.mean(), on_step=True, on_epoch=False, batch_size=batch_size)
 
-                self.train_loss_epoch.update(loss)
-                self.rho_train_epoch.update(rho_pcc)
-                self.mu_train_epoch.update(mu_pcc)
-                self.w_train_epoch.update(w_pcc)
-                self.kl_w_train_epoch.update(w_kl_mean)
+                self.train_loss_epoch.update(loss.detach())
+                self.rho_train_epoch.update(rho_pcc.detach())
+                self.mu_train_epoch.update(mu_pcc.detach())
+                self.w_train_epoch.update(w_pcc.detach())
+                self.kl_w_train_epoch.update(w_kl_mean.detach())
 
             else:
-                self.log("val_diag_a_variance", a_var_per_sample.mean(), on_step=False, on_epoch=True)
-                self.log("val_diag_b_variance", b_var_per_sample.mean(), on_step=False, on_epoch=True)
-                self.log("val_diag_scale_variance", scale_var_per_sample.mean(), on_step=False, on_epoch=True)
-                self.val_loss_epoch.update(loss)
-                self.rho_val_epoch.update(rho_pcc)
-                self.mu_val_epoch.update(mu_pcc)
-                self.w_val_epoch.update(w_pcc)
-                self.kl_w_val_epoch.update(w_kl_mean)
+                self.log("val_diag_a_variance", a_var_per_sample.mean(),
+                         on_step=False, on_epoch=True, sync_dist=True, batch_size=batch_size)
+                self.log("val_diag_b_variance", b_var_per_sample.mean(),
+                         on_step=False, on_epoch=True, sync_dist=True, batch_size=batch_size)
+                self.log("val_diag_scale_variance", scale_var_per_sample.mean(),
+                         on_step=False, on_epoch=True, sync_dist=True, batch_size=batch_size)
+                self.val_loss_epoch.update(loss.detach())
+                self.rho_val_epoch.update(rho_pcc.detach())
+                self.mu_val_epoch.update(mu_pcc.detach())
+                self.w_val_epoch.update(w_pcc.detach())
+                self.kl_w_val_epoch.update(w_kl_mean.detach())
 
                 for d in ids_datasets_sorted.unique():
+                    '''
+                        These indeces are based on the encoding
+                    '''
                     d_int = int(d.item())
+                    dataset_name = self.idx_to_dataset_enc[d_int]
+                    '''
+                        Report on theindeces of the used datasets
+                    '''
+                    d_int = self.used_datasets_names.index(dataset_name)
                     ds_mask = ids_datasets_sorted == d
 
                     if ds_mask.any():
-                        self.val_loss_per_dataset[d_int].update(loss_per_sample[ds_mask].mean())
-                        self.val_mu_pcc_per_dataset[d_int].update(mu_pcc_per_sample[ds_mask].mean())
-                        self.val_rho_pcc_per_dataset[d_int].update(rho_pcc_per_sample[ds_mask].mean())
-                        self.val_w_pcc_per_dataset[d_int].update(w_pcc_per_sample[ds_mask].mean())
-                        self.val_w_kl_per_dataset[d_int].update(w_kl[ds_mask].mean())
+                        self.val_loss_per_dataset[d_int].update(loss_per_sample[ds_mask].mean().detach())
+                        self.val_mu_pcc_per_dataset[d_int].update(mu_pcc_per_sample[ds_mask].mean().detach())
+                        self.val_rho_pcc_per_dataset[d_int].update(rho_pcc_per_sample[ds_mask].mean().detach())
+                        self.val_w_pcc_per_dataset[d_int].update(w_pcc_per_sample[ds_mask].mean().detach())
+                        self.val_w_kl_per_dataset[d_int].update(w_kl[ds_mask].mean().detach())
 
                 if (not self._val_plot_logged_this_epoch) and (batch_idx == 0):
                     exp = getattr(self.logger, "experiment", None) if self.logger is not None else None
                     log_plot_validation(
-                        profiles_target,
-                        mu_phys=mu_obs,
-                        mu_total=mu_total,
-                        pi=pi,
-                        w_prob=w_prob,
-                        sigma=sigma,
+                        profiles_target.detach().cpu(),
+                        mu_phys=mu_obs.detach().cpu(),
+                        mu_total=mu_total.detach().cpu(),
+                        pi=pi.detach().cpu(),
+                        w_prob=w_prob.detach().cpu(),
+                        sigma=sigma.detach().cpu(),
                         css=css,
                         lengths=lengths,
                         sample=0,
@@ -312,71 +337,60 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         return self._shared_step(batch, stage="val", batch_idx=batch_idx)
 
     def on_validation_epoch_end(self):
-        self.log("val_loss_epoch", self.val_loss_epoch.compute(), on_step=False, on_epoch=True)
-        self.log("val_rho_pcc_epoch", self.rho_val_epoch.compute(), on_step=False, on_epoch=True)
-        self.log("val_mu_pcc_epoch", self.mu_val_epoch.compute(), on_step=False, on_epoch=True)
-        self.log("val_w_pcc_epoch", self.w_val_epoch.compute(), on_step=False, on_epoch=True)
-        self.log("val_kl_w_epoch", self.kl_w_val_epoch.compute(), on_step=False, on_epoch=True)
+        # Pass the Metric OBJECT directly to self.log.
+        # REMOVED: .compute(), sync_dist=True, and .reset()
+        self.log("val_loss_epoch", self.val_loss_epoch, on_step=False, on_epoch=True)
+        self.log("val_rho_pcc_epoch", self.rho_val_epoch, on_step=False, on_epoch=True)
+        self.log("val_mu_pcc_epoch", self.mu_val_epoch, on_step=False, on_epoch=True)
+        self.log("val_w_pcc_epoch", self.w_val_epoch, on_step=False, on_epoch=True)
+        self.log("val_kl_w_epoch", self.kl_w_val_epoch, on_step=False, on_epoch=True)
 
-        self.val_loss_epoch.reset()
-        self.rho_val_epoch.reset()
-        self.mu_val_epoch.reset()
-        self.w_val_epoch.reset()
-        self.kl_w_val_epoch.reset()
+        for d in range(self.num_used_datasets):
+            name = self.used_datasets_names[d]
 
-        for d in range(self.num_datasets):
-            name = self.dataset_names[d]
-
-            try:
-                self.log(f"val_loss_epoch/{name}", self.val_loss_per_dataset[d].compute(), on_step=False, on_epoch=True)
-                self.log(f"val_mu_pcc_epoch/{name}", self.val_mu_pcc_per_dataset[d].compute(), on_step=False, on_epoch=True)
-                self.log(f"val_rho_pcc_epoch/{name}", self.val_rho_pcc_per_dataset[d].compute(), on_step=False, on_epoch=True)
-                self.log(f"val_w_pcc_epoch/{name}", self.val_w_pcc_per_dataset[d].compute(), on_step=False, on_epoch=True)
-                self.log(f"val_w_kl_epoch/{name}", self.val_w_kl_per_dataset[d].compute(), on_step=False, on_epoch=True)
-            except Exception:
-                pass
-
-            self.val_loss_per_dataset[d].reset()
-            self.val_mu_pcc_per_dataset[d].reset()
-            self.val_rho_pcc_per_dataset[d].reset()
-            self.val_w_pcc_per_dataset[d].reset()
-            self.val_w_kl_per_dataset[d].reset()
+            # Pass the Metric OBJECT directly to self.log.
+            self.log(f"val_loss_epoch/{name}", self.val_loss_per_dataset[d], on_step=False, on_epoch=True)
+            self.log(f"val_mu_pcc_epoch/{name}", self.val_mu_pcc_per_dataset[d], on_step=False, on_epoch=True)
+            self.log(f"val_rho_pcc_epoch/{name}", self.val_rho_pcc_per_dataset[d], on_step=False, on_epoch=True)
+            self.log(f"val_w_pcc_epoch/{name}", self.val_w_pcc_per_dataset[d], on_step=False, on_epoch=True)
+            self.log(f"val_w_kl_epoch/{name}", self.val_w_kl_per_dataset[d], on_step=False, on_epoch=True)
 
         self._val_plot_logged_this_epoch = False
 
     def on_train_epoch_end(self) -> None:
-        self.log("train_loss_epoch", self.train_loss_epoch.compute(), on_step=False, on_epoch=True)
-        self.log("train_rho_pcc_epoch", self.rho_train_epoch.compute(), on_step=False, on_epoch=True)
-        self.log("train_mu_pcc_epoch", self.mu_train_epoch.compute(), on_step=False, on_epoch=True)
-        self.log("train_w_pcc_epoch", self.w_train_epoch.compute(), on_step=False, on_epoch=True)
-        self.log("train_kl_w_epoch", self.kl_w_train_epoch.compute(), on_step=False, on_epoch=True)
+        # Pass the Metric OBJECT directly to self.log.
+        # REMOVED: .compute(), sync_dist=True, and .reset()
+        self.log("train_loss_epoch", self.train_loss_epoch, on_step=False, on_epoch=True)
+        self.log("train_rho_pcc_epoch", self.rho_train_epoch, on_step=False, on_epoch=True)
+        self.log("train_mu_pcc_epoch", self.mu_train_epoch, on_step=False, on_epoch=True)
+        self.log("train_w_pcc_epoch", self.w_train_epoch, on_step=False, on_epoch=True)
+        self.log("train_kl_w_epoch", self.kl_w_train_epoch, on_step=False, on_epoch=True)
 
-        self.train_loss_epoch.reset()
-        self.rho_train_epoch.reset()
-        self.mu_train_epoch.reset()
-        self.w_train_epoch.reset()
-        self.kl_w_train_epoch.reset()
+    def predict_step(self, batch, batch_idx, dataloader_idx=0):
+        # The *extra_items catches transcript_ids, lengths, or anything else the collate_fn yields
+        id_datasets, ids, x_packed, profiles_target, lengths, mask, css, batch_embeddings = batch
 
-    def predict_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0) -> dict[str, torch.Tensor]:
-        """
-        Surgically extracts the core biological and technical parameters for downstream
-        Metagene and Motif analysis. Offloads to CPU to prevent CUDA OOM.
-        """
-        # Unpack the batch exactly like _shared_step
-        ids_datasets_sorted, ids, packed_sequence, profiles_target, lengths, mask, css = batch
+        # Forward pass
+        mu, pi, sigma, (rho, w_prob, J, transcript_scale_S, log_transcript_scale, total_scale, a, b,
+                        log_sigma) = self.model(x_packed, id_datasets, profiles_target, batch_embeddings)
 
-        y = profiles_target.to(torch.float32)
+        # Extract lengths from packed sequence
+        from torch.nn.utils.rnn import pad_packed_sequence
+        _, lengths = pad_packed_sequence(x_packed, batch_first=True)
 
-        # Run the forward pass
-        mu_obs, pi, sigma, extras = self.model(packed_sequence, ids_datasets_sorted, y)
-        rho, w_prob, J, transcript_scale_S, log_transcript_scale, total_scale, a, b, log_sigma = extras
-
-        # We only return what is strictly necessary for the biological validation plots
+        # Return the complete physical state
         return {
-            "w_prob": w_prob.detach().cpu(),  # The pure biological shape
-            "b_offset": b.detach().cpu(),  # The technical RNase shift
-            "lengths": lengths.detach().cpu(),  # Needed to un-pad the arrays later
-            "dataset_id": ids_datasets_sorted.detach().cpu(),  # To split by dataset
+            "ids": ids,
+            "dataset_id": id_datasets.detach().cpu(),
+            "lengths": lengths.detach().cpu(),
+            "J": J.detach().cpu(),
+            "w_prob": w_prob.detach().cpu(),
+            "rho": rho.detach().cpu(),
+            "mu": mu.detach().cpu(),
+            "sigma": sigma.detach().cpu(),
+            "b_offset": b.detach().cpu(),
+            "pi": pi.detach().cpu(),
+            "css": css
         }
 
     def configure_optimizers(self):
@@ -386,19 +400,17 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             weight_decay=self.config.optim.weight_decay,
         )
 
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        # Force the model to explore, then smoothly settle, completely ignoring val_loss spikes
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            mode=self.config.optim.scheduler.mode,
-            factor=self.config.optim.scheduler.factor,
-            patience=self.config.optim.scheduler.patience,
-            min_lr=self.config.optim.scheduler.min_lr,
+            T_max=self.config.trainer.max_epochs,
+            eta_min=self.config.optim.scheduler.min_lr,
         )
 
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "monitor": self.config.optim.scheduler.monitor,
                 "interval": "epoch",
             },
         }

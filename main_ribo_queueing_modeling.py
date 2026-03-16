@@ -14,7 +14,7 @@ from omegaconf import DictConfig
 
 from Dataloaders.RiboAIQueuing.RiboAIQueuingDatamodule import RiboAIQueuingDatamodule
 from Models.RiboQueuingModel import RiboQueuingModel
-from Models.RiboQueuingModelLighningModule2 import RiboQueuingModelLightningModule
+from Models.RiboQueuingModelLighningModule import RiboQueuingModelLightningModule
 from Utils.checkpoints import find_checkpoint
 from Utils.prediction_io import flatten_predictions, plot_example_profile, save_predictions_parquet
 from Utils.splits import conserved_stalling_sites_aware_split
