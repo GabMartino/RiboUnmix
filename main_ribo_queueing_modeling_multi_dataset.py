@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import pathlib
 from pathlib import Path
+import hashlib  # Added for OS-safe hashing
 
 import hydra
 import lightning as pl
@@ -34,11 +35,12 @@ try:
 except AttributeError:
     pass
 
-# Apply the whitelist
+# Apply the whitelista
 torch.serialization.add_safe_globals(safe_globals)
+
+
 @hydra.main(version_base=None, config_path="config", config_name="config_riboai_queuing_multidataset")
 def main(cfg: DictConfig):
-
     # -------------------------
     # seeds
     # -------------------------
@@ -47,20 +49,49 @@ def main(cfg: DictConfig):
     torch.manual_seed(seed)
 
     # -------------------------
-    # dataset split
+    # dataset split & "all" logic
     # -------------------------
-    datasets = cfg.experiment.dataset
+    raw_datasets_cfg = cfg.experiment.dataset
+
+    # --- THE NEW "ALL" LOGIC ---
+    if isinstance(raw_datasets_cfg, str) and raw_datasets_cfg.lower() == "all":
+        # Extract all dataset names dynamically from the dataset_config dictionary
+        datasets = list(cfg.dataset_config.dataset_path.keys())
+        print(f"Command 'all' detected. Loading all {len(datasets)} datasets from config.")
+    elif isinstance(raw_datasets_cfg, str):
+        # Catch case where a single dataset was provided as a string instead of a list
+        datasets = [raw_datasets_cfg]
+    else:
+        # It's already a list
+        datasets = list(raw_datasets_cfg)
+
     split_size = cfg.experiment.split_size
     datasets_paths = []
     for dataset in datasets:
         dataset_path = cfg.dataset_config.dataset_path[dataset]
         datasets_paths.append(dataset_path)
-        train_fold, val_fold = conserved_stalling_sites_aware_split(cfg.paths.css_split, split_size=split_size, random_seed=seed)
+
+    train_fold, val_fold = conserved_stalling_sites_aware_split(cfg.paths.css_split, split_size=split_size,
+                                                                random_seed=seed)
+
+    # --- OS-SAFE FOLDER NAMING LOGIC ---
+    sorted_datasets = sorted(datasets)
+    raw_dataset_str = "_".join(sorted_datasets)
+
+    if len(raw_dataset_str) > 100:
+        short_hash = hashlib.md5(raw_dataset_str.encode()).hexdigest()[:6]
+        dataset_str = f"{len(datasets)}_datasets_mix_{short_hash}"
+    else:
+        dataset_str = raw_dataset_str
+
+    print(f"Tracking experiment under dataset signature: {dataset_str}")
+
     # -------------------------
-    # paths
+    # paths (Dynamically routed by dataset_str)
     # -------------------------
-    paths_logs = cfg.paths.logs
-    paths_results = cfg.paths.results
+    paths_logs = str(Path(cfg.paths.logs) / dataset_str)
+    paths_results = Path(cfg.paths.results) / dataset_str
+    paths_checkpoints = Path(cfg.paths.checkpoints) / dataset_str
 
     # -------------------------
     # model
@@ -80,9 +111,9 @@ def main(cfg: DictConfig):
     # optional restore
     from_ckpt = cfg.experiment.from_checkpoint
     if from_ckpt:
-        ckpt_path = find_checkpoint(cfg.paths.checkpoints, prefer="latest")
+        ckpt_path = find_checkpoint(str(paths_checkpoints), prefer="latest")
         if ckpt_path is None:
-            raise FileNotFoundError(f"from_checkpoint=True but no checkpoint found under: {cfg.paths.checkpoints}")
+            raise FileNotFoundError(f"from_checkpoint=True but no checkpoint found under: {paths_checkpoints}")
 
         lit_model = lit_model.__class__.load_from_checkpoint(
             checkpoint_path=str(ckpt_path),
@@ -112,14 +143,14 @@ def main(cfg: DictConfig):
     # logger
     # -------------------------
     logger_dir = paths_logs
-    tb_logger = TensorBoardLogger(save_dir=str(logger_dir), name="")
+    tb_logger = TensorBoardLogger(save_dir=logger_dir, name="")
 
     exp_name = Path(tb_logger.log_dir or tb_logger.save_dir).name
 
     # -------------------------
     # callbacks
     # -------------------------
-    ckpt_dir = os.path.join(cfg.paths.checkpoints, exp_name)
+    ckpt_dir = os.path.join(str(paths_checkpoints), exp_name)
     pathlib.Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
 
     monitor = cfg.optim.scheduler.monitor
@@ -172,20 +203,23 @@ def main(cfg: DictConfig):
 
         ckpt_to_use = checkpoint_callback.best_model_path or None
         if not ckpt_to_use:
-            ckpt_found = find_checkpoint(ckpt_dir, prefer="best")
+            ckpt_found = find_checkpoint(str(ckpt_dir), prefer="best")
             ckpt_to_use = str(ckpt_found) if ckpt_found is not None else None
 
-        print("Running comprehensive physical inference extraction...")
+        # Fetch the global rank of the current GPU
+        current_rank = trainer.global_rank
+
+        print(f"[Rank {current_rank}] Running comprehensive physical inference extraction...")
         preds = trainer.predict(lit_model, datamodule=datamodule, ckpt_path=ckpt_to_use)
 
-        if len(preds) == 0:
-            raise RuntimeError("trainer.predict returned empty results.")
+        if not preds or len(preds) == 0:
+            print(f"[Rank {current_rank}] No predictions to process. Exiting safely.")
+            return
 
-        print("Slicing padding and compiling master Parquet database...")
+        print(f"[Rank {current_rank}] Slicing padding and compiling master Parquet database...")
         master_rows = []
 
         for batch in preds:
-            # Extract to numpy for fast slicing
             lengths = batch["lengths"].numpy()
             transcripts_ids = batch["ids"]
             dataset_ids = batch["dataset_id"].numpy()
@@ -198,46 +232,44 @@ def main(cfg: DictConfig):
             b_offsets = batch["b_offset"].numpy()
             pis = batch["pi"].numpy()
 
-            # FIX: Extract the CSS batch
             css_batch = batch["css"]
+            y_vals = batch["y"].numpy()
+            total_scales = batch["total_scale"].numpy()
 
             for i in range(len(lengths)):
                 L = int(lengths[i])
 
-                # Safely format the CSS array for this specific transcript
                 css_i = css_batch[i]
                 if torch.is_tensor(css_i):
                     css_i = css_i.numpy()
                 else:
                     css_i = np.array(css_i)
 
-                # Create a comprehensive dictionary for this specific transcript & dataset
                 row_data = {
                     "dataset_id": int(dataset_ids[i]),
                     "length": L,
                     "transcripts_id": transcripts_ids[i],
                     "J": float(J_vals[i].item()),
-                    # Slice arrays to exact length L and convert to float32 to save RAM
                     "w_prob": w_probs[i, :L].astype(np.float32),
                     "rho": rhos[i, :L].astype(np.float32),
                     "mu": mus[i, :L].astype(np.float32),
                     "sigma": sigmas[i, :L].astype(np.float32),
                     "b_offset": b_offsets[i, :L].astype(np.float32),
                     "pi": pis[i, :L].astype(np.float32),
-                    # FIX: Slice and save the CSS array
-                    "css": css_i[:L] if len(css_i) >= L else css_i
+                    "css": css_i[:L] if len(css_i) >= L else css_i,
+                    "target": y_vals[i, :L].astype(np.float32),
+                    "total_scale": total_scales[i, :L].astype(np.float32)
                 }
                 master_rows.append(row_data)
 
-        # Convert to Pandas and save to Parquet
-        print(f"Aggregated {len(master_rows)} dataset-transcript interactions.")
+        print(f"[Rank {current_rank}] Aggregated {len(master_rows)} dataset-transcript interactions.")
         df_results = pd.DataFrame(master_rows)
 
-        parquet_path = out_dir / "comprehensive_predictions.parquet"
+        parquet_path = out_dir / f"comprehensive_predictions_rank{current_rank}.parquet"
         df_results.to_parquet(parquet_path, engine="pyarrow")
 
         print("==================================================")
-        print(f"Full Physical State Saved: {parquet_path}")
+        print(f"[Rank {current_rank}] Full Physical State Saved: {parquet_path}")
         print("==================================================")
 
 

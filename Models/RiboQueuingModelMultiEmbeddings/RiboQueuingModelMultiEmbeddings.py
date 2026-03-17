@@ -1,44 +1,8 @@
-from __future__ import annotations
-
 import torch
-import torch.nn as nn
+from torch import nn
 from torch.nn.utils.rnn import pad_packed_sequence
-import torch.nn.functional as F
-import math
 
-
-@torch.no_grad()
-def compute_S_quantile(
-        y_true: torch.Tensor,
-        mask: torch.Tensor,
-        q: float,
-        eps: float,
-        censor_threshold: float,
-        use_censor_threshold: bool,
-        use_nonzero_only: bool,
-) -> torch.Tensor:
-    y = y_true.to(torch.float32)
-    m = mask.bool()
-
-    if use_censor_threshold:
-        m = m & (y > float(censor_threshold))
-    elif use_nonzero_only:
-        m = m & (y > 0)
-
-    counts = m.sum(dim=1)  # [B]
-    B, _T = y.shape
-
-    vals = y.masked_fill(~m, float("inf"))
-    vals_sorted, _ = torch.sort(vals, dim=1)
-
-    q = float(q)
-    k = (q * (counts.clamp_min(1) - 1).float()).floor().long()
-    k_max = (counts.clamp_min(1) - 1).long()
-    k = torch.minimum(k.clamp_min(0), k_max)
-
-    S = vals_sorted.gather(1, k.view(B, 1))
-    S = torch.where(counts.view(B, 1) > 0, S, torch.full_like(S, float(eps)))
-    return S.clamp_min(float(eps))
+from Models.utils.compute_S_quantile import compute_S_quantile
 
 
 class RiboQueuingModelMultiEmbeddings(nn.Module):
@@ -46,6 +10,7 @@ class RiboQueuingModelMultiEmbeddings(nn.Module):
             self,
             input_size: int,
             hidden_size: int,
+            embeddings_list: list = None,  # NEW: Pass the list of embeddings here
             num_layers: int = 2,
             dropout: float = 0.1,
             w_temperature: float = 1.0,
@@ -89,8 +54,24 @@ class RiboQueuingModelMultiEmbeddings(nn.Module):
         if dataset_emb_dim is None:
             dataset_emb_dim = hidden_size
 
-
         self.dataset_emb_dim = int(dataset_emb_dim)
+
+        # --- THE EMBEDDING PROJECTION HEAD ---
+        self.embeddings_list = embeddings_list or []
+
+        # If we have embeddings, we project them into a dense 32-dim vector
+        self.emb_hidden_dim = 32 if len(self.embeddings_list) > 0 else 0
+
+        if self.emb_hidden_dim > 0:
+            raw_emb_dim = 0
+            for emb in self.embeddings_list:
+                raw_emb_dim += 3 if emb in ['dom', 'exo', 'fra', 'gmp', 'tmp', 'openen'] else 1
+
+            self.emb_proj = nn.Sequential(
+                nn.Linear(raw_emb_dim, self.emb_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(p=dropout)
+            )
 
         self.rnn = nn.GRU(
             input_size=input_size,
@@ -103,9 +84,12 @@ class RiboQueuingModelMultiEmbeddings(nn.Module):
         feat_dim = hidden_size * 2
         h_dim = self.num_layers * 2 * hidden_size
 
+        # The new augmented dimension for the downstream physics heads
+        augmented_feat_dim = feat_dim + self.emb_hidden_dim
+
         # --- Intrinsic biology ---
         self.ff_w_logits = nn.Sequential(
-            nn.Linear(feat_dim, feat_dim),
+            nn.Linear(augmented_feat_dim, feat_dim),
             nn.GELU(),
             nn.Dropout(p=dropout),
             nn.Linear(feat_dim, feat_dim),
@@ -113,7 +97,6 @@ class RiboQueuingModelMultiEmbeddings(nn.Module):
             nn.Linear(feat_dim, 1),
         )
 
-        # THE FIX 1: Change input from feat_dim (local) to h_dim (global)
         self.ff_pi = nn.Sequential(
             nn.Linear(h_dim + self.dataset_emb_dim, feat_dim),
             nn.GELU(),
@@ -124,9 +107,8 @@ class RiboQueuingModelMultiEmbeddings(nn.Module):
             nn.Sigmoid(),
         )
 
-        # predicts log_sigma, then sigma = exp(log_sigma)
         self.ff_log_sigma = nn.Sequential(
-            nn.Linear(feat_dim + self.dataset_emb_dim, feat_dim),
+            nn.Linear(augmented_feat_dim + self.dataset_emb_dim, feat_dim),
             nn.GELU(),
             nn.Dropout(p=dropout),
             nn.Linear(feat_dim, feat_dim),
@@ -149,13 +131,13 @@ class RiboQueuingModelMultiEmbeddings(nn.Module):
         self.dataset_embeddings = nn.Embedding(self.num_datasets, self.dataset_emb_dim)
 
         self.dataset_offset_ff = nn.Sequential(
-            nn.Linear(feat_dim + self.dataset_emb_dim, h_dim),
+            nn.Linear(augmented_feat_dim + self.dataset_emb_dim, h_dim),
             nn.GELU(),
             nn.Dropout(p=dropout),
             nn.Linear(h_dim, h_dim),
             nn.GELU(),
             nn.Dropout(p=dropout),
-            nn.Linear(h_dim, h_dim),  # <-- The new expansion layer
+            nn.Linear(h_dim, h_dim),
             nn.GELU(),
             nn.Linear(h_dim, 2),
         )
@@ -163,14 +145,8 @@ class RiboQueuingModelMultiEmbeddings(nn.Module):
         # --- Initialization ---
         nn.init.constant_(self.ff_w_logits[-1].bias, 0.0)
         nn.init.constant_(self.ff_J_conditioned[-2].bias, -1.0)
-
-        # pi_max * Sigmoid(-2.0) sets initial dropout probability very low (approx 12%)
         nn.init.constant_(self.ff_pi[-2].bias, -2.0)
-
-        # log_sigma = -1.0 -> sigma = 0.36 (starts with low variance assumption)
         nn.init.constant_(self.ff_log_sigma[-1].bias, -1.0)
-
-        # Force the dataset offset network to start at true neutral (a_raw=0, b_raw=0)
         nn.init.constant_(self.dataset_offset_ff[-1].weight, 0.0)
         nn.init.constant_(self.dataset_offset_ff[-1].bias, 0.0)
 
@@ -188,24 +164,25 @@ class RiboQueuingModelMultiEmbeddings(nn.Module):
 
         return out, h_n, mask, mask_f, B, T, lengths
 
-    def utilization_rate(self, x, h_n, dataset_embeddings, mask, mask_f, lengths, B):
-        w_logits = self.ff_w_logits(x).squeeze(-1)  # [B,T]
+    # UPDATED: Now takes augmented_out instead of raw out
+    def utilization_rate(self, augmented_out, h_n, dataset_embeddings, mask, mask_f, lengths, B):
+        w_logits = self.ff_w_logits(augmented_out).squeeze(-1)  # [B,T]
         w_logits = w_logits.masked_fill(~mask, float("-inf"))
         w_prob = torch.softmax(w_logits / max(self.w_temperature, 1e-6), dim=1)
         w_prob = w_prob * mask_f
 
-        # Format h_n to [B, h_dim]
         h_n_flat = h_n.permute(1, 0, 2).reshape(B, -1)
-
         h_n_dataset = torch.cat([h_n_flat.detach(), dataset_embeddings], -1)
         J = self.ff_J_conditioned(h_n_dataset)
 
-        L = lengths.unsqueeze(1).to(dtype=x.dtype)  # [B,1]
-        x_flux = J * L * w_prob  # [B,T]
+        L = lengths.unsqueeze(1).to(dtype=augmented_out.dtype)  # [B,1]
+        x_flux = J * L * w_prob
         rho = (1.0 - torch.exp(-x_flux)).clamp_max(1.0 - self.rho_eps) * mask_f
         return rho, w_prob, J
 
-    def transcript_and_dataset_scaling(self, out, dataset_embeddings, y_raw_target, mask, detach_out: bool = True):
+    # UPDATED: Now takes augmented_out
+    def transcript_and_dataset_scaling(self, augmented_out, dataset_embeddings, y_raw_target, mask,
+                                       detach_out: bool = True):
         transcript_scale_S = compute_S_quantile(
             y_raw_target, mask, q=self.S_quantile, eps=self.S_eps,
             censor_threshold=self.censor_threshold, use_censor_threshold=self.S_use_censor_threshold,
@@ -214,18 +191,15 @@ class RiboQueuingModelMultiEmbeddings(nn.Module):
 
         log_transcript_scale = torch.log(transcript_scale_S.clamp_min(self.eps))
 
-        B, T, _ = out.shape
+        B, T, _ = augmented_out.shape
         mask_f = mask.unsqueeze(-1).float()
 
         dataset_emb_expanded = dataset_embeddings.unsqueeze(1).expand(B, T, -1)
         log_transcript_scale_pos = log_transcript_scale.unsqueeze(1).expand(B, T, 1)
 
-        out_for_scale = out.detach() if detach_out else out
+        out_for_scale = augmented_out.detach() if detach_out else augmented_out
 
-        ff_input = torch.cat(
-            [out_for_scale, dataset_emb_expanded],
-            dim=-1,
-        )
+        ff_input = torch.cat([out_for_scale, dataset_emb_expanded], dim=-1)
 
         ab = self.dataset_offset_ff(ff_input)
         a, b = ab.chunk(2, dim=-1)
@@ -241,50 +215,59 @@ class RiboQueuingModelMultiEmbeddings(nn.Module):
 
         return total_scale.squeeze(-1), transcript_scale_S, log_transcript_scale, a.squeeze(-1), b.squeeze(-1)
 
-    def compute_conditional_sigma(self, out, dataset_embeddings):
-        B, T, _ = out.shape
-
+    # UPDATED: Now takes augmented_out
+    def compute_conditional_sigma(self, augmented_out, dataset_embeddings):
+        B, T, _ = augmented_out.shape
         dataset_emb_expanded = dataset_embeddings.unsqueeze(1).expand(B, T, -1)
-
-        sigma_ff_input = torch.cat([out.detach(), dataset_emb_expanded], dim=-1)
-
-        log_sigma_raw = self.ff_log_sigma(sigma_ff_input).squeeze(-1)  # [B, T]
-
+        sigma_ff_input = torch.cat([augmented_out.detach(), dataset_emb_expanded], dim=-1)
+        log_sigma_raw = self.ff_log_sigma(sigma_ff_input).squeeze(-1)
         log_sigma = log_sigma_raw.clamp(self.log_sigma_min, self.log_sigma_max)
-
-        sigma = torch.exp(log_sigma)  # [B, T]
+        sigma = torch.exp(log_sigma)
         return sigma, log_sigma
 
-    def forward(self, x_packed, id_datasets: torch.Tensor, y_raw_target: torch.Tensor):
+    # NEW SIGNATURE: Accepts batch_embeddings
+    def forward(self, x_packed, id_datasets: torch.Tensor, y_raw_target: torch.Tensor, batch_embeddings: dict = None):
         out, h_n, mask, mask_f, B, T, lengths = self.rnn_out(x_packed)
 
-        '''
-            Intrinsic biology
-        '''
+        # --- THE EMBEDDING FUSION ---
+        if self.emb_hidden_dim > 0 and batch_embeddings is not None:
+            emb_tensors = []
+            # Extract in the exact order specified in __init__
+            for emb_name in self.embeddings_list:
+                # Shape is [B, Tmax, 3]
+                emb_tensors.append(batch_embeddings[emb_name])
+
+            # Concatenate along the last dimension.
+            # E.g., 9 embeddings * 3 nts = 27 features [B, Tmax, 27]
+            fused_embs = torch.cat(emb_tensors, dim=-1)
+
+            # Pass through the projection head to get a [B, Tmax, 32] vector
+            projected_embs = self.emb_proj(fused_embs)
+
+            # Concatenate the biological features with the GRU's memory state
+            augmented_out = torch.cat([out, projected_embs], dim=-1)
+        else:
+            augmented_out = out
+
+        # ----------------------------
+
         dataset_embeddings = self.dataset_embeddings(id_datasets)
 
-        rho, w_prob, J = self.utilization_rate(out, h_n, dataset_embeddings, mask, mask_f, lengths, B)
+        # Feed the augmented representation to the physics heads
+        rho, w_prob, J = self.utilization_rate(augmented_out, h_n, dataset_embeddings, mask, mask_f, lengths, B)
 
         total_scale, transcript_scale_S, log_transcript_scale, a, b = self.transcript_and_dataset_scaling(
-            out, dataset_embeddings, y_raw_target, mask
+            augmented_out, dataset_embeddings, y_raw_target, mask
         )
 
         mu = rho * total_scale
 
-        # THE FIX 2: Global Pi Execution
-        # 1. Format and detach the global h_n vector [B, h_dim]
         h_n_flat_detached = h_n.permute(1, 0, 2).reshape(B, -1).detach()
-
-        # 2. Concatenate with dataset embeddings [B, h_dim + E]
         pi_ff_input = torch.cat([h_n_flat_detached, dataset_embeddings], dim=-1)
-
-        # 3. Predict a single, global dropout scalar per transcript [B, 1]
         pi_global = self.ff_pi(pi_ff_input) * self.pi_max
-
-        # 4. Expand it across the sequence length and apply padding mask [B, T]
         pi = pi_global.expand(B, T) * mask_f
 
-        sigma, log_sigma = self.compute_conditional_sigma(out, dataset_embeddings)
+        sigma, log_sigma = self.compute_conditional_sigma(augmented_out, dataset_embeddings)
 
         return mu, pi, sigma, (
             rho,

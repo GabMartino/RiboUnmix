@@ -1,5 +1,4 @@
 import os
-
 import lightning as pl
 import pandas as pd
 import torch
@@ -10,33 +9,30 @@ from torch import Generator
 from torch.utils.data import DataLoader, Subset, Sampler, BatchSampler, SequentialSampler
 from tqdm import tqdm
 
-from Dataloaders.RiboAIQueuingMultiDataset.RiboAIQueuingMultiDataset import (
-    RiboAIQueuingDatasetMultiDataset
-)
+from Dataloaders.RiboAIQueuingMultiDatasetMultiEmbeddings.RiboAIQueuingMultiDatasetMultiEmbeddings import \
+    RiboAIQueuingDatasetMultiDatasetMultiEmbeddings
 
 
 def open_file(path: str):
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
+
 class SortedLengthBatchSampler(BatchSampler):
     """
     Batch sampler that groups subset-space indices by sequence length.
-    Compatible with Lightning sampler injection because it exposes:
-      - sampler
-      - batch_size
-      - drop_last
+    Compatible with Lightning sampler injection.
     """
 
     def __init__(
-        self,
-        sampler,
-        batch_size: int,
-        drop_last: bool = False,
-        lengths=None,
-        seed: int = 42,
-        shuffle: bool = True,
-        descending: bool = True,
+            self,
+            sampler,
+            batch_size: int,
+            drop_last: bool = False,
+            lengths=None,
+            seed: int = 42,
+            shuffle: bool = True,
+            descending: bool = True,
     ):
         self.sampler = sampler
         self.batch_size = int(batch_size)
@@ -48,14 +44,12 @@ class SortedLengthBatchSampler(BatchSampler):
         self._rng = np.random.default_rng(self.seed)
 
     def __iter__(self):
-        # sampler yields indices in subset-space: 0..len(subset)-1
         idx = np.fromiter(iter(self.sampler), dtype=np.int64)
 
         if idx.size == 0:
             return
             yield  # pragma: no cover
 
-        # sort only the indices assigned by the current sampler
         order = np.argsort(self.lengths[idx], kind="stable")
         if self.descending:
             order = order[::-1]
@@ -86,19 +80,20 @@ class SortedLengthBatchSampler(BatchSampler):
 
 class RiboAIQueuingDatamoduleMultiDatasetMultiEmbeddings(pl.LightningDataModule):
     def __init__(
-        self,
-        sequences_path: str,
-        datasets_paths: list,
-        batch_size: int,
-        split: tuple | None,
-        nt_encoding_path: str,
-        codon_to_aa_encoding_path: str,
-        codon_encoding_path: str,
-        aa_encoding_path: str,
-        datasets_encoding_path: str,
-        split_p: float = 0.9,
-        num_workers: int = 4,
-        seed: int = 42,
+            self,
+            sequences_path: str,
+            datasets_paths: list,
+            batch_size: int,
+            split: tuple | None,
+            nt_encoding_path: str,
+            codon_to_aa_encoding_path: str,
+            codon_encoding_path: str,
+            aa_encoding_path: str,
+            datasets_encoding_path: str,
+            embeddings: list,  # FIX 2: Added the embeddings list argument
+            split_p: float = 0.9,
+            num_workers: int = 4,
+            seed: int = 42,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -110,6 +105,9 @@ class RiboAIQueuingDatamoduleMultiDatasetMultiEmbeddings(pl.LightningDataModule)
         self.split_p = float(split_p)
         self.num_workers = int(num_workers)
         self.seed = int(seed)
+
+        # Save the embeddings list so setup() can use it
+        self.embeddings = embeddings if embeddings is not None else []
 
         self.nt_enc = open_file(nt_encoding_path)
         self.c2aa_enc = open_file(codon_to_aa_encoding_path)
@@ -147,7 +145,6 @@ class RiboAIQueuingDatamoduleMultiDatasetMultiEmbeddings(pl.LightningDataModule)
             if "id" in df.columns:
                 df = df.set_index("id")
 
-            # keep master order, avoid sorting overhead
             common_index = common_index.intersection(df.index, sort=False)
             loaded_datasets[dataset_name] = df
 
@@ -159,11 +156,15 @@ class RiboAIQueuingDatamoduleMultiDatasetMultiEmbeddings(pl.LightningDataModule)
         if len(common_index) == 0:
             raise RuntimeError("Empty intersection between master sequences and datasets.")
 
-        # ---- 3) filter master to common transcripts (in common_index order) ----
+        # ---- 3) filter master to common transcripts ----
         seq_df_common = seq_df.loc[common_index]
 
         ref_arrays = seq_df_common["ref"].values
-        css = seq_df_common["conserved_stalling_sites"].values
+
+        # Handle column naming variations safely
+        css_col = "conserved_stalling_sites" if "conserved_stalling_sites" in seq_df_common.columns else "css"
+        css = seq_df_common[css_col].values
+
         lengths = np.array([len(x) for x in ref_arrays], dtype=np.int32)
 
         nT = len(common_index)
@@ -177,28 +178,30 @@ class RiboAIQueuingDatamoduleMultiDatasetMultiEmbeddings(pl.LightningDataModule)
             "datasets_names": dataset_names,
         }
 
+        # FIX 3: Dynamically extract the requested embeddings
+        for emb_name in self.embeddings:
+            if emb_name not in seq_df_common.columns:
+                raise ValueError(f"Requested embedding '{emb_name}' is missing from the master sequences parquet file!")
+            shared_data[emb_name] = seq_df_common[emb_name].values
+
         # ---- 4) extract ribo profiles aligned to common_index ----
         for dataset_name, df in loaded_datasets.items():
             aligned_df = df.loc[common_index]
-            # Ensure numpy float32 arrays
             shared_data["ribo_profiles"][dataset_name] = [
                 np.asarray(arr, dtype=np.float32) for arr in aligned_df["ribo"].values
             ]
 
-        # ---- 5) build transcript-level train/val split (indices in 0..nT-1) ----
+        # ---- 5) build transcript-level train/val split ----
         if self.split is not None:
             print("Using provided split (transcript IDs).")
             train_ids = set(self.split[0])
             val_ids = set(self.split[1])
 
-            # transcript indices (0..nT-1)
             train_t = [i for i, t in enumerate(shared_data["transcript_id"]) if t in train_ids]
             val_t = [i for i, t in enumerate(shared_data["transcript_id"]) if t in val_ids]
 
             if len(train_t) == 0 or len(val_t) == 0:
-                raise RuntimeError(
-                    f"Split produced empty train/val: train={len(train_t)} val={len(val_t)}"
-                )
+                raise RuntimeError(f"Split produced empty train/val: train={len(train_t)} val={len(val_t)}")
         else:
             print(f"Random split with split_p={self.split_p:.3f}")
             g = Generator().manual_seed(self.seed)
@@ -210,31 +213,31 @@ class RiboAIQueuingDatamoduleMultiDatasetMultiEmbeddings(pl.LightningDataModule)
                 raise RuntimeError("Validation split is empty; decrease split_p.")
 
         # ---- 6) expand transcript indices to global multi-dataset indices ----
-        # global index = d*nT + t, for d in [0..nD-1], t in [0..nT-1]
         def expand_indices(t_indices: list[int]) -> list[int]:
             return [d * nT + t for d in range(nD) for t in t_indices]
 
         train_indices = expand_indices(train_t)
         val_indices = expand_indices(val_t)
 
-        # lengths per sample in global index space
-        all_lengths = np.tile(lengths, nD)  # [nT*nD]
+        all_lengths = np.tile(lengths, nD)
         train_lengths = all_lengths[train_indices]
         val_lengths = all_lengths[val_indices]
 
-        # ---- 7) build datasets ----
-        self.train_dataset_obj = RiboAIQueuingDatasetMultiDataset(
+        # ---- 7) build datasets (Using the NEW Dataset Class) ----
+        self.train_dataset_obj = RiboAIQueuingDatasetMultiDatasetMultiEmbeddings(
             data=shared_data,
             lengths=shared_data["lengths"],
+            embeddings=self.embeddings,  # <-- Pass the list here
             nt_encoding=self.nt_enc,
             codon_to_aa_encoding=self.c2aa_enc,
             codon_encoding=self.c_enc,
             aa_encoding=self.aa_enc,
             datasets_encoding=self.datasets_enc,
         )
-        self.val_dataset_obj = RiboAIQueuingDatasetMultiDataset(
+        self.val_dataset_obj = RiboAIQueuingDatasetMultiDatasetMultiEmbeddings(
             data=shared_data,
             lengths=shared_data["lengths"],
+            embeddings=self.embeddings,  # <-- Pass the list here
             nt_encoding=self.nt_enc,
             codon_to_aa_encoding=self.c2aa_enc,
             codon_encoding=self.c_enc,

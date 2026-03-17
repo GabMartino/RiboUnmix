@@ -8,8 +8,8 @@ import torch.nn as nn
 import torchmetrics
 
 from Dataloaders.RiboAIQueuingMultiDataset.RiboAIQueuingDatamoduleMultiDataset import open_file
-from Models.losses.zi_lognormal import ScaledZeroInflatedLogNormalLoss
-from Models.RiboQueuingModel.targets import mu_total_from_median_lognormal
+from Models.utils.targets import mu_total_from_median_lognormal
+from Models.utils.zi_lognormal_loss import ScaledZeroInflatedLogNormalLoss
 from Models.utils.log_plot import log_plot_validation
 from Utils.utils import PearsonCorrelation
 import torch.nn.functional as F
@@ -389,7 +389,9 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "sigma": sigma.detach().cpu(),
             "b_offset": b.detach().cpu(),
             "pi": pi.detach().cpu(),
-            "css": css
+            "css": css,
+            "y": profiles_target.detach().cpu(),
+            "total_scale": total_scale.detach().cpu()
         }
 
     def configure_optimizers(self):

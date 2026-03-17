@@ -108,7 +108,6 @@ class RiboAIQueuingDatasetMultiDatasetMultiEmbeddings(Dataset):
             cached_emb = self._embeddings_cache[emb_name][idx_transcript]
 
             if cached_emb is None:
-                print(emb_name)
                 # Raw list is length L. Elements are size 3 arrays (per NT in codon).
                 raw_list = self.data_records[emb_name][idx_transcript]
                 arr = np.stack(raw_list).astype(np.float32, copy=False)

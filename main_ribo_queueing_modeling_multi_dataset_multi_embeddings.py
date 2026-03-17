@@ -13,10 +13,10 @@ from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, Mode
 from lightning.pytorch.loggers import TensorBoardLogger
 from omegaconf import DictConfig
 
-from Dataloaders.RiboAIQueuingMultiDataset.RiboAIQueuingDatamoduleMultiDataset import \
-    RiboAIQueuingDatamoduleMultiDataset
-from Models.RiboQueuingModel import RiboQueuingModel
-from Models.RiboQueuingModelLighningModule import RiboQueuingModelLightningModule
+from Dataloaders.RiboAIQueuingMultiDatasetMultiEmbeddings.RiboAIQueuingDatamoduleMultiDatasetMultiEmbeddings import \
+    RiboAIQueuingDatamoduleMultiDatasetMultiEmbeddings
+from Models.RiboQueuingModelMultiEmbeddings.RiboQueuingModelMultiEmbeddings import RiboQueuingModelMultiEmbeddings
+from Models.RiboQueuingModelMultiEmbeddingsLighningModule import RiboQueuingModelMultiEmbeddingsLightningModule
 from Utils.checkpoints import find_checkpoint
 from Utils.prediction_io import flatten_predictions, plot_example_profile, save_predictions_parquet
 from Utils.splits import conserved_stalling_sites_aware_split
@@ -36,9 +36,10 @@ except AttributeError:
 
 # Apply the whitelist
 torch.serialization.add_safe_globals(safe_globals)
-@hydra.main(version_base=None, config_path="config", config_name="config_riboai_queuing_multidataset")
-def main(cfg: DictConfig):
 
+
+@hydra.main(version_base=None, config_path="config", config_name="config_riboai_queuing_multidataset_multi_embeddings")
+def main(cfg: DictConfig):
     # -------------------------
     # seeds
     # -------------------------
@@ -55,7 +56,9 @@ def main(cfg: DictConfig):
     for dataset in datasets:
         dataset_path = cfg.dataset_config.dataset_path[dataset]
         datasets_paths.append(dataset_path)
-        train_fold, val_fold = conserved_stalling_sites_aware_split(cfg.paths.css_split, split_size=split_size, random_seed=seed)
+        train_fold, val_fold = conserved_stalling_sites_aware_split(cfg.paths.css_split, split_size=split_size,
+                                                                    random_seed=seed)
+
     # -------------------------
     # paths
     # -------------------------
@@ -65,9 +68,11 @@ def main(cfg: DictConfig):
     # -------------------------
     # model
     # -------------------------
-    torch_model = RiboQueuingModel(
+    # FIX 2: Instantiate the MultiEmbeddings PyTorch Model
+    torch_model = RiboQueuingModelMultiEmbeddings(
         input_size=cfg.model.input_size,
         hidden_size=cfg.model.hidden_dims,
+        embeddings_list=cfg.model.embeddings,  # <-- NEW: Pass from config
         dropout=cfg.model.dropout,
         num_datasets=cfg.model.num_datasets,
         num_layers=cfg.model.num_layers,
@@ -75,7 +80,8 @@ def main(cfg: DictConfig):
         rho_eps=cfg.model.rho_eps,
     )
 
-    lit_model = RiboQueuingModelLightningModule(torch_model, config=cfg)
+    # FIX 3: Instantiate the MultiEmbeddings Lightning Module
+    lit_model = RiboQueuingModelMultiEmbeddingsLightningModule(torch_model, config=cfg)
 
     # optional restore
     from_ckpt = cfg.experiment.from_checkpoint
@@ -94,13 +100,15 @@ def main(cfg: DictConfig):
     # -------------------------
     # datamodule
     # -------------------------
-    datamodule = RiboAIQueuingDatamoduleMultiDataset(
+    # FIX 4: Instantiate the MultiEmbeddings DataModule
+    datamodule = RiboAIQueuingDatamoduleMultiDatasetMultiEmbeddings(
         sequences_path=cfg.paths.sequences_path,
         datasets_paths=datasets_paths,
         batch_size=cfg.data.batch_size,
         split=(train_fold, val_fold),
         split_p=split_size,
         num_workers=cfg.data.num_workers,
+        embeddings=cfg.data.embeddings,  # <-- NEW: Pass from config
         nt_encoding_path=cfg.paths.encodings.nt,
         codon_encoding_path=cfg.paths.encodings.codon,
         codon_to_aa_encoding_path=cfg.paths.encodings.codon_to_aa,
@@ -198,7 +206,6 @@ def main(cfg: DictConfig):
             b_offsets = batch["b_offset"].numpy()
             pis = batch["pi"].numpy()
 
-            # FIX: Extract the CSS batch
             css_batch = batch["css"]
 
             for i in range(len(lengths)):
@@ -211,25 +218,21 @@ def main(cfg: DictConfig):
                 else:
                     css_i = np.array(css_i)
 
-                # Create a comprehensive dictionary for this specific transcript & dataset
                 row_data = {
                     "dataset_id": int(dataset_ids[i]),
                     "length": L,
                     "transcripts_id": transcripts_ids[i],
                     "J": float(J_vals[i].item()),
-                    # Slice arrays to exact length L and convert to float32 to save RAM
                     "w_prob": w_probs[i, :L].astype(np.float32),
                     "rho": rhos[i, :L].astype(np.float32),
                     "mu": mus[i, :L].astype(np.float32),
                     "sigma": sigmas[i, :L].astype(np.float32),
                     "b_offset": b_offsets[i, :L].astype(np.float32),
                     "pi": pis[i, :L].astype(np.float32),
-                    # FIX: Slice and save the CSS array
                     "css": css_i[:L] if len(css_i) >= L else css_i
                 }
                 master_rows.append(row_data)
 
-        # Convert to Pandas and save to Parquet
         print(f"Aggregated {len(master_rows)} dataset-transcript interactions.")
         df_results = pd.DataFrame(master_rows)
 

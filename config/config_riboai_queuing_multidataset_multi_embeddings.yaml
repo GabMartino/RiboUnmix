@@ -1,5 +1,5 @@
 
-name: ribo_queueing_multi_datasets
+name: ribo_queueing_multi_datasets_multi_embeddings
 
 defaults:
   - dataset_config: preprocessed_datasets_ribo_only
@@ -9,7 +9,7 @@ experiment:
   from_checkpoint: False
   train: True
   predict: True
-  dataset: ["kutay_2021"] #, "grimson_2019", "cui_2024", "gillen_2019", "martinez_2019", "iwasaki_2020", "kito_2023", "volegova_2018"]
+  dataset: ["kutay_2021"]
   seed: 42
   split_size: 0.9
 
@@ -27,10 +27,12 @@ paths:
     datasets: "Datasets/encodings/dataset_encoding.yaml"
 
 data:
-  batch_size: 64
-  num_workers: 8
+  batch_size: 16
+  num_workers: 4
+  embeddings: ['dom', 'exo', 'fra', 'gmp', 'tmp', 'openen', 'tAI_profile_codon']
 
 model:
+  embeddings: ['dom', 'exo', 'fra', 'gmp', 'tmp', 'openen', 'tAI_profile_codon']
   input_size: 97
   hidden_dims: 256
   num_layers: 2
@@ -66,7 +68,7 @@ optim:
     min_lr: 1e-6
 
 trainer:
-  devices: [0, 1]
+  devices: [0]
   accelerator: gpu
   precision: bf16-mixed
   accumulate_grad_batches: 2

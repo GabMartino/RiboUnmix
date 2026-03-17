@@ -8,8 +8,8 @@ import torch.nn as nn
 import torchmetrics
 
 from Dataloaders.RiboAIQueuingMultiDataset.RiboAIQueuingDatamoduleMultiDataset import open_file
-from Models.losses.zi_lognormal import ScaledZeroInflatedLogNormalLoss
-from Models.RiboQueuingModel.targets import mu_total_from_median_lognormal
+from Models.utils.targets import mu_total_from_median_lognormal
+from Models.utils.zi_lognormal_loss import ScaledZeroInflatedLogNormalLoss
 from Models.utils.log_plot import log_plot_validation
 from Utils.utils import PearsonCorrelation
 import torch.nn.functional as F
