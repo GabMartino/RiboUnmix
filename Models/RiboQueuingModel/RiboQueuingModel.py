@@ -1,5 +1,3 @@
-
-
 from __future__ import annotations
 
 import torch
@@ -23,6 +21,7 @@ class RiboQueuingModel(nn.Module):
             pi_max: float = 0.99,
             num_datasets: int = 32,
             dataset_emb_dim: int | None = None,
+            cnn_hidden_dim: int = 64,  # NEW: Dimension for the RNase Convolutional Head
             eps: float = 1e-8,
             dataset_log_offset_clip: float = 6.0,
             log_sigma_min: float = -4.0,
@@ -59,8 +58,21 @@ class RiboQueuingModel(nn.Module):
         if dataset_emb_dim is None:
             dataset_emb_dim = hidden_size
 
-
         self.dataset_emb_dim = int(dataset_emb_dim)
+        self.cnn_hidden_dim = int(cnn_hidden_dim)
+
+        # --- NEW: The RNase Convolutional Head ---
+        # A 1D CNN that slides a 5-codon window over the raw sequence
+        # to detect sequence-specific RNase enzyme cleavage biases.
+        # padding=2 ensures the output sequence length (T) perfectly matches the input.
+        self.rnase_cnn = nn.Sequential(
+            nn.Conv1d(in_channels=input_size, out_channels=self.cnn_hidden_dim, kernel_size=5, padding=2),
+            nn.GELU(),
+            nn.Dropout(p=dropout),
+            nn.Conv1d(in_channels=self.cnn_hidden_dim, out_channels=self.cnn_hidden_dim, kernel_size=5, padding=2),
+            nn.GELU(),
+            nn.Dropout(p=dropout),
+        )
 
         self.rnn = nn.GRU(
             input_size=input_size,
@@ -83,7 +95,6 @@ class RiboQueuingModel(nn.Module):
             nn.Linear(feat_dim, 1),
         )
 
-        # THE FIX 1: Change input from feat_dim (local) to h_dim (global)
         self.ff_pi = nn.Sequential(
             nn.Linear(h_dim + self.dataset_emb_dim, feat_dim),
             nn.GELU(),
@@ -118,14 +129,15 @@ class RiboQueuingModel(nn.Module):
         # --- Transcript and dataset scaling ---
         self.dataset_embeddings = nn.Embedding(self.num_datasets, self.dataset_emb_dim)
 
+        # THE FIX: Input dimension is now cnn_hidden_dim + dataset_emb_dim
         self.dataset_offset_ff = nn.Sequential(
-            nn.Linear(feat_dim + self.dataset_emb_dim, h_dim),
+            nn.Linear(self.cnn_hidden_dim + self.dataset_emb_dim, h_dim),
             nn.GELU(),
             nn.Dropout(p=dropout),
             nn.Linear(h_dim, h_dim),
             nn.GELU(),
             nn.Dropout(p=dropout),
-            nn.Linear(h_dim, h_dim),  # <-- The new expansion layer
+            nn.Linear(h_dim, h_dim),
             nn.GELU(),
             nn.Linear(h_dim, 2),
         )
@@ -133,14 +145,8 @@ class RiboQueuingModel(nn.Module):
         # --- Initialization ---
         nn.init.constant_(self.ff_w_logits[-1].bias, 0.0)
         nn.init.constant_(self.ff_J_conditioned[-2].bias, -1.0)
-
-        # pi_max * Sigmoid(-2.0) sets initial dropout probability very low (approx 12%)
         nn.init.constant_(self.ff_pi[-2].bias, -2.0)
-
-        # log_sigma = -1.0 -> sigma = 0.36 (starts with low variance assumption)
         nn.init.constant_(self.ff_log_sigma[-1].bias, -1.0)
-
-        # Force the dataset offset network to start at true neutral (a_raw=0, b_raw=0)
         nn.init.constant_(self.dataset_offset_ff[-1].weight, 0.0)
         nn.init.constant_(self.dataset_offset_ff[-1].bias, 0.0)
 
@@ -164,9 +170,7 @@ class RiboQueuingModel(nn.Module):
         w_prob = torch.softmax(w_logits / max(self.w_temperature, 1e-6), dim=1)
         w_prob = w_prob * mask_f
 
-        # Format h_n to [B, h_dim]
         h_n_flat = h_n.permute(1, 0, 2).reshape(B, -1)
-
         h_n_dataset = torch.cat([h_n_flat.detach(), dataset_embeddings], -1)
         J = self.ff_J_conditioned(h_n_dataset)
 
@@ -175,7 +179,8 @@ class RiboQueuingModel(nn.Module):
         rho = (1.0 - torch.exp(-x_flux)).clamp_max(1.0 - self.rho_eps) * mask_f
         return rho, w_prob, J
 
-    def transcript_and_dataset_scaling(self, out, dataset_embeddings, y_raw_target, mask, detach_out: bool = True):
+    # THE FIX: Now accepts cnn_out instead of the GRU's out
+    def transcript_and_dataset_scaling(self, cnn_out, dataset_embeddings, y_raw_target, mask):
         transcript_scale_S = compute_S_quantile(
             y_raw_target, mask, q=self.S_quantile, eps=self.S_eps,
             censor_threshold=self.censor_threshold, use_censor_threshold=self.S_use_censor_threshold,
@@ -184,18 +189,14 @@ class RiboQueuingModel(nn.Module):
 
         log_transcript_scale = torch.log(transcript_scale_S.clamp_min(self.eps))
 
-        B, T, _ = out.shape
+        B, T, _ = cnn_out.shape
         mask_f = mask.unsqueeze(-1).float()
 
         dataset_emb_expanded = dataset_embeddings.unsqueeze(1).expand(B, T, -1)
         log_transcript_scale_pos = log_transcript_scale.unsqueeze(1).expand(B, T, 1)
 
-        out_for_scale = out.detach() if detach_out else out
-
-        ff_input = torch.cat(
-            [out_for_scale, dataset_emb_expanded],
-            dim=-1,
-        )
+        # We want gradients to flow through cnn_out to train the RNase Head
+        ff_input = torch.cat([cnn_out, dataset_emb_expanded], dim=-1)
 
         ab = self.dataset_offset_ff(ff_input)
         a, b = ab.chunk(2, dim=-1)
@@ -219,39 +220,39 @@ class RiboQueuingModel(nn.Module):
         sigma_ff_input = torch.cat([out.detach(), dataset_emb_expanded], dim=-1)
 
         log_sigma_raw = self.ff_log_sigma(sigma_ff_input).squeeze(-1)  # [B, T]
-
         log_sigma = log_sigma_raw.clamp(self.log_sigma_min, self.log_sigma_max)
-
         sigma = torch.exp(log_sigma)  # [B, T]
         return sigma, log_sigma
 
     def forward(self, x_packed, id_datasets: torch.Tensor, y_raw_target: torch.Tensor):
+        # 1. BiGRU Process (Global Biology)
         out, h_n, mask, mask_f, B, T, lengths = self.rnn_out(x_packed)
 
-        '''
-            Intrinsic biology
-        '''
+        # 2. Extract Raw Inputs for the CNN
+        x_pad, _ = pad_packed_sequence(x_packed, batch_first=True)
+
+        # PyTorch Conv1d expects [Batch, Channels, Length]
+        x_pad_t = x_pad.transpose(1, 2)
+        cnn_out_t = self.rnase_cnn(x_pad_t)
+
+        # Transpose back to [Batch, Length, Channels] and mask padding
+        cnn_out = cnn_out_t.transpose(1, 2) * mask_f.unsqueeze(-1)
+
         dataset_embeddings = self.dataset_embeddings(id_datasets)
 
+        # 3. Predict Biology (Using GRU)
         rho, w_prob, J = self.utilization_rate(out, h_n, dataset_embeddings, mask, mask_f, lengths, B)
 
+        # 4. Predict Laboratory Noise (Using CNN)
         total_scale, transcript_scale_S, log_transcript_scale, a, b = self.transcript_and_dataset_scaling(
-            out, dataset_embeddings, y_raw_target, mask
+            cnn_out, dataset_embeddings, y_raw_target, mask
         )
 
         mu = rho * total_scale
 
-        # THE FIX 2: Global Pi Execution
-        # 1. Format and detach the global h_n vector [B, h_dim]
         h_n_flat_detached = h_n.permute(1, 0, 2).reshape(B, -1).detach()
-
-        # 2. Concatenate with dataset embeddings [B, h_dim + E]
         pi_ff_input = torch.cat([h_n_flat_detached, dataset_embeddings], dim=-1)
-
-        # 3. Predict a single, global dropout scalar per transcript [B, 1]
         pi_global = self.ff_pi(pi_ff_input) * self.pi_max
-
-        # 4. Expand it across the sequence length and apply padding mask [B, T]
         pi = pi_global.expand(B, T) * mask_f
 
         sigma, log_sigma = self.compute_conditional_sigma(out, dataset_embeddings)

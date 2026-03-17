@@ -337,18 +337,26 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         return self._shared_step(batch, stage="val", batch_idx=batch_idx)
 
     def on_validation_epoch_end(self):
+        # 1. Existing Logging
         self.log("val_loss_epoch", self.val_loss_epoch, on_step=False, on_epoch=True, sync_dist=True)
         self.log("val_rho_pcc_epoch", self.rho_val_epoch, on_step=False, on_epoch=True, sync_dist=True)
         self.log("val_mu_pcc_epoch", self.mu_val_epoch, on_step=False, on_epoch=True, sync_dist=True)
         self.log("val_w_pcc_epoch", self.w_val_epoch, on_step=False, on_epoch=True, sync_dist=True)
         self.log("val_kl_w_epoch", self.kl_w_val_epoch, on_step=False, on_epoch=True, sync_dist=True)
 
+        # 2. NEW: Compute Physics Monitor Score
+        # We access the computed values from our metrics objects
+        avg_pcc = self.mu_val_epoch.compute()
+        avg_kl = self.kl_w_val_epoch.compute()
 
+        # Physics Score = (1 - PCC) + KL
+        # Goal: Minimize this value
+        physics_score = (1.0 - avg_pcc) + avg_kl
+        self.log("val_physics_score", physics_score, on_step=False, on_epoch=True, sync_dist=True, prog_bar=True)
+
+        # 3. Existing Dataset-specific logging
         for d in range(self.num_used_datasets):
             name = self.used_datasets_names[d]
-
-            # Pass the Metric OBJECT directly to self.log.
-            # Lightning will automatically sync it across GPUs and compute the epoch average.
             self.log(f"val_loss_epoch/{name}", self.val_loss_per_dataset[d], on_step=False, on_epoch=True)
             self.log(f"val_mu_pcc_epoch/{name}", self.val_mu_pcc_per_dataset[d], on_step=False, on_epoch=True)
             self.log(f"val_rho_pcc_epoch/{name}", self.val_rho_pcc_per_dataset[d], on_step=False, on_epoch=True)
@@ -401,11 +409,13 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             weight_decay=self.config.optim.weight_decay,
         )
 
-        # Force the model to explore, then smoothly settle, completely ignoring val_loss spikes
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        # Swapping to Plateau to actually use our new Physics Monitor
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
-            T_max=self.config.trainer.max_epochs,
-            eta_min=self.config.optim.scheduler.min_lr,
+            mode='min',
+            factor=self.config.optim.scheduler.factor,
+            patience=self.config.optim.scheduler.patience,
+            min_lr=self.config.optim.scheduler.min_lr,
         )
 
         return {
@@ -413,5 +423,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "lr_scheduler": {
                 "scheduler": scheduler,
                 "interval": "epoch",
+                "monitor": "val_physics_score", # Crucial: Point to new score
             },
         }
