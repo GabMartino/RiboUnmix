@@ -54,7 +54,7 @@ def main():
 
     # 3. Load Distributed Parquet Predictions
     print("Loading distributed Parquet files...")
-    parquet_files = glob.glob("riboai_queueing/comprehensive_predictions_rank*.parquet")
+    parquet_files = glob.glob("riboai_queueing/32_datasets_mix_2aae07/comprehensive_predictions_rank*.parquet")
     if not parquet_files:
         raise FileNotFoundError("No comprehensive_predictions_rank*.parquet files found!")
 

@@ -1,4 +1,5 @@
 import os
+from collections import defaultdict
 
 import lightning as pl
 import pandas as pd
@@ -116,113 +117,102 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         self.c_enc = open_file(codon_encoding_path)
         self.aa_enc = open_file(aa_encoding_path)
         self.datasets_enc = open_file(datasets_encoding_path)
-
-        self.train_set = None
-        self.val_set = None
-
         self.train_dataset_obj = None
         self.val_dataset_obj = None
 
         self.train_lengths = None
         self.val_lengths = None
-
+        self._has_loaded_data = False
     def setup(self, stage=None):
-        if self.train_set is not None:
+        if self._has_loaded_data:
+            print(f"Data already in memory. Skipping load for stage: {stage}")
             return
 
-        print(f"Intersecting master sequences with {len(self.datasets_paths)} datasets...")
+        print(f"Loading data from disk for stage: {stage}")
+        self._has_loaded_data = True
+        print(f"Unioning master sequences with {len(self.datasets_paths)} datasets...")
 
-        # ---- 1) master sequences ----
         seq_df = pd.read_parquet(self.sequences_path)
         if "transcript_id" in seq_df.columns:
             seq_df = seq_df.set_index("transcript_id")
 
-        common_index = seq_df.index
-        loaded_datasets: dict[str, pd.DataFrame] = {}
+        # Optional but often important: normalize ID dtype
+        seq_df.index = seq_df.index.astype(str)
 
-        # ---- 2) load datasets + compute intersection ----
-        for path in tqdm(self.datasets_paths, desc="Loading and Intersecting"):
+        print("Length of the main sequence:", len(seq_df.index))
+
+        loaded_datasets = {}
+        union_index = pd.Index([], dtype=seq_df.index.dtype)
+
+        for path in tqdm(self.datasets_paths, desc="Loading Data"):
             df = pd.read_parquet(path)
-            dataset_name = path.split("/")[-1].split(".")[0]
-            if "id" in df.columns:
-                df = df.set_index("id")
+            df = df.set_index("id")
 
-            # keep master order, avoid sorting overhead
-            common_index = common_index.intersection(df.index, sort=False)
+            if "ribo" not in df.columns:
+                raise KeyError(f"'ribo' column missing in {path}")
+
+            df = df[["ribo"]]
+            df.index = df.index.astype(str)
+
+            dataset_name = path.split("/")[-1].split(".")[0]
             loaded_datasets[dataset_name] = df
 
-        dataset_names = list(loaded_datasets.keys())
-        nD = len(dataset_names)
+            union_index = union_index.union(df.index, sort=False)
 
-        print(f"Original sequences: {len(seq_df)}")
-        print(f"Sequences surviving the Inner Join: {len(common_index)}")
-        if len(common_index) == 0:
-            raise RuntimeError("Empty intersection between master sequences and datasets.")
+        valid_index = seq_df.index.intersection(union_index, sort=False)
+        seq_df_union = seq_df.loc[valid_index]
 
-        # ---- 3) filter master to common transcripts (in common_index order) ----
-        seq_df_common = seq_df.loc[common_index]
-
-        ref_arrays = seq_df_common["ref"].values
-        css = seq_df_common["conserved_stalling_sites"].values
+        ref_arrays = seq_df_union["ref"].values
+        css_col = "conserved_stalling_sites" if "conserved_stalling_sites" in seq_df_union.columns else "css"
+        css = seq_df_union[css_col].values
         lengths = np.array([len(x) for x in ref_arrays], dtype=np.int32)
 
-        nT = len(common_index)
-
         shared_data = {
-            "transcript_id": common_index.values,
+            "transcript_id": valid_index.values,
             "ref": ref_arrays,
             "css": css,
-            "ribo_profiles": {},
+            "ribo_profiles": defaultdict(dict),
             "lengths": lengths,
-            "datasets_names": dataset_names,
+            "datasets_names": list(loaded_datasets.keys())
         }
 
-        # ---- 4) extract ribo profiles aligned to common_index ----
-        for dataset_name, df in loaded_datasets.items():
-            aligned_df = df.loc[common_index]
-            # Ensure numpy float32 arrays
-            shared_data["ribo_profiles"][dataset_name] = [
-                np.asarray(arr, dtype=np.float32) for arr in aligned_df["ribo"].values
-            ]
+        valid_ids = set(valid_index)
 
-        # ---- 5) build transcript-level train/val split (indices in 0..nT-1) ----
+        for dataset_name, df in loaded_datasets.items():
+            for t_id, ribo_profile in zip(df.index, df["ribo"].values):
+                if t_id in valid_ids:
+                    shared_data["ribo_profiles"][t_id][dataset_name] = ribo_profile
+
+
+        # ---- 5) build transcript-level train/val split ----
         if self.split is not None:
             print("Using provided split (transcript IDs).")
-            train_ids = set(self.split[0])
-            val_ids = set(self.split[1])
+            all_ids = np.asarray(shared_data["transcript_id"]).astype(str)
 
-            # transcript indices (0..nT-1)
-            train_t = [i for i, t in enumerate(shared_data["transcript_id"]) if t in train_ids]
-            val_t = [i for i, t in enumerate(shared_data["transcript_id"]) if t in val_ids]
+            train_id_set = set(map(str, self.split[0]))
+            val_id_set = set(map(str, self.split[1]))
 
-            if len(train_t) == 0 or len(val_t) == 0:
-                raise RuntimeError(
-                    f"Split produced empty train/val: train={len(train_t)} val={len(val_t)}"
-                )
+            train_indices = [i for i, t in enumerate(all_ids) if t in train_id_set]
+            val_indices = [i for i, t in enumerate(all_ids) if t in val_id_set]
+
+            train_ids = all_ids[train_indices].tolist()
+            val_ids = all_ids[val_indices].tolist()
         else:
-            print(f"Random split with split_p={self.split_p:.3f}")
-            g = Generator().manual_seed(self.seed)
-            perm = torch.randperm(nT, generator=g).tolist()
-            train_len = int(nT * self.split_p)
-            train_t = perm[:train_len]
-            val_t = perm[train_len:]
-            if len(val_t) == 0:
-                raise RuntimeError("Validation split is empty; decrease split_p.")
+            raise NotImplementedError("This has not implemented yet")
+            # print(f"Random split with split_p={self.split_p:.3f}")
+            # g = Generator().manual_seed(self.seed)
+            # perm = torch.randperm(nT, generator=g).tolist()
+            # train_len = int(nT * self.split_p)
+            # train_indices = perm[:train_len]
+            # val_indices = perm[train_len:]
+            # if len(val_indices) == 0:
+            #     raise RuntimeError("Validation split is empty; decrease split_p.")
 
-        # ---- 6) expand transcript indices to global multi-dataset indices ----
-        # global index = d*nT + t, for d in [0..nD-1], t in [0..nT-1]
-        def expand_indices(t_indices: list[int]) -> list[int]:
-            return [d * nT + t for d in range(nD) for t in t_indices]
-
-        train_indices = expand_indices(train_t)
-        val_indices = expand_indices(val_t)
-
-        # lengths per sample in global index space
-        all_lengths = np.tile(lengths, nD)  # [nT*nD]
-        train_lengths = all_lengths[train_indices]
-        val_lengths = all_lengths[val_indices]
-
-        # ---- 7) build datasets ----
+        '''
+            Training set: 1 epoch of full transcripts list ( with subset) randomly sampling the datasets
+            Validation set: 1 epoch of transcripts list ( with subset) randomly sampling the datasets
+            Prediction set: full datasets
+        '''
         self.train_dataset_obj = RiboAIQueuingDatasetMultiDataset(
             data=shared_data,
             lengths=shared_data["lengths"],
@@ -231,7 +221,10 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             codon_encoding=self.c_enc,
             aa_encoding=self.aa_enc,
             datasets_encoding=self.datasets_enc,
+            transcripts_ids=train_ids,
+            dataset_choice_mode="random",
         )
+
         self.val_dataset_obj = RiboAIQueuingDatasetMultiDataset(
             data=shared_data,
             lengths=shared_data["lengths"],
@@ -240,14 +233,16 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             codon_encoding=self.c_enc,
             aa_encoding=self.aa_enc,
             datasets_encoding=self.datasets_enc,
+            transcripts_ids=val_ids,
+            dataset_choice_mode="deterministic",
         )
 
-        # ---- 8) subsets + per-subset lengths for sampler ----
-        self.train_set = Subset(self.train_dataset_obj, train_indices)
-        self.val_set = Subset(self.val_dataset_obj, val_indices)
+        self.train_lengths = lengths[train_indices]
+        self.val_lengths = np.repeat(
+            lengths[val_indices],
+            [len(shared_data["ribo_profiles"][tid]) for tid in val_ids]
+        )
 
-        self.train_lengths = train_lengths
-        self.val_lengths = val_lengths
 
     def worker_init_fn(self, worker_id):
         epoch = self.trainer.current_epoch if self.trainer is not None else 0
@@ -257,7 +252,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
 
     def train_dataloader(self):
         batch_sampler = SortedLengthBatchSampler(
-            sampler=SequentialSampler(self.train_set),
+            sampler=SequentialSampler(self.train_dataset_obj),
             batch_size=self.batch_size,
             drop_last=False,
             shuffle=True,
@@ -266,7 +261,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             descending=True,
         )
         return DataLoader(
-            self.train_set,
+            self.train_dataset_obj,
             batch_sampler=batch_sampler,
             num_workers=self.num_workers,
             collate_fn=self.train_dataset_obj.collate_fn,
@@ -277,7 +272,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
 
     def val_dataloader(self):
         batch_sampler = SortedLengthBatchSampler(
-            sampler=SequentialSampler(self.val_set),
+            sampler=SequentialSampler(self.val_dataset_obj),
             batch_size=self.batch_size,
             drop_last=False,
             shuffle=False,
@@ -286,7 +281,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             descending=True,
         )
         return DataLoader(
-            self.val_set,
+            self.val_dataset_obj,
             batch_sampler=batch_sampler,
             num_workers=self.num_workers,
             collate_fn=self.val_dataset_obj.collate_fn,
@@ -297,7 +292,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
 
     def predict_dataloader(self):
         batch_sampler = SortedLengthBatchSampler(
-            sampler=SequentialSampler(self.val_set),
+            sampler=SequentialSampler(self.val_dataset_obj),
             batch_size=self.batch_size,
             drop_last=False,
             shuffle=False,
@@ -306,7 +301,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             descending=True,
         )
         return DataLoader(
-            self.val_set,
+            self.val_dataset_obj,
             batch_sampler=batch_sampler,
             num_workers=self.num_workers,
             collate_fn=self.val_dataset_obj.collate_fn,

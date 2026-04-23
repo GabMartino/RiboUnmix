@@ -28,7 +28,7 @@ class ScaledZeroInflatedLogNormalLoss(nn.Module):
         eps = self.eps
 
         pi = pi.clamp(eps, 1.0 - eps)
-        mu = mu_phys.clamp_min(eps)
+        mu = mu_phys.clamp(min=eps, max=1e8)
         sigma = sigma.clamp_min(eps)
 
         mu_stat = torch.log(mu)

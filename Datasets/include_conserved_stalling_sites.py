@@ -111,7 +111,7 @@ def main() -> None:
 
     datasets_paths = sorted(str(p) for p in pathlib.Path(base_path).glob("*.parquet"))
     os.makedirs(out_path, exist_ok=True)
-
+    datasets_paths = [d for d in datasets_paths]
     for path in tqdm(datasets_paths, desc="Datasets"):
         dataset_name = pathlib.Path(path).stem
         data = pd.read_parquet(path)

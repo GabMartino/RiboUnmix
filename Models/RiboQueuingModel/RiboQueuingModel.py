@@ -6,7 +6,7 @@ from torch.nn.utils.rnn import pad_packed_sequence
 import torch.nn.functional as F
 import math
 
-from Models.utils.compute_S_quantile import compute_S_quantile
+from Models.utils.compute_S_quantile import compute_S_quantile, compute_S_median, compute_S_mean
 
 
 class RiboQueuingModel(nn.Module):
@@ -21,7 +21,7 @@ class RiboQueuingModel(nn.Module):
             pi_max: float = 0.99,
             num_datasets: int = 32,
             dataset_emb_dim: int | None = None,
-            cnn_hidden_dim: int = 64,  # NEW: Dimension for the RNase Convolutional Head
+            cnn_hidden_dim: int = 128,  # NEW: Dimension for the RNase Convolutional Head
             eps: float = 1e-8,
             dataset_log_offset_clip: float = 6.0,
             log_sigma_min: float = -4.0,
@@ -61,19 +61,21 @@ class RiboQueuingModel(nn.Module):
         self.dataset_emb_dim = int(dataset_emb_dim)
         self.cnn_hidden_dim = int(cnn_hidden_dim)
 
+        feat_dim = hidden_size * 2
+        h_dim = self.num_layers * 2 * hidden_size
         # --- NEW: The RNase Convolutional Head ---
         # A 1D CNN that slides a 5-codon window over the raw sequence
         # to detect sequence-specific RNase enzyme cleavage biases.
         # padding=2 ensures the output sequence length (T) perfectly matches the input.
         self.rnase_cnn = nn.Sequential(
-            nn.Conv1d(in_channels=input_size, out_channels=self.cnn_hidden_dim, kernel_size=5, padding=2),
+            nn.Conv1d(in_channels=feat_dim + self.dataset_emb_dim, out_channels=self.cnn_hidden_dim, kernel_size=5,
+                      padding=2),
             nn.GELU(),
             nn.Dropout(p=dropout),
             nn.Conv1d(in_channels=self.cnn_hidden_dim, out_channels=self.cnn_hidden_dim, kernel_size=5, padding=2),
             nn.GELU(),
             nn.Dropout(p=dropout),
         )
-
         self.rnn = nn.GRU(
             input_size=input_size,
             hidden_size=hidden_size,
@@ -82,8 +84,6 @@ class RiboQueuingModel(nn.Module):
             bidirectional=True,
         )
 
-        feat_dim = hidden_size * 2
-        h_dim = self.num_layers * 2 * hidden_size
 
         # --- Intrinsic biology ---
         self.ff_w_logits = nn.Sequential(
@@ -96,7 +96,7 @@ class RiboQueuingModel(nn.Module):
         )
 
         self.ff_pi = nn.Sequential(
-            nn.Linear(h_dim + self.dataset_emb_dim, feat_dim),
+            nn.Linear(feat_dim + self.dataset_emb_dim, feat_dim),
             nn.GELU(),
             nn.Dropout(p=dropout),
             nn.Linear(feat_dim, feat_dim),
@@ -117,7 +117,7 @@ class RiboQueuingModel(nn.Module):
         )
 
         self.ff_J_conditioned = nn.Sequential(
-            nn.Linear(h_dim + self.dataset_emb_dim, h_dim),
+            nn.Linear(h_dim, h_dim),
             nn.GELU(),
             nn.Dropout(p=dropout),
             nn.Linear(h_dim, h_dim),
@@ -134,12 +134,12 @@ class RiboQueuingModel(nn.Module):
             nn.Linear(self.cnn_hidden_dim + self.dataset_emb_dim, h_dim),
             nn.GELU(),
             nn.Dropout(p=dropout),
-            nn.Linear(h_dim, h_dim),
+            nn.Linear(h_dim, h_dim*2),
             nn.GELU(),
             nn.Dropout(p=dropout),
-            nn.Linear(h_dim, h_dim),
+            nn.Linear(h_dim*2, h_dim),
             nn.GELU(),
-            nn.Linear(h_dim, 2),
+            nn.Linear(h_dim, 1),
         )
 
         # --- Initialization ---
@@ -164,107 +164,117 @@ class RiboQueuingModel(nn.Module):
 
         return out, h_n, mask, mask_f, B, T, lengths
 
-    def utilization_rate(self, x, h_n, dataset_embeddings, mask, mask_f, lengths, B):
+    def utilization_rate(self, x, h_n, mask, mask_f, lengths, B):
         w_logits = self.ff_w_logits(x).squeeze(-1)  # [B,T]
         w_logits = w_logits.masked_fill(~mask, float("-inf"))
+
         w_prob = torch.softmax(w_logits / max(self.w_temperature, 1e-6), dim=1)
         w_prob = w_prob * mask_f
 
         h_n_flat = h_n.permute(1, 0, 2).reshape(B, -1)
-        h_n_dataset = torch.cat([h_n_flat.detach(), dataset_embeddings], -1)
-        J = self.ff_J_conditioned(h_n_dataset)
+        J = self.ff_J_conditioned(h_n_flat).clamp(1e-6, 100.0)  # [B,1]
 
-        L = lengths.unsqueeze(1).to(dtype=x.dtype)  # [B,1]
-        x_flux = J * L * w_prob  # [B,T]
-        rho = (1.0 - torch.exp(-x_flux)).clamp_max(1.0 - self.rho_eps) * mask_f
-        return rho, w_prob, J
+        safe_w_prob = w_prob.clamp_min(1e-10)
+        L_seq = lengths.unsqueeze(1).to(dtype=x.dtype)  # [B,1]
 
-    # THE FIX: Now accepts cnn_out instead of the GRU's out
-    def transcript_and_dataset_scaling(self, cnn_out, dataset_embeddings, y_raw_target, mask):
-        transcript_scale_S = compute_S_quantile(
-            y_raw_target, mask, q=self.S_quantile, eps=self.S_eps,
-            censor_threshold=self.censor_threshold, use_censor_threshold=self.S_use_censor_threshold,
+        x_flux = J * L_seq * safe_w_prob
+        x_flux = x_flux.clamp_max(200.0)
+
+        L_queue = torch.expm1(x_flux) * mask_f
+        rho_diagnostic = (1.0 - torch.exp(-x_flux)) * mask_f
+
+        return L_queue, rho_diagnostic, w_prob, J
+
+    def transcript_and_dataset_scaling(self, out, dataset_embeddings, y_raw_target, mask, mask_f, B, T):
+        dataset_emb_expanded = dataset_embeddings.unsqueeze(1).expand(B, T, -1)
+
+        x_cnn_input = torch.cat([out.detach(), dataset_emb_expanded], dim=-1)
+        x_cnn_input_t = x_cnn_input.transpose(1, 2)
+
+        cnn_out_t = self.rnase_cnn(x_cnn_input_t)
+        cnn_out = cnn_out_t.transpose(1, 2) * mask_f.unsqueeze(-1)
+
+        mask_f_3d = mask.unsqueeze(-1).float()
+
+        ff_input = torch.cat([cnn_out, dataset_emb_expanded], dim=-1)
+        b = self.dataset_offset_ff(ff_input)
+        b = b * mask_f_3d
+
+        valid_lengths = mask_f_3d.sum(dim=1, keepdim=True).clamp_min(1.0)
+        b_mean = b.sum(dim=1, keepdim=True) / valid_lengths
+        b = (b - b_mean) * mask_f_3d
+        b = b.clamp(-self.dataset_log_offset_clip, self.dataset_log_offset_clip) * mask_f_3d
+
+        transcript_scale_S = compute_S_mean(
+            y_raw_target,
+            mask,
+            eps=self.S_eps,
+            censor_threshold=self.censor_threshold,
+            use_censor_threshold=self.S_use_censor_threshold,
             use_nonzero_only=self.S_use_nonzero_only,
         )
 
         log_transcript_scale = torch.log(transcript_scale_S.clamp_min(self.eps))
-
-        B, T, _ = cnn_out.shape
-        mask_f = mask.unsqueeze(-1).float()
-
-        dataset_emb_expanded = dataset_embeddings.unsqueeze(1).expand(B, T, -1)
         log_transcript_scale_pos = log_transcript_scale.unsqueeze(1).expand(B, T, 1)
 
-        # We want gradients to flow through cnn_out to train the RNase Head
-        ff_input = torch.cat([cnn_out, dataset_emb_expanded], dim=-1)
+        log_total_scale = log_transcript_scale_pos + b
 
-        ab = self.dataset_offset_ff(ff_input)
-        a, b = ab.chunk(2, dim=-1)
+        max_log = math.log(torch.finfo(log_total_scale.dtype).max) - 2.0
+        total_scale = torch.exp(log_total_scale.clamp(max=max_log))
 
-        a = 1.0 + 0.1 * torch.tanh(a)
-        b = b * mask_f
-        valid_lengths = mask_f.sum(dim=1, keepdim=True).clamp_min(1.0)
-        b_mean = b.sum(dim=1, keepdim=True) / valid_lengths
-        b = (b - b_mean) * mask_f
-        b = b.clamp(-self.dataset_log_offset_clip, self.dataset_log_offset_clip) * mask_f
-        log_total_scale = a * log_transcript_scale_pos + b
-        total_scale = torch.exp(log_total_scale)
+        return total_scale.squeeze(-1), transcript_scale_S, log_transcript_scale, b.squeeze(-1)
 
-        return total_scale.squeeze(-1), transcript_scale_S, log_transcript_scale, a.squeeze(-1), b.squeeze(-1)
-
-    def compute_conditional_sigma(self, out, dataset_embeddings):
+    def compute_conditional_sigma(self, out, dataset_embeddings, mu_phys, mask_f):
         B, T, _ = out.shape
-
         dataset_emb_expanded = dataset_embeddings.unsqueeze(1).expand(B, T, -1)
+        alpha_ff_input = torch.cat([out.detach(), dataset_emb_expanded], dim=-1)
 
-        sigma_ff_input = torch.cat([out.detach(), dataset_emb_expanded], dim=-1)
+        alpha = F.softplus(self.ff_log_sigma(alpha_ff_input).squeeze(-1))
+        alpha = alpha * mask_f
 
-        log_sigma_raw = self.ff_log_sigma(sigma_ff_input).squeeze(-1)  # [B, T]
-        log_sigma = log_sigma_raw.clamp(self.log_sigma_min, self.log_sigma_max)
-        sigma = torch.exp(log_sigma)  # [B, T]
-        return sigma, log_sigma
+        safe_mu = mu_phys.clamp_min(1e-6)
+        rel_var = 1.0 / safe_mu + alpha
+
+        X = 0.5 * (1.0 + torch.sqrt(1.0 + 4.0 * rel_var))
+        sigma_sq = torch.log(X)
+        sigma = torch.sqrt(sigma_sq.clamp_min(1e-8))
+
+        log_sigma = torch.log(sigma).clamp(self.log_sigma_min, self.log_sigma_max)
+        sigma = torch.exp(log_sigma) * mask_f
+        log_sigma = log_sigma * mask_f
+
+        return sigma, log_sigma, alpha
+
+    def compute_conditional_pi(self, out, dataset_embeddings, mask_f, B, T):
+        dataset_emb_expanded = dataset_embeddings.unsqueeze(1).expand(B, T, -1)
+        pi_ff_input = torch.cat([out.detach(), dataset_emb_expanded], dim=-1)  # Shape: [B, T, Hidden + Emb]
+
+        pi_local = self.ff_pi(pi_ff_input) * self.pi_max
+        pi = pi_local.squeeze(-1) * mask_f  # Shape: [B, T]
+        return pi
 
     def forward(self, x_packed, id_datasets: torch.Tensor, y_raw_target: torch.Tensor):
-        # 1. BiGRU Process (Global Biology)
         out, h_n, mask, mask_f, B, T, lengths = self.rnn_out(x_packed)
 
-        # 2. Extract Raw Inputs for the CNN
-        x_pad, _ = pad_packed_sequence(x_packed, batch_first=True)
-
-        # PyTorch Conv1d expects [Batch, Channels, Length]
-        x_pad_t = x_pad.transpose(1, 2)
-        cnn_out_t = self.rnase_cnn(x_pad_t)
-
-        # Transpose back to [Batch, Length, Channels] and mask padding
-        cnn_out = cnn_out_t.transpose(1, 2) * mask_f.unsqueeze(-1)
+        L_queue, rho_diag, w_prob, J = self.utilization_rate(out, h_n, mask, mask_f, lengths, B)
 
         dataset_embeddings = self.dataset_embeddings(id_datasets)
-
-        # 3. Predict Biology (Using GRU)
-        rho, w_prob, J = self.utilization_rate(out, h_n, dataset_embeddings, mask, mask_f, lengths, B)
-
-        # 4. Predict Laboratory Noise (Using CNN)
-        total_scale, transcript_scale_S, log_transcript_scale, a, b = self.transcript_and_dataset_scaling(
-            cnn_out, dataset_embeddings, y_raw_target, mask
+        total_scale, S_mean, log_S, b = self.transcript_and_dataset_scaling(
+            out, dataset_embeddings, y_raw_target, mask, mask_f, B, T
         )
 
-        mu = rho * total_scale
-
-        h_n_flat_detached = h_n.permute(1, 0, 2).reshape(B, -1).detach()
-        pi_ff_input = torch.cat([h_n_flat_detached, dataset_embeddings], dim=-1)
-        pi_global = self.ff_pi(pi_ff_input) * self.pi_max
-        pi = pi_global.expand(B, T) * mask_f
-
-        sigma, log_sigma = self.compute_conditional_sigma(out, dataset_embeddings)
+        mu = L_queue * total_scale
+        pi = self.compute_conditional_pi(out, dataset_embeddings, mask_f, B, T)
+        sigma, log_sigma, alpha = self.compute_conditional_sigma(out, dataset_embeddings, mu, mask_f)
 
         return mu, pi, sigma, (
-            rho,
-            w_prob,
-            J,
-            transcript_scale_S,
-            log_transcript_scale,
-            total_scale,
-            a,
-            b,
-            log_sigma * mask_f,
-        )
+                rho_diag,  # 0: Occupancy (0-1)
+                w_prob,  # 1: Intrinsic slowness
+                L_queue,  # 2: Queue intensity (Pile-up)
+                J,  # 3: Initiation rate
+                S_mean,  # 4: Library baseline
+                total_scale,  # 5: S_mean * exp(b)
+                b,  # 6: Spatial bias (footprint)
+                alpha,  # 7: Overdispersion (the "Noise" factor)
+                log_sigma,  # 8: Clamped log variance
+            )

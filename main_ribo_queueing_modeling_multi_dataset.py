@@ -12,7 +12,7 @@ import pandas as pd
 import torch
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import TensorBoardLogger
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from Dataloaders.RiboAIQueuingMultiDataset.RiboAIQueuingDatamoduleMultiDataset import \
     RiboAIQueuingDatamoduleMultiDataset
@@ -104,8 +104,20 @@ def main(cfg: DictConfig):
         num_layers=cfg.model.num_layers,
         w_temperature=cfg.model.w_temperature,
         rho_eps=cfg.model.rho_eps,
+        log_sigma_min=cfg.model.log_sigma_min,
+        log_sigma_max=cfg.model.log_sigma_max,
+        S_quantile=cfg.metrics.S_quantile,
+        S_eps=cfg.metrics.S_eps,
+        S_use_nonzero_only=cfg.metrics.S_use_nonzero_only,
+        S_use_censor_threshold=cfg.metrics.S_use_censor_threshold,
+        censor_threshold=cfg.metrics.censor_threshold,
     )
 
+    if raw_datasets_cfg == "all":
+        datasets = list(cfg.dataset_config.dataset_path.keys())
+        OmegaConf.set_struct(cfg, False)
+        cfg.experiment.dataset = datasets
+        OmegaConf.set_struct(cfg, True)
     lit_model = RiboQueuingModelLightningModule(torch_model, config=cfg)
 
     # optional restore
@@ -154,19 +166,20 @@ def main(cfg: DictConfig):
     pathlib.Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
 
     monitor = cfg.optim.scheduler.monitor
+    metric_mode = "max" if "pcc" in monitor else "min"
 
     checkpoint_callback = ModelCheckpoint(
         dirpath=str(ckpt_dir),
         filename="{epoch}-{val_loss_epoch:.4f}",
         save_top_k=1,
-        mode="min",
+        mode=metric_mode,
         save_last=True,
         monitor=monitor,
         save_weights_only=True,
     )
 
     early_pat = cfg.callbacks.early_stopping_patience
-    early_stopping = EarlyStopping(monitor=monitor, patience=early_pat, mode="min")
+    early_stopping = EarlyStopping(monitor=monitor, patience=early_pat, mode=metric_mode)
     lr_monitor = LearningRateMonitor(logging_interval="epoch")
 
     # -------------------------
@@ -271,7 +284,7 @@ def main(cfg: DictConfig):
         print("==================================================")
         print(f"[Rank {current_rank}] Full Physical State Saved: {parquet_path}")
         print("==================================================")
-
+        trainer.strategy.barrier()
 
 if __name__ == "__main__":
     main()
