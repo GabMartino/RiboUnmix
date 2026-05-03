@@ -1,1 +1,1 @@
-from Models.RiboQueuingModel.RiboQueuingModel import RiboQueuingModel
+from Models.RiboQueuingModel.RiboQueuingModel2 import RiboQueuingModel

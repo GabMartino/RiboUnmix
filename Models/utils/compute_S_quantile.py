@@ -83,7 +83,6 @@ def compute_S_median(
 def compute_S_mean(
         y_true: torch.Tensor,
         mask: torch.Tensor,
-        eps: float = 1e-8,
         censor_threshold: float = 0.5,
         use_censor_threshold: bool = True,
         use_nonzero_only: bool = False,
@@ -109,7 +108,4 @@ def compute_S_mean(
 
     S_mean = total_reads / counts
 
-    # Fallback to eps if sequence is entirely empty
-    S_mean = torch.where(counts > 0, S_mean, torch.full_like(S_mean, float(eps)))
-
-    return S_mean.clamp_min(float(eps))
+    return S_mean

@@ -7,10 +7,11 @@ from torch.utils.data import Dataset
 class RiboAIQueuingDatasetMultiDataset(Dataset):
     """
     Returns per-sample:
-      (real_idx_dataset, transcript_id, encoded_sequence[T,F], ribo[T], classes[T], mask[T], total_reads)
+      (real_idx_dataset, transcript_id, encoded_sequence[T,F], ribo[T], css)
 
     Collate returns:
-      (ids_datasets_sorted, ids_sorted, packed_sequence, ribo_padded, lengths_sorted, mask_padded_bool, css_sorted)
+      (ids_datasets_sorted, ids_sorted, packed_sequence, ribo_padded,
+       lengths_sorted, mask_padded_bool, css_sorted)
     """
 
     def __init__(
@@ -24,8 +25,7 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         data: dict | None = None,
         lengths: np.ndarray | None = None,
         seed: int = 42,
-        dataset_choice_mode: str = "random", ##"random", "deterministic"ì
-
+        dataset_choice_mode: str = "random",  # "random" or "deterministic"
     ):
         super().__init__()
 
@@ -38,6 +38,7 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         self.nt_encoding = nt_encoding
         self.datasets_encoding = datasets_encoding
         self.idx_to_dataset = {v: k for k, v in self.datasets_encoding.items()}
+
         self.transcripts_ids = list(transcripts_ids)
         self.num_codons = 64
         self.n_codons = len(self.codon_map)
@@ -46,29 +47,96 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         self.codon_idx_to_aa_idx = {
             v: self.aa_map[self.codon2aa_map[k]] for k, v in self.codon_map.items()
         }
+
         self.dataset_choice_mode = dataset_choice_mode
         self.seed = seed
+
+        if self.dataset_choice_mode not in {"random", "deterministic"}:
+            raise ValueError(f"Unknown dataset_choice_mode={self.dataset_choice_mode}")
+
         self.global_idx_by_tid = {
             tid: i for i, tid in enumerate(self.data_records["transcript_id"])
         }
 
         self._encoded_cache = [None] * len(self.data_records["ref"])
 
-        self.linearized_indexing = [len(self.data_records["ribo_profiles"][t_id].keys()) for t_id in self.transcripts_ids]
-        self.cum_sum_starts = np.cumsum(np.r_[0, self.linearized_indexing[:-1]])
-        self.cum_sum_ends = np.cumsum(self.linearized_indexing)
-        self.total_length = self.cum_sum_ends[-1]
+        # ------------------------------------------------------------
+        # Build deterministic flat pair index:
+        #   flat index j -> (local transcript index, dataset name)
+        # ------------------------------------------------------------
+        self.flat_local_indices: list[int] = []
+        self.flat_dataset_names: list[str] = []
+        self.flat_dataset_ids: list[int] = []
+        self.flat_lengths: list[int] = []
+
+        for local_idx, tid in enumerate(self.transcripts_ids):
+            available_map = self.data_records["ribo_profiles"][tid]
+            available_datasets = list(available_map.keys())
+
+            global_idx = self.global_idx_by_tid[tid]
+            transcript_length = int(self.lengths[global_idx])
+
+            for dataset_name in available_datasets:
+                self.flat_local_indices.append(local_idx)
+                self.flat_dataset_names.append(dataset_name)
+                self.flat_dataset_ids.append(int(self.datasets_encoding[dataset_name]))
+                self.flat_lengths.append(transcript_length)
+
+        self.flat_local_indices = np.asarray(self.flat_local_indices, dtype=np.int64)
+        self.flat_dataset_ids = np.asarray(self.flat_dataset_ids, dtype=np.int64)
+        self.flat_lengths = np.asarray(self.flat_lengths, dtype=np.int32)
+
+        self.total_length = int(len(self.flat_local_indices))
+
+        if self.total_length == 0:
+            raise RuntimeError("Dataset has zero transcript-dataset pairs.")
 
     def __len__(self) -> int:
         if self.dataset_choice_mode == "random":
             return len(self.transcripts_ids)
-        elif self.dataset_choice_mode == "deterministic":
+
+        if self.dataset_choice_mode == "deterministic":
             return self.total_length
 
-    def _flat_to_logical(self, j):
-        i = np.searchsorted(self.cum_sum_ends, j, side="right")
-        offset = j - self.cum_sum_starts[i]
-        return i, offset
+        raise ValueError(f"Unknown dataset_choice_mode={self.dataset_choice_mode}")
+
+    def make_dataset_balanced_weights(self, gamma: float = 1.0) -> torch.Tensor:
+        """
+        Returns one sampling weight per flat transcript-dataset pair.
+
+        For pair j from dataset d:
+
+            weight_j = N_d^(-gamma)
+
+        gamma = 0.0 -> no balancing
+        gamma = 1.0 -> equal expected dataset sampling
+        gamma = 0.5 -> softened balancing
+        """
+        if self.dataset_choice_mode != "deterministic":
+            raise RuntimeError(
+                "Balanced sampling requires dataset_choice_mode='deterministic'."
+            )
+
+        gamma = float(gamma)
+
+        dataset_ids = self.flat_dataset_ids
+        unique_ids, counts = np.unique(dataset_ids, return_counts=True)
+        count_map = {int(ds): int(c) for ds, c in zip(unique_ids, counts)}
+
+        weights = np.asarray(
+            [count_map[int(ds)] ** (-gamma) for ds in dataset_ids],
+            dtype=np.float64,
+        )
+
+        # Normalization is not required by WeightedRandomSampler, but it keeps
+        # the numbers easier to inspect.
+        weights = weights / np.mean(weights)
+
+        return torch.as_tensor(weights, dtype=torch.double)
+
+    def dataset_pair_counts(self) -> dict[int, int]:
+        unique_ids, counts = np.unique(self.flat_dataset_ids, return_counts=True)
+        return {int(ds): int(c) for ds, c in zip(unique_ids, counts)}
 
     def _extract_features(self, nucleotide_sequence_per_codon) -> np.ndarray:
         raw_nt_sequence = np.stack([np.stack(c) for c in nucleotide_sequence_per_codon])
@@ -80,7 +148,7 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         )
         codon_sequence = np.char.add(
             np.char.add(codon_sequence[:, 0], codon_sequence[:, 1]),
-            codon_sequence[:, 2]
+            codon_sequence[:, 2],
         )
         codon_sequence = np.stack([self.codon_map[c] for c in codon_sequence])
 
@@ -93,12 +161,21 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
 
     def __getitem__(self, index: int):
         if self.dataset_choice_mode == "random":
-            local_idx = index
-            offset = None
-        else:
-            local_idx, offset = self._flat_to_logical(index)
+            local_idx = int(index)
+            transcript_id = self.transcripts_ids[local_idx]
+            available_map = self.data_records["ribo_profiles"][transcript_id]
+            available_datasets = list(available_map.keys())
+            dataset_name = np.random.choice(available_datasets)
 
-        transcript_id = self.transcripts_ids[local_idx]
+        elif self.dataset_choice_mode == "deterministic":
+            local_idx = int(self.flat_local_indices[index])
+            transcript_id = self.transcripts_ids[local_idx]
+            dataset_name = self.flat_dataset_names[index]
+            available_map = self.data_records["ribo_profiles"][transcript_id]
+
+        else:
+            raise ValueError(f"Unknown dataset_choice_mode={self.dataset_choice_mode}")
+
         global_idx = self.global_idx_by_tid[transcript_id]
 
         ref = self.data_records["ref"][global_idx]
@@ -108,16 +185,6 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         if encoded is None:
             encoded = self._extract_features(ref).astype(np.float32, copy=False)
             self._encoded_cache[global_idx] = encoded
-
-        available_map = self.data_records["ribo_profiles"][transcript_id]
-        available_datasets = list(available_map.keys())
-
-        if self.dataset_choice_mode == "random":
-            dataset_name = np.random.choice(available_datasets)
-        elif self.dataset_choice_mode == "deterministic":
-            dataset_name = available_datasets[offset]
-        else:
-            raise ValueError(f"Unknown dataset_choice_mode={self.dataset_choice_mode}")
 
         ribo = available_map[dataset_name]
 
@@ -139,6 +206,7 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
 
         ids_datasets_sorted = torch.as_tensor([idx_datasets[i] for i in order], dtype=torch.long)
         ids_sorted = [ids[i] for i in order]
+
         seq_sorted = [
             torch.tensor(np.array(sequences[i], copy=True), dtype=torch.float32)
             for i in order

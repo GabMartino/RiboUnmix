@@ -1,4 +1,3 @@
-
 name: ribo_queueing_multi_datasets
 
 defaults:
@@ -8,8 +7,8 @@ defaults:
 experiment:
   from_checkpoint: False
   train: True
-  predict: True
-  dataset: ["gillen_2019", "cui_2024"] #, "grimson_2019", "cui_2024", "gillen_2019", "martinez_2019", "iwasaki_2020", "kito_2023", "volegova_2018"]
+  predict: False
+  dataset: ["grimson_2019", "eichhorn_2014"]
   seed: 42
   split_size: 0.9
 
@@ -28,46 +27,80 @@ paths:
 
 data:
   batch_size: 16
-  num_workers: 4
+
+  # Keep this at 0 until the DataLoader worker CUDA crash is fixed.
+  num_workers: 0
+
+  balanced_train_sampling: True
+  dataset_balance_gamma: 1.0
+  train_samples_per_epoch: null
 
 model:
   input_size: 97
   hidden_dims: 256
   num_layers: 2
-  dropout: 0.2
-  w_temperature: 1.0
-  rho_eps: 1e-6
-  log_sigma_min: -4.0  # Fixed name
-  log_sigma_max: 1.0   # Fixed name
+  dropout: 0.1
+
+  # Must be >= max(dataset_id) + 1.
+  # eichhorn_2014 has id 32, so this must be at least 33.
   num_datasets: 33
 
+  eps: 1.0e-8
+  mu_max: 1.0e8
+
+  # Codon one-hot slice in the input features.
+  codon_feature_start: 12
+  num_codons: 64
+
+  # Multiplicative dataset/codon log-bias branch:
+  # mu_base = S_mean * L_effective * multiplier
+  dataset_emb_dim: 16
+  codon_emb_dim: 16
+  bias_hidden_dim: 64
+  b_clip: 1.0
+
+  # Additive residual branch:
+  # additive_bg = S_mean * additive_rel
+  additive_dataset_emb_dim: 16
+  additive_codon_emb_dim: 8
+  additive_hidden_dim: 32
+  additive_init_bias: -8.0
 
 loss:
-  eps: 1e-6
+  eps: 1.0e-8
+  censor_threshold: 0.0
 
+  # Your current model returns phi = ones_like(mu).
+  # Keep phi fixed at 1 unless you add a learnable phi head later.
+  phi_min: 1.0
+  phi_max: 1.0
+
+  zero_censor_to_zero: True
+  include_log_phi: True
+
+  # Additive residual cost:
+  # penalty = lambda_additive_l1 * mean(additive_bg / S_mean)
+  lambda_additive_l1: 0.05
 
 metrics:
-  S_quantile: 0.99
-  S_eps: 1e-6
-  S_use_nonzero_only: true
-  S_use_censor_threshold: true
-  censor_threshold: 0.5
+  peak_frac: 0.01
+  peak_min_k: 10
 
 optim:
-  lr: 1e-3
-  weight_decay: 1e-4
+  lr: 1.0e-3
+  weight_decay: 1.0e-8
   scheduler:
     name: reduce_on_plateau
     monitor: val_loss_epoch
     mode: min
     factor: 0.9
     patience: 10
-    min_lr: 1e-6
+    min_lr: 1.0e-6
 
 trainer:
   devices: [0]
   accelerator: gpu
-  precision: bf16-mixed
+  precision: 16-mixed
   accumulate_grad_batches: 1
   max_epochs: 300
   log_every_n_steps: 1
@@ -75,7 +108,7 @@ trainer:
   gradient_clip_algorithm: norm
 
 callbacks:
-  early_stopping_patience: 15
+  early_stopping_patience: 25
 
 predict:
   example_idx: 0

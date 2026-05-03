@@ -80,3 +80,4 @@ class ScaledZeroInflatedLogNormalLoss(nn.Module):
             0.5
             * torch.erfc(-z / self.sqrt2.to(dtype=z.dtype, device=z.device)).clamp_min(self.eps)
         )
+
