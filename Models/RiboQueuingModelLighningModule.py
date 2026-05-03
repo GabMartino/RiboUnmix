@@ -48,208 +48,39 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             for k, v in self.dataset_encoding.items()
         }
 
+    # ============================================================
+    # Epoch hooks
+    # ============================================================
+
     def on_validation_epoch_start(self) -> None:
         self._val_plot_logged_this_epoch = False
 
-    def _log_validation_profile_plot(
-            self,
-            *,
-            y: torch.Tensor,
-            mu: torch.Tensor,
-            phi: torch.Tensor,
-            tweedie_p: torch.Tensor,
-            L_queue: torch.Tensor,
-            mask_b: torch.Tensor,
-            mu_pcc_per_sample: torch.Tensor,
-            L_queue_pcc_per_sample: torch.Tensor,
-            batch_idx: int,
-            sample_idx: int = 0,
-            tag: str = "val/profile_diagnostic",
-            mu_base: torch.Tensor | None = None,
-            additive_bg: torch.Tensor | None = None,
-            additive_rel: torch.Tensor | None = None,
-    ) -> None:
-        if self._val_plot_logged_this_epoch:
-            return
+    # ============================================================
+    # CSS helpers
+    # ============================================================
 
-        if batch_idx != 0:
-            return
+    @staticmethod
+    def _get_css_item(css: Any, sample_idx: int) -> Any:
+        if css is None:
+            return None
 
-        if not getattr(self.trainer, "is_global_zero", True):
-            return
+        if isinstance(css, (list, tuple)):
+            if sample_idx >= len(css):
+                return None
+            return css[sample_idx]
 
-        experiment = (
-            getattr(self.logger, "experiment", None)
-            if self.logger is not None
-            else None
-        )
-        if experiment is None:
-            return
+        if torch.is_tensor(css):
+            if css.ndim == 0:
+                return css
+            if sample_idx >= css.shape[0]:
+                return None
+            return css[sample_idx]
 
-        B = y.shape[0]
-        if B == 0:
-            return
+        try:
+            return css[sample_idx]
+        except Exception:
+            return None
 
-        sample_idx = max(0, min(int(sample_idx), B - 1))
-
-        with torch.no_grad():
-            valid = mask_b[sample_idx].detach().bool().cpu()
-
-            if valid.sum().item() < 2:
-                return
-
-            y_i = y[sample_idx].detach().float().cpu()[valid]
-            mu_i = mu[sample_idx].detach().float().cpu()[valid]
-            phi_i = phi[sample_idx].detach().float().cpu()[valid]
-            L_queue_i = L_queue[sample_idx].detach().float().cpu()[valid]
-
-            p_scalar = (
-                tweedie_p.detach()
-                .float()
-                .reshape(())
-                .cpu()
-                .clamp(1.0001, 1.9999)
-            )
-
-            tweedie_var_i = phi_i.clamp_min(1e-8) * torch.pow(
-                mu_i.clamp_min(1e-8),
-                p_scalar,
-            )
-
-            mu_pcc_i = float(mu_pcc_per_sample[sample_idx].detach().float().cpu())
-            L_queue_pcc_i = float(
-                L_queue_pcc_per_sample[sample_idx].detach().float().cpu()
-            )
-            p_value = float(p_scalar)
-
-            x = torch.arange(y_i.numel()).numpy()
-
-            y_np = y_i.numpy()
-            mu_np = mu_i.numpy()
-            L_queue_np = L_queue_i.numpy()
-            var_np = tweedie_var_i.numpy()
-            if mu_base is not None:
-                mu_base_i = mu_base[sample_idx].detach().float().cpu()[valid]
-                mu_base_np = mu_base_i.numpy()
-            else:
-                mu_base_np = None
-
-            if additive_bg is not None:
-                additive_bg_i = additive_bg[sample_idx].detach().float().cpu()[valid]
-                additive_bg_np = additive_bg_i.numpy()
-            else:
-                additive_bg_np = None
-
-            if additive_rel is not None:
-                additive_rel_i = additive_rel[sample_idx].detach().float().cpu()[valid]
-                additive_rel_np = additive_rel_i.numpy()
-            else:
-                additive_rel_np = None
-        fig, axes = plt.subplots(
-            3,
-            1,
-            figsize=(16, 9),
-            sharex=True,
-            gridspec_kw={"height_ratios": [1.4, 1.0, 1.0]},
-        )
-
-        fig.suptitle(
-            f"Validation profile diagnostic | sample={sample_idx} | "
-            f"PCC(mu, y)={mu_pcc_i:.4f} | "
-            f"PCC(L_queue, y)={L_queue_pcc_i:.4f} | "
-            f"Tweedie p={p_value:.4f}",
-            fontsize=12,
-        )
-
-        axes[0].plot(x, y_np, label="target y", linewidth=1.2)
-        axes[0].plot(x, mu_np, label="mu = mu_base + additive", linewidth=1.2)
-
-        if mu_base_np is not None:
-            axes[0].plot(x, mu_base_np, label="mu_base", linewidth=1.0)
-
-        if additive_bg_np is not None:
-            axes[0].plot(x, additive_bg_np, label="additive_bg", linewidth=1.0)
-        axes[0].set_ylabel("profile")
-        axes[0].set_title("Target profile vs predicted mean")
-        axes[0].grid(True, alpha=0.3)
-        axes[0].legend(loc="upper right")
-
-        axes[1].plot(x, L_queue_np, label="L_queue", linewidth=1.2)
-        axes[1].set_ylabel("L_queue")
-        axes[1].set_title("Biological queueing prediction")
-        axes[1].grid(True, alpha=0.3)
-        axes[1].legend(loc="upper right")
-
-        axes[2].plot(
-            x,
-            var_np,
-            label=r"Tweedie variance $\phi\mu^p$",
-            linewidth=1.2,
-        )
-        if additive_rel_np is not None:
-            ax2 = axes[2].twinx()
-            ax2.plot(x, additive_rel_np, label="additive_rel = A/S", linewidth=1.0, linestyle="--")
-            ax2.set_ylabel("additive_rel")
-            ax2.legend(loc="upper left")
-        axes[2].set_ylabel("variance")
-        axes[2].set_xlabel("codon position")
-        axes[2].set_title("Tweedie variance and additive_rel diagnostic")
-        axes[2].grid(True, alpha=0.3)
-        axes[2].legend(loc="upper right")
-
-        fig.tight_layout(rect=(0, 0, 1, 0.93))
-
-        if hasattr(experiment, "add_figure"):
-            experiment.add_figure(tag, fig, global_step=self.global_step)
-        elif hasattr(experiment, "log_figure"):
-            experiment.log_figure(figure_name=tag, figure=fig, step=self.global_step)
-
-        plt.close(fig)
-        self._val_plot_logged_this_epoch = True
-
-    def _log_dataset_pcc_metrics(
-        self,
-        *,
-        stage: str,
-        dataset_ids: torch.Tensor,
-        mu_pcc_per_sample: torch.Tensor,
-        L_queue_pcc_per_sample: torch.Tensor,
-    ) -> None:
-        dataset_ids = dataset_ids.detach()
-
-        for dataset_id in torch.unique(dataset_ids).detach().cpu().tolist():
-            dataset_id = int(dataset_id)
-            dataset_name = self.dataset_id_to_name.get(
-                dataset_id,
-                f"dataset_{dataset_id}",
-            )
-
-            ds_mask = dataset_ids == dataset_id
-            ds_count = int(ds_mask.sum().detach().cpu().item())
-
-            if ds_count == 0:
-                continue
-
-            ds_mu_pcc = mu_pcc_per_sample[ds_mask].mean()
-            ds_L_queue_pcc = L_queue_pcc_per_sample[ds_mask].mean()
-
-            self.log(
-                f"{stage}_mu_pcc_by_dataset/{dataset_name}",
-                ds_mu_pcc.detach(),
-                on_step=False,
-                on_epoch=True,
-                logger=True,
-                batch_size=ds_count,
-            )
-
-            self.log(
-                f"{stage}_L_queue_pcc_by_dataset/{dataset_name}",
-                ds_L_queue_pcc.detach(),
-                on_step=False,
-                on_epoch=True,
-                logger=True,
-                batch_size=ds_count,
-            )
     @staticmethod
     def _normalize_css_positions(
         css_i: Any,
@@ -257,7 +88,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         device: torch.device,
     ) -> torch.Tensor:
         """
-        Converts one sample's CSS annotation into a 1D LongTensor of valid positions.
+        Converts one sample's CSS annotation into valid integer positions.
 
         Supports:
           - list/array/tensor of positions
@@ -294,7 +125,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
             arr_long = arr.to(torch.long)
 
-            # Dense 0/1 CSS mask.
             if arr_long.numel() == L and torch.all((arr_long == 0) | (arr_long == 1)):
                 pos = torch.nonzero(arr_long.bool(), as_tuple=False).reshape(-1)
             else:
@@ -316,9 +146,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         window: int,
         device: torch.device,
     ) -> torch.Tensor:
-        """
-        Builds a boolean mask covering CSS positions ± window codons.
-        """
         css_mask = torch.zeros(int(L), dtype=torch.bool, device=device)
 
         if css_pos.numel() == 0:
@@ -345,12 +172,11 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         eps: float = 1e-8,
     ) -> tuple[dict[str, torch.Tensor], int]:
         """
-        Computes CSS diagnostics for a positive score such as L_queue or additive_bg.
+        Computes CSS diagnostics for a positive score.
 
-        Returns:
+        Metrics:
           css_rank_percentile:
               Mean percentile rank of exact CSS positions.
-              Higher is better. 0.90 means CSS are around top 10%.
 
           css_recall_topk_window:
               Fraction of CSS positions hit by top-k score positions,
@@ -374,7 +200,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 continue
 
             score_i = score[i, :L].detach().float()
-            css_i = css[i] if isinstance(css, (list, tuple)) else None
+            css_i = self._get_css_item(css, i)
 
             css_pos = self._normalize_css_positions(
                 css_i=css_i,
@@ -397,22 +223,14 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             if css_win.sum() == 0 or non_css_win.sum() == 0:
                 continue
 
-            # --------------------------------------------------------
-            # Rank percentile at exact CSS positions.
-            # --------------------------------------------------------
             css_scores = score_i[css_pos]
 
-            # Percentile = fraction of positions with score <= CSS score.
-            # Higher is better.
             percentiles = []
             for s in css_scores:
                 percentiles.append((score_i <= s).float().mean())
 
             rank_percentiles.append(torch.stack(percentiles).mean())
 
-            # --------------------------------------------------------
-            # Recall@top-k, allowing positional window.
-            # --------------------------------------------------------
             k = max(int(min_k), int(math.ceil(float(top_frac) * L)))
             k = min(k, L)
 
@@ -427,9 +245,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 hit = distances.min(dim=1).values <= int(window)
                 recalls.append(hit.float().mean())
 
-            # --------------------------------------------------------
-            # CSS enrichment.
-            # --------------------------------------------------------
             css_mean = score_i[css_win].mean()
             bg_mean = score_i[non_css_win].mean().clamp_min(eps)
 
@@ -440,7 +255,11 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
         out = {
             "css_rank_percentile": torch.stack(rank_percentiles).mean(),
-            "css_recall_topk_window": torch.stack(recalls).mean() if recalls else torch.zeros((), device=device),
+            "css_recall_topk_window": (
+                torch.stack(recalls).mean()
+                if recalls
+                else torch.zeros((), device=device)
+            ),
             "css_enrichment": torch.stack(enrichments).mean(),
         }
 
@@ -459,7 +278,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
             mean(values at CSS ± window) - mean(values elsewhere)
 
-        Useful for b_offset, where a ratio is less meaningful because b can be negative.
+        Useful for b and phi.
         """
         device = values.device
         deltas = []
@@ -473,7 +292,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 continue
 
             values_i = values[i, :L].detach().float()
-            css_i = css[i] if isinstance(css, (list, tuple)) else None
+            css_i = self._get_css_item(css, i)
 
             css_pos = self._normalize_css_positions(
                 css_i=css_i,
@@ -511,21 +330,8 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         css: Any,
         additive_bg: torch.Tensor | None = None,
         b_offset: torch.Tensor | None = None,
+        phi: torch.Tensor | None = None,
     ) -> tuple[dict[str, torch.Tensor], int]:
-        """
-        Computes validation CSS diagnostics.
-
-        Main biological interpretation:
-
-          high css_L_queue_*:
-              CSS are captured by biological queueing branch.
-
-          high css_additive_bg_enrichment:
-              additive branch may be stealing CSS signal.
-
-          high positive css_b_delta:
-              multiplicative technical bias may be explaining CSS peaks.
-        """
         top_frac = float(getattr(self.config.metrics, "css_top_frac", 0.01))
         min_k = int(getattr(self.config.metrics, "css_min_k", 10))
         window = int(getattr(self.config.metrics, "css_window", 3))
@@ -574,274 +380,312 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             if b_delta is not None and b_count > 0:
                 logs["css_b_delta"] = b_delta
 
+        if phi is not None:
+            phi_delta, phi_count = self._css_delta_for_values(
+                values=phi,
+                mask_b=mask_b,
+                css=css,
+                window=window,
+            )
+
+            if phi_delta is not None and phi_count > 0:
+                logs["css_phi_delta"] = phi_delta
+
         return logs, css_count
-    def _shared_step(
+
+    # ============================================================
+    # Plotting
+    # ============================================================
+
+    def _log_validation_profile_plot(
         self,
-        batch: Any,
-        stage: str,
+        *,
+        y: torch.Tensor,
+        mu: torch.Tensor,
+        phi: torch.Tensor,
+        tweedie_p: torch.Tensor,
+        L_queue: torch.Tensor,
+        mask_b: torch.Tensor,
+        mu_pcc_per_sample: torch.Tensor,
+        L_queue_pcc_per_sample: torch.Tensor,
         batch_idx: int,
-    ) -> torch.Tensor:
-        ids_datasets_sorted, ids, packed_sequence, profiles_target, lengths, mask, css = batch
+        sample_idx: int = 0,
+        tag: str = "val/profile_diagnostic",
+        mu_base: torch.Tensor | None = None,
+        additive_bg: torch.Tensor | None = None,
+        additive_rel: torch.Tensor | None = None,
+        css: Any | None = None,
+    ) -> None:
+        if self._val_plot_logged_this_epoch:
+            return
 
-        batch_size = int(profiles_target.shape[0])
+        if batch_idx != 0:
+            return
 
-        y = profiles_target.to(torch.float32)
-        mask_b = mask.bool()
-        mask_f = mask_b.float()
+        if not getattr(self.trainer, "is_global_zero", True):
+            return
 
-        mu, tweedie_p, phi, extras = self.model(
-            packed_sequence,
-            ids_datasets_sorted,
-            y,
+        experiment = (
+            getattr(self.logger, "experiment", None)
+            if self.logger is not None
+            else None
         )
 
-        # Current expected extras layout:
-        # extras[2]  = L_queue
-        # extras[8]  = b
-        # extras[10] = mu_base
-        # extras[11] = additive_bg
-        # extras[12] = additive_rel
-        L_queue = extras[2]
+        if experiment is None:
+            return
 
-        b_offset = extras[8] if len(extras) > 8 else None
-        mu_base = extras[10] if len(extras) > 10 else None
-        additive_bg = extras[11] if len(extras) > 11 else None
-        additive_rel = extras[12] if len(extras) > 12 else None
-        shift_weights_used = extras[14] if len(extras) > 14 else None
-        shift_weights_soft = extras[15] if len(extras) > 15 else None
-        nll_per_sample = self.loss_fn(
-            mu_phys=mu,
-            power=tweedie_p,
-            phi=phi,
-            y_true=y,
-            mask=mask_b,
-            return_per_sample=True,
-        )
+        B = y.shape[0]
 
-        loss_per_sample = nll_per_sample
+        if B == 0:
+            return
 
-        lambda_additive_l1 = float(
-            getattr(self.config.loss, "lambda_additive_l1", 0.0)
-        )
-
-        additive_penalty = torch.zeros(
-            (),
-            device=y.device,
-            dtype=loss_per_sample.dtype,
-        )
-
-        additive_rel_mean = torch.zeros(
-            (),
-            device=y.device,
-            dtype=loss_per_sample.dtype,
-        )
-
-        if additive_rel is not None:
-            additive_rel_float = additive_rel.float()
-
-            additive_penalty_per_sample = (
-                                                  additive_rel_float * mask_f
-                                          ).sum(dim=1) / mask_f.sum(dim=1).clamp_min(1.0)
-
-            additive_penalty = additive_penalty_per_sample.mean()
-            additive_rel_mean = (
-                                        additive_rel_float * mask_f
-                                ).sum() / mask_f.sum().clamp_min(1.0)
-
-            if lambda_additive_l1 > 0.0:
-                loss_per_sample = (
-                        loss_per_sample
-                        + lambda_additive_l1 * additive_penalty_per_sample
-                )
-
-        loss = loss_per_sample.mean()
+        sample_idx = max(0, min(int(sample_idx), B - 1))
 
         with torch.no_grad():
-            mu_detached = mu.detach()
-            L_queue_detached = L_queue.detach()
+            valid = mask_b[sample_idx].detach().bool().cpu()
+            L = int(valid.sum().item())
 
-            mu_pcc_per_sample = self.masked_pcc(
-                pred=mu_detached,
-                target=y,
-                mask=mask_b,
+            if L < 2:
+                return
+
+            y_i = y[sample_idx].detach().float().cpu()[valid]
+            mu_i = mu[sample_idx].detach().float().cpu()[valid]
+            phi_i = phi[sample_idx].detach().float().cpu()[valid]
+            L_queue_i = L_queue[sample_idx].detach().float().cpu()[valid]
+
+            p_scalar = (
+                tweedie_p.detach()
+                .float()
+                .reshape(-1)
+                .mean()
+                .cpu()
+                .clamp(1.0001, 1.9999)
             )
 
-            L_queue_pcc_per_sample = self.masked_pcc(
-                pred=L_queue_detached,
-                target=y,
-                mask=mask_b,
+            tweedie_var_i = phi_i.clamp_min(1e-8) * torch.pow(
+                mu_i.clamp_min(1e-8),
+                p_scalar,
             )
 
-            mu_pcc = mu_pcc_per_sample.mean()
-            L_queue_pcc = L_queue_pcc_per_sample.mean()
+            mu_pcc_i = float(mu_pcc_per_sample[sample_idx].detach().float().cpu())
+            L_queue_pcc_i = float(
+                L_queue_pcc_per_sample[sample_idx].detach().float().cpu()
+            )
+            p_value = float(p_scalar)
 
-            css_logs: dict[str, torch.Tensor] = {}
-            css_count = 0
+            x = torch.arange(y_i.numel()).numpy()
 
-            if stage == "val":
-                css_logs, css_count = self._compute_css_diagnostics(
-                    L_queue=L_queue_detached,
-                    mask_b=mask_b,
-                    css=css,
-                    additive_bg=additive_bg.detach() if additive_bg is not None else None,
-                    b_offset=b_offset.detach() if b_offset is not None else None,
+            y_np = y_i.numpy()
+            mu_np = mu_i.numpy()
+            L_queue_np = L_queue_i.numpy()
+            var_np = tweedie_var_i.numpy()
+            phi_np = phi_i.numpy()
+
+            if mu_base is not None:
+                mu_base_np = mu_base[sample_idx].detach().float().cpu()[valid].numpy()
+            else:
+                mu_base_np = None
+
+            if additive_bg is not None:
+                additive_bg_np = additive_bg[sample_idx].detach().float().cpu()[valid].numpy()
+            else:
+                additive_bg_np = None
+
+            if additive_rel is not None:
+                additive_rel_np = additive_rel[sample_idx].detach().float().cpu()[valid].numpy()
+            else:
+                additive_rel_np = None
+
+            css_i = self._get_css_item(css, sample_idx)
+            css_pos = self._normalize_css_positions(
+                css_i=css_i,
+                L=L,
+                device=torch.device("cpu"),
+            )
+
+        fig, axes = plt.subplots(
+            3,
+            1,
+            figsize=(16, 9),
+            sharex=True,
+            gridspec_kw={"height_ratios": [1.4, 1.0, 1.0]},
+        )
+
+        fig.suptitle(
+            f"Validation profile diagnostic | sample={sample_idx} | "
+            f"PCC(mu, y)={mu_pcc_i:.4f} | "
+            f"PCC(L_queue, y)={L_queue_pcc_i:.4f} | "
+            f"Tweedie p={p_value:.4f}",
+            fontsize=12,
+        )
+
+        axes[0].plot(x, y_np, label="target y", linewidth=1.2)
+        axes[0].plot(x, mu_np, label="mu = mu_base + additive", linewidth=1.2)
+
+        if mu_base_np is not None:
+            axes[0].plot(x, mu_base_np, label="mu_base", linewidth=1.0)
+
+        if additive_bg_np is not None:
+            axes[0].plot(x, additive_bg_np, label="additive_bg", linewidth=1.0)
+
+        axes[0].set_ylabel("profile")
+        axes[0].set_title("Target profile vs predicted mean")
+        axes[0].grid(True, alpha=0.3)
+        axes[0].legend(loc="upper right")
+
+        axes[1].plot(x, L_queue_np, label="L_queue", linewidth=1.2)
+        axes[1].set_ylabel("L_queue")
+        axes[1].set_title("Biological queueing prediction")
+        axes[1].grid(True, alpha=0.3)
+        axes[1].legend(loc="upper right")
+
+        axes[2].plot(
+            x,
+            var_np,
+            label=r"Tweedie variance $\phi\mu^p$",
+            linewidth=1.2,
+        )
+        axes[2].plot(
+            x,
+            phi_np,
+            label=r"$\phi$",
+            linewidth=1.0,
+            linestyle=":",
+        )
+
+        if additive_rel_np is not None:
+            ax2 = axes[2].twinx()
+            ax2.plot(
+                x,
+                additive_rel_np,
+                label="additive_rel = A/S",
+                linewidth=1.0,
+                linestyle="--",
+            )
+            ax2.set_ylabel("additive_rel")
+            ax2.legend(loc="upper left")
+
+        axes[2].set_ylabel("variance / phi")
+        axes[2].set_xlabel("codon position")
+        axes[2].set_title("Tweedie variance, phi, and additive_rel diagnostic")
+        axes[2].grid(True, alpha=0.3)
+        axes[2].legend(loc="upper right")
+
+        for ax in axes:
+            for j, css_position in enumerate(css_pos.detach().cpu().tolist()):
+                ax.axvline(
+                    int(css_position),
+                    linestyle="--",
+                    linewidth=0.8,
+                    alpha=0.35,
+                    label="CSS" if j == 0 else None,
                 )
 
-        if stage == "val":
-            sample_idx = int(
-                getattr(
-                    getattr(self.config, "predict", object()),
-                    "example_idx",
-                    0,
-                )
+        fig.tight_layout(rect=(0, 0, 1, 0.93))
+
+        if hasattr(experiment, "add_figure"):
+            experiment.add_figure(tag, fig, global_step=self.global_step)
+        elif hasattr(experiment, "log_figure"):
+            experiment.log_figure(figure_name=tag, figure=fig, step=self.global_step)
+
+        plt.close(fig)
+        self._val_plot_logged_this_epoch = True
+
+    # ============================================================
+    # Dataset metric logging
+    # ============================================================
+
+    def _log_dataset_pcc_metrics(
+        self,
+        *,
+        stage: str,
+        dataset_ids: torch.Tensor,
+        mu_pcc_per_sample: torch.Tensor,
+        L_queue_pcc_per_sample: torch.Tensor,
+    ) -> None:
+        dataset_ids = dataset_ids.detach()
+
+        for dataset_id in torch.unique(dataset_ids).detach().cpu().tolist():
+            dataset_id = int(dataset_id)
+            dataset_name = self.dataset_id_to_name.get(
+                dataset_id,
+                f"dataset_{dataset_id}",
             )
 
-            self._log_validation_profile_plot(
-                y=y,
-                mu=mu,
-                phi=phi,
-                tweedie_p=tweedie_p,
-                L_queue=L_queue_detached,
-                mask_b=mask_b,
-                mu_pcc_per_sample=mu_pcc_per_sample,
-                L_queue_pcc_per_sample=L_queue_pcc_per_sample,
-                batch_idx=batch_idx,
-                sample_idx=sample_idx,
-                tag="val/profile_diagnostic",
-                mu_base=mu_base,
-                additive_bg=additive_bg,
-                additive_rel=additive_rel,
-            )
+            ds_mask = dataset_ids == dataset_id
+            ds_count = int(ds_mask.sum().detach().cpu().item())
 
-        self.log(
-            f"{stage}_loss",
-            loss.detach(),
-            on_step=(stage == "train"),
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-            batch_size=batch_size,
-        )
+            if ds_count == 0:
+                continue
 
-        self.log(
-            f"{stage}_nll",
-            nll_per_sample.mean().detach(),
-            on_step=(stage == "train"),
-            on_epoch=True,
-            logger=True,
-            batch_size=batch_size,
-        )
+            ds_mu_pcc = mu_pcc_per_sample[ds_mask].mean()
+            ds_L_queue_pcc = L_queue_pcc_per_sample[ds_mask].mean()
 
-        self.log(
-            f"{stage}_p",
-            tweedie_p.detach().reshape(()),
-            on_step=False,
-            on_epoch=True,
-            logger=True,
-            batch_size=batch_size,
-        )
-
-        self.log(
-            f"{stage}_mu_pcc",
-            mu_pcc,
-            on_step=False,
-            on_epoch=True,
-            prog_bar=(stage == "val"),
-            logger=True,
-            batch_size=batch_size,
-        )
-
-        self.log(
-            f"{stage}_L_queue_pcc",
-            L_queue_pcc,
-            on_step=False,
-            on_epoch=True,
-            prog_bar=(stage == "val"),
-            logger=True,
-            batch_size=batch_size,
-        )
-
-        if len(extras) > 12:
             self.log(
-                f"{stage}_additive_rel_mean",
-                additive_rel_mean.detach(),
+                f"{stage}_mu_pcc_by_dataset/{dataset_name}",
+                ds_mu_pcc.detach(),
                 on_step=False,
                 on_epoch=True,
                 logger=True,
-                batch_size=batch_size,
-            )
-
-            if lambda_additive_l1 > 0.0:
-                self.log(
-                    f"{stage}_additive_l1_penalty",
-                    additive_penalty.detach(),
-                    on_step=False,
-                    on_epoch=True,
-                    logger=True,
-                    batch_size=batch_size,
-                )
-
-        self._log_dataset_pcc_metrics(
-            stage=stage,
-            dataset_ids=ids_datasets_sorted,
-            mu_pcc_per_sample=mu_pcc_per_sample,
-            L_queue_pcc_per_sample=L_queue_pcc_per_sample,
-        )
-        self._log_dataset_shift_metrics(
-            stage=stage,
-            dataset_ids=ids_datasets_sorted,
-            shift_weights_used=shift_weights_used,
-            shift_weights_soft=shift_weights_soft,
-        )
-
-        if stage == "val":
-            self.log(
-                "val_loss_epoch",
-                loss.detach(),
-                on_step=False,
-                on_epoch=True,
-                prog_bar=True,
-                logger=True,
-                batch_size=batch_size,
+                batch_size=ds_count,
             )
 
             self.log(
-                "val_mu_pcc_epoch",
-                mu_pcc,
+                f"{stage}_L_queue_pcc_by_dataset/{dataset_name}",
+                ds_L_queue_pcc.detach(),
                 on_step=False,
                 on_epoch=True,
-                prog_bar=True,
                 logger=True,
-                batch_size=batch_size,
+                batch_size=ds_count,
+            )
+
+    def _log_dataset_phi_metrics(
+        self,
+        *,
+        stage: str,
+        dataset_ids: torch.Tensor,
+        phi: torch.Tensor,
+        mask_b: torch.Tensor,
+    ) -> None:
+        dataset_ids = dataset_ids.detach()
+        mask_f = mask_b.float()
+
+        phi_detached = phi.detach().float()
+
+        for dataset_id in torch.unique(dataset_ids).detach().cpu().tolist():
+            dataset_id = int(dataset_id)
+            dataset_name = self.dataset_id_to_name.get(
+                dataset_id,
+                f"dataset_{dataset_id}",
+            )
+
+            ds_mask = dataset_ids == dataset_id
+            ds_count = int(ds_mask.sum().detach().cpu().item())
+
+            if ds_count == 0:
+                continue
+
+            ds_phi = phi_detached[ds_mask]
+            ds_mask_f = mask_f[ds_mask]
+
+            ds_phi_mean = (
+                (ds_phi * ds_mask_f).sum()
+                / ds_mask_f.sum().clamp_min(1.0)
             )
 
             self.log(
-                "val_L_queue_pcc_epoch",
-                L_queue_pcc,
+                f"{stage}_phi_mean_by_dataset/{dataset_name}",
+                ds_phi_mean.detach(),
                 on_step=False,
                 on_epoch=True,
-                prog_bar=True,
                 logger=True,
-                batch_size=batch_size,
+                batch_size=ds_count,
             )
-        if stage == "val" and css_count > 0:
-            for name, value in css_logs.items():
-                self.log(
-                    f"val_{name}",
-                    value.detach(),
-                    on_step=False,
-                    on_epoch=True,
-                    logger=True,
-                    prog_bar=(
-                            name in {
-                        "css_L_queue_css_rank_percentile",
-                        "css_L_queue_css_recall_topk_window",
-                    }
-                    ),
-                    batch_size=css_count,
-                )
 
-        return loss
+    # ============================================================
+    # Shift logging
+    # ============================================================
+
     def _get_shift_values(
         self,
         *,
@@ -876,17 +720,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         shift_weights_used: torch.Tensor | None,
         shift_weights_soft: torch.Tensor | None,
     ) -> None:
-        """
-        Logs dataset-specific shift diagnostics.
-
-        Expected logs:
-          {stage}_shift_expected_used_by_dataset/<dataset>
-          {stage}_shift_expected_soft_by_dataset/<dataset>
-          {stage}_shift_max_prob_soft_by_dataset/<dataset>
-          {stage}_shift_prob_soft_k=-1_by_dataset/<dataset>
-          {stage}_shift_prob_soft_k=+0_by_dataset/<dataset>
-          {stage}_shift_prob_soft_k=+1_by_dataset/<dataset>
-        """
         weights_ref = shift_weights_soft if shift_weights_soft is not None else shift_weights_used
 
         if weights_ref is None:
@@ -924,6 +757,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         )
 
         argmax_shift_soft = None
+
         if shift_weights_soft is not None:
             argmax_idx = shift_weights_soft.detach().argmax(dim=1)
             argmax_shift_soft = shifts[argmax_idx]
@@ -993,6 +827,329 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                         logger=True,
                         batch_size=ds_count,
                     )
+
+    # ============================================================
+    # Shared step
+    # ============================================================
+
+    def _shared_step(
+        self,
+        batch: Any,
+        stage: str,
+        batch_idx: int,
+    ) -> torch.Tensor:
+        ids_datasets_sorted, ids, packed_sequence, profiles_target, lengths, mask, css = batch
+
+        batch_size = int(profiles_target.shape[0])
+
+        y = profiles_target.to(torch.float32)
+        mask_b = mask.bool()
+        mask_f = mask_b.float()
+
+        mu, tweedie_p, phi, extras = self.model(
+            packed_sequence,
+            ids_datasets_sorted,
+            y,
+        )
+
+        # Expected extras layout:
+        # extras[2]  = L_queue
+        # extras[8]  = b
+        # extras[10] = mu_base
+        # extras[11] = additive_bg
+        # extras[12] = additive_rel
+        # extras[14] = shift_weights_used
+        # extras[15] = shift_weights_soft
+        L_queue = extras[2]
+
+        b_offset = extras[8] if len(extras) > 8 else None
+        mu_base = extras[10] if len(extras) > 10 else None
+        additive_bg = extras[11] if len(extras) > 11 else None
+        additive_rel = extras[12] if len(extras) > 12 else None
+        shift_weights_used = extras[14] if len(extras) > 14 else None
+        shift_weights_soft = extras[15] if len(extras) > 15 else None
+
+        nll_per_sample = self.loss_fn(
+            mu_phys=mu,
+            power=tweedie_p,
+            phi=phi,
+            y_true=y,
+            mask=mask_b,
+            return_per_sample=True,
+        )
+
+        loss_per_sample = nll_per_sample
+
+        lambda_additive_l1 = float(
+            getattr(self.config.loss, "lambda_additive_l1", 0.0)
+        )
+
+        additive_penalty = torch.zeros(
+            (),
+            device=y.device,
+            dtype=loss_per_sample.dtype,
+        )
+
+        additive_rel_mean = torch.zeros(
+            (),
+            device=y.device,
+            dtype=loss_per_sample.dtype,
+        )
+
+        if additive_rel is not None:
+            additive_rel_float = additive_rel.float()
+
+            additive_penalty_per_sample = (
+                additive_rel_float * mask_f
+            ).sum(dim=1) / mask_f.sum(dim=1).clamp_min(1.0)
+
+            additive_penalty = additive_penalty_per_sample.mean()
+            additive_rel_mean = (
+                additive_rel_float * mask_f
+            ).sum() / mask_f.sum().clamp_min(1.0)
+
+            if lambda_additive_l1 > 0.0:
+                loss_per_sample = (
+                    loss_per_sample
+                    + lambda_additive_l1 * additive_penalty_per_sample
+                )
+
+        loss = loss_per_sample.mean()
+
+        with torch.no_grad():
+            mu_detached = mu.detach()
+            L_queue_detached = L_queue.detach()
+            phi_detached = phi.detach()
+
+            mu_pcc_per_sample = self.masked_pcc(
+                pred=mu_detached,
+                target=y,
+                mask=mask_b,
+            )
+
+            L_queue_pcc_per_sample = self.masked_pcc(
+                pred=L_queue_detached,
+                target=y,
+                mask=mask_b,
+            )
+
+            mu_pcc = mu_pcc_per_sample.mean()
+            L_queue_pcc = L_queue_pcc_per_sample.mean()
+
+            phi_mean = (
+                (phi_detached.float() * mask_f).sum()
+                / mask_f.sum().clamp_min(1.0)
+            )
+
+            css_logs: dict[str, torch.Tensor] = {}
+            css_count = 0
+
+            if stage == "val":
+                css_logs, css_count = self._compute_css_diagnostics(
+                    L_queue=L_queue_detached,
+                    mask_b=mask_b,
+                    css=css,
+                    additive_bg=(
+                        additive_bg.detach()
+                        if additive_bg is not None
+                        else None
+                    ),
+                    b_offset=(
+                        b_offset.detach()
+                        if b_offset is not None
+                        else None
+                    ),
+                    phi=phi_detached,
+                )
+
+        if stage == "val":
+            sample_idx = int(
+                getattr(
+                    getattr(self.config, "predict", object()),
+                    "example_idx",
+                    0,
+                )
+            )
+
+            self._log_validation_profile_plot(
+                y=y,
+                mu=mu,
+                phi=phi,
+                tweedie_p=tweedie_p,
+                L_queue=L_queue_detached,
+                mask_b=mask_b,
+                mu_pcc_per_sample=mu_pcc_per_sample,
+                L_queue_pcc_per_sample=L_queue_pcc_per_sample,
+                batch_idx=batch_idx,
+                sample_idx=sample_idx,
+                tag="val/profile_diagnostic",
+                mu_base=mu_base,
+                additive_bg=additive_bg,
+                additive_rel=additive_rel,
+                css=css,
+            )
+
+        # ------------------------------------------------------------
+        # Global logs
+        # ------------------------------------------------------------
+        self.log(
+            f"{stage}_loss",
+            loss.detach(),
+            on_step=(stage == "train"),
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+            batch_size=batch_size,
+        )
+
+        self.log(
+            f"{stage}_nll",
+            nll_per_sample.mean().detach(),
+            on_step=(stage == "train"),
+            on_epoch=True,
+            logger=True,
+            batch_size=batch_size,
+        )
+
+        self.log(
+            f"{stage}_p",
+            tweedie_p.detach().reshape(-1).mean(),
+            on_step=False,
+            on_epoch=True,
+            logger=True,
+            batch_size=batch_size,
+        )
+
+        self.log(
+            f"{stage}_phi_mean",
+            phi_mean.detach(),
+            on_step=False,
+            on_epoch=True,
+            logger=True,
+            batch_size=batch_size,
+        )
+
+        self.log(
+            f"{stage}_mu_pcc",
+            mu_pcc.detach(),
+            on_step=False,
+            on_epoch=True,
+            prog_bar=(stage == "val"),
+            logger=True,
+            batch_size=batch_size,
+        )
+
+        self.log(
+            f"{stage}_L_queue_pcc",
+            L_queue_pcc.detach(),
+            on_step=False,
+            on_epoch=True,
+            prog_bar=(stage == "val"),
+            logger=True,
+            batch_size=batch_size,
+        )
+
+        if additive_rel is not None:
+            self.log(
+                f"{stage}_additive_rel_mean",
+                additive_rel_mean.detach(),
+                on_step=False,
+                on_epoch=True,
+                logger=True,
+                batch_size=batch_size,
+            )
+
+            if lambda_additive_l1 > 0.0:
+                self.log(
+                    f"{stage}_additive_l1_penalty",
+                    additive_penalty.detach(),
+                    on_step=False,
+                    on_epoch=True,
+                    logger=True,
+                    batch_size=batch_size,
+                )
+
+        # ------------------------------------------------------------
+        # Dataset-specific logs
+        # ------------------------------------------------------------
+        self._log_dataset_pcc_metrics(
+            stage=stage,
+            dataset_ids=ids_datasets_sorted,
+            mu_pcc_per_sample=mu_pcc_per_sample,
+            L_queue_pcc_per_sample=L_queue_pcc_per_sample,
+        )
+
+        self._log_dataset_phi_metrics(
+            stage=stage,
+            dataset_ids=ids_datasets_sorted,
+            phi=phi,
+            mask_b=mask_b,
+        )
+
+        self._log_dataset_shift_metrics(
+            stage=stage,
+            dataset_ids=ids_datasets_sorted,
+            shift_weights_used=shift_weights_used,
+            shift_weights_soft=shift_weights_soft,
+        )
+
+        # ------------------------------------------------------------
+        # Validation summary logs
+        # ------------------------------------------------------------
+        if stage == "val":
+            self.log(
+                "val_loss_epoch",
+                loss.detach(),
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+                batch_size=batch_size,
+            )
+
+            self.log(
+                "val_mu_pcc_epoch",
+                mu_pcc.detach(),
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+                batch_size=batch_size,
+            )
+
+            self.log(
+                "val_L_queue_pcc_epoch",
+                L_queue_pcc.detach(),
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+                batch_size=batch_size,
+            )
+
+            if css_count > 0:
+                for name, value in css_logs.items():
+                    self.log(
+                        f"val_{name}",
+                        value.detach(),
+                        on_step=False,
+                        on_epoch=True,
+                        logger=True,
+                        prog_bar=(
+                            name in {
+                                "css_L_queue_css_rank_percentile",
+                                "css_L_queue_css_recall_topk_window",
+                            }
+                        ),
+                        batch_size=css_count,
+                    )
+
+        return loss
+
+    # ============================================================
+    # Lightning API
+    # ============================================================
+
     def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
         return self._shared_step(batch, stage="train", batch_idx=batch_idx)
 

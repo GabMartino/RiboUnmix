@@ -8,7 +8,7 @@ experiment:
   from_checkpoint: False
   train: True
   predict: False
-  dataset: ["grimson_2019", "eichhorn_2014"]
+  dataset: ["grimson_2019", "gillen_2019"]
   seed: 42
   split_size: 0.9
 
@@ -69,11 +69,15 @@ model:
 loss:
   eps: 1.0e-8
   censor_threshold: 0.0
-
   # Your current model returns phi = ones_like(mu).
   # Keep phi fixed at 1 unless you add a learnable phi head later.
-  phi_min: 1.0
-  phi_max: 1.0
+  phi_min: 0.05
+  phi_max: 5.0
+  init_phi: 1.0
+
+  phi_dataset_emb_dim: 16
+  phi_codon_emb_dim: 8
+  phi_hidden_dim: 32
 
   zero_censor_to_zero: True
   include_log_phi: True

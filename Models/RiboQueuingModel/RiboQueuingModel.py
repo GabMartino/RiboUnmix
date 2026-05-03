@@ -6,33 +6,37 @@ from torch.nn.utils.rnn import pad_packed_sequence
 
 from Models.RiboQueuingModel.DatasetBiasSubmodel import DatasetBiasSubmodel
 from Models.RiboQueuingModel.QueuingBiologicalModel import QueuingBiologicalModel
+from Models.RiboQueuingModel.submodels.DatasetCodonDispersionHead import DatasetCodonDispersionHead
 from Models.RiboQueuingModel.submodels.DatasetDispersionHead import DatasetDispersionHead
 from Models.utils.compute_S_quantile import compute_S_mean
 
 
 class RiboQueuingModel(nn.Module):
     def __init__(
-        self,
-        input_size: int,
-        hidden_size: int,
-        num_layers: int = 2,
-        dropout: float = 0.1,
-        num_datasets: int = 32,
-        eps: float = 1e-8,
-        mu_max: float = 1e8,
-        codon_feature_start: int = 12,
-        num_codons: int = 64,
-        dataset_emb_dim: int = 16,
-        codon_emb_dim: int = 16,
-        bias_hidden_dim: int = 64,
-        b_clip: float = 1.0,
-        additive_dataset_emb_dim: int = 16,
-        additive_codon_emb_dim: int = 8,
-        additive_hidden_dim: int = 32,
-        additive_init_bias: float = -8.0,
-        phi_min: float = 0.05,
-        phi_max: float = 5.0,
-        init_phi: float = 1.0,
+            self,
+            input_size: int,
+            hidden_size: int,
+            num_layers: int = 2,
+            dropout: float = 0.1,
+            num_datasets: int = 32,
+            eps: float = 1e-8,
+            mu_max: float = 1e8,
+            codon_feature_start: int = 12,
+            num_codons: int = 64,
+            dataset_emb_dim: int = 16,
+            codon_emb_dim: int = 16,
+            bias_hidden_dim: int = 64,
+            b_clip: float = 1.0,
+            additive_dataset_emb_dim: int = 16,
+            additive_codon_emb_dim: int = 8,
+            additive_hidden_dim: int = 32,
+            additive_init_bias: float = -8.0,
+            phi_min: float = 0.05,
+            phi_max: float = 5.0,
+            init_phi: float = 1.0,
+            phi_dataset_emb_dim: int = 16,
+            phi_codon_emb_dim: int = 8,
+            phi_hidden_dim: int = 32,
     ):
         super().__init__()
 
@@ -71,8 +75,13 @@ class RiboQueuingModel(nn.Module):
             additive_init_bias=additive_init_bias,
             eps=eps,
         )
-        self.dispersion_head = DatasetDispersionHead(
+        self.dispersion_head = DatasetCodonDispersionHead(
             num_datasets=num_datasets,
+            num_codons=num_codons,
+            dataset_emb_dim=phi_dataset_emb_dim,
+            codon_emb_dim=phi_codon_emb_dim,
+            hidden_dim=phi_hidden_dim,
+            dropout=dropout,
             phi_min=phi_min,
             phi_max=phi_max,
             init_phi=init_phi,
@@ -202,9 +211,11 @@ class RiboQueuingModel(nn.Module):
 
         phi = self.dispersion_head(
             dataset_ids=id_datasets,
-            T=T,
+            codon_ids=codon_ids,
             mask=mask_b,
-        ).to(device=mu.device, dtype=mu.dtype)
+        )
+
+        phi = phi.to(device=mu.device, dtype=mu.dtype)
 
         extras = (
             rho_diag,  # 0

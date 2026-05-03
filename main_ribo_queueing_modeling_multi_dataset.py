@@ -138,7 +138,7 @@ def main(cfg: DictConfig):
         hidden_size=int(cfg.model.hidden_dims),
         num_layers=int(cfg.model.num_layers),
         dropout=float(cfg.model.dropout),
-        num_datasets=num_datasets,
+        num_datasets=int(cfg.model.num_datasets),
 
         eps=float(cfg_get("model.eps", 1e-8)),
         mu_max=float(cfg_get("model.mu_max", 1e8)),
@@ -146,17 +146,22 @@ def main(cfg: DictConfig):
         codon_feature_start=int(cfg.model.codon_feature_start),
         num_codons=int(cfg.model.num_codons),
 
-        # Multiplicative dataset/codon bias
         dataset_emb_dim=int(cfg.model.dataset_emb_dim),
         codon_emb_dim=int(cfg.model.codon_emb_dim),
         bias_hidden_dim=int(cfg.model.bias_hidden_dim),
         b_clip=float(cfg.model.b_clip),
 
-        # Additive dataset/codon residual bias
         additive_dataset_emb_dim=int(cfg_get("model.additive_dataset_emb_dim", 16)),
         additive_codon_emb_dim=int(cfg_get("model.additive_codon_emb_dim", 8)),
         additive_hidden_dim=int(cfg_get("model.additive_hidden_dim", 32)),
         additive_init_bias=float(cfg_get("model.additive_init_bias", -8.0)),
+
+        phi_min=float(cfg_get("model.phi_min", cfg_get("loss.phi_min", 0.05))),
+        phi_max=float(cfg_get("model.phi_max", cfg_get("loss.phi_max", 5.0))),
+        init_phi=float(cfg_get("model.init_phi", 1.0)),
+        phi_dataset_emb_dim=int(cfg_get("model.phi_dataset_emb_dim", 16)),
+        phi_codon_emb_dim=int(cfg_get("model.phi_codon_emb_dim", 8)),
+        phi_hidden_dim=int(cfg_get("model.phi_hidden_dim", 32)),
     )
 
     lit_model = RiboQueuingModelLightningModule(torch_model,
