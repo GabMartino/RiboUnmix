@@ -8,7 +8,7 @@ experiment:
   from_checkpoint: False
   train: True
   predict: False
-  dataset: ["grimson_2019", "gillen_2019"]
+  dataset: ["grimson_2019", "eichhorn_2014", "gillen_2019"]
   seed: 42
   split_size: 0.9
 
@@ -26,10 +26,10 @@ paths:
     datasets: "Datasets/encodings/dataset_encoding.yaml"
 
 data:
-  batch_size: 16
+  batch_size: 32
 
   # Keep this at 0 until the DataLoader worker CUDA crash is fixed.
-  num_workers: 0
+  num_workers: 4
 
   balanced_train_sampling: True
   dataset_balance_gamma: 1.0

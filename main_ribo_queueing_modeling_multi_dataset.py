@@ -255,8 +255,8 @@ def main(cfg: DictConfig):
         max_epochs=int(cfg.trainer.max_epochs),
         logger=tb_logger,
         log_every_n_steps=int(cfg.trainer.log_every_n_steps),
-        gradient_clip_val=float(cfg.trainer.gradient_clip_val),
-        gradient_clip_algorithm=cfg.trainer.gradient_clip_algorithm,
+        #gradient_clip_val=float(cfg.trainer.gradient_clip_val),
+        #gradient_clip_algorithm=cfg.trainer.gradient_clip_algorithm,
         callbacks=[checkpoint_callback, lr_monitor],
     )
 
