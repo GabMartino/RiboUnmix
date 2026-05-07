@@ -5,13 +5,6 @@ import torch.nn as nn
 
 
 class DatasetDispersionHead(nn.Module):
-    """
-    Dataset-level Tweedie dispersion.
-
-        Var[Y] = phi_d * mu^p
-
-    phi is dataset-level, not position-specific.
-    """
 
     def __init__(
         self,

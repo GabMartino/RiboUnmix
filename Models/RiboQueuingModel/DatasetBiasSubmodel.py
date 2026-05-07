@@ -10,30 +10,6 @@ from Models.RiboQueuingModel.submodels.DatasetAdditiveBiasHead import DatasetAdd
 
 
 class DatasetBiasSubmodel(nn.Module):
-    """
-    Dataset-specific technical bias model.
-
-    It applies:
-
-        1. Dataset-level coordinate shift:
-              L_queue -> L_effective
-
-        2. Dataset/codon-dependent multiplicative log-bias:
-              multiplier_i = exp(b_i)
-
-           where b_i is centered per transcript and exp(b_i) is mean-normalized.
-
-        3. Dataset/codon-dependent additive residual:
-              additive_bg_i = S_mean * additive_rel_i
-
-           The additive branch has no fixed beta budget. Its use should be
-           controlled by an explicit loss penalty on additive_rel.
-
-    Final external usage:
-
-        mu_base = S_mean * L_effective * multiplier
-        mu = mu_base + additive_bg
-    """
 
     def __init__(
         self,
@@ -114,45 +90,13 @@ class DatasetBiasSubmodel(nn.Module):
             eps=self.eps,
         )
 
-    def _check_dataset_ids(
-        self,
-        dataset_ids: torch.Tensor,
-    ) -> None:
-        min_id = int(dataset_ids.min().detach().cpu())
-        max_id = int(dataset_ids.max().detach().cpu())
-
-        if min_id < 0 or max_id >= self.num_datasets:
-            raise ValueError(
-                f"dataset_ids out of range: min={min_id}, max={max_id}, "
-                f"num_datasets={self.num_datasets}. Need num_datasets >= {max_id + 1}."
-            )
-
     def compute_log_bias(
         self,
         codon_ids: torch.Tensor,
         dataset_ids: torch.Tensor,
         mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Parameters
-        ----------
-        codon_ids:
-            [B, T] integer codon IDs in [0, num_codons - 1]
 
-        dataset_ids:
-            [B] integer dataset IDs
-
-        mask:
-            [B, T] bool
-
-        Returns
-        -------
-        b:
-            [B, T] centered log-bias
-
-        multiplier:
-            [B, T] mean-normalized exp(b)
-        """
         if codon_ids.ndim != 2:
             raise ValueError(f"codon_ids must be [B, T], got {codon_ids.shape}.")
 
@@ -163,8 +107,6 @@ class DatasetBiasSubmodel(nn.Module):
         codon_ids = codon_ids.to(device=device, dtype=torch.long)
         mask_b = mask.to(device=device, dtype=torch.bool)
         mask_f = mask_b.float()
-
-        self._check_dataset_ids(dataset_ids)
 
         codon_ids = codon_ids.clamp(min=0, max=self.num_codons - 1)
 
@@ -188,8 +130,6 @@ class DatasetBiasSubmodel(nn.Module):
         # Clip to prevent multiplicative technical bias from dominating.
         if self.b_clip > 0.0:
             b = b.clamp(-self.b_clip, self.b_clip) * mask_f
-
-            # Recenter after clipping because clipping breaks exact centering.
             b_mean = b.sum(dim=1, keepdim=True) / valid_lengths
             b = (b - b_mean) * mask_f
 
@@ -219,30 +159,6 @@ class DatasetBiasSubmodel(nn.Module):
         torch.Tensor,
         torch.Tensor,
     ]:
-        """
-        Returns
-        -------
-        L_effective:
-            [B, T]
-
-        b:
-            [B, T] centered log-bias
-
-        multiplier:
-            [B, T] mean-normalized exp(b)
-
-        additive_bg:
-            [B, T] additive residual in target/profile units
-
-        additive_rel:
-            [B, T] additive_bg / S_mean
-
-        shift_weights_used:
-            [B, K]
-
-        shift_weights_soft:
-            [B, K]
-        """
         mask_b = mask.bool()
         mask_f = mask_b.to(device=L_queue.device, dtype=L_queue.dtype)
 

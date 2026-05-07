@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from typing import Any
 
 import matplotlib.pyplot as plt
@@ -9,6 +8,19 @@ import torch
 import torch.nn as nn
 
 from Models.utils.masked_pearson import MaskedPearsonCorrelation
+from Models.utils.ribo_lightning_helpers import (
+    assign_flat_grads,
+    cfg_get,
+    compute_css_diagnostics,
+    flatten_current_grads,
+    get_pcgrad_target_parameters,
+    get_shift_values,
+    make_validation_profile_figure,
+    pcgrad_combine,
+    pcgrad_pairwise_stats,
+    per_dataset_losses,
+    unpack_batch,
+)
 from Models.utils.tweedie_deviance_loss import TweedieDevianceLoss
 
 
@@ -27,16 +39,18 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         self._val_plot_logged_this_epoch = False
 
         self.loss_fn = TweedieDevianceLoss(
-            eps=float(self._cfg_get("loss.eps", 1e-8)),
-            phi_min=float(self._cfg_get("loss.phi_min", 1e-4)),
-            phi_max=float(self._cfg_get("loss.phi_max", 10.0)),
-            censor_threshold=float(self._cfg_get("loss.censor_threshold", 0.0)),
-            zero_censor_to_zero=bool(self._cfg_get("loss.zero_censor_to_zero", True)),
-            include_log_phi=bool(self._cfg_get("loss.include_log_phi", True)),
+            eps=float(cfg_get(self.config, "loss.eps", 1e-8)),
+            phi_min=float(cfg_get(self.config, "loss.phi_min", 1e-4)),
+            phi_max=float(cfg_get(self.config, "loss.phi_max", 10.0)),
+            censor_threshold=float(cfg_get(self.config, "loss.censor_threshold", 0.0)),
+            zero_censor_to_zero=bool(
+                cfg_get(self.config, "loss.zero_censor_to_zero", True)
+            ),
+            include_log_phi=bool(cfg_get(self.config, "loss.include_log_phi", True)),
         )
 
         self.masked_pcc = MaskedPearsonCorrelation(
-            eps=float(self._cfg_get("loss.eps", 1e-8)),
+            eps=float(cfg_get(self.config, "loss.eps", 1e-8)),
         )
 
         if dataset_encoding is None:
@@ -48,25 +62,10 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             for k, v in self.dataset_encoding.items()
         }
 
-        self.use_pcgrad = bool(self._cfg_get("optim.use_pcgrad", True))
+        self.use_pcgrad = bool(cfg_get(self.config, "optim.use_pcgrad", True))
 
-        # PCGrad needs manual optimization because we manually rewrite gradients.
+        # PCGrad requires manual optimization because gradients are rewritten.
         self.automatic_optimization = not self.use_pcgrad
-
-    # ============================================================
-    # Config helper
-    # ============================================================
-
-    def _cfg_get(self, path: str, default: Any = None) -> Any:
-        obj = self.config
-
-        for part in path.split("."):
-            try:
-                obj = getattr(obj, part)
-            except Exception:
-                return default
-
-        return obj
 
     # ============================================================
     # Epoch hooks
@@ -76,12 +75,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         self._val_plot_logged_this_epoch = False
 
     def on_validation_epoch_end(self) -> None:
-        """
-        Required only for manual optimization / PCGrad.
-
-        In automatic optimization, Lightning steps the scheduler.
-        In manual optimization, we step ReduceLROnPlateau ourselves.
-        """
         if not self.use_pcgrad:
             return
 
@@ -90,7 +83,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         if scheduler is None:
             return
 
-        monitor = str(self._cfg_get("optim.scheduler.monitor", "val_loss_epoch"))
+        monitor = str(cfg_get(self.config, "optim.scheduler.monitor", "val_loss_epoch"))
         metric = self.trainer.callback_metrics.get(monitor)
 
         if metric is None:
@@ -101,514 +94,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 sched.step(metric)
         else:
             scheduler.step(metric)
-
-    # ============================================================
-    # CSS helpers
-    # ============================================================
-
-    @staticmethod
-    def _get_css_item(css: Any, sample_idx: int) -> Any:
-        if css is None:
-            return None
-
-        if isinstance(css, (list, tuple)):
-            if sample_idx >= len(css):
-                return None
-            return css[sample_idx]
-
-        if torch.is_tensor(css):
-            if css.ndim == 0:
-                return css
-            if sample_idx >= css.shape[0]:
-                return None
-            return css[sample_idx]
-
-        try:
-            return css[sample_idx]
-        except Exception:
-            return None
-
-    @staticmethod
-    def _normalize_css_positions(
-        css_i: Any,
-        L: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """
-        Converts one sample's CSS annotation into valid integer positions.
-
-        Supports:
-          - list/array/tensor of positions
-          - dense boolean mask of length L
-          - dense 0/1 mask of length L
-        """
-        if css_i is None:
-            return torch.empty(0, dtype=torch.long, device=device)
-
-        try:
-            if torch.is_tensor(css_i):
-                arr = css_i.detach().cpu()
-            else:
-                arr = torch.as_tensor(css_i)
-        except Exception:
-            return torch.empty(0, dtype=torch.long, device=device)
-
-        arr = arr.reshape(-1)
-
-        if arr.numel() == 0:
-            return torch.empty(0, dtype=torch.long, device=device)
-
-        if arr.dtype == torch.bool:
-            if arr.numel() >= L:
-                pos = torch.nonzero(arr[:L], as_tuple=False).reshape(-1)
-            else:
-                pos = torch.nonzero(arr, as_tuple=False).reshape(-1)
-        else:
-            if torch.is_floating_point(arr):
-                arr = arr[torch.isfinite(arr)]
-
-            if arr.numel() == 0:
-                return torch.empty(0, dtype=torch.long, device=device)
-
-            arr_long = arr.to(torch.long)
-
-            if arr_long.numel() == L and torch.all((arr_long == 0) | (arr_long == 1)):
-                pos = torch.nonzero(arr_long.bool(), as_tuple=False).reshape(-1)
-            else:
-                pos = arr_long.reshape(-1)
-
-        pos = pos.to(dtype=torch.long)
-        pos = pos[(pos >= 0) & (pos < int(L))]
-
-        if pos.numel() == 0:
-            return torch.empty(0, dtype=torch.long, device=device)
-
-        pos = torch.unique(pos, sorted=True)
-        return pos.to(device=device)
-
-    @staticmethod
-    def _css_window_mask(
-        css_pos: torch.Tensor,
-        L: int,
-        window: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        css_mask = torch.zeros(int(L), dtype=torch.bool, device=device)
-
-        if css_pos.numel() == 0:
-            return css_mask
-
-        window = max(0, int(window))
-
-        for p in css_pos.detach().cpu().tolist():
-            left = max(0, int(p) - window)
-            right = min(int(L), int(p) + window + 1)
-            css_mask[left:right] = True
-
-        return css_mask
-
-    def _css_rank_recall_enrichment_for_score(
-        self,
-        *,
-        score: torch.Tensor,
-        mask_b: torch.Tensor,
-        css: Any,
-        top_frac: float,
-        min_k: int,
-        window: int,
-        eps: float = 1e-8,
-    ) -> tuple[dict[str, torch.Tensor], int]:
-        device = score.device
-
-        rank_percentiles = []
-        recalls = []
-        enrichments = []
-
-        B = int(score.shape[0])
-
-        for i in range(B):
-            L = int(mask_b[i].sum().detach().cpu().item())
-
-            if L < 3:
-                continue
-
-            score_i = score[i, :L].detach().float()
-            css_i = self._get_css_item(css, i)
-
-            css_pos = self._normalize_css_positions(
-                css_i=css_i,
-                L=L,
-                device=device,
-            )
-
-            if css_pos.numel() == 0:
-                continue
-
-            css_win = self._css_window_mask(
-                css_pos=css_pos,
-                L=L,
-                window=window,
-                device=device,
-            )
-
-            non_css_win = ~css_win
-
-            if css_win.sum() == 0 or non_css_win.sum() == 0:
-                continue
-
-            css_scores = score_i[css_pos]
-
-            percentiles = []
-            for s in css_scores:
-                percentiles.append((score_i <= s).float().mean())
-
-            rank_percentiles.append(torch.stack(percentiles).mean())
-
-            k = max(int(min_k), int(math.ceil(float(top_frac) * L)))
-            k = min(k, L)
-
-            if k > 0:
-                top_idx = torch.topk(score_i, k=k, largest=True).indices
-
-                distances = (
-                    css_pos.reshape(-1, 1)
-                    - top_idx.reshape(1, -1)
-                ).abs()
-
-                hit = distances.min(dim=1).values <= int(window)
-                recalls.append(hit.float().mean())
-
-            css_mean = score_i[css_win].mean()
-            bg_mean = score_i[non_css_win].mean().clamp_min(eps)
-
-            enrichments.append(css_mean / bg_mean)
-
-        if not rank_percentiles:
-            return {}, 0
-
-        out = {
-            "css_rank_percentile": torch.stack(rank_percentiles).mean(),
-            "css_recall_topk_window": (
-                torch.stack(recalls).mean()
-                if recalls
-                else torch.zeros((), device=device)
-            ),
-            "css_enrichment": torch.stack(enrichments).mean(),
-        }
-
-        return out, len(rank_percentiles)
-
-    def _css_delta_for_values(
-        self,
-        *,
-        values: torch.Tensor,
-        mask_b: torch.Tensor,
-        css: Any,
-        window: int,
-    ) -> tuple[torch.Tensor | None, int]:
-        """
-        Computes:
-
-            mean(values at CSS ± window) - mean(values elsewhere)
-
-        Useful for b and phi.
-        """
-        device = values.device
-        deltas = []
-
-        B = int(values.shape[0])
-
-        for i in range(B):
-            L = int(mask_b[i].sum().detach().cpu().item())
-
-            if L < 3:
-                continue
-
-            values_i = values[i, :L].detach().float()
-            css_i = self._get_css_item(css, i)
-
-            css_pos = self._normalize_css_positions(
-                css_i=css_i,
-                L=L,
-                device=device,
-            )
-
-            if css_pos.numel() == 0:
-                continue
-
-            css_win = self._css_window_mask(
-                css_pos=css_pos,
-                L=L,
-                window=window,
-                device=device,
-            )
-
-            non_css_win = ~css_win
-
-            if css_win.sum() == 0 or non_css_win.sum() == 0:
-                continue
-
-            deltas.append(values_i[css_win].mean() - values_i[non_css_win].mean())
-
-        if not deltas:
-            return None, 0
-
-        return torch.stack(deltas).mean(), len(deltas)
-
-    def _compute_css_diagnostics(
-        self,
-        *,
-        L_queue: torch.Tensor,
-        mask_b: torch.Tensor,
-        css: Any,
-        L_effective: torch.Tensor | None = None,
-        mu_base: torch.Tensor | None = None,
-        additive_bg: torch.Tensor | None = None,
-        b_offset: torch.Tensor | None = None,
-        phi: torch.Tensor | None = None,
-    ) -> tuple[dict[str, torch.Tensor], int]:
-        top_frac = float(self._cfg_get("metrics.css_top_frac", 0.01))
-        min_k = int(self._cfg_get("metrics.css_min_k", 10))
-        window = int(self._cfg_get("metrics.css_window", 3))
-        eps = float(self._cfg_get("loss.eps", 1e-8))
-
-        logs: dict[str, torch.Tensor] = {}
-
-        L_metrics, css_count = self._css_rank_recall_enrichment_for_score(
-            score=L_queue,
-            mask_b=mask_b,
-            css=css,
-            top_frac=top_frac,
-            min_k=min_k,
-            window=window,
-            eps=eps,
-        )
-
-        if css_count == 0:
-            return logs, 0
-
-        for name, value in L_metrics.items():
-            logs[f"css_L_queue_{name}"] = value
-
-        if L_effective is not None:
-            L_eff_metrics, _ = self._css_rank_recall_enrichment_for_score(
-                score=L_effective,
-                mask_b=mask_b,
-                css=css,
-                top_frac=top_frac,
-                min_k=min_k,
-                window=window,
-                eps=eps,
-            )
-
-            for name, value in L_eff_metrics.items():
-                logs[f"css_L_effective_{name}"] = value
-
-        if mu_base is not None:
-            mu_base_metrics, _ = self._css_rank_recall_enrichment_for_score(
-                score=mu_base,
-                mask_b=mask_b,
-                css=css,
-                top_frac=top_frac,
-                min_k=min_k,
-                window=window,
-                eps=eps,
-            )
-
-            for name, value in mu_base_metrics.items():
-                logs[f"css_mu_base_{name}"] = value
-
-        if additive_bg is not None:
-            A_metrics, _ = self._css_rank_recall_enrichment_for_score(
-                score=additive_bg,
-                mask_b=mask_b,
-                css=css,
-                top_frac=top_frac,
-                min_k=min_k,
-                window=window,
-                eps=eps,
-            )
-
-            for name, value in A_metrics.items():
-                logs[f"css_additive_bg_{name}"] = value
-
-        if b_offset is not None:
-            b_delta, b_count = self._css_delta_for_values(
-                values=b_offset,
-                mask_b=mask_b,
-                css=css,
-                window=window,
-            )
-
-            if b_delta is not None and b_count > 0:
-                logs["css_b_delta"] = b_delta
-
-        if phi is not None:
-            phi_delta, phi_count = self._css_delta_for_values(
-                values=phi,
-                mask_b=mask_b,
-                css=css,
-                window=window,
-            )
-
-            if phi_delta is not None and phi_count > 0:
-                logs["css_phi_delta"] = phi_delta
-
-        return logs, css_count
-
-    # ============================================================
-    # PCGrad helpers
-    # ============================================================
-
-    def _pcgrad_target_parameters(self) -> list[torch.nn.Parameter]:
-        """
-        By default, apply PCGrad only to the shared biological branch.
-
-        Dataset-specific nuisance heads should remain dataset-specific.
-        """
-        biology_only = bool(self._cfg_get("optim.pcgrad_biology_only", True))
-
-        if biology_only:
-            biological_model = getattr(self.model, "biological_model", None)
-
-            if biological_model is None:
-                raise AttributeError(
-                    "optim.pcgrad_biology_only=True, but self.model.biological_model "
-                    "does not exist."
-                )
-
-            params = [
-                p for p in biological_model.parameters()
-                if p.requires_grad
-            ]
-        else:
-            params = [
-                p for p in self.model.parameters()
-                if p.requires_grad
-            ]
-
-        return params
-
-    @staticmethod
-    def _flatten_current_grads(
-        params: list[torch.nn.Parameter],
-    ) -> torch.Tensor:
-        flats = []
-
-        for p in params:
-            if p.grad is None:
-                flats.append(torch.zeros_like(p).reshape(-1))
-            else:
-                flats.append(p.grad.detach().clone().reshape(-1))
-
-        if not flats:
-            return torch.empty(0)
-
-        return torch.cat(flats, dim=0)
-
-    @staticmethod
-    def _assign_flat_grads(
-        params: list[torch.nn.Parameter],
-        flat_grad: torch.Tensor,
-    ) -> None:
-        offset = 0
-
-        for p in params:
-            n = p.numel()
-            g = flat_grad[offset:offset + n].view_as(p)
-            offset += n
-
-            if p.grad is None:
-                p.grad = g.detach().clone()
-            else:
-                p.grad.detach().copy_(g)
-
-    @staticmethod
-    def _pcgrad_combine(
-        flat_grads: list[torch.Tensor],
-        eps: float = 1e-12,
-    ) -> torch.Tensor:
-        """
-        PCGrad projection.
-
-        If two dataset gradients conflict:
-
-            dot(g_i, g_j) < 0
-
-        remove the conflicting component.
-        """
-        if len(flat_grads) == 0:
-            raise ValueError("No gradients passed to PCGrad.")
-
-        if len(flat_grads) == 1:
-            return flat_grads[0]
-
-        projected = []
-
-        for i, g_i_original in enumerate(flat_grads):
-            g_i = g_i_original.clone()
-
-            order = torch.randperm(len(flat_grads), device=g_i.device)
-
-            for j_tensor in order:
-                j = int(j_tensor.item())
-
-                if j == i:
-                    continue
-
-                g_j = flat_grads[j]
-
-                dot = torch.dot(g_i, g_j)
-                denom = torch.dot(g_j, g_j).clamp_min(eps)
-
-                if dot < 0:
-                    g_i = g_i - (dot / denom) * g_j
-
-            projected.append(g_i)
-
-        return torch.stack(projected, dim=0).mean(dim=0)
-
-    @staticmethod
-    def _pcgrad_pairwise_stats(
-        flat_grads: list[torch.Tensor],
-        eps: float = 1e-12,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        if len(flat_grads) < 2:
-            return None, None
-
-        cosines = []
-        conflicts = []
-
-        for i in range(len(flat_grads)):
-            for j in range(i + 1, len(flat_grads)):
-                g_i = flat_grads[i]
-                g_j = flat_grads[j]
-
-                denom = (g_i.norm() * g_j.norm()).clamp_min(eps)
-                cosine = torch.dot(g_i, g_j) / denom
-
-                cosines.append(cosine)
-                conflicts.append((cosine < 0).float())
-
-        return torch.stack(cosines).mean(), torch.stack(conflicts).mean()
-
-    @staticmethod
-    def _per_dataset_losses(
-        loss_per_sample: torch.Tensor,
-        dataset_ids: torch.Tensor,
-    ) -> list[torch.Tensor]:
-        dataset_ids = dataset_ids.reshape(-1)
-        loss_per_sample = loss_per_sample.reshape(-1)
-
-        losses = []
-
-        for dataset_id in torch.unique(dataset_ids.detach()):
-            ds_mask = dataset_ids == dataset_id
-
-            if torch.any(ds_mask):
-                losses.append(loss_per_sample[ds_mask].mean())
-
-        return losses
 
     # ============================================================
     # Plotting
@@ -651,152 +136,24 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         if experiment is None:
             return
 
-        B = y.shape[0]
+        fig = make_validation_profile_figure(
+            y=y,
+            mu=mu,
+            phi=phi,
+            tweedie_p=tweedie_p,
+            L_queue=L_queue,
+            mask_b=mask_b,
+            mu_pcc_per_sample=mu_pcc_per_sample,
+            L_queue_pcc_per_sample=L_queue_pcc_per_sample,
+            sample_idx=sample_idx,
+            mu_base=mu_base,
+            additive_bg=additive_bg,
+            additive_rel=additive_rel,
+            css=css,
+        )
 
-        if B == 0:
+        if fig is None:
             return
-
-        sample_idx = max(0, min(int(sample_idx), B - 1))
-
-        with torch.no_grad():
-            valid = mask_b[sample_idx].detach().bool().cpu()
-            L = int(valid.sum().item())
-
-            if L < 2:
-                return
-
-            y_i = y[sample_idx].detach().float().cpu()[valid]
-            mu_i = mu[sample_idx].detach().float().cpu()[valid]
-            phi_i = phi[sample_idx].detach().float().cpu()[valid]
-            L_queue_i = L_queue[sample_idx].detach().float().cpu()[valid]
-
-            p_scalar = (
-                tweedie_p.detach()
-                .float()
-                .reshape(-1)
-                .mean()
-                .cpu()
-                .clamp(1.0001, 1.9999)
-            )
-
-            tweedie_var_i = phi_i.clamp_min(1e-8) * torch.pow(
-                mu_i.clamp_min(1e-8),
-                p_scalar,
-            )
-
-            mu_pcc_i = float(mu_pcc_per_sample[sample_idx].detach().float().cpu())
-            L_queue_pcc_i = float(
-                L_queue_pcc_per_sample[sample_idx].detach().float().cpu()
-            )
-            p_value = float(p_scalar)
-
-            x = torch.arange(y_i.numel()).numpy()
-
-            y_np = y_i.numpy()
-            mu_np = mu_i.numpy()
-            L_queue_np = L_queue_i.numpy()
-            var_np = tweedie_var_i.numpy()
-            phi_np = phi_i.numpy()
-
-            if mu_base is not None:
-                mu_base_np = mu_base[sample_idx].detach().float().cpu()[valid].numpy()
-            else:
-                mu_base_np = None
-
-            if additive_bg is not None:
-                additive_bg_np = additive_bg[sample_idx].detach().float().cpu()[valid].numpy()
-            else:
-                additive_bg_np = None
-
-            if additive_rel is not None:
-                additive_rel_np = additive_rel[sample_idx].detach().float().cpu()[valid].numpy()
-            else:
-                additive_rel_np = None
-
-            css_i = self._get_css_item(css, sample_idx)
-            css_pos = self._normalize_css_positions(
-                css_i=css_i,
-                L=L,
-                device=torch.device("cpu"),
-            )
-
-        fig, axes = plt.subplots(
-            3,
-            1,
-            figsize=(16, 9),
-            sharex=True,
-            gridspec_kw={"height_ratios": [1.4, 1.0, 1.0]},
-        )
-
-        fig.suptitle(
-            f"Validation profile diagnostic | sample={sample_idx} | "
-            f"PCC(mu, y)={mu_pcc_i:.4f} | "
-            f"PCC(L_queue, y)={L_queue_pcc_i:.4f} | "
-            f"Tweedie p={p_value:.4f}",
-            fontsize=12,
-        )
-
-        axes[0].plot(x, y_np, label="target y", linewidth=1.2)
-        axes[0].plot(x, mu_np, label="mu = mu_base + additive", linewidth=1.2)
-
-        if mu_base_np is not None:
-            axes[0].plot(x, mu_base_np, label="mu_base", linewidth=1.0)
-
-        if additive_bg_np is not None:
-            axes[0].plot(x, additive_bg_np, label="additive_bg", linewidth=1.0)
-
-        axes[0].set_ylabel("profile")
-        axes[0].set_title("Target profile vs predicted mean")
-        axes[0].grid(True, alpha=0.3)
-
-        axes[1].plot(x, L_queue_np, label="L_queue", linewidth=1.2)
-        axes[1].set_ylabel("L_queue")
-        axes[1].set_title("Biological queueing prediction")
-        axes[1].grid(True, alpha=0.3)
-
-        axes[2].plot(
-            x,
-            var_np,
-            label=r"Tweedie variance $\phi\mu^p$",
-            linewidth=1.2,
-        )
-        axes[2].plot(
-            x,
-            phi_np,
-            label=r"$\phi$",
-            linewidth=1.0,
-            linestyle=":",
-        )
-
-        if additive_rel_np is not None:
-            ax2 = axes[2].twinx()
-            ax2.plot(
-                x,
-                additive_rel_np,
-                label="additive_rel = A/S",
-                linewidth=1.0,
-                linestyle="--",
-            )
-            ax2.set_ylabel("additive_rel")
-            ax2.legend(loc="upper left")
-
-        axes[2].set_ylabel("variance / phi")
-        axes[2].set_xlabel("codon position")
-        axes[2].set_title("Tweedie variance, phi, and additive_rel diagnostic")
-        axes[2].grid(True, alpha=0.3)
-
-        for ax in axes:
-            for j, css_position in enumerate(css_pos.detach().cpu().tolist()):
-                ax.axvline(
-                    int(css_position),
-                    linestyle="--",
-                    linewidth=0.8,
-                    alpha=0.35,
-                    label="CSS" if j == 0 else None,
-                )
-            ax.legend(loc="upper right")
-
-        fig.tight_layout(rect=(0, 0, 1, 0.93))
 
         if hasattr(experiment, "add_figure"):
             experiment.add_figure(tag, fig, global_step=self.global_step)
@@ -916,36 +273,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 batch_size=ds_count,
             )
 
-    # ============================================================
-    # Shift logging
-    # ============================================================
-
-    def _get_shift_values(
-        self,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor | None:
-        shift_head = getattr(
-            getattr(self.model, "dataset_bias_model", None),
-            "dataset_shift_head",
-            None,
-        )
-
-        if shift_head is None:
-            return None
-
-        shifts = getattr(shift_head, "shifts", None)
-
-        if shifts is None:
-            return None
-
-        return torch.tensor(
-            list(shifts),
-            device=device,
-            dtype=dtype,
-        )
-
     def _log_dataset_shift_metrics(
         self,
         *,
@@ -961,7 +288,8 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
         dataset_ids = dataset_ids.detach()
 
-        shifts = self._get_shift_values(
+        shifts = get_shift_values(
+            self.model,
             device=weights_ref.device,
             dtype=weights_ref.dtype,
         )
@@ -969,17 +297,17 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         if shifts is None:
             return
 
-        def _expected_shift(weights: torch.Tensor) -> torch.Tensor:
+        def expected_shift(weights: torch.Tensor) -> torch.Tensor:
             return (weights * shifts.reshape(1, -1)).sum(dim=1)
 
         expected_used = (
-            _expected_shift(shift_weights_used.detach())
+            expected_shift(shift_weights_used.detach())
             if shift_weights_used is not None
             else None
         )
 
         expected_soft = (
-            _expected_shift(shift_weights_soft.detach())
+            expected_shift(shift_weights_soft.detach())
             if shift_weights_soft is not None
             else None
         )
@@ -1067,7 +395,16 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         self,
         batch: Any,
     ) -> dict[str, Any]:
-        ids_datasets_sorted, ids, packed_sequence, profiles_target, lengths, mask, css = batch
+        batch_data = unpack_batch(batch)
+
+        ids_datasets_sorted = batch_data["ids_datasets_sorted"]
+        ids = batch_data["ids"]
+        packed_sequence = batch_data["packed_sequence"]
+        profiles_target = batch_data["profiles_target"]
+        lengths = batch_data["lengths"]
+        mask = batch_data["mask"]
+        codon_ids = batch_data["codon_ids"]
+        css = batch_data["css"]
 
         y = profiles_target.to(torch.float32)
         mask_b = mask.bool()
@@ -1075,6 +412,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
         mu, tweedie_p, phi, extras = self.model(
             packed_sequence,
+            codon_ids,
             ids_datasets_sorted,
             y,
         )
@@ -1092,7 +430,9 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
         additive_rel = extras[12] if len(extras) > 12 else None
 
-        lambda_additive_l1 = float(self._cfg_get("loss.lambda_additive_l1", 0.0))
+        lambda_additive_l1 = float(
+            cfg_get(self.config, "loss.lambda_additive_l1", 0.0)
+        )
 
         additive_penalty = torch.zeros(
             (),
@@ -1125,7 +465,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                     + lambda_additive_l1 * additive_penalty_per_sample
                 )
 
-        dataset_losses = self._per_dataset_losses(
+        dataset_losses = per_dataset_losses(
             loss_per_sample=loss_per_sample,
             dataset_ids=ids_datasets_sorted,
         )
@@ -1138,7 +478,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             loss_dataset_balanced = loss_sample_mean
 
         use_dataset_balanced_loss = bool(
-            self._cfg_get("optim.use_dataset_balanced_loss", False)
+            cfg_get(self.config, "optim.use_dataset_balanced_loss", False)
         )
 
         loss_train_objective = (
@@ -1154,6 +494,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "profiles_target": profiles_target,
             "lengths": lengths,
             "mask": mask,
+            "codon_ids": codon_ids,
             "css": css,
             "y": y,
             "mask_b": mask_b,
@@ -1228,20 +569,18 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             }
 
             if L_effective is not None:
-                L_effective_pcc_per_sample = self.masked_pcc(
+                component_pccs["L_effective"] = self.masked_pcc(
                     pred=L_effective.detach(),
                     target=y,
                     mask=mask_b,
                 )
-                component_pccs["L_effective"] = L_effective_pcc_per_sample
 
             if mu_base is not None:
-                mu_base_pcc_per_sample = self.masked_pcc(
+                component_pccs["mu_base"] = self.masked_pcc(
                     pred=mu_base.detach(),
                     target=y,
                     mask=mask_b,
                 )
-                component_pccs["mu_base"] = mu_base_pcc_per_sample
 
             mu_pcc = mu_pcc_per_sample.mean()
             L_queue_pcc = L_queue_pcc_per_sample.mean()
@@ -1255,7 +594,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             css_count = 0
 
             if stage == "val":
-                css_logs, css_count = self._compute_css_diagnostics(
+                css_logs, css_count = compute_css_diagnostics(
                     L_queue=L_queue_detached,
                     L_effective=(
                         L_effective.detach()
@@ -1280,6 +619,10 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                         else None
                     ),
                     phi=phi_detached,
+                    top_frac=float(cfg_get(self.config, "metrics.css_top_frac", 0.01)),
+                    min_k=int(cfg_get(self.config, "metrics.css_min_k", 10)),
+                    window=int(cfg_get(self.config, "metrics.css_window", 3)),
+                    eps=float(cfg_get(self.config, "loss.eps", 1e-8)),
                 )
 
         if stage == "val":
@@ -1315,9 +658,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             else info["loss_sample_mean"]
         )
 
-        # ------------------------------------------------------------
-        # Global logs
-        # ------------------------------------------------------------
         self.log(
             f"{stage}_loss",
             loss_for_log.detach(),
@@ -1404,7 +744,10 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 batch_size=batch_size,
             )
 
-            lambda_additive_l1 = float(self._cfg_get("loss.lambda_additive_l1", 0.0))
+            lambda_additive_l1 = float(
+                cfg_get(self.config, "loss.lambda_additive_l1", 0.0)
+            )
+
             if lambda_additive_l1 > 0.0:
                 self.log(
                     f"{stage}_additive_l1_penalty",
@@ -1415,9 +758,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                     batch_size=batch_size,
                 )
 
-        # ------------------------------------------------------------
-        # Dataset-specific logs
-        # ------------------------------------------------------------
         self._log_dataset_loss_metrics(
             stage=stage,
             dataset_ids=ids_datasets_sorted,
@@ -1445,9 +785,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             shift_weights_soft=shift_weights_soft,
         )
 
-        # ------------------------------------------------------------
-        # Validation summary logs
-        # ------------------------------------------------------------
         if stage == "val":
             self.log(
                 "val_loss_epoch",
@@ -1549,14 +886,30 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         dataset_losses = info["dataset_losses"]
         batch_size = int(info["y"].shape[0])
 
-        pcgrad_params = self._pcgrad_target_parameters()
+        pcgrad_every_n_steps = int(
+            cfg_get(self.config, "optim.pcgrad_every_n_steps", 1)
+        )
 
-        if len(dataset_losses) <= 1 or len(pcgrad_params) == 0:
+        use_pcgrad_this_step = (
+            pcgrad_every_n_steps > 0
+            and (self.global_step % pcgrad_every_n_steps == 0)
+        )
+
+        pcgrad_params = get_pcgrad_target_parameters(
+            self.model,
+            biology_only=bool(cfg_get(self.config, "optim.pcgrad_biology_only", True)),
+        )
+
+        if (
+            not use_pcgrad_this_step
+            or len(dataset_losses) <= 1
+            or len(pcgrad_params) == 0
+        ):
             self.manual_backward(loss)
+
         else:
             flat_dataset_grads = []
 
-            # One biological gradient per dataset present in the batch.
             for ds_loss in dataset_losses:
                 opt.zero_grad(set_to_none=True)
 
@@ -1565,21 +918,36 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                     retain_graph=True,
                 )
 
-                flat_g = self._flatten_current_grads(pcgrad_params)
+                flat_g = flatten_current_grads(pcgrad_params)
                 flat_dataset_grads.append(flat_g)
 
-            pcgrad_flat = self._pcgrad_combine(flat_dataset_grads)
+            mean_flat_grad = torch.stack(flat_dataset_grads, dim=0).mean(dim=0)
+            pcgrad_flat = pcgrad_combine(flat_dataset_grads)
 
-            cosine_mean, conflict_frac = self._pcgrad_pairwise_stats(
-                flat_dataset_grads
-            )
+            pcgrad_alpha = float(cfg_get(self.config, "optim.pcgrad_alpha", 1.0))
+            pcgrad_alpha = max(0.0, min(pcgrad_alpha, 1.0))
 
-            # Normal backward for all parameters.
-            # Then overwrite biological_model gradients with PCGrad gradients.
+            if pcgrad_alpha < 1.0:
+                pcgrad_flat = (
+                    pcgrad_alpha * pcgrad_flat
+                    + (1.0 - pcgrad_alpha) * mean_flat_grad
+                )
+
+            mean_grad_norm = mean_flat_grad.norm().clamp_min(1e-12)
+            pcgrad_norm = pcgrad_flat.norm()
+            pcgrad_norm_ratio = pcgrad_norm / mean_grad_norm
+
+            if bool(cfg_get(self.config, "optim.pcgrad_rescale_to_mean_norm", False)):
+                pcgrad_flat = pcgrad_flat * (
+                    mean_grad_norm / pcgrad_flat.norm().clamp_min(1e-12)
+                )
+
+            cosine_mean, conflict_frac = pcgrad_pairwise_stats(flat_dataset_grads)
+
             opt.zero_grad(set_to_none=True)
             self.manual_backward(loss)
 
-            self._assign_flat_grads(
+            assign_flat_grads(
                 params=pcgrad_params,
                 flat_grad=pcgrad_flat,
             )
@@ -1604,9 +972,36 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                     batch_size=batch_size,
                 )
 
-        gradient_clip_val = float(self._cfg_get("trainer.gradient_clip_val", 0.0))
+            self.log(
+                "train_pcgrad_bio_norm_ratio",
+                pcgrad_norm_ratio.detach(),
+                on_step=True,
+                on_epoch=True,
+                logger=True,
+                batch_size=batch_size,
+            )
+
+            self.log(
+                "train_pcgrad_bio_norm",
+                pcgrad_norm.detach(),
+                on_step=True,
+                on_epoch=True,
+                logger=True,
+                batch_size=batch_size,
+            )
+
+            self.log(
+                "train_pcgrad_bio_mean_grad_norm",
+                mean_grad_norm.detach(),
+                on_step=True,
+                on_epoch=True,
+                logger=True,
+                batch_size=batch_size,
+            )
+
+        gradient_clip_val = float(cfg_get(self.config, "trainer.gradient_clip_val", 0.0))
         gradient_clip_algorithm = str(
-            self._cfg_get("trainer.gradient_clip_algorithm", "norm")
+            cfg_get(self.config, "trainer.gradient_clip_algorithm", "norm")
         )
 
         if gradient_clip_val > 0.0:
@@ -1631,20 +1026,36 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         return self._shared_step(batch, stage="val", batch_idx=batch_idx)
 
     def predict_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0):
-        ids_datasets_sorted, ids, packed_sequence, profiles_target, lengths, mask, css = batch
+        batch_data = unpack_batch(batch)
+
+        ids_datasets_sorted = batch_data["ids_datasets_sorted"]
+        ids = batch_data["ids"]
+        packed_sequence = batch_data["packed_sequence"]
+        profiles_target = batch_data["profiles_target"]
+        lengths = batch_data["lengths"]
+        mask = batch_data["mask"]
+        codon_ids = batch_data["codon_ids"]
+        css = batch_data["css"]
+
+        y = profiles_target.to(torch.float32)
+        mask_b = mask.bool()
+        mask_f = mask_b.float()
+
+        mu, tweedie_p, phi, extras = self.model(
+            packed_sequence,
+            codon_ids,
+            ids_datasets_sorted,
+            y,
+        )
 
         def to_cpu(x):
             if torch.is_tensor(x):
                 return x.detach().cpu()
+            if isinstance(x, list):
+                return [to_cpu(v) for v in x]
+            if isinstance(x, tuple):
+                return tuple(to_cpu(v) for v in x)
             return x
-
-        y = profiles_target.to(torch.float32)
-
-        mu, tweedie_p, phi, extras = self.model(
-            packed_sequence,
-            ids_datasets_sorted,
-            y,
-        )
 
         rho_diag = extras[0] if len(extras) > 0 else None
         w_prob = extras[1] if len(extras) > 1 else None
@@ -1657,7 +1068,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         mu_base = extras[10] if len(extras) > 10 else None
         additive_bg = extras[11] if len(extras) > 11 else None
         additive_rel = extras[12] if len(extras) > 12 else None
-        codon_ids = extras[13] if len(extras) > 13 else None
+        codon_ids = extras[13] if len(extras) > 13 else codon_ids_from_batch
         shift_weights_used = extras[14] if len(extras) > 14 else None
         shift_weights_soft = extras[15] if len(extras) > 15 else None
 

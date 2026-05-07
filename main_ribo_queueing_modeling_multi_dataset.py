@@ -282,7 +282,11 @@ def main(cfg: DictConfig):
         current_rank = trainer.global_rank
 
         print(f"[Rank {current_rank}] Running comprehensive physical inference extraction...")
-        preds = trainer.predict(lit_model, datamodule=datamodule, ckpt_path=ckpt_to_use)
+        preds = trainer.predict(
+            lit_model,
+            datamodule=datamodule,
+            ckpt_path=ckpt_to_use,
+        )
 
         if not preds:
             print(f"[Rank {current_rank}] No predictions to process. Exiting safely.")
@@ -295,8 +299,14 @@ def main(cfg: DictConfig):
         def _to_numpy(x):
             if x is None:
                 return None
+
             if torch.is_tensor(x):
                 return x.detach().cpu().numpy()
+
+            # Keep ragged Python lists as lists, e.g. css.
+            if isinstance(x, (list, tuple)):
+                return x
+
             return np.asarray(x)
 
         def _to_python_scalar(x):
@@ -304,142 +314,252 @@ def main(cfg: DictConfig):
                 if x.ndim == 0:
                     return x.item()
                 return x.detach().cpu().tolist()
+
             if isinstance(x, np.generic):
                 return x.item()
+
             return x
 
-        def _normalize_css(css_i, L: int):
-            css_arr = _to_numpy(css_i).reshape(-1)
-
-            if np.issubdtype(css_arr.dtype, np.number):
-                css_arr = css_arr[np.isfinite(css_arr)]
-                css_arr = css_arr.astype(np.int64, copy=False)
-                css_arr = css_arr[(css_arr >= 0) & (css_arr < L)]
-
-            return css_arr
-
-        def _batch_get(batch: dict, key: str, fallback_key: str | None = None, default=None):
+        def _batch_get(
+                batch: dict,
+                key: str,
+                fallback_key: str | None = None,
+                default=None,
+        ):
             if key in batch and batch[key] is not None:
                 return batch[key]
+
             if fallback_key is not None and fallback_key in batch and batch[fallback_key] is not None:
                 return batch[fallback_key]
+
             return default
 
+        def _normalize_css(css_i, L: int) -> np.ndarray:
+            if css_i is None:
+                return np.asarray([], dtype=np.int64)
+
+            if torch.is_tensor(css_i):
+                css_arr = css_i.detach().cpu().numpy()
+            else:
+                try:
+                    css_arr = np.asarray(css_i)
+                except Exception:
+                    return np.asarray([], dtype=np.int64)
+
+            css_arr = css_arr.reshape(-1)
+
+            if css_arr.size == 0:
+                return np.asarray([], dtype=np.int64)
+
+            # Dense boolean mask.
+            if css_arr.dtype == np.bool_:
+                if css_arr.size >= L:
+                    return np.nonzero(css_arr[:L])[0].astype(np.int64, copy=False)
+                return np.nonzero(css_arr)[0].astype(np.int64, copy=False)
+
+            # Numeric positions or dense 0/1 mask.
+            if np.issubdtype(css_arr.dtype, np.number):
+                css_arr = css_arr[np.isfinite(css_arr)]
+
+                if css_arr.size == 0:
+                    return np.asarray([], dtype=np.int64)
+
+                css_long = css_arr.astype(np.int64, copy=False)
+
+                # Dense 0/1 mask.
+                if css_long.size == L and np.all((css_long == 0) | (css_long == 1)):
+                    return np.nonzero(css_long.astype(bool))[0].astype(np.int64, copy=False)
+
+                # Position list.
+                css_long = css_long[(css_long >= 0) & (css_long < L)]
+                return np.unique(css_long).astype(np.int64, copy=False)
+
+            return np.asarray([], dtype=np.int64)
+
         def _slice_array(arr, i: int, L: int, dtype=np.float32):
+            arr = _to_numpy(arr)
+
             if arr is None:
                 return None
-            return arr[i, :L].astype(dtype, copy=False)
 
-        def _slice_optional(row_data: dict, name: str, arr, i: int, L: int, dtype=np.float32):
+            arr_i = np.asarray(arr[i])
+
+            if arr_i.ndim == 0:
+                return arr_i.astype(dtype, copy=False)
+
+            return arr_i[:L].astype(dtype, copy=False)
+
+        def _slice_optional(
+                row_data: dict,
+                name: str,
+                arr,
+                i: int,
+                L: int,
+                dtype=np.float32,
+        ) -> None:
             if arr is not None:
                 row_data[name] = _slice_array(arr, i, L, dtype=dtype)
 
-        def _scalar_optional(row_data: dict, name: str, arr, i: int):
-            if arr is not None:
-                row_data[name] = float(np.asarray(arr[i]).reshape(-1)[0])
+        def _scalar_at(arr, i: int, default=None):
+            arr = _to_numpy(arr)
+
+            if arr is None:
+                return default
+
+            arr_np = np.asarray(arr)
+
+            if arr_np.ndim == 0:
+                return float(arr_np)
+
+            return float(np.asarray(arr_np[i]).reshape(-1)[0])
+
+        def _scalar_optional(row_data: dict, name: str, arr, i: int) -> None:
+            value = _scalar_at(arr, i, default=None)
+
+            if value is not None:
+                row_data[name] = value
 
         for batch in preds:
             lengths = _to_numpy(batch["lengths"]).astype(np.int64, copy=False)
             transcript_ids = batch["ids"]
             dataset_ids = _to_numpy(batch["dataset_id"]).astype(np.int64, copy=False)
 
-            J_vals = _to_numpy(batch["J"])
-            w_probs = _to_numpy(batch["w_prob"])
-            rhos = _to_numpy(batch["rho"])
+            batch_size = len(lengths)
 
-            L_queue = _to_numpy(batch["L_queue"])
-            L_effective = _to_numpy(_batch_get(batch, "L_effective", default=None))
-
-            S_mean = _to_numpy(batch["S_mean"])
-            total_scale = _to_numpy(batch["total_scale"])
-
-            mu_obs = _to_numpy(batch["mu_obs"])
-            mu_total = _to_numpy(_batch_get(batch, "mu_total", default=batch["mu_obs"]))
-
-            # Hurdle-Gamma naming.
-            phi = _to_numpy(_batch_get(batch, "phi", fallback_key="alpha", default=None))
-            log_phi = _to_numpy(_batch_get(batch, "log_phi", fallback_key="log_sigma", default=None))
-
-            b_offset = _to_numpy(batch["b_offset"])
-            pi = _to_numpy(batch["pi"])
             masks = _to_numpy(batch["mask"])
             y_vals = _to_numpy(batch["y"])
 
-            # Optional decomposition diagnostics from new model.
-            shift_weights = _to_numpy(_batch_get(batch, "shift_weights", default=None))
+            # Core biological outputs.
+            J_vals = _to_numpy(_batch_get(batch, "J", default=None))
+            w_probs = _to_numpy(_batch_get(batch, "w_prob", default=None))
+            rhos = _to_numpy(_batch_get(batch, "rho", default=None))
+            L_queue = _to_numpy(_batch_get(batch, "L_queue", default=None))
+            L_effective = _to_numpy(_batch_get(batch, "L_effective", default=None))
+
+            # Scale and observed mean.
+            S_mean = _to_numpy(_batch_get(batch, "S_mean", default=None))
+            mu_obs = _to_numpy(_batch_get(batch, "mu_obs", default=None))
+            mu_total = _to_numpy(_batch_get(batch, "mu_total", default=mu_obs))
+            mu_base = _to_numpy(_batch_get(batch, "mu_base", default=None))
+
+            # Tweedie outputs.
+            tweedie_p = _to_numpy(_batch_get(batch, "tweedie_p", default=None))
+            phi = _to_numpy(_batch_get(batch, "phi", fallback_key="alpha", default=None))
+            log_phi = _to_numpy(_batch_get(batch, "log_phi", fallback_key="log_sigma", default=None))
+
+            # Dataset-bias decomposition.
+            b_offset = _to_numpy(_batch_get(batch, "b_offset", default=None))
+            multiplier = _to_numpy(_batch_get(batch, "multiplier", default=None))
             additive_bg = _to_numpy(_batch_get(batch, "additive_bg", default=None))
+            additive_rel = _to_numpy(_batch_get(batch, "additive_rel", default=None))
+            codon_ids = _to_numpy(_batch_get(batch, "codon_ids", default=None))
+
+            # Shift diagnostics.
+            shift_weights = _to_numpy(_batch_get(batch, "shift_weights", default=None))
+            shift_weights_soft = _to_numpy(_batch_get(batch, "shift_weights_soft", default=None))
+
+            # Old optional outputs, kept for compatibility if present.
+            total_scale = _to_numpy(_batch_get(batch, "total_scale", default=None))
+            pi = _to_numpy(_batch_get(batch, "pi", default=None))
             bg_fraction = _to_numpy(_batch_get(batch, "bg_fraction", default=None))
             bg_q = _to_numpy(_batch_get(batch, "bg_q", default=None))
             p_bio = _to_numpy(_batch_get(batch, "p_bio", default=None))
             mu_bio = _to_numpy(_batch_get(batch, "mu_bio", default=None))
             M_y = _to_numpy(_batch_get(batch, "M_y", default=None))
 
-            css_batch = batch["css"]
-
-            batch_size = len(lengths)
+            css_batch = batch.get("css", [None] * batch_size)
 
             for i in range(batch_size):
                 L = int(lengths[i])
                 transcript_id = _to_python_scalar(transcript_ids[i])
                 css_i = _normalize_css(css_batch[i], L)
 
+                p_i = _scalar_at(tweedie_p, i, default=None)
+
                 row_data = {
                     "dataset_id": int(dataset_ids[i]),
                     "transcript_id": transcript_id,
                     "length": L,
-
-                    "J": float(np.asarray(J_vals[i]).reshape(-1)[0]),
-
-                    "w_prob": w_probs[i, :L].astype(np.float32, copy=False),
-                    "rho": rhos[i, :L].astype(np.float32, copy=False),
-
-                    "L_queue": L_queue[i, :L].astype(np.float32, copy=False),
-                    "S_mean": (
-                        S_mean[i].astype(np.float32, copy=False)
-                        if np.ndim(S_mean[i]) > 0
-                        else np.float32(S_mean[i])
-                    ),
-                    "total_scale": total_scale[i, :L].astype(np.float32, copy=False),
-
-                    "mu_obs": mu_obs[i, :L].astype(np.float32, copy=False),
-                    "mu_total": mu_total[i, :L].astype(np.float32, copy=False),
-
-                    # New Hurdle-Gamma names.
-                    "phi": phi[i, :L].astype(np.float32, copy=False) if phi is not None else None,
-                    "log_phi": (
-                        log_phi[i, :L].astype(np.float32, copy=False)
-                        if log_phi is not None
-                        else None
-                    ),
-
-                    # Backward-compatible aliases for old analysis scripts.
-                    "alpha": phi[i, :L].astype(np.float32, copy=False) if phi is not None else None,
-                    "sigma": phi[i, :L].astype(np.float32, copy=False) if phi is not None else None,
-                    "log_sigma": (
-                        log_phi[i, :L].astype(np.float32, copy=False)
-                        if log_phi is not None
-                        else None
-                    ),
-
-                    "b_offset": b_offset[i, :L].astype(np.float32, copy=False),
-                    "pi": pi[i, :L].astype(np.float32, copy=False),
                     "mask": masks[i, :L].astype(np.bool_, copy=False),
                     "css": css_i,
                     "target": y_vals[i, :L].astype(np.float32, copy=False),
                 }
 
-                _slice_optional(row_data, "L_effective", L_effective, i, L)
-                _slice_optional(row_data, "additive_bg", additive_bg, i, L)
-                _slice_optional(row_data, "bg_q", bg_q, i, L)
-                _slice_optional(row_data, "p_bio", p_bio, i, L)
-                _slice_optional(row_data, "mu_bio", mu_bio, i, L)
+                # --------------------------------------------------------
+                # Scalars
+                # --------------------------------------------------------
+                if J_vals is not None:
+                    row_data["J"] = float(np.asarray(J_vals[i]).reshape(-1)[0])
+
+                if S_mean is not None:
+                    row_data["S_mean"] = _scalar_at(S_mean, i)
+
+                if p_i is not None:
+                    row_data["tweedie_p"] = p_i
 
                 _scalar_optional(row_data, "bg_fraction", bg_fraction, i)
                 _scalar_optional(row_data, "M_y", M_y, i)
 
+                # --------------------------------------------------------
+                # Core arrays
+                # --------------------------------------------------------
+                _slice_optional(row_data, "w_prob", w_probs, i, L)
+                _slice_optional(row_data, "rho", rhos, i, L)
+                _slice_optional(row_data, "L_queue", L_queue, i, L)
+                _slice_optional(row_data, "L_effective", L_effective, i, L)
+
+                _slice_optional(row_data, "mu_obs", mu_obs, i, L)
+                _slice_optional(row_data, "mu_total", mu_total, i, L)
+                _slice_optional(row_data, "mu_base", mu_base, i, L)
+
+                _slice_optional(row_data, "phi", phi, i, L)
+                _slice_optional(row_data, "log_phi", log_phi, i, L)
+
+                # Backward-compatible aliases.
+                _slice_optional(row_data, "alpha", phi, i, L)
+                _slice_optional(row_data, "sigma", phi, i, L)
+                _slice_optional(row_data, "log_sigma", log_phi, i, L)
+
+                _slice_optional(row_data, "b_offset", b_offset, i, L)
+                _slice_optional(row_data, "multiplier", multiplier, i, L)
+                _slice_optional(row_data, "additive_bg", additive_bg, i, L)
+                _slice_optional(row_data, "additive_rel", additive_rel, i, L)
+                _slice_optional(row_data, "codon_ids", codon_ids, i, L, dtype=np.int64)
+
+                # Optional old diagnostics.
+                _slice_optional(row_data, "total_scale", total_scale, i, L)
+                _slice_optional(row_data, "pi", pi, i, L)
+                _slice_optional(row_data, "bg_q", bg_q, i, L)
+                _slice_optional(row_data, "p_bio", p_bio, i, L)
+                _slice_optional(row_data, "mu_bio", mu_bio, i, L)
+
+                # --------------------------------------------------------
+                # Derived Tweedie variance
+                # Var[Y] = phi * mu^p
+                # --------------------------------------------------------
+                if phi is not None and mu_obs is not None and p_i is not None:
+                    phi_i = phi[i, :L].astype(np.float32, copy=False)
+                    mu_i = mu_obs[i, :L].astype(np.float32, copy=False)
+
+                    tweedie_var_i = phi_i * np.power(
+                        np.clip(mu_i, 1e-8, None),
+                        float(p_i),
+                    )
+
+                    row_data["tweedie_var"] = tweedie_var_i.astype(np.float32, copy=False)
+
+                # --------------------------------------------------------
+                # Shift arrays
+                # --------------------------------------------------------
                 if shift_weights is not None:
                     row_data["shift_weights"] = np.asarray(
                         shift_weights[i],
+                        dtype=np.float32,
+                    )
+
+                if shift_weights_soft is not None:
+                    row_data["shift_weights_soft"] = np.asarray(
+                        shift_weights_soft[i],
                         dtype=np.float32,
                     )
 
@@ -456,7 +576,8 @@ def main(cfg: DictConfig):
         print(f"[Rank {current_rank}] Full Physical State Saved: {parquet_path}")
         print("==================================================")
 
-        trainer.strategy.barrier()
+        if hasattr(trainer.strategy, "barrier"):
+            trainer.strategy.barrier()
 
 
 if __name__ == "__main__":

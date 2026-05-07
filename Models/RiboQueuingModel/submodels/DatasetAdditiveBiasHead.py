@@ -5,22 +5,6 @@ import torch.nn as nn
 
 
 class DatasetAdditiveBiasHead(nn.Module):
-    """
-    Dataset/codon-dependent additive residual bias.
-
-    Mathematical form:
-
-        A[d,t,i] = S[d,t] * softplus(g(dataset_d, codon_i) + init_bias)
-
-    No fixed beta budget is used.
-
-    The additive branch is controlled by a loss penalty:
-
-        lambda_A * mean(A / S)
-
-    This means the model may use additive bias, but it must pay for it.
-    """
-
     def __init__(
         self,
         num_datasets: int,
@@ -64,16 +48,6 @@ class DatasetAdditiveBiasHead(nn.Module):
         nn.init.zeros_(self.ff[-1].weight)
         nn.init.constant_(self.ff[-1].bias, float(init_bias))
 
-    def _check_dataset_ids(self, dataset_ids: torch.Tensor) -> None:
-        min_id = int(dataset_ids.min().detach().cpu())
-        max_id = int(dataset_ids.max().detach().cpu())
-
-        if min_id < 0 or max_id >= self.num_datasets:
-            raise ValueError(
-                f"dataset_ids out of range: min={min_id}, max={max_id}, "
-                f"num_datasets={self.num_datasets}. Need num_datasets >= {max_id + 1}."
-            )
-
     def forward(
         self,
         *,
@@ -82,29 +56,6 @@ class DatasetAdditiveBiasHead(nn.Module):
         S_mean: torch.Tensor,
         mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Parameters
-        ----------
-        dataset_ids:
-            [B]
-
-        codon_ids:
-            [B, T]
-
-        S_mean:
-            [B] or [B, 1]
-
-        mask:
-            [B, T] bool
-
-        Returns
-        -------
-        additive_bg:
-            [B, T]
-
-        additive_rel:
-            [B, T], equal to additive_bg / S_mean
-        """
         if codon_ids.ndim != 2:
             raise ValueError(f"codon_ids must have shape [B, T], got {codon_ids.shape}.")
 
@@ -116,7 +67,6 @@ class DatasetAdditiveBiasHead(nn.Module):
         mask_b = mask.to(device=device, dtype=torch.bool)
         mask_f = mask_b.float()
 
-        self._check_dataset_ids(dataset_ids)
 
         codon_ids = codon_ids.clamp(min=0, max=self.num_codons - 1)
 

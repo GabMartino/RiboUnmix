@@ -93,67 +93,25 @@ class RiboQueuingModel(nn.Module):
     def tweedie_power(self) -> torch.Tensor:
         return 1.1 + 0.8 * torch.sigmoid(self.p_raw)
 
-    def extract_codon_ids_from_packed(
-        self,
-        x_packed,
-        T: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """
-        Extracts codon IDs from the padded input sequence.
-
-        Assumes codon one-hot features are:
-
-            x[..., codon_feature_start : codon_feature_start + num_codons]
-
-        Returns:
-            codon_ids [B, T]
-        """
-        x_padded, _ = pad_packed_sequence(x_packed, batch_first=True)
-
-        x_padded = x_padded.to(device=device)
-
-        if x_padded.size(1) != T:
-            if x_padded.size(1) > T:
-                x_padded = x_padded[:, :T, :]
-            else:
-                pad_T = T - x_padded.size(1)
-                x_padded = torch.cat(
-                    [
-                        x_padded,
-                        torch.zeros(
-                            x_padded.size(0),
-                            pad_T,
-                            x_padded.size(2),
-                            device=x_padded.device,
-                            dtype=x_padded.dtype,
-                        ),
-                    ],
-                    dim=1,
-                )
-
-        codon_onehot = x_padded[
-            ...,
-            self.codon_feature_start:self.codon_feature_end,
-        ]
-
-        codon_ids = codon_onehot.argmax(dim=-1).long()
-
-        return codon_ids
 
     def forward(
-        self,
-        x_packed,
-        id_datasets: torch.Tensor,
-        y_raw_target: torch.Tensor,
+            self,
+            x_packed,
+            codon_ids: torch.Tensor,
+            id_datasets: torch.Tensor,
+            y_raw_target: torch.Tensor,
     ):
-        p = self.tweedie_power()
 
+        p = self.tweedie_power()
+        '''
+            BIOLOGY
+        '''
         L_queue, rho_diag, w_prob, J, mask = self.biological_model(x_packed)
 
         mask_b = mask.bool()
         mask_f = mask_b.to(device=L_queue.device, dtype=L_queue.dtype)
 
+        
         S_mean = compute_S_mean(
             y_raw_target,
             mask_b,
@@ -169,11 +127,21 @@ class RiboQueuingModel(nn.Module):
             dtype=L_queue.dtype,
         )
 
-        codon_ids = self.extract_codon_ids_from_packed(
-            x_packed=x_packed,
-            T=T,
-            device=L_queue.device,
+        pad_T = T - codon_ids.size(1)
+        codon_ids = torch.cat(
+            [
+                codon_ids,
+                torch.zeros(
+                    codon_ids.size(0),
+                    pad_T,
+                    device=codon_ids.device,
+                    dtype=codon_ids.dtype,
+                ),
+            ],
+            dim=1,
         )
+        codon_ids = codon_ids.clamp(min=0, max=self.num_codons - 1)
+        codon_ids = codon_ids * mask_b.long()
 
         (
             L_effective,

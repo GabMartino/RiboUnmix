@@ -1,171 +1,418 @@
+from __future__ import annotations
+
 import glob
 import os
+from pathlib import Path
+
 import yaml
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.stats import pearsonr, norm
+from scipy.stats import norm
 
 
-def pcc_mu_obs_vs_y(mu_obs_list, y_target_list, alpha=0.05):
-    """
-    Computes the weighted mean Pearson Correlation Coefficient and its
-    confidence interval across multiple independent samples using Fisher Z.
-    """
+# ============================================================
+# Robust PCC aggregation
+# ============================================================
+
+def safe_pearsonr(x, y, eps: float = 1e-12) -> float:
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+
+    L = min(len(x), len(y))
+    if L < 4:
+        return np.nan
+
+    x = x[:L]
+    y = y[:L]
+
+    valid = np.isfinite(x) & np.isfinite(y)
+    x = x[valid]
+    y = y[valid]
+
+    if len(x) < 4:
+        return np.nan
+
+    if np.std(x) <= eps or np.std(y) <= eps:
+        return np.nan
+
+    x = x - x.mean()
+    y = y - y.mean()
+
+    denom = np.sqrt(np.sum(x ** 2) * np.sum(y ** 2))
+    if denom <= eps:
+        return np.nan
+
+    return float(np.sum(x * y) / denom)
+
+
+def fisher_weighted_pcc(pred_list, target_list, alpha: float = 0.05):
     pcc_s = []
     n_s = []
 
-    for mu_obs, y in zip(mu_obs_list, y_target_list):
-        r = pearsonr(mu_obs, y)[0]
-        n = len(mu_obs)
-        if n > 3 and not np.isnan(r):
+    for pred, target in zip(pred_list, target_list):
+        pred = np.asarray(pred, dtype=np.float64).reshape(-1)
+        target = np.asarray(target, dtype=np.float64).reshape(-1)
+
+        L = min(len(pred), len(target))
+        if L < 4:
+            continue
+
+        r = safe_pearsonr(pred[:L], target[:L])
+        if np.isfinite(r):
             pcc_s.append(r)
-            n_s.append(n)
+            n_s.append(L)
 
     if not pcc_s:
-        return np.nan, np.nan, np.nan
+        return np.nan, np.nan, np.nan, 0
 
-    pcc_array = np.array(pcc_s)
-    n_array = np.array(n_s)
+    pcc_array = np.asarray(pcc_s, dtype=np.float64)
+    n_array = np.asarray(n_s, dtype=np.float64)
 
     r_clipped = np.clip(pcc_array, -0.9999, 0.9999)
     z_scores = np.arctanh(r_clipped)
 
-    weights = n_array - 3
+    weights = np.maximum(n_array - 3.0, 1.0)
     z_mean = np.average(z_scores, weights=weights)
 
-    se_z_mean = 1 / np.sqrt(np.sum(weights))
-    z_critical = norm.ppf(1 - alpha / 2)
+    se_z_mean = 1.0 / np.sqrt(np.sum(weights))
+    z_critical = norm.ppf(1.0 - alpha / 2.0)
 
-    z_ci_lower = z_mean - z_critical * se_z_mean
-    z_ci_upper = z_mean + z_critical * se_z_mean
-
+    ci_lower = np.tanh(z_mean - z_critical * se_z_mean)
+    ci_upper = np.tanh(z_mean + z_critical * se_z_mean)
     mean_pcc = np.tanh(z_mean)
-    ci_lower = np.tanh(z_ci_lower)
-    ci_upper = np.tanh(z_ci_upper)
 
-    return mean_pcc, ci_lower, ci_upper
+    return float(mean_pcc), float(ci_lower), float(ci_upper), int(len(pcc_s))
 
+
+# ============================================================
+# Component reconstruction
+# ============================================================
+
+def scalar_smean(s):
+    arr = np.asarray(s)
+    return float(arr.reshape(-1)[0])
+
+
+def scale_by_smean(profile, s):
+    return np.asarray(profile, dtype=np.float32) * scalar_smean(s)
+
+
+def multiply_arrays(a, b):
+    return np.asarray(a, dtype=np.float32) * np.asarray(b, dtype=np.float32)
+
+
+def get_component_lists(df: pd.DataFrame) -> dict[str, list[np.ndarray]]:
+    """
+    Constructs comparable prediction components.
+
+    Required:
+      target
+      mu_obs
+      L_queue
+      S_mean
+
+    Optional:
+      L_effective
+      multiplier
+      mu_base
+      additive_bg
+    """
+    target = df["target"].values
+
+    mu_obs = df["mu_obs"].values
+    L_queue = df["L_queue"].values
+    S_mean = df["S_mean"].values
+
+    raw_biology = [
+        scale_by_smean(lq, s)
+        for lq, s in zip(L_queue, S_mean)
+    ]
+
+    if "L_effective" in df.columns and df["L_effective"].notna().any():
+        L_effective = df["L_effective"].values
+        shifted_biology = [
+            scale_by_smean(le, s)
+            for le, s in zip(L_effective, S_mean)
+        ]
+    else:
+        shifted_biology = raw_biology
+
+    if "mu_base" in df.columns and df["mu_base"].notna().any():
+        mu_base = df["mu_base"].values
+    elif "multiplier" in df.columns and df["multiplier"].notna().any():
+        multiplier = df["multiplier"].values
+        mu_base = [
+            multiply_arrays(sb, m)
+            for sb, m in zip(shifted_biology, multiplier)
+        ]
+    else:
+        mu_base = shifted_biology
+
+    if "additive_bg" in df.columns and df["additive_bg"].notna().any():
+        additive_bg = df["additive_bg"].values
+    else:
+        additive_bg = [np.zeros_like(np.asarray(m, dtype=np.float32)) for m in mu_obs]
+
+    return {
+        "target": target,
+        "raw_biology": raw_biology,
+        "shifted_biology": shifted_biology,
+        "mu_base": mu_base,
+        "mu_obs": mu_obs,
+        "additive_bg": additive_bg,
+    }
+
+
+def compute_decomposition_metrics(df: pd.DataFrame) -> dict[str, float]:
+    comps = get_component_lists(df)
+    target = comps["target"]
+
+    pcc_raw, raw_l, raw_u, n_raw = fisher_weighted_pcc(comps["raw_biology"], target)
+    pcc_shifted, shifted_l, shifted_u, _ = fisher_weighted_pcc(comps["shifted_biology"], target)
+    pcc_base, base_l, base_u, _ = fisher_weighted_pcc(comps["mu_base"], target)
+    pcc_obs, obs_l, obs_u, _ = fisher_weighted_pcc(comps["mu_obs"], target)
+
+    return {
+        "pcc_raw_biology": pcc_raw,
+        "pcc_shifted_biology": pcc_shifted,
+        "pcc_mu_base": pcc_base,
+        "pcc_mu_obs": pcc_obs,
+
+        "ci_raw_lower": raw_l,
+        "ci_raw_upper": raw_u,
+        "ci_shifted_lower": shifted_l,
+        "ci_shifted_upper": shifted_u,
+        "ci_base_lower": base_l,
+        "ci_base_upper": base_u,
+        "ci_obs_lower": obs_l,
+        "ci_obs_upper": obs_u,
+
+        "shift_gain": pcc_shifted - pcc_raw,
+        "b_gain": pcc_base - pcc_shifted,
+        "additive_gain": pcc_obs - pcc_base,
+        "total_gain": pcc_obs - pcc_raw,
+
+        "n_valid": n_raw,
+    }
+
+
+# ============================================================
+# Loading
+# ============================================================
+
+def load_prediction_folder(folder: Path) -> pd.DataFrame | None:
+    parquet_files = sorted(glob.glob(str(folder / "comprehensive_predictions_rank*.parquet")))
+
+    if not parquet_files:
+        return None
+
+    return pd.concat(
+        [pd.read_parquet(f) for f in parquet_files],
+        ignore_index=True,
+    )
+
+
+# ============================================================
+# Main
+# ============================================================
 
 def main():
-    base_path = "./riboai_queueing/"
+    base_path = Path("./riboai_queueing")
+    mixed_folder_name = "eichhorn_2014_grimson_2019"
 
-    # ---------------------------------------------------------
-    # 1. Process Individual Datasets
-    # ---------------------------------------------------------
-    datasets_results = [d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))]
-    if "33_datasets_mix_6e5e33" in datasets_results:
-        datasets_results.remove("33_datasets_mix_6e5e33")
+    dataset_encoding_path = Path("../Datasets/encodings/dataset_encoding.yaml")
+    with dataset_encoding_path.open("r", encoding="utf-8") as f:
+        dataset_encoding = yaml.safe_load(f)
 
+    id2dataset = {int(v): str(k) for k, v in dataset_encoding.items()}
+
+    # ------------------------------------------------------------
+    # Individual runs
+    # ------------------------------------------------------------
     indiv_metrics = {}
-    for folder_name in datasets_results:
-        base_path_d = os.path.join(base_path, folder_name, "comprehensive_predictions_rank*.parquet")
-        parquet_files = glob.glob(base_path_d)
 
-        if not parquet_files:
+    for folder in base_path.iterdir():
+        if not folder.is_dir():
             continue
 
-        dataset_df = pd.concat([pd.read_parquet(f) for f in parquet_files], ignore_index=True)
+        folder_name = folder.name
 
-        targets = dataset_df["target"].values
-        mu_obs = dataset_df["mu_obs"].values
+        if folder_name == mixed_folder_name:
+            continue
 
-        # Extract components to build mu_base
-        l_queue = dataset_df["L_queue"].values
-        total_scale = dataset_df["total_scale"].values
-        b_offset = dataset_df["b_offset"].values
+        # Skip all-dataset aggregate folders if present.
+        if folder_name.startswith("33_datasets_mix"):
+            continue
 
-        # Reconstruct mu_base: L_queue * (total_scale / e^b)
-        # Using a list comprehension to handle the element-wise array math
-        mu_base = [l * (s / np.exp(b)) for l, s, b in zip(l_queue, total_scale, b_offset)]
+        df = load_prediction_folder(folder)
+        if df is None:
+            continue
 
-        pcc_obs, _, _ = pcc_mu_obs_vs_y(mu_obs, targets)
-        pcc_base, _, _ = pcc_mu_obs_vs_y(mu_base, targets)
+        if "target" not in df.columns or "mu_obs" not in df.columns:
+            print(f"[WARN] Missing required columns in {folder_name}. Skipping.")
+            continue
 
-        # Calculate Delta_b
-        delta_b = pcc_obs - pcc_base
+        indiv_metrics[folder_name] = compute_decomposition_metrics(df)
 
-        indiv_metrics[folder_name] = {
-            "indiv_delta_b": delta_b,
-            "indiv_pcc_obs": pcc_obs,
-            "indiv_pcc_base": pcc_base
-        }
+    # ------------------------------------------------------------
+    # Mixed run split by dataset_id
+    # ------------------------------------------------------------
+    mixed_folder = base_path / mixed_folder_name
+    df_mix = load_prediction_folder(mixed_folder)
 
-    # ---------------------------------------------------------
-    # 2. Process Mixed Dataset
-    # ---------------------------------------------------------
-    path_mix = os.path.join(base_path, "33_datasets_mix_6e5e33", "comprehensive_predictions_rank*.parquet")
-    dataset_encoding = yaml.load(open("../Datasets/encodings/dataset_encoding.yaml"), Loader=yaml.FullLoader)
-    id2dataset = {id: name for name, id in dataset_encoding.items()}
-
-    parquet_files_mix = glob.glob(path_mix)
-    df_mix = pd.concat([pd.read_parquet(f) for f in parquet_files_mix], ignore_index=True)
-    datasets_id = df_mix["dataset_id"].unique()
+    if df_mix is None:
+        raise FileNotFoundError(f"No prediction parquet files found in {mixed_folder}")
 
     results = []
-    for d_id in datasets_id:
-        dataset_name = id2dataset[d_id]
-        subset = df_mix.loc[df_mix["dataset_id"] == d_id]
 
-        targets = subset["target"].values
-        mu_obs = subset["mu_obs"].values
+    for dataset_id in sorted(df_mix["dataset_id"].unique()):
+        dataset_id = int(dataset_id)
+        dataset_name = id2dataset.get(dataset_id, f"dataset_{dataset_id}")
 
-        l_queue = subset["L_queue"].values
-        S_mean = subset["S_mean"].values
-        total_scale = subset["total_scale"].values
-        b_offset = subset["b_offset"].values
+        subset = df_mix[df_mix["dataset_id"] == dataset_id]
+        mix_metrics = compute_decomposition_metrics(subset)
 
-        mu_base = [l * s for l, s in zip(l_queue, S_mean)]
+        indiv = indiv_metrics.get(dataset_name, {})
 
-        pcc_obs, _, _ = pcc_mu_obs_vs_y(mu_obs, targets)
-        pcc_base, _, _ = pcc_mu_obs_vs_y(mu_base, targets)
-
-        delta_b = pcc_obs - pcc_base
-
-        indiv_data = indiv_metrics.get(dataset_name, {
-            "indiv_delta_b": np.nan, "indiv_pcc_obs": np.nan, "indiv_pcc_base": np.nan
-        })
-
-        results.append({
+        row = {
             "dataset": dataset_name,
-            "mix_delta_b": delta_b,
-            "mix_pcc_obs": pcc_obs,
-            "mix_pcc_base": pcc_base,
-            **indiv_data
-        })
+
+            "mix_pcc_raw_biology": mix_metrics["pcc_raw_biology"],
+            "mix_pcc_shifted_biology": mix_metrics["pcc_shifted_biology"],
+            "mix_pcc_mu_base": mix_metrics["pcc_mu_base"],
+            "mix_pcc_mu_obs": mix_metrics["pcc_mu_obs"],
+
+            "mix_shift_gain": mix_metrics["shift_gain"],
+            "mix_b_gain": mix_metrics["b_gain"],
+            "mix_additive_gain": mix_metrics["additive_gain"],
+            "mix_total_gain": mix_metrics["total_gain"],
+            "mix_n_valid": mix_metrics["n_valid"],
+
+            "indiv_pcc_raw_biology": indiv.get("pcc_raw_biology", np.nan),
+            "indiv_pcc_shifted_biology": indiv.get("pcc_shifted_biology", np.nan),
+            "indiv_pcc_mu_base": indiv.get("pcc_mu_base", np.nan),
+            "indiv_pcc_mu_obs": indiv.get("pcc_mu_obs", np.nan),
+
+            "indiv_shift_gain": indiv.get("shift_gain", np.nan),
+            "indiv_b_gain": indiv.get("b_gain", np.nan),
+            "indiv_additive_gain": indiv.get("additive_gain", np.nan),
+            "indiv_total_gain": indiv.get("total_gain", np.nan),
+            "indiv_n_valid": indiv.get("n_valid", np.nan),
+        }
+
+        results.append(row)
 
     res_df = pd.DataFrame(results)
-    res_df = res_df.dropna(subset=['mix_delta_b']).sort_values("mix_delta_b", ascending=True).reset_index(drop=True)
+    res_df = res_df.sort_values("mix_pcc_mu_obs", ascending=True).reset_index(drop=True)
 
-    # ---------------------------------------------------------
-    # 3. Plotting Setup
-    # ---------------------------------------------------------
-    y_indices = np.arange(len(res_df))
+    print(res_df)
+
+    out_csv = base_path / f"decomposition_metrics_{mixed_folder_name}.csv"
+    res_df.to_csv(out_csv, index=False)
+    print(f"Saved metrics to: {out_csv}")
+
+    # ------------------------------------------------------------
+    # Plot 1: final prediction quality
+    # ------------------------------------------------------------
+    y = np.arange(len(res_df))
     bar_width = 0.35
 
-    plt.figure(figsize=(14, 12))
+    plt.figure(figsize=(12, max(5, 0.5 * len(res_df))))
 
-    # Plot Individual Delta_b
-    plt.barh(y_indices - bar_width / 2, res_df["indiv_delta_b"], height=bar_width,
-             color='lightcoral', edgecolor='black', label='Individual Model $\Delta_b$')
-
-    # Plot Mix Delta_b
-    plt.barh(y_indices + bar_width / 2, res_df["mix_delta_b"], height=bar_width,
-             color='darkred', edgecolor='black', label='Mix Model $\Delta_b$')
-
-    # Formatting
-    plt.axvline(0, color='black', linewidth=1.5, linestyle='-')
-    plt.yticks(y_indices, res_df["dataset"])
-    plt.xlabel(r"Gain in Correlation ($\Delta_b = PCC_{\mu_{obs}} - PCC_{\mu_{base}}$)")
-
-    plt.title(
-        r"Impact of `b_offset` on Profile Reconstruction ($\Delta_b$)" + "\n" +
-        r"Positive = Improvement | Near Zero = No Effect | Negative = Overfitting/Hurting",
-        pad=15, fontsize=14
+    plt.barh(
+        y - bar_width / 2,
+        res_df["indiv_pcc_mu_obs"],
+        height=bar_width,
+        color="lightsteelblue",
+        edgecolor="black",
+        label="Individual: PCC(mu_obs, target)",
     )
-    plt.legend(loc='lower right', framealpha=0.9)
-    plt.grid(axis='x', linestyle='--', alpha=0.7)
 
+    plt.barh(
+        y + bar_width / 2,
+        res_df["mix_pcc_mu_obs"],
+        height=bar_width,
+        color="navy",
+        edgecolor="black",
+        label="Mixed: PCC(mu_obs, target)",
+    )
+
+    plt.axvline(0, color="black", linewidth=1)
+    plt.yticks(y, res_df["dataset"])
+    plt.xlabel("Fisher-Z aggregated per-transcript PCC")
+    plt.title("Final prediction quality: individual vs mixed")
+    plt.legend()
+    plt.grid(axis="x", linestyle="--", alpha=0.6)
+    plt.tight_layout()
+    plt.show()
+
+    # ------------------------------------------------------------
+    # Plot 2: decomposition gains in the mixed model
+    # ------------------------------------------------------------
+    plt.figure(figsize=(12, max(5, 0.5 * len(res_df))))
+
+    left = np.zeros(len(res_df))
+
+    for col, color, label in [
+        ("mix_shift_gain", "lightblue", "Shift gain"),
+        ("mix_b_gain", "orange", "Multiplicative b gain"),
+        ("mix_additive_gain", "darkred", "Additive gain"),
+    ]:
+        values = res_df[col].fillna(0.0).values
+
+        plt.barh(
+            y,
+            values,
+            left=left,
+            color=color,
+            edgecolor="black",
+            label=label,
+        )
+
+        left = left + values
+
+    plt.axvline(0, color="black", linewidth=1)
+    plt.yticks(y, res_df["dataset"])
+    plt.xlabel("PCC gain relative to previous component")
+    plt.title(
+        "Mixed-model component gains\n"
+        "raw biology → shifted biology → mu_base → mu_obs"
+    )
+    plt.legend()
+    plt.grid(axis="x", linestyle="--", alpha=0.6)
+    plt.tight_layout()
+    plt.show()
+
+    # ------------------------------------------------------------
+    # Plot 3: b gain individual vs mixed
+    # ------------------------------------------------------------
+    plt.figure(figsize=(12, max(5, 0.5 * len(res_df))))
+
+    plt.barh(
+        y - bar_width / 2,
+        res_df["indiv_b_gain"],
+        height=bar_width,
+        color="lightsalmon",
+        edgecolor="black",
+        label="Individual b gain",
+    )
+
+    plt.barh(
+        y + bar_width / 2,
+        res_df["mix_b_gain"],
+        height=bar_width,
+        color="darkorange",
+        edgecolor="black",
+        label="Mixed b gain",
+    )
+
+    plt.axvline(0, color="black", linewidth=1)
+    plt.yticks(y, res_df["dataset"])
+    plt.xlabel("b gain = PCC(mu_base) - PCC(shifted_biology)")
+    plt.title("Impact of multiplicative dataset/codon bias b")
+    plt.legend()
+    plt.grid(axis="x", linestyle="--", alpha=0.6)
     plt.tight_layout()
     plt.show()
 

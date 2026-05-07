@@ -1,188 +1,406 @@
+from __future__ import annotations
+
 import glob
 import os
-import yaml
-import pandas as pd
+from pathlib import Path
+
 import numpy as np
+import pandas as pd
+import yaml
 import matplotlib.pyplot as plt
-from scipy.stats import pearsonr, norm
+from scipy.stats import norm
 
 
-def pcc_mu_obs_vs_y(mu_obs_list, y_target_list, alpha=0.05):
+# ============================================================
+# Robust per-transcript PCC + Fisher-Z aggregation
+# ============================================================
+
+def safe_pearsonr(x, y, eps: float = 1e-12) -> float:
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+
+    valid = np.isfinite(x) & np.isfinite(y)
+    x = x[valid]
+    y = y[valid]
+
+    if x.size < 4:
+        return np.nan
+
+    if np.std(x) <= eps or np.std(y) <= eps:
+        return np.nan
+
+    x = x - x.mean()
+    y = y - y.mean()
+
+    denom = np.sqrt(np.sum(x ** 2) * np.sum(y ** 2))
+
+    if denom <= eps:
+        return np.nan
+
+    return float(np.sum(x * y) / denom)
+
+
+def fisher_weighted_pcc(
+    pred_list,
+    target_list,
+    alpha: float = 0.05,
+) -> dict[str, float]:
     """
-    Computes the weighted mean Pearson Correlation Coefficient and its
-    confidence interval across multiple independent samples using Fisher Z.
+    Aggregates per-transcript PCC values using Fisher-Z weighting.
+
+    Returns:
+        mean_pcc:
+            Fisher-Z weighted mean PCC.
+
+        ci_lower, ci_upper:
+            Approximate confidence interval.
+
+        n_transcripts:
+            Number of valid transcript-level PCC values.
+
+        median_pcc:
+            Median transcript-level PCC.
+
+        unweighted_mean_pcc:
+            Simple mean of transcript-level PCC values.
     """
     pcc_s = []
     n_s = []
 
-    # Step 1: Collect valid correlations and sample sizes
-    for mu_obs, y in zip(mu_obs_list, y_target_list):
-        r = pearsonr(mu_obs, y)[0]
-        n = len(mu_obs)
-        # Ensure mathematical validity for Fisher Z
-        if n > 3 and not np.isnan(r):
-            pcc_s.append(r)
-            n_s.append(n)
+    for pred, target in zip(pred_list, target_list):
+        pred = np.asarray(pred, dtype=np.float64).reshape(-1)
+        target = np.asarray(target, dtype=np.float64).reshape(-1)
 
-    if not pcc_s:
-        return np.nan, np.nan, np.nan
+        L = min(pred.size, target.size)
+        if L < 4:
+            continue
 
-    pcc_array = np.array(pcc_s)
-    n_array = np.array(n_s)
+        pred = pred[:L]
+        target = target[:L]
 
-    # Step 2: Transform to Fisher z-space
+        r = safe_pearsonr(pred, target)
+        if not np.isfinite(r):
+            continue
+
+        pcc_s.append(r)
+        n_s.append(L)
+
+    if len(pcc_s) == 0:
+        return {
+            "mean_pcc": np.nan,
+            "ci_lower": np.nan,
+            "ci_upper": np.nan,
+            "n_transcripts": 0,
+            "median_pcc": np.nan,
+            "unweighted_mean_pcc": np.nan,
+        }
+
+    pcc_array = np.asarray(pcc_s, dtype=np.float64)
+    n_array = np.asarray(n_s, dtype=np.float64)
+
     r_clipped = np.clip(pcc_array, -0.9999, 0.9999)
     z_scores = np.arctanh(r_clipped)
 
-    # Step 3: Compute weighted mean of z-scores
-    weights = n_array - 3
+    weights = np.maximum(n_array - 3.0, 1.0)
+
     z_mean = np.average(z_scores, weights=weights)
 
-    # Step 4: Compute Standard Error and CI in z-space
-    se_z_mean = 1 / np.sqrt(np.sum(weights))
-    z_critical = norm.ppf(1 - alpha / 2)
+    se_z_mean = 1.0 / np.sqrt(np.sum(weights))
+    z_critical = norm.ppf(1.0 - alpha / 2.0)
 
     z_ci_lower = z_mean - z_critical * se_z_mean
     z_ci_upper = z_mean + z_critical * se_z_mean
 
-    # Step 5: Transform back to r-space
-    mean_pcc = np.tanh(z_mean)
-    ci_lower = np.tanh(z_ci_lower)
-    ci_upper = np.tanh(z_ci_upper)
+    return {
+        "mean_pcc": float(np.tanh(z_mean)),
+        "ci_lower": float(np.tanh(z_ci_lower)),
+        "ci_upper": float(np.tanh(z_ci_upper)),
+        "n_transcripts": int(len(pcc_s)),
+        "median_pcc": float(np.median(pcc_array)),
+        "unweighted_mean_pcc": float(np.mean(pcc_array)),
+    }
 
-    return mean_pcc, ci_lower, ci_upper
+
+def component_metrics(
+    df: pd.DataFrame,
+    component: str,
+    target_col: str = "target",
+) -> dict[str, float]:
+    if component not in df.columns:
+        return {
+            "mean_pcc": np.nan,
+            "ci_lower": np.nan,
+            "ci_upper": np.nan,
+            "n_transcripts": 0,
+            "median_pcc": np.nan,
+            "unweighted_mean_pcc": np.nan,
+        }
+
+    valid_df = df[[component, target_col]].dropna()
+
+    if len(valid_df) == 0:
+        return {
+            "mean_pcc": np.nan,
+            "ci_lower": np.nan,
+            "ci_upper": np.nan,
+            "n_transcripts": 0,
+            "median_pcc": np.nan,
+            "unweighted_mean_pcc": np.nan,
+        }
+
+    return fisher_weighted_pcc(
+        pred_list=valid_df[component].values,
+        target_list=valid_df[target_col].values,
+    )
+
+
+def load_prediction_folder(folder: Path) -> pd.DataFrame | None:
+    parquet_files = sorted(glob.glob(str(folder / "comprehensive_predictions_rank*.parquet")))
+
+    if not parquet_files:
+        return None
+
+    return pd.concat(
+        [pd.read_parquet(f) for f in parquet_files],
+        ignore_index=True,
+    )
+
+
+def add_metrics_row(
+    rows: list[dict],
+    *,
+    dataset: str,
+    run_type: str,
+    df: pd.DataFrame,
+    components: list[str],
+) -> None:
+    for component in components:
+        metrics = component_metrics(df, component)
+
+        rows.append(
+            {
+                "dataset": dataset,
+                "run_type": run_type,
+                "component": component,
+                "pcc": metrics["mean_pcc"],
+                "ci_lower": metrics["ci_lower"],
+                "ci_upper": metrics["ci_upper"],
+                "n_transcripts": metrics["n_transcripts"],
+                "median_pcc": metrics["median_pcc"],
+                "unweighted_mean_pcc": metrics["unweighted_mean_pcc"],
+            }
+        )
+
+
+def plot_component_comparison(
+    res_df: pd.DataFrame,
+    *,
+    component: str,
+    title: str,
+) -> None:
+    sub = res_df[res_df["component"] == component].copy()
+    sub = sub.dropna(subset=["pcc"])
+
+    if sub.empty:
+        print(f"[WARN] No valid results for component={component}. Skipping plot.")
+        return
+
+    pivot = sub.pivot(index="dataset", columns="run_type", values="pcc")
+    sub = sub.sort_values("pcc", ascending=True)
+
+    datasets = sorted(sub["dataset"].unique())
+
+    # Sort by mixed performance if available; otherwise by individual.
+    sort_values = []
+    for d in datasets:
+        d_sub = sub[sub["dataset"] == d]
+        mix_val = d_sub.loc[d_sub["run_type"] == "mixed", "pcc"]
+        indiv_val = d_sub.loc[d_sub["run_type"] == "individual", "pcc"]
+
+        if len(mix_val) > 0 and np.isfinite(mix_val.iloc[0]):
+            sort_values.append((d, mix_val.iloc[0]))
+        elif len(indiv_val) > 0 and np.isfinite(indiv_val.iloc[0]):
+            sort_values.append((d, indiv_val.iloc[0]))
+        else:
+            sort_values.append((d, np.nan))
+
+    sort_values = sorted(sort_values, key=lambda x: np.inf if not np.isfinite(x[1]) else x[1])
+    datasets = [x[0] for x in sort_values]
+
+    y_indices = np.arange(len(datasets))
+    bar_width = 0.35
+
+    fig, ax = plt.subplots(figsize=(12, max(5, 0.45 * len(datasets))))
+
+    for offset, run_type, color, label in [
+        (-bar_width / 2, "individual", "lightsteelblue", "Individual"),
+        (+bar_width / 2, "mixed", "navy", "Mixed"),
+    ]:
+        values = []
+        err_lower = []
+        err_upper = []
+
+        for dataset in datasets:
+            row = sub[(sub["dataset"] == dataset) & (sub["run_type"] == run_type)]
+
+            if len(row) == 0:
+                values.append(np.nan)
+                err_lower.append(0.0)
+                err_upper.append(0.0)
+                continue
+
+            r = row.iloc[0]
+            values.append(r["pcc"])
+            err_lower.append(r["pcc"] - r["ci_lower"])
+            err_upper.append(r["ci_upper"] - r["pcc"])
+
+        values = np.asarray(values, dtype=np.float64)
+        xerr = np.asarray([err_lower, err_upper], dtype=np.float64)
+
+        ax.barh(
+            y_indices + offset,
+            values,
+            height=bar_width,
+            xerr=xerr,
+            capsize=2,
+            color=color,
+            edgecolor="black",
+            label=label,
+        )
+
+    ax.axvline(0, color="black", linewidth=1)
+    ax.set_yticks(y_indices)
+    ax.set_yticklabels(datasets)
+    ax.set_xlabel("Fisher-Z aggregated per-transcript PCC")
+    ax.set_title(title)
+    ax.legend(loc="lower right", framealpha=0.9)
+    ax.grid(axis="x", linestyle="--", alpha=0.6)
+
+    fig.tight_layout()
+    plt.show()
 
 
 def main():
-    base_path = "./riboai_queueing/"
+    base_path = Path("./riboai_queueing")
 
-    # ---------------------------------------------------------
-    # 1. Process Individual Datasets
-    # ---------------------------------------------------------
-    datasets_results = [d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))]
-    if "33_datasets_mix_6e5e33" in datasets_results:
-        datasets_results.remove("33_datasets_mix_6e5e33")
+    mixed_folder_name = "eichhorn_2014_grimson_2019"
+    dataset_encoding_path = Path("../Datasets/encodings/dataset_encoding.yaml")
 
-    indiv_metrics = {}
-    for folder_name in datasets_results:
-        base_path_d = os.path.join(base_path, folder_name, "comprehensive_predictions_rank*.parquet")
-        parquet_files = glob.glob(base_path_d)
+    components = [
+        "mu_obs",       # final predicted mean
+        "mu_base",      # before additive residual
+        "L_queue",      # raw biological branch
+        "L_effective",  # shifted biological branch
+    ]
 
-        if not parquet_files:
+    with dataset_encoding_path.open("r", encoding="utf-8") as f:
+        dataset_encoding = yaml.safe_load(f)
+
+    id2dataset = {int(v): str(k) for k, v in dataset_encoding.items()}
+
+    rows = []
+
+    # ------------------------------------------------------------
+    # 1. Individual runs
+    # ------------------------------------------------------------
+    folders = [
+        d for d in base_path.iterdir()
+        if d.is_dir()
+    ]
+
+    for folder in folders:
+        folder_name = folder.name
+
+        if folder_name == mixed_folder_name:
             continue
 
-        dataset_df = pd.concat([pd.read_parquet(f) for f in parquet_files], ignore_index=True)
+        df = load_prediction_folder(folder)
+        if df is None:
+            continue
 
-        # Because these are columns of arrays, we can pass them directly to our Fisher Z function
-        targets = dataset_df["target"].values
-        mu_obs = dataset_df["mu_obs"].values
-        mu_total = dataset_df["mu_total"].values
+        # Assumption: individual run folder name is the dataset name.
+        dataset_name = folder_name
 
-        pcc_obs, ci_l_obs, ci_u_obs = pcc_mu_obs_vs_y(mu_obs, targets)
-        pcc_total, ci_l_total, ci_u_total = pcc_mu_obs_vs_y(mu_total, targets)
+        if "target" not in df.columns:
+            print(f"[WARN] Missing target column in {folder}. Skipping.")
+            continue
 
-        indiv_metrics[folder_name] = {
-            "indiv_pcc_total": pcc_total,
-            "indiv_ci_total_lower": ci_l_total,
-            "indiv_ci_total_upper": ci_u_total,
-            "indiv_pcc_obs": pcc_obs,
-            "indiv_ci_obs_lower": ci_l_obs,
-            "indiv_ci_obs_upper": ci_u_obs
-        }
+        add_metrics_row(
+            rows,
+            dataset=dataset_name,
+            run_type="individual",
+            df=df,
+            components=components,
+        )
 
-    # ---------------------------------------------------------
-    # 2. Process Mixed Dataset
-    # ---------------------------------------------------------
-    path_mix = os.path.join(base_path, "33_datasets_mix_6e5e33", "comprehensive_predictions_rank*.parquet")
-    dataset_encoding = yaml.load(open("../Datasets/encodings/dataset_encoding.yaml"), Loader=yaml.FullLoader)
-    id2dataset = {id: name for name, id in dataset_encoding.items()}
+    # ------------------------------------------------------------
+    # 2. Mixed run, split by dataset_id
+    # ------------------------------------------------------------
+    mixed_folder = base_path / mixed_folder_name
+    df_mix = load_prediction_folder(mixed_folder)
 
-    parquet_files_mix = glob.glob(path_mix)
-    df_mix = pd.concat([pd.read_parquet(f) for f in parquet_files_mix], ignore_index=True)
-    datasets_id = df_mix["dataset_id"].unique()
+    if df_mix is None:
+        raise FileNotFoundError(f"No prediction parquet files found in: {mixed_folder}")
 
-    results = []
-    for d_id in datasets_id:
-        dataset_name = id2dataset[d_id]
-        subset = df_mix.loc[df_mix["dataset_id"] == d_id]
+    if "dataset_id" not in df_mix.columns:
+        raise KeyError("Mixed dataframe does not contain dataset_id column.")
 
-        targets = subset["target"].values
-        mu_obs = subset["mu_obs"].values
-        mu_total = subset["mu_total"].values
+    for dataset_id in sorted(df_mix["dataset_id"].unique()):
+        dataset_id = int(dataset_id)
+        dataset_name = id2dataset.get(dataset_id, f"dataset_{dataset_id}")
 
-        pcc_obs, ci_l_obs, ci_u_obs = pcc_mu_obs_vs_y(mu_obs, targets)
-        pcc_total, ci_l_total, ci_u_total = pcc_mu_obs_vs_y(mu_total, targets)
+        subset = df_mix[df_mix["dataset_id"] == dataset_id]
 
-        # Merge with individual metrics.
-        # Note: Ensure the folder names in 'indiv_metrics' match 'dataset_name' exactly.
-        indiv_data = indiv_metrics.get(dataset_name, {
-            "indiv_pcc_total": np.nan, "indiv_ci_total_lower": np.nan, "indiv_ci_total_upper": np.nan,
-            "indiv_pcc_obs": np.nan, "indiv_ci_obs_lower": np.nan, "indiv_ci_obs_upper": np.nan
-        })
+        add_metrics_row(
+            rows,
+            dataset=dataset_name,
+            run_type="mixed",
+            df=subset,
+            components=components,
+        )
 
-        results.append({
-            "dataset": dataset_name,
-            # Mixed Metrics
-            "mix_pcc_total": pcc_total,
-            "mix_ci_total_lower": ci_l_total,
-            "mix_ci_total_upper": ci_u_total,
-            "mix_pcc_obs": pcc_obs,
-            "mix_ci_obs_lower": ci_l_obs,
-            "mix_ci_obs_upper": ci_u_obs,
-            # Individual Metrics
-            **indiv_data
-        })
+    # ------------------------------------------------------------
+    # 3. Save metrics table
+    # ------------------------------------------------------------
+    res_df = pd.DataFrame(rows)
 
-    res_df = pd.DataFrame(results)
-    # Drop rows where the mixed dataset correlation failed to compute, and sort
-    res_df = res_df.dropna(subset=['mix_pcc_total']).sort_values("mix_pcc_total", ascending=True).reset_index(drop=True)
+    res_df = res_df.sort_values(
+        ["component", "dataset", "run_type"],
+        ascending=True,
+    ).reset_index(drop=True)
 
-    # ---------------------------------------------------------
-    # 3. Plotting Setup (4 Bars per Dataset)
-    # ---------------------------------------------------------
-    def calc_err(mean_col, lower_col, upper_col):
-        return np.array([
-            res_df[mean_col] - res_df[lower_col],
-            res_df[upper_col] - res_df[mean_col]
-        ])
+    print(res_df)
 
-    err_mix_total = calc_err("mix_pcc_total", "mix_ci_total_lower", "mix_ci_total_upper")
-    err_mix_obs = calc_err("mix_pcc_obs", "mix_ci_obs_lower", "mix_ci_obs_upper")
-    err_indiv_total = calc_err("indiv_pcc_total", "indiv_ci_total_lower", "indiv_ci_total_upper")
-    err_indiv_obs = calc_err("indiv_pcc_obs", "indiv_ci_obs_lower", "indiv_ci_obs_upper")
+    out_csv = base_path / f"metrics_individual_vs_mixed_{mixed_folder_name}.csv"
+    res_df.to_csv(out_csv, index=False)
+    print(f"\nSaved metrics table to: {out_csv}")
 
-    y_indices = np.arange(len(res_df))
-    bar_width = 0.2
-
-    plt.figure(figsize=(14, 16))
-
-    # Plot 1: Individual Obs
-    plt.barh(y_indices - bar_width * 1.5, res_df["indiv_pcc_obs"], height=bar_width,
-             xerr=err_indiv_obs, capsize=2, color='lightsalmon', edgecolor='black', label='Indiv: $\mu_{obs}$')
-    # Plot 2: Individual Total
-    plt.barh(y_indices - bar_width * 0.5, res_df["indiv_pcc_total"], height=bar_width,
-             xerr=err_indiv_total, capsize=2, color='lightblue', edgecolor='black', label='Indiv: $\mu_{total}$')
-    # Plot 3: Mix Obs
-    plt.barh(y_indices + bar_width * 0.5, res_df["mix_pcc_obs"], height=bar_width,
-             xerr=err_mix_obs, capsize=2, color='darkred', edgecolor='black', label='Mix: $\mu_{obs}$')
-    # Plot 4: Mix Total
-    plt.barh(y_indices + bar_width * 1.5, res_df["mix_pcc_total"], height=bar_width,
-             xerr=err_mix_total, capsize=2, color='navy', edgecolor='black', label='Mix: $\mu_{total}$')
-
-    plt.axvline(0, color='black', linewidth=1)
-    plt.yticks(y_indices, res_df["dataset"])
-    plt.xlabel("Pearson Correlation Coefficient (PCC)")
-
-    plt.title(
-        r"Comparison of Individual vs Mixed Dataset Predictions" + "\n" +
-        r"Where: $\mu_{total} = (1 - \pi)\mu_{obs}e^{\sigma^2/2}$",
-        pad=15, fontsize=14
+    # ------------------------------------------------------------
+    # 4. Plots
+    # ------------------------------------------------------------
+    plot_component_comparison(
+        res_df,
+        component="mu_obs",
+        title="Final prediction: mixed vs individual runs\nPCC(mu_obs, target)",
     )
-    plt.legend(loc='lower right', framealpha=0.9)
-    plt.grid(axis='x', linestyle='--', alpha=0.7)
 
-    plt.tight_layout()
-    plt.show()
+    plot_component_comparison(
+        res_df,
+        component="mu_base",
+        title="Base model before additive residual\nPCC(mu_base, target)",
+    )
+
+    plot_component_comparison(
+        res_df,
+        component="L_queue",
+        title="Raw biological queueing branch\nPCC(L_queue, target)",
+    )
+
+    plot_component_comparison(
+        res_df,
+        component="L_effective",
+        title="Shift-corrected biological branch\nPCC(L_effective, target)",
+    )
 
 
 if __name__ == "__main__":

@@ -204,7 +204,10 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         lengths_sorted, order = lengths.sort(descending=True)
         order = order.tolist()
 
-        ids_datasets_sorted = torch.as_tensor([idx_datasets[i] for i in order], dtype=torch.long)
+        ids_datasets_sorted = torch.as_tensor(
+            [idx_datasets[i] for i in order],
+            dtype=torch.long,
+        )
         ids_sorted = [ids[i] for i in order]
 
         seq_sorted = [
@@ -221,7 +224,30 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         prof_pad = pad_sequence(prof_sorted, batch_first=True, padding_value=0.0)
 
         Tmax = prof_pad.size(1)
-        mask_pad = (torch.arange(Tmax).unsqueeze(0) < lengths_sorted.unsqueeze(1)).bool()
+        mask_pad = (
+                torch.arange(Tmax).unsqueeze(0)
+                < lengths_sorted.unsqueeze(1)
+        ).bool()
+
+        # ------------------------------------------------------------
+        # Extract codon IDs once in the dataloader.
+        # This avoids pad_packed_sequence + argmax inside the model.
+        # ------------------------------------------------------------
+        codon_feature_start = int(getattr(self, "codon_feature_start", 12))
+        num_codons = int(getattr(self, "num_codons", 64))
+        codon_feature_end = codon_feature_start + num_codons
+
+        if seq_pad.size(-1) < codon_feature_end:
+            raise ValueError(
+                f"Sequence feature dimension {seq_pad.size(-1)} is too small for "
+                f"codon slice [{codon_feature_start}:{codon_feature_end}]."
+            )
+
+        codon_onehot = seq_pad[..., codon_feature_start:codon_feature_end]
+        codon_ids_pad = codon_onehot.argmax(dim=-1).long()
+
+        # Padding positions should be harmless.
+        codon_ids_pad = codon_ids_pad.masked_fill(~mask_pad, 0)
 
         seq_packed = pack_padded_sequence(
             seq_pad,
@@ -230,4 +256,13 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             enforce_sorted=True,
         )
 
-        return ids_datasets_sorted, ids_sorted, seq_packed, prof_pad, lengths_sorted, mask_pad, css_sorted
+        return (
+            ids_datasets_sorted,  # 0: [B]
+            ids_sorted,  # 1: list[str]
+            seq_packed,  # 2: safe packed representation
+            prof_pad,  # 3: [B, T]
+            lengths_sorted,  # 4: [B]
+            mask_pad,  # 5: [B, T]
+            codon_ids_pad,  # 6: [B, T]
+            css_sorted,  # 7: list
+        )
