@@ -5,6 +5,7 @@ from typing import Any
 import lightning as pl
 import torch
 import torch.nn as nn
+from numpy.ma import extras
 
 from Models.utils.PCGrad_utils import per_dataset_losses, pcgrad_combine, assign_flat_grads
 from Models.utils.masked_pearson import MaskedPearsonCorrelation
@@ -33,35 +34,73 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             eps=float(self.config.loss.eps),
         )
 
-    def _log_pcc_metrics(
+    def _log_profile_pcc_diagnostics(
             self,
             *,
             stage: str,
-            mu: torch.Tensor,
             target: torch.Tensor,
             mask: torch.Tensor,
+            dataset_ids: torch.Tensor,
+            components: dict[str, torch.Tensor | None],
             batch_size: int,
-    ) -> torch.Tensor:
+    ) -> dict[str, torch.Tensor]:
+        pccs: dict[str, torch.Tensor] = {}
+
+        dataset_ids = dataset_ids.detach()
+        mask_b = mask.bool()
+
         with torch.no_grad():
-            mu_pcc_per_sample = self.masked_pcc(
-                pred=mu.detach(),
-                target=target,
-                mask=mask.bool(),
-            )
+            for component_name, value in components.items():
+                if value is None:
+                    continue
 
-            mu_pcc = mu_pcc_per_sample.mean()
+                pcc_per_sample = self.masked_pcc(
+                    pred=value.detach(),
+                    target=target,
+                    mask=mask_b,
+                )
 
-        self.log(
-            f"{stage}_mu_pcc",
-            mu_pcc.detach(),
-            on_step=False,
-            on_epoch=True,
-            prog_bar=(stage == "val"),
-            logger=True,
-            batch_size=batch_size,
-        )
+                pccs[component_name] = pcc_per_sample
 
-        return mu_pcc_per_sample
+                # Global component PCC.
+                self.log(
+                    f"{stage}_{component_name}_pcc",
+                    pcc_per_sample.mean().detach(),
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=(stage == "val" and component_name in {"mu", "L_queue", "mu_base"}),
+                    logger=True,
+                    batch_size=batch_size,
+                )
+
+                # Per-dataset component PCC.
+                for dataset_id in torch.unique(dataset_ids).detach().cpu().tolist():
+                    dataset_id = int(dataset_id)
+                    dataset_name = self.dataset_id_to_name.get(
+                        dataset_id,
+                        f"dataset_{dataset_id}",
+                    )
+
+                    ds_mask = dataset_ids == dataset_id
+                    ds_count = int(ds_mask.sum().detach().cpu().item())
+
+                    if ds_count == 0:
+                        continue
+
+                    self.log(
+                        f"{stage}_{component_name}_pcc_by_dataset/{dataset_name}",
+                        pcc_per_sample[ds_mask].mean().detach(),
+                        on_step=False,
+                        on_epoch=True,
+                        prog_bar=False,
+                        logger=True,
+                        batch_size=ds_count,
+                    )
+
+        return pccs
+
+
+
     def pcgrad_optimize(self, loss_per_sample, dataset_ids):
         opt = self.optimizers()
         opt.zero_grad(set_to_none=True)
@@ -144,7 +183,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             css_sorted,
         ) = batch
 
-        mu, p, phi = self.model(
+        mu, p, phi, extras = self.model(
             seq_packed,
             codon_ids_pad,
             ids_datasets_sorted,
@@ -166,11 +205,18 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             loss_per_sample=loss_per_sample,
             dataset_ids=ids_datasets_sorted,
         )
-        self._log_pcc_metrics(
-            stage="train",
-            mu=mu,
+        self._log_profile_pcc_diagnostics(
+            stage="train",  # or "train"
             target=prof_pad,
             mask=mask_pad,
+            dataset_ids=ids_datasets_sorted,
+            components={
+                "mu": mu,
+                "L_queue": extras.get("L_queue"),
+                "L_effective": extras.get("L_effective"),
+                "mu_base": extras.get("mu_base"),
+                "additive_bias": extras.get("additive_bias"),
+            },
             batch_size=int(prof_pad.shape[0]),
         )
         if len(dataset_losses) > 0:
@@ -236,7 +282,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             css_sorted,
         ) = batch
 
-        mu, p, phi = self.model(
+        mu, p, phi, extras = self.model(
             seq_packed,
             codon_ids_pad,
             ids_datasets_sorted,
@@ -265,11 +311,19 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             loss_dataset_balanced = torch.stack(dataset_losses).mean()
         else:
             loss_dataset_balanced = loss_sample_mean
-        self._log_pcc_metrics(
-            stage="val",
-            mu=mu,
+
+        self._log_profile_pcc_diagnostics(
+            stage="val",  # or "train"
             target=prof_pad,
             mask=mask_pad,
+            dataset_ids=ids_datasets_sorted,
+            components={
+                "mu": mu,
+                "L_queue": extras.get("L_queue"),
+                "L_effective": extras.get("L_effective"),
+                "mu_base": extras.get("mu_base"),
+                "additive_bias": extras.get("additive_bias"),
+            },
             batch_size=int(prof_pad.shape[0]),
         )
         # Main monitor metric.

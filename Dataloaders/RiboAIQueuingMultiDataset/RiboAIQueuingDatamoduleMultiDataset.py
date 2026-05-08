@@ -9,10 +9,9 @@ import numpy as np
 import pandas as pd
 import torch
 import yaml
-
 from torch.utils.data import (
-    DataLoader,
     BatchSampler,
+    DataLoader,
     SequentialSampler,
     WeightedRandomSampler,
 )
@@ -28,14 +27,136 @@ def open_file(path: str):
         return yaml.safe_load(f)
 
 
+class DatasetAwareBatchSampler:
+    """
+    Batch sampler for deterministic flat transcript-dataset pairs.
+
+    Each batch contains a controlled number of datasets.
+
+    Example:
+        batch_size = 8
+        datasets_per_batch = 4
+
+    gives approximately:
+
+        2 samples from dataset A
+        2 samples from dataset B
+        2 samples from dataset C
+        2 samples from dataset D
+    """
+
+    def __init__(
+        self,
+        *,
+        dataset_ids,
+        lengths,
+        batch_size: int,
+        datasets_per_batch: int,
+        num_batches: int,
+        gamma: float = 1.0,
+        seed: int = 42,
+        drop_last: bool = False,
+        sort_by_length: bool = True,
+    ):
+        self.dataset_ids = np.asarray(dataset_ids, dtype=np.int64)
+        self.lengths = np.asarray(lengths, dtype=np.int64)
+
+        self.batch_size = int(batch_size)
+        self.datasets_per_batch = int(datasets_per_batch)
+        self.num_batches = int(num_batches)
+        self.gamma = float(gamma)
+        self.seed = int(seed)
+        self.drop_last = bool(drop_last)
+        self.sort_by_length = bool(sort_by_length)
+
+        if self.batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+
+        if self.datasets_per_batch <= 0:
+            raise ValueError("datasets_per_batch must be positive.")
+
+        if self.datasets_per_batch > self.batch_size:
+            raise ValueError(
+                f"datasets_per_batch={self.datasets_per_batch} cannot exceed "
+                f"batch_size={self.batch_size}."
+            )
+
+        if len(self.dataset_ids) != len(self.lengths):
+            raise ValueError("dataset_ids and lengths must have the same length.")
+
+        self.unique_dataset_ids = np.unique(self.dataset_ids)
+
+        self.indices_by_dataset = {
+            int(ds): np.flatnonzero(self.dataset_ids == ds)
+            for ds in self.unique_dataset_ids
+        }
+
+        counts = np.asarray(
+            [
+                len(self.indices_by_dataset[int(ds)])
+                for ds in self.unique_dataset_ids
+            ],
+            dtype=np.float64,
+        )
+
+        # gamma = 0.0 -> sample datasets proportional to pair counts.
+        # gamma = 1.0 -> sample datasets uniformly.
+        probs = counts ** (1.0 - self.gamma)
+        self.dataset_probs = probs / probs.sum()
+
+        self._iter_count = 0
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self._iter_count)
+        self._iter_count += 1
+
+        n_datasets = len(self.unique_dataset_ids)
+        d_per_batch = min(self.datasets_per_batch, n_datasets)
+
+        base_k = self.batch_size // d_per_batch
+        remainder = self.batch_size % d_per_batch
+
+        for _ in range(self.num_batches):
+            chosen_datasets = rng.choice(
+                self.unique_dataset_ids,
+                size=d_per_batch,
+                replace=False,
+                p=self.dataset_probs,
+            )
+
+            batch = []
+
+            for j, ds in enumerate(chosen_datasets):
+                ds = int(ds)
+                k = base_k + (1 if j < remainder else 0)
+
+                pool = self.indices_by_dataset[ds]
+
+                sampled = rng.choice(
+                    pool,
+                    size=k,
+                    replace=True,
+                )
+
+                batch.extend(sampled.tolist())
+
+            if self.sort_by_length:
+                batch = sorted(
+                    batch,
+                    key=lambda idx: int(self.lengths[idx]),
+                    reverse=True,
+                )
+
+            if len(batch) == self.batch_size or not self.drop_last:
+                yield batch
+
+    def __len__(self):
+        return self.num_batches
+
+
 class SortedLengthBatchSampler(BatchSampler):
     """
     Batch sampler that groups sampled indices by sequence length.
-
-    Important:
-      - sampler yields dataset indices.
-      - lengths must be aligned to the dataset indexing space.
-      - supports SequentialSampler and WeightedRandomSampler.
     """
 
     def __init__(
@@ -66,15 +187,15 @@ class SortedLengthBatchSampler(BatchSampler):
 
         if idx.size == 0:
             return
-            yield  # pragma: no cover
+            yield
 
         if idx.max(initial=0) >= len(self.lengths):
             raise IndexError(
                 f"Sampler yielded index {idx.max()} but lengths has size {len(self.lengths)}."
             )
 
-        # Sort only the sampled indices by length.
         order = np.argsort(self.lengths[idx], kind="stable")
+
         if self.descending:
             order = order[::-1]
 
@@ -90,6 +211,7 @@ class SortedLengthBatchSampler(BatchSampler):
 
         if self.shuffle and len(batches) > 1:
             batch_order = self._rng.permutation(len(batches))
+
             for j in batch_order:
                 yield batches[j]
         else:
@@ -98,8 +220,10 @@ class SortedLengthBatchSampler(BatchSampler):
 
     def __len__(self):
         n = len(self.sampler)
+
         if self.drop_last:
             return n // self.batch_size
+
         return (n + self.batch_size - 1) // self.batch_size
 
 
@@ -121,6 +245,8 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         balanced_train_sampling: bool = False,
         dataset_balance_gamma: float = 1.0,
         train_samples_per_epoch: Optional[int] = None,
+        dataset_aware_batching: bool = False,
+        datasets_per_batch: int = 4,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -136,6 +262,9 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         self.balanced_train_sampling = bool(balanced_train_sampling)
         self.dataset_balance_gamma = float(dataset_balance_gamma)
         self.train_samples_per_epoch = train_samples_per_epoch
+
+        self.dataset_aware_batching = bool(dataset_aware_batching)
+        self.datasets_per_batch = int(datasets_per_batch)
 
         self.nt_enc = open_file(nt_encoding_path)
         self.c2aa_enc = open_file(codon_to_aa_encoding_path)
@@ -186,17 +315,17 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             if "ribo" not in df.columns:
                 raise KeyError(f"'ribo' column missing in {path}")
 
-            df = df[["ribo"]]
-
             dataset_name = os.path.basename(path).split(".")[0]
-            loaded_datasets[dataset_name] = df
 
+            loaded_datasets[dataset_name] = df[["ribo"]]
             union_index = union_index.union(df.index, sort=False)
 
         valid_index = seq_df.index.intersection(union_index, sort=False)
 
         if len(valid_index) == 0:
-            raise RuntimeError("No transcript IDs overlap between sequence table and ribo datasets.")
+            raise RuntimeError(
+                "No transcript IDs overlap between sequence table and ribo datasets."
+            )
 
         seq_df_union = seq_df.loc[valid_index]
 
@@ -215,7 +344,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             )
 
         css = seq_df_union[css_col].values
-        lengths = np.array([len(x) for x in ref_arrays], dtype=np.int32)
+        lengths = np.asarray([len(x) for x in ref_arrays], dtype=np.int32)
 
         shared_data = {
             "transcript_id": valid_index.values.astype(str),
@@ -234,7 +363,9 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
                     shared_data["ribo_profiles"][t_id][dataset_name] = ribo_profile
 
         if self.split is None:
-            raise NotImplementedError("Random split is not implemented here. Pass a transcript-level split.")
+            raise NotImplementedError(
+                "Random split is not implemented here. Pass a transcript-level split."
+            )
 
         print("Using provided split transcript IDs.")
 
@@ -250,26 +381,18 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         val_ids = all_ids[val_indices].tolist()
 
         if len(train_ids) == 0:
-            raise RuntimeError("Training split is empty after intersecting with available transcripts.")
+            raise RuntimeError(
+                "Training split is empty after intersecting with available transcripts."
+            )
 
         if len(val_ids) == 0:
-            raise RuntimeError("Validation split is empty after intersecting with available transcripts.")
+            raise RuntimeError(
+                "Validation split is empty after intersecting with available transcripts."
+            )
 
         print(f"Train transcripts: {len(train_ids)}")
         print(f"Validation transcripts: {len(val_ids)}")
 
-        # ============================================================
-        # Training dataset
-        # ============================================================
-        #
-        # Unbalanced mode:
-        #   __len__ = number of transcripts.
-        #   __getitem__ chooses a random dataset for that transcript.
-        #
-        # Balanced mode:
-        #   __len__ = number of transcript-dataset pairs.
-        #   sampler controls dataset balance over flat pairs.
-        #
         train_choice_mode = "deterministic" if self.balanced_train_sampling else "random"
 
         self.train_dataset_obj = RiboAIQueuingDatasetMultiDataset(
@@ -286,31 +409,22 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         )
 
         if self.balanced_train_sampling:
-            if not hasattr(self.train_dataset_obj, "flat_lengths"):
-                raise AttributeError(
-                    "balanced_train_sampling=True requires the dataset to expose flat_lengths."
-                )
-
-            if not hasattr(self.train_dataset_obj, "make_dataset_balanced_weights"):
-                raise AttributeError(
-                    "balanced_train_sampling=True requires the dataset method "
-                    "make_dataset_balanced_weights(gamma)."
-                )
-
-            self.train_lengths = np.asarray(self.train_dataset_obj.flat_lengths, dtype=np.int32)
+            self.train_lengths = np.asarray(
+                self.train_dataset_obj.flat_lengths,
+                dtype=np.int32,
+            )
 
             self.train_sample_weights = self.train_dataset_obj.make_dataset_balanced_weights(
                 gamma=self.dataset_balance_gamma,
             )
 
-            if len(self.train_sample_weights) != len(self.train_dataset_obj):
-                raise RuntimeError(
-                    f"train_sample_weights length {len(self.train_sample_weights)} "
-                    f"does not match train dataset length {len(self.train_dataset_obj)}."
-                )
-
             print("\n=== Balanced training sampling enabled ===")
             print(f"dataset_balance_gamma: {self.dataset_balance_gamma}")
+            print(f"dataset_aware_batching: {self.dataset_aware_batching}")
+
+            if self.dataset_aware_batching:
+                print(f"datasets_per_batch: {self.datasets_per_batch}")
+
             print(f"train dataset flat pairs: {len(self.train_dataset_obj)}")
 
             if self.train_samples_per_epoch is None:
@@ -318,12 +432,12 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             else:
                 print(f"train_samples_per_epoch: {self.train_samples_per_epoch}")
 
-            if hasattr(self.train_dataset_obj, "dataset_pair_counts"):
-                counts = self.train_dataset_obj.dataset_pair_counts()
-                print("\n=== Training dataset pair counts ===")
-                for ds_id, n in sorted(counts.items()):
-                    ds_name = self.train_dataset_obj.idx_to_dataset.get(ds_id, str(ds_id))
-                    print(f"  {ds_name:35s} id={ds_id:3d} pairs={n}")
+            counts = self.train_dataset_obj.dataset_pair_counts()
+
+            print("\n=== Training dataset pair counts ===")
+            for ds_id, n in sorted(counts.items()):
+                ds_name = self.train_dataset_obj.idx_to_dataset.get(ds_id, str(ds_id))
+                print(f"  {ds_name:35s} id={ds_id:3d} pairs={n}")
 
         else:
             self.train_lengths = lengths[train_indices]
@@ -332,12 +446,6 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             print("\n=== Unbalanced/random training sampling enabled ===")
             print("Each transcript appears once per epoch; dataset is randomly chosen inside __getitem__.")
 
-        # ============================================================
-        # Validation dataset
-        # ============================================================
-        #
-        # Always deterministic so validation covers all transcript-dataset pairs.
-        #
         self.val_dataset_obj = RiboAIQueuingDatasetMultiDataset(
             data=shared_data,
             lengths=shared_data["lengths"],
@@ -351,13 +459,10 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             seed=self.seed,
         )
 
-        if hasattr(self.val_dataset_obj, "flat_lengths"):
-            self.val_lengths = np.asarray(self.val_dataset_obj.flat_lengths, dtype=np.int32)
-        else:
-            self.val_lengths = np.repeat(
-                lengths[val_indices],
-                [len(shared_data["ribo_profiles"][tid]) for tid in val_ids],
-            )
+        self.val_lengths = np.asarray(
+            self.val_dataset_obj.flat_lengths,
+            dtype=np.int32,
+        )
 
         print(f"Validation flat transcript-dataset pairs: {len(self.val_dataset_obj)}")
 
@@ -373,13 +478,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             raise RuntimeError("setup() must be called before train_dataloader().")
 
         if self.balanced_train_sampling:
-            if self.train_sample_weights is None:
-                raise RuntimeError(
-                    "balanced_train_sampling=True but train_sample_weights is None."
-                )
-
             epoch = self.trainer.current_epoch if self.trainer is not None else 0
-            generator = torch.Generator().manual_seed(self.seed + int(epoch))
 
             num_samples = (
                 int(self.train_samples_per_epoch)
@@ -387,28 +486,53 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
                 else len(self.train_dataset_obj)
             )
 
-            base_sampler = WeightedRandomSampler(
-                weights=self.train_sample_weights,
-                num_samples=num_samples,
-                replacement=True,
-                generator=generator,
-            )
+            num_batches = (num_samples + self.batch_size - 1) // self.batch_size
 
-            shuffle_batches = True
+            if self.dataset_aware_batching:
+                batch_sampler = DatasetAwareBatchSampler(
+                    dataset_ids=self.train_dataset_obj.flat_dataset_ids,
+                    lengths=self.train_lengths,
+                    batch_size=self.batch_size,
+                    datasets_per_batch=self.datasets_per_batch,
+                    num_batches=num_batches,
+                    gamma=self.dataset_balance_gamma,
+                    seed=self.seed + int(epoch),
+                    drop_last=False,
+                    sort_by_length=True,
+                )
+
+            else:
+                generator = torch.Generator().manual_seed(self.seed + int(epoch))
+
+                base_sampler = WeightedRandomSampler(
+                    weights=self.train_sample_weights,
+                    num_samples=num_samples,
+                    replacement=True,
+                    generator=generator,
+                )
+
+                batch_sampler = SortedLengthBatchSampler(
+                    sampler=base_sampler,
+                    batch_size=self.batch_size,
+                    drop_last=False,
+                    shuffle=True,
+                    lengths=self.train_lengths,
+                    seed=self.seed + int(epoch),
+                    descending=True,
+                )
 
         else:
             base_sampler = SequentialSampler(self.train_dataset_obj)
-            shuffle_batches = True
 
-        batch_sampler = SortedLengthBatchSampler(
-            sampler=base_sampler,
-            batch_size=self.batch_size,
-            drop_last=False,
-            shuffle=shuffle_batches,
-            lengths=self.train_lengths,
-            seed=self.seed,
-            descending=True,
-        )
+            batch_sampler = SortedLengthBatchSampler(
+                sampler=base_sampler,
+                batch_size=self.batch_size,
+                drop_last=False,
+                shuffle=True,
+                lengths=self.train_lengths,
+                seed=self.seed,
+                descending=True,
+            )
 
         return DataLoader(
             self.train_dataset_obj,
@@ -465,5 +589,5 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             collate_fn=self.val_dataset_obj.collate_fn,
             persistent_workers=(self.num_workers > 0),
             worker_init_fn=self.worker_init_fn,
-            pin_memory=True,
+            pin_memory=False,
         )

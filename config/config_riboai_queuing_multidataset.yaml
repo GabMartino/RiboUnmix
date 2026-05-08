@@ -30,6 +30,9 @@ data:
   num_workers: 4
   balanced_train_sampling: True
   dataset_balance_gamma: 1.0
+
+  dataset_aware_batching: True
+  datasets_per_batch: 4
   train_samples_per_epoch: null
 
 model:
@@ -89,7 +92,7 @@ optim:
   use_pcgrad: True
   pcgrad_biology_only: true
   pcgrad_every_n_steps: 4
-  pcgrad_alpha: 0.5
+  pcgrad_alpha: 1.0
   pcgrad_rescale_to_mean_norm: true
   pcgrad_max_datasets_per_step: 2
 

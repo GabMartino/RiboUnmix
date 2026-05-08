@@ -63,7 +63,7 @@ class RiboQueuingModel(nn.Module):
             DATASET BIAS
         '''
         mask_b = mask.bool()
-        mask_f = mask_b.to(device=L_queue.device, dtype=L_queue.dtype)
+        #mask_f = mask_b.to(device=L_queue.device, dtype=L_queue.dtype)
 
         S_mean = compute_S_mean( y_raw_target, mask_b, censor_threshold=0.0, use_censor_threshold=False, use_nonzero_only=False )
 
@@ -91,5 +91,17 @@ class RiboQueuingModel(nn.Module):
         '''
         phi = self.dispersion_head(dataset_ids=id_datasets,codon_ids=codon_ids,  mask=mask_b)
 
+        extras = {
+            "L_queue": L_queue,
+            "L_effective": L_effective,
+            "mu_base": mu_base,
+            "additive_bias": additive_bias,
+            "exp_b": exp_b,
+            "phi": phi,
+            "S_mean": S_mean.squeeze(-1),
+            "rho": rho_diag,
+            "w_prob": w_prob,
+            "J": J,
+        }
 
-        return mu, p, phi
+        return mu, p, phi, extras
