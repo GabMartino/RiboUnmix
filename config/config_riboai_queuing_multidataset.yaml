@@ -26,82 +26,75 @@ paths:
     datasets: "Datasets/encodings/dataset_encoding.yaml"
 
 data:
-  batch_size: 32
-
-  # Keep this at 0 until the DataLoader worker CUDA crash is fixed.
-  num_workers: 2
-
+  batch_size: 8
+  num_workers: 4
   balanced_train_sampling: True
   dataset_balance_gamma: 1.0
   train_samples_per_epoch: null
 
 model:
-  input_size: 97
-  hidden_dims: 256
-  num_layers: 2
-  dropout: 0.1
+  biological_params:
+    input_size: 97
+    hidden_size: 256
+    num_layers: 2
+    dropout: 0.1
+    w_temperature: 1.0
 
-  # Must be >= max(dataset_id) + 1.
-  # eichhorn_2014 has id 32, so this must be at least 33.
-  num_datasets: 33
+  dataset_bias_params:
+    dataset_shift_submodule_params:
+      num_datasets: 33
+      shifts: [-1, 0, 1]
+      temperature: 1.0
+      init_strength: 1
+      hard_eval: True
+      straight_through_train: False
 
-  eps: 1.0e-8
-  mu_max: 1.0e8
+    dataset_multiplicative_bias_submodule_params:
+      num_datasets: 33
+      dataset_embeddings_size: 16
+      num_codons: 64
+      codon_embeddings_size: 16
+      hidden_size: 128
+      dropout: 0.0
 
-  # Codon one-hot slice in the input features.
-  codon_feature_start: 12
-  num_codons: 64
+    dataset_additive_bias_submodule_params:
+      num_datasets: 33
+      dataset_embeddings_size: 16
+      num_codons: 64
+      codon_embeddings_size: 16
+      hidden_size: 128
+      dropout: 0.0
 
-  # Multiplicative dataset/codon log-bias branch:
-  # mu_base = S_mean * L_effective * multiplier
-  dataset_emb_dim: 16
-  codon_emb_dim: 16
-  bias_hidden_dim: 64
-  b_clip: 1.0
-
-  # Additive residual branch:
-  # additive_bg = S_mean * additive_rel
-  additive_dataset_emb_dim: 16
-  additive_codon_emb_dim: 8
-  additive_hidden_dim: 32
-  additive_init_bias: -8.0
+    dataset_dispersion_submodule_params:
+      num_datasets: 33
+      dataset_embeddings_size: 16
+      num_codons: 64
+      codon_embeddings_size: 16
+      hidden_size: 128
+      dropout: 0.0
+      phi_min: 0.02
+      phi_max: 2.0
 
 loss:
   eps: 1.0e-8
   censor_threshold: 0.0
-  # Your current model returns phi = ones_like(mu).
-  # Keep phi fixed at 1 unless you add a learnable phi head later.
-  phi_min: 0.05
-  phi_max: 5.0
-  init_phi: 1.0
-
-  phi_dataset_emb_dim: 16
-  phi_codon_emb_dim: 8
-  phi_hidden_dim: 32
-
   zero_censor_to_zero: True
   include_log_phi: True
-
-  # Additive residual cost:
-  # penalty = lambda_additive_l1 * mean(additive_bg / S_mean)
   lambda_additive_l1: 0.05
-
-metrics:
-  peak_frac: 0.01
-  peak_min_k: 10
 
 optim:
   lr: 1.0e-3
   weight_decay: 1.0e-8
+
   use_pcgrad: True
-  pcgrad_biology_only: True
-  pcgrad_every_n_steps: 1
-  pcgrad_alpha: 1.0
-  pcgrad_rescale_to_mean_norm: False
-  use_dataset_balanced_loss: False
+  pcgrad_biology_only: true
+  pcgrad_every_n_steps: 4
+  pcgrad_alpha: 0.5
+  pcgrad_rescale_to_mean_norm: true
+  pcgrad_max_datasets_per_step: 2
+
   scheduler:
-    name: reduce_on_plateau
-    monitor: val_loss_epoch
+    monitor: val_loss
     mode: min
     factor: 0.9
     patience: 10
@@ -112,7 +105,7 @@ trainer:
   accelerator: gpu
   precision: 16-mixed
   accumulate_grad_batches: 1
-  max_epochs: 1
+  max_epochs: 300
   log_every_n_steps: 1
   gradient_clip_val: 1.0
   gradient_clip_algorithm: norm

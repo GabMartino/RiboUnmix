@@ -58,7 +58,8 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             tid: i for i, tid in enumerate(self.data_records["transcript_id"])
         }
 
-        self._encoded_cache = [None] * len(self.data_records["ref"])
+        self._feature_cache = [None] * len(self.data_records["ref"])
+        self._codon_id_cache = [None] * len(self.data_records["ref"])
 
         # ------------------------------------------------------------
         # Build deterministic flat pair index:
@@ -138,26 +139,80 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         unique_ids, counts = np.unique(self.flat_dataset_ids, return_counts=True)
         return {int(ds): int(c) for ds, c in zip(unique_ids, counts)}
 
-    def _extract_features(self, nucleotide_sequence_per_codon) -> np.ndarray:
-        raw_nt_sequence = np.stack([np.stack(c) for c in nucleotide_sequence_per_codon])
-        batch_size = raw_nt_sequence.shape[0]
-        nt_sequence = raw_nt_sequence.reshape(batch_size, -1)
+    def _extract_features_and_codon_ids(
+            self,
+            nucleotide_sequence_per_codon,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Builds sequence features and codon IDs.
 
-        codon_sequence = np.stack(
-            [np.stack([self.onehot2nt[np.argmax(n).item()] for n in c]) for c in raw_nt_sequence]
+        Parameters
+        ----------
+        nucleotide_sequence_per_codon:
+            Iterable with length T, where each item contains the 3 nucleotide
+            one-hot vectors of one codon.
+
+        Returns
+        -------
+        concatenated_sequence:
+            [T, F] float/int feature matrix:
+                nucleotide features + codon one-hot + amino-acid one-hot
+
+        codon_ids:
+            [T] integer codon IDs in [0, num_codons - 1]
+        """
+        raw_nt_sequence = np.stack(
+            [np.stack(c) for c in nucleotide_sequence_per_codon]
         )
-        codon_sequence = np.char.add(
-            np.char.add(codon_sequence[:, 0], codon_sequence[:, 1]),
-            codon_sequence[:, 2],
+
+        T = raw_nt_sequence.shape[0]
+
+        # Flatten 3 nucleotide one-hots per codon into one vector per codon.
+        nt_sequence = raw_nt_sequence.reshape(T, -1)
+
+        # Convert nucleotide one-hot triplets back to nucleotide symbols.
+        codon_letters = np.stack(
+            [
+                np.stack(
+                    [
+                        self.onehot2nt[np.argmax(n).item()]
+                        for n in codon_nts
+                    ]
+                )
+                for codon_nts in raw_nt_sequence
+            ]
         )
-        codon_sequence = np.stack([self.codon_map[c] for c in codon_sequence])
 
-        aa_sequence = np.stack([self.codon_idx_to_aa_idx[c] for c in codon_sequence])
-        aa_sequence = np.eye(self.n_aa, dtype=np.int32)[aa_sequence]
-        codon_sequence = np.eye(self.num_codons, dtype=np.int32)[codon_sequence]
+        codon_strings = np.char.add(
+            np.char.add(codon_letters[:, 0], codon_letters[:, 1]),
+            codon_letters[:, 2],
+        )
 
-        concatenated_sequence = np.concatenate([nt_sequence, codon_sequence, aa_sequence], axis=1)
-        return concatenated_sequence
+        # Integer codon IDs.
+        codon_ids = np.asarray(
+            [self.codon_map[codon] for codon in codon_strings],
+            dtype=np.int64,
+        )
+
+        # Amino-acid IDs from codon IDs.
+        aa_ids = np.asarray(
+            [self.codon_idx_to_aa_idx[int(codon_id)] for codon_id in codon_ids],
+            dtype=np.int64,
+        )
+
+        aa_onehot = np.eye(self.n_aa, dtype=np.float32)[aa_ids]
+        codon_onehot = np.eye(self.num_codons, dtype=np.float32)[codon_ids]
+
+        concatenated_sequence = np.concatenate(
+            [
+                nt_sequence.astype(np.float32, copy=False),
+                codon_onehot,
+                aa_onehot,
+            ],
+            axis=1,
+        )
+
+        return concatenated_sequence.astype(np.float32, copy=False), codon_ids
 
     def __getitem__(self, index: int):
         if self.dataset_choice_mode == "random":
@@ -181,10 +236,13 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         ref = self.data_records["ref"][global_idx]
         css = self.data_records["css"][global_idx]
 
-        encoded = self._encoded_cache[global_idx]
-        if encoded is None:
-            encoded = self._extract_features(ref).astype(np.float32, copy=False)
-            self._encoded_cache[global_idx] = encoded
+        encoded = self._feature_cache[global_idx]
+        codon_ids = self._codon_id_cache[global_idx]
+
+        if encoded is None or codon_ids is None:
+            encoded, codon_ids = self._extract_features_and_codon_ids(ref)
+            self._feature_cache[global_idx] = encoded
+            self._codon_id_cache[global_idx] = codon_ids
 
         ribo = available_map[dataset_name]
 
@@ -194,13 +252,24 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
                 f"seq_len={encoded.shape[0]}, ribo_len={len(ribo)}, css_len={len(css)}"
             )
 
-        real_idx_dataset = self.datasets_encoding[dataset_name]
-        return real_idx_dataset, transcript_id, encoded, ribo, css
+        if len(codon_ids) != encoded.shape[0]:
+            raise ValueError(
+                f"Codon ID length mismatch for transcript_id={transcript_id}: "
+                f"seq_len={encoded.shape[0]}, codon_ids_len={len(codon_ids)}"
+            )
+
+        real_idx_dataset = int(self.datasets_encoding[dataset_name])
+
+        return real_idx_dataset, transcript_id, encoded, codon_ids, ribo, css
 
     def collate_fn(self, batch):
-        idx_datasets, ids, sequences, profiles, css_s = zip(*batch)
+        idx_datasets, ids, sequences, codon_ids, profiles, css_s = zip(*batch)
 
-        lengths = torch.tensor([s.shape[0] for s in sequences], dtype=torch.long)
+        lengths = torch.tensor(
+            [s.shape[0] for s in sequences],
+            dtype=torch.long,
+        )
+
         lengths_sorted, order = lengths.sort(descending=True)
         order = order.tolist()
 
@@ -208,45 +277,74 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             [idx_datasets[i] for i in order],
             dtype=torch.long,
         )
+
         ids_sorted = [ids[i] for i in order]
 
         seq_sorted = [
-            torch.tensor(np.array(sequences[i], copy=True), dtype=torch.float32)
+            torch.from_numpy(
+                np.array(sequences[i], dtype=np.float32, copy=True)
+            )
             for i in order
         ]
+
+        codon_ids_sorted = [
+            torch.from_numpy(
+                np.array(codon_ids[i], dtype=np.int64, copy=True)
+            )
+            for i in order
+        ]
+
         prof_sorted = [
-            torch.tensor(np.array(profiles[i], copy=True), dtype=torch.float32)
+            torch.from_numpy(
+                np.array(profiles[i], dtype=np.float32, copy=True)
+            )
             for i in order
         ]
+
         css_sorted = [css_s[i] for i in order]
 
-        seq_pad = pad_sequence(seq_sorted, batch_first=True, padding_value=0.0)
-        prof_pad = pad_sequence(prof_sorted, batch_first=True, padding_value=0.0)
+        seq_pad = pad_sequence(
+            seq_sorted,
+            batch_first=True,
+            padding_value=0.0,
+        )
+
+        prof_pad = pad_sequence(
+            prof_sorted,
+            batch_first=True,
+            padding_value=0.0,
+        )
+
+        codon_ids_pad = pad_sequence(
+            codon_ids_sorted,
+            batch_first=True,
+            padding_value=0,
+        )
 
         Tmax = prof_pad.size(1)
+
         mask_pad = (
                 torch.arange(Tmax).unsqueeze(0)
                 < lengths_sorted.unsqueeze(1)
         ).bool()
 
-        # ------------------------------------------------------------
-        # Extract codon IDs once in the dataloader.
-        # This avoids pad_packed_sequence + argmax inside the model.
-        # ------------------------------------------------------------
-        codon_feature_start = int(getattr(self, "codon_feature_start", 12))
-        num_codons = int(getattr(self, "num_codons", 64))
-        codon_feature_end = codon_feature_start + num_codons
-
-        if seq_pad.size(-1) < codon_feature_end:
-            raise ValueError(
-                f"Sequence feature dimension {seq_pad.size(-1)} is too small for "
-                f"codon slice [{codon_feature_start}:{codon_feature_end}]."
+        # Ensure codon_ids has exactly the same T as profile/mask.
+        if codon_ids_pad.size(1) > Tmax:
+            codon_ids_pad = codon_ids_pad[:, :Tmax]
+        elif codon_ids_pad.size(1) < Tmax:
+            pad_T = Tmax - codon_ids_pad.size(1)
+            codon_ids_pad = torch.cat(
+                [
+                    codon_ids_pad,
+                    torch.zeros(
+                        codon_ids_pad.size(0),
+                        pad_T,
+                        dtype=codon_ids_pad.dtype,
+                    ),
+                ],
+                dim=1,
             )
 
-        codon_onehot = seq_pad[..., codon_feature_start:codon_feature_end]
-        codon_ids_pad = codon_onehot.argmax(dim=-1).long()
-
-        # Padding positions should be harmless.
         codon_ids_pad = codon_ids_pad.masked_fill(~mask_pad, 0)
 
         seq_packed = pack_padded_sequence(
@@ -259,7 +357,7 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         return (
             ids_datasets_sorted,  # 0: [B]
             ids_sorted,  # 1: list[str]
-            seq_packed,  # 2: safe packed representation
+            seq_packed,  # 2: PackedSequence
             prof_pad,  # 3: [B, T]
             lengths_sorted,  # 4: [B]
             mask_pad,  # 5: [B, T]

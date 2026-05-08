@@ -451,57 +451,7 @@ def flatten_current_grads(
     return torch.cat(flats, dim=0)
 
 
-def assign_flat_grads(
-    params: list[nn.Parameter],
-    flat_grad: torch.Tensor,
-) -> None:
-    offset = 0
 
-    for p in params:
-        n = p.numel()
-        g = flat_grad[offset:offset + n].view_as(p)
-        offset += n
-
-        if p.grad is None:
-            p.grad = g.detach().clone()
-        else:
-            p.grad.detach().copy_(g)
-
-
-def pcgrad_combine(
-    flat_grads: list[torch.Tensor],
-    eps: float = 1e-12,
-) -> torch.Tensor:
-    if len(flat_grads) == 0:
-        raise ValueError("No gradients passed to PCGrad.")
-
-    if len(flat_grads) == 1:
-        return flat_grads[0]
-
-    projected = []
-
-    for i, g_i_original in enumerate(flat_grads):
-        g_i = g_i_original.clone()
-
-        order = torch.randperm(len(flat_grads), device=g_i.device)
-
-        for j_tensor in order:
-            j = int(j_tensor.item())
-
-            if j == i:
-                continue
-
-            g_j = flat_grads[j]
-
-            dot = torch.dot(g_i, g_j)
-            denom = torch.dot(g_j, g_j).clamp_min(eps)
-
-            if dot < 0:
-                g_i = g_i - (dot / denom) * g_j
-
-        projected.append(g_i)
-
-    return torch.stack(projected, dim=0).mean(dim=0)
 
 
 def pcgrad_pairwise_stats(
@@ -528,22 +478,6 @@ def pcgrad_pairwise_stats(
     return torch.stack(cosines).mean(), torch.stack(conflicts).mean()
 
 
-def per_dataset_losses(
-    loss_per_sample: torch.Tensor,
-    dataset_ids: torch.Tensor,
-) -> list[torch.Tensor]:
-    dataset_ids = dataset_ids.reshape(-1)
-    loss_per_sample = loss_per_sample.reshape(-1)
-
-    losses = []
-
-    for dataset_id in torch.unique(dataset_ids.detach()):
-        ds_mask = dataset_ids == dataset_id
-
-        if torch.any(ds_mask):
-            losses.append(loss_per_sample[ds_mask].mean())
-
-    return losses
 
 
 def get_shift_values(
@@ -737,3 +671,151 @@ def make_validation_profile_figure(
     fig.tight_layout(rect=(0, 0, 1, 0.93))
     return fig
 
+import lightning as pl
+
+
+def log_dataset_stats(pl_module, stage, info, batch_size):
+    ids_datasets = info["ids_datasets_sorted"]
+    unique_ids = torch.unique(ids_datasets).detach().cpu().tolist()
+
+    for ds_id in unique_ids:
+        ds_id = int(ds_id)
+        name = pl_module.dataset_id_to_name.get(ds_id, f"dataset_{ds_id}")
+
+        ds_mask = ids_datasets == ds_id
+        count = int(ds_mask.sum().detach().cpu().item())
+
+        if count == 0:
+            continue
+
+        pl_module.log(
+            f"{stage}_loss_by_dataset/{name}",
+            info["loss_per_sample"][ds_mask].mean().detach(),
+            on_step=False,
+            on_epoch=True,
+            logger=True,
+            batch_size=count,
+            sync_dist=False,
+        )
+
+        pl_module.log(
+            f"{stage}_nll_by_dataset/{name}",
+            info["nll_per_sample"][ds_mask].mean().detach(),
+            on_step=False,
+            on_epoch=True,
+            logger=True,
+            batch_size=count,
+            sync_dist=False,
+        )
+
+        ds_phi = info["phi"].detach().float()[ds_mask]
+        ds_mask_f = info["mask_f"][ds_mask]
+
+        phi_mean = (
+            ds_phi * ds_mask_f
+        ).sum() / ds_mask_f.sum().clamp_min(1.0)
+
+        pl_module.log(
+            f"{stage}_phi_mean_by_dataset/{name}",
+            phi_mean.detach(),
+            on_step=False,
+            on_epoch=True,
+            logger=True,
+            batch_size=count,
+            sync_dist=False,
+        )
+def log_pcgrad_stats(pl_module, stats: dict, batch_size: int):
+    for key, val in stats.items():
+        if val is None:
+            continue
+
+        pl_module.log(
+            f"train_pcgrad_bio_{key}",
+            val.detach(),
+            on_step=True,
+            on_epoch=True,
+            logger=True,
+            batch_size=batch_size,
+            sync_dist=False,
+        )
+
+
+
+
+
+def log_main_metrics(pl_module, stage, info, batch_size):
+    is_train = stage == "train"
+
+    loss_to_log = (
+        info["loss_train_objective"]
+        if stage == "train"
+        else info["loss_sample_mean"]
+    )
+
+    pl_module.log(
+        f"{stage}_loss",
+        loss_to_log.detach(),
+        on_step=is_train,
+        on_epoch=True,
+        prog_bar=True,
+        logger=True,
+        batch_size=batch_size,
+        sync_dist=False,
+    )
+
+    pl_module.log(
+        f"{stage}_loss_sample_mean",
+        info["loss_sample_mean"].detach(),
+        on_step=is_train,
+        on_epoch=True,
+        logger=True,
+        batch_size=batch_size,
+        sync_dist=False,
+    )
+
+    pl_module.log(
+        f"{stage}_nll",
+        info["nll_per_sample"].mean().detach(),
+        on_step=is_train,
+        on_epoch=True,
+        logger=True,
+        batch_size=batch_size,
+        sync_dist=False,
+    )
+
+    pl_module.log(
+        f"{stage}_p",
+        info["tweedie_p"].detach().reshape(-1).mean(),
+        on_step=False,
+        on_epoch=True,
+        logger=True,
+        batch_size=batch_size,
+        sync_dist=False,
+    )
+
+    mask_f = info["mask_f"]
+    phi_mean = (
+        info["phi"].detach().float() * mask_f
+    ).sum() / mask_f.sum().clamp_min(1.0)
+
+    pl_module.log(
+        f"{stage}_phi_mean",
+        phi_mean.detach(),
+        on_step=False,
+        on_epoch=True,
+        logger=True,
+        batch_size=batch_size,
+        sync_dist=False,
+    )
+
+    if stage == "val":
+        pl_module.log(
+            "val_loss_epoch",
+            info["loss_sample_mean"].detach(),
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+            batch_size=batch_size,
+            sync_dist=False,
+        )

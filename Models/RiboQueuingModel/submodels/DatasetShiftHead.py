@@ -22,33 +22,24 @@ class DatasetShiftHead(nn.Module):
         output position i uses biological L at i+k.
     """
 
-    def __init__(
-        self,
-        num_datasets: int,
-        shifts: Sequence[int] = (-2, -1, 0, 1, 2),
-        init_strength: float = 1.0,
-        temperature: float = 0.25,
-        hard_eval: bool = True,
-        straight_through_train: bool = False,
-    ):
+    def __init__(self, config_params: dict):
         super().__init__()
 
-        self.shifts = tuple(int(k) for k in shifts)
-        if 0 not in self.shifts:
-            raise ValueError("shifts must include 0")
+        self.num_datasets = config_params["num_datasets"]
+        self.shifts = config_params["shifts"]
+        self.init_strength = config_params["init_strength"]
+        self.temperature = config_params["temperature"]
+        self.hard_eval = config_params["hard_eval"]
+        self.straight_through_train = config_params["straight_through_train"]
 
-        self.temperature = float(temperature)
-        self.hard_eval = bool(hard_eval)
-        self.straight_through_train = bool(straight_through_train)
-
-        self.shift_logits = nn.Embedding(num_datasets, len(self.shifts))
+        self.shift_logits = nn.Embedding(self.num_datasets, len(self.shifts))
 
         # Smaller init_strength makes it easier to move away from zero-shift.
-        nn.init.constant_(self.shift_logits.weight, -float(init_strength))
+        nn.init.constant_(self.shift_logits.weight, -float(self.init_strength))
         zero_idx = self.shifts.index(0)
 
         with torch.no_grad():
-            self.shift_logits.weight[:, zero_idx] = float(init_strength)
+            self.shift_logits.weight[:, zero_idx] = float(self.init_strength)
 
     def _shift_tensor(self, L_queue: torch.Tensor, k: int) -> torch.Tensor:
         shifted = torch.zeros_like(L_queue)

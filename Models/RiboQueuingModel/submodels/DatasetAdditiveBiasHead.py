@@ -5,88 +5,57 @@ import torch.nn as nn
 
 
 class DatasetAdditiveBiasHead(nn.Module):
-    def __init__(
-        self,
-        num_datasets: int,
-        num_codons: int = 64,
-        dataset_emb_dim: int = 16,
-        codon_emb_dim: int = 8,
-        hidden_dim: int = 32,
-        dropout: float = 0.1,
-        init_bias: float = -8.0,
-        eps: float = 1e-8,
-    ):
+    def __init__(self, config_params: dict):
         super().__init__()
 
-        self.num_datasets = int(num_datasets)
-        self.num_codons = int(num_codons)
-        self.eps = float(eps)
+        self.num_datasets = config_params["num_datasets"]
+        self.dataset_embeddings_size = config_params["dataset_embeddings_size"]
 
-        self.dataset_embedding = nn.Embedding(
-            self.num_datasets,
-            int(dataset_emb_dim),
-        )
+        self.num_codons = config_params["num_codons"]
+        self.codon_embeddings_size = config_params["codon_embeddings_size"]
+        self.hidden_size = config_params["hidden_size"]
+        self.dropout = config_params["dropout"]
 
-        self.codon_embedding = nn.Embedding(
-            self.num_codons,
-            int(codon_emb_dim),
-        )
+        self.dataset_embedding = nn.Embedding(self.num_datasets, self.dataset_embeddings_size)
 
-        in_dim = int(dataset_emb_dim) + int(codon_emb_dim)
+        self.codon_embedding = nn.Embedding(self.num_codons, self.codon_embeddings_size)
+
+        in_dim = self.dataset_embeddings_size + self.codon_embeddings_size
 
         self.ff = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
+            nn.Linear(in_dim, self.hidden_size),
             nn.GELU(),
-            nn.Dropout(p=dropout),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Dropout(p=self.dropout),
+            nn.Linear(self.hidden_size, self.hidden_size),
             nn.GELU(),
-            nn.Dropout(p=dropout),
-            nn.Linear(hidden_dim, 1),
+            nn.Dropout(p=self.dropout),
+            nn.Linear(self.hidden_size, 1),
         )
-
-        # Start almost off.
         nn.init.zeros_(self.ff[-1].weight)
-        nn.init.constant_(self.ff[-1].bias, float(init_bias))
+        nn.init.constant_(self.ff[-1].bias, -8.0)
 
     def forward(
         self,
-        *,
         dataset_ids: torch.Tensor,
         codon_ids: torch.Tensor,
         S_mean: torch.Tensor,
         mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if codon_ids.ndim != 2:
-            raise ValueError(f"codon_ids must have shape [B, T], got {codon_ids.shape}.")
+
 
         B, T = codon_ids.shape
-        device = codon_ids.device
 
-        dataset_ids = dataset_ids.to(device=device, dtype=torch.long)
-        codon_ids = codon_ids.to(device=device, dtype=torch.long)
-        mask_b = mask.to(device=device, dtype=torch.bool)
-        mask_f = mask_b.float()
+        dataset_embeddings = self.dataset_embedding(dataset_ids)          # [B, D]
+        dataset_embeddings = dataset_embeddings.unsqueeze(1).expand(B, T, -1)    # [B, T, D]
 
+        codon_embeddings = self.codon_embedding(codon_ids)                # [B, T, C]
 
-        codon_ids = codon_ids.clamp(min=0, max=self.num_codons - 1)
+        x = torch.cat([dataset_embeddings, codon_embeddings], dim=-1)
 
-        dataset_emb = self.dataset_embedding(dataset_ids)          # [B, D]
-        dataset_emb = dataset_emb.unsqueeze(1).expand(B, T, -1)    # [B, T, D]
-
-        codon_emb = self.codon_embedding(codon_ids)                # [B, T, C]
-
-        x = torch.cat([dataset_emb, codon_emb], dim=-1)
-
-        additive_rel = torch.nn.functional.softplus(
+        beta_per_position = torch.nn.functional.softplus(
             self.ff(x).squeeze(-1)
         )
 
-        additive_rel = additive_rel * mask_f
+        additive_bias = S_mean.reshape(B, 1) * beta_per_position * mask
 
-        S = S_mean.reshape(B, 1).to(device=device, dtype=additive_rel.dtype)
-        S = S.clamp_min(self.eps)
-
-        additive_bg = S * additive_rel
-        additive_bg = additive_bg * mask_f
-
-        return additive_bg, additive_rel
+        return additive_bias, beta_per_position

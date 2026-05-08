@@ -2,7 +2,7 @@ import torch
 from torch import nn
 from torch.nn.utils.rnn import pad_packed_sequence
 
-from Models.utils.compute_S_quantile import compute_S_quantile
+from Models.utils.compute_S_mean import compute_S_quantile
 
 
 class RiboQueuingModelMultiEmbeddings(nn.Module):
