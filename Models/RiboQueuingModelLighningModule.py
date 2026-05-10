@@ -5,9 +5,10 @@ from typing import Any
 import lightning as pl
 import torch
 import torch.nn as nn
-from numpy.ma import extras
 
 from Models.utils.PCGrad_utils import per_dataset_losses, pcgrad_combine, assign_flat_grads
+from Models.utils.advanced_metrics import masked_mae, masked_auprc_peak_caller, masked_1d_wasserstein, \
+    physics_asymmetry_ratio
 from Models.utils.masked_pearson import MaskedPearsonCorrelation
 from Models.utils.ribo_lightning_helpers import flatten_current_grads
 from Models.utils.tweedie_deviance_loss import TweedieDevianceLoss
@@ -16,7 +17,7 @@ from Models.utils.tweedie_deviance_loss import TweedieDevianceLoss
 class RiboQueuingModelLightningModule(pl.LightningModule):
     def __init__(self, torch_model: nn.Module, *, config: Any, dataset_encoding: dict = None):
         super().__init__()
-        self.save_hyperparameters(ignore=['torch_model'])
+        self.save_hyperparameters(ignore=["torch_model", "config", "dataset_encoding"])
         self.model = torch_model
         self.config = config
         self._val_plot_logged_this_epoch = False
@@ -34,70 +35,109 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             eps=float(self.config.loss.eps),
         )
 
-    def _log_profile_pcc_diagnostics(
+    def _log_profile_diagnostics(
             self,
             *,
             stage: str,
             target: torch.Tensor,
             mask: torch.Tensor,
+            css: list,
             dataset_ids: torch.Tensor,
             components: dict[str, torch.Tensor | None],
             batch_size: int,
-    ) -> dict[str, torch.Tensor]:
-        pccs: dict[str, torch.Tensor] = {}
-
+    ) -> None:
         dataset_ids = dataset_ids.detach()
         mask_b = mask.bool()
+        mask_f = mask.float()
 
         with torch.no_grad():
+            # ==========================================
+            # 1. GLOBAL METRICS
+            # ==========================================
             for component_name, value in components.items():
-                if value is None:
-                    continue
+                if value is None: continue
+                pcc_per_sample = self.masked_pcc(pred=value.detach(), target=target, mask=mask_b)
 
-                pcc_per_sample = self.masked_pcc(
-                    pred=value.detach(),
-                    target=target,
-                    mask=mask_b,
-                )
-
-                pccs[component_name] = pcc_per_sample
-
-                # Global component PCC.
                 self.log(
                     f"{stage}_{component_name}_pcc",
                     pcc_per_sample.mean().detach(),
-                    on_step=False,
-                    on_epoch=True,
+                    on_step=False, on_epoch=True,
                     prog_bar=(stage == "val" and component_name in {"mu", "L_queue", "mu_base"}),
-                    logger=True,
-                    batch_size=batch_size,
+                    logger=True, batch_size=batch_size,
                 )
 
-                # Per-dataset component PCC.
-                for dataset_id in torch.unique(dataset_ids).detach().cpu().tolist():
-                    dataset_id = int(dataset_id)
-                    dataset_name = self.dataset_id_to_name.get(
-                        dataset_id,
-                        f"dataset_{dataset_id}",
-                    )
+            eval_tensor = components.get("L_queue") if components.get("L_queue") is not None else components.get("mu")
 
-                    ds_mask = dataset_ids == dataset_id
-                    ds_count = int(ds_mask.sum().detach().cpu().item())
+            if eval_tensor is not None:
+                eval_tensor = eval_tensor.detach()
+                global_mae = masked_mae(eval_tensor, target, mask_f)
+                global_emd = masked_1d_wasserstein(eval_tensor, target, mask_f)
+                global_auprc = masked_auprc_peak_caller(eval_tensor, target, mask_f)
+                global_phys_ratio = physics_asymmetry_ratio(eval_tensor, css)
 
-                    if ds_count == 0:
+                self.log(f"{stage}_eval_MAE", global_mae, on_epoch=True, logger=True, batch_size=batch_size)
+                self.log(f"{stage}_eval_EMD", global_emd, on_epoch=True, logger=True, batch_size=batch_size)
+                self.log(f"{stage}_eval_AUPRC", global_auprc, on_epoch=True, logger=True, batch_size=batch_size)
+                self.log(f"{stage}_eval_Physics_Ratio", global_phys_ratio, on_epoch=True, logger=True,
+                         batch_size=batch_size)
+
+            # ==========================================
+            # 2. PER-DATASET METRICS
+            # ==========================================
+            unique_ids = torch.unique(dataset_ids).detach().cpu().tolist()
+
+            for ds_id in unique_ids:
+                ds_id = int(ds_id)
+                dataset_name = self.dataset_id_to_name.get(ds_id, f"dataset_{ds_id}")
+                ds_mask = (dataset_ids == ds_id)
+                ds_count = int(ds_mask.sum().detach().cpu().item())
+
+                if ds_count == 0: continue
+                component_pccs = {}
+                for component_name, value in components.items():
+                    if value is None:
                         continue
 
-                    self.log(
-                        f"{stage}_{component_name}_pcc_by_dataset/{dataset_name}",
-                        pcc_per_sample[ds_mask].mean().detach(),
-                        on_step=False,
-                        on_epoch=True,
-                        prog_bar=False,
-                        logger=True,
-                        batch_size=ds_count,
+                    pcc_per_sample = self.masked_pcc(
+                        pred=value.detach(),
+                        target=target,
+                        mask=mask_b,
                     )
 
-        return pccs
+                    component_pccs[component_name] = pcc_per_sample
+                    for component_name, pcc_per_sample in component_pccs.items():
+                        self.log(
+                            f"{stage}_{component_name}_pcc_by_dataset/{dataset_name}",
+                            pcc_per_sample[ds_mask].mean().detach(),
+                            on_step=False,
+                            on_epoch=True,
+                            logger=True,
+                            batch_size=ds_count,
+                        )
+
+                # B. Per-Dataset Advanced Metrics
+                if eval_tensor is not None:
+                    # Isolate tensors for this specific dataset
+                    ds_eval = eval_tensor[ds_mask]
+                    ds_target = target[ds_mask]
+                    ds_mask_f = mask_f[ds_mask]
+
+                    # Isolate CSS list for this dataset
+                    ds_css = [css[i] for i, m in enumerate(ds_mask.tolist()) if m]
+
+                    ds_mae = masked_mae(ds_eval, ds_target, ds_mask_f)
+                    ds_emd = masked_1d_wasserstein(ds_eval, ds_target, ds_mask_f)
+                    ds_auprc = masked_auprc_peak_caller(ds_eval, ds_target, ds_mask_f)
+                    ds_phys_ratio = physics_asymmetry_ratio(ds_eval, ds_css)
+
+                    self.log(f"{stage}_eval_MAE_by_dataset/{dataset_name}", ds_mae, on_epoch=True, logger=True,
+                             batch_size=ds_count)
+                    self.log(f"{stage}_eval_EMD_by_dataset/{dataset_name}", ds_emd, on_epoch=True, logger=True,
+                             batch_size=ds_count)
+                    self.log(f"{stage}_eval_AUPRC_by_dataset/{dataset_name}", ds_auprc, on_epoch=True, logger=True,
+                             batch_size=ds_count)
+                    self.log(f"{stage}_eval_Physics_Ratio_by_dataset/{dataset_name}", ds_phys_ratio, on_epoch=True,
+                             logger=True, batch_size=ds_count)
 
 
 
@@ -205,20 +245,22 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             loss_per_sample=loss_per_sample,
             dataset_ids=ids_datasets_sorted,
         )
-        self._log_profile_pcc_diagnostics(
-            stage="train",  # or "train"
-            target=prof_pad,
-            mask=mask_pad,
-            dataset_ids=ids_datasets_sorted,
-            components={
-                "mu": mu,
-                "L_queue": extras.get("L_queue"),
-                "L_effective": extras.get("L_effective"),
-                "mu_base": extras.get("mu_base"),
-                "additive_bias": extras.get("additive_bias"),
-            },
-            batch_size=int(prof_pad.shape[0]),
-        )
+        if batch_idx == 0:
+            self._log_profile_diagnostics(  # Updated name
+                stage="train",  # (or "val" in validation_step)
+                target=prof_pad,
+                mask=mask_pad,
+                css=css_sorted,  # Added CSS for physics ratio
+                dataset_ids=ids_datasets_sorted,
+                components={
+                    "mu": mu,
+                    "L_queue": extras.get("L_queue"),
+                    "L_effective": extras.get("L_effective"),
+                    "mu_base": extras.get("mu_base"),
+                    "additive_bias": extras.get("additive_bias"),
+                },
+                batch_size=int(prof_pad.shape[0]),
+            )
         if len(dataset_losses) > 0:
             loss = torch.stack(dataset_losses).mean()
         else:
@@ -231,7 +273,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             self.log(
                 "train_loss",
                 loss.detach(),
-                on_step=True,
+                on_step=False,
                 on_epoch=True,
                 prog_bar=True,
                 batch_size=int(prof_pad.shape[0]),
@@ -262,7 +304,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         self.log(
             "train_loss",
             loss.detach(),
-            on_step=True,
+            on_step=False,
             on_epoch=True,
             prog_bar=True,
             batch_size=int(prof_pad.shape[0]),
@@ -312,10 +354,11 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         else:
             loss_dataset_balanced = loss_sample_mean
 
-        self._log_profile_pcc_diagnostics(
-            stage="val",  # or "train"
+        self._log_profile_diagnostics(  # Updated name
+            stage="val",  # (or "val" in validation_step)
             target=prof_pad,
             mask=mask_pad,
+            css=css_sorted,  # Added CSS for physics ratio
             dataset_ids=ids_datasets_sorted,
             components={
                 "mu": mu,
@@ -357,6 +400,58 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         sched = self.lr_schedulers()
         metric = self.trainer.callback_metrics[self.config.optim.scheduler.monitor]
         sched.step(metric)
+
+    def predict_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0) -> dict[str, Any]:
+        # 1. Unpack the batch exactly as you do in training_step
+        (
+            ids_datasets_sorted,
+            ids_sorted,
+            seq_packed,
+            prof_pad,
+            lengths_sorted,
+            mask_pad,
+            codon_ids_pad,
+            css_sorted,
+        ) = batch
+
+        # 2. Run the forward pass
+        mu, p, phi, extras = self.model(
+            seq_packed,
+            codon_ids_pad,
+            ids_datasets_sorted,
+            prof_pad,
+        )
+
+        # 3. CPU Mover Helper
+        # Crucial for predict_step to prevent OOM errors when collecting predictions
+        def to_cpu(x):
+            if torch.is_tensor(x):
+                return x.detach().cpu()
+            if isinstance(x, (list, tuple)):
+                return [to_cpu(v) for v in x]
+            return x
+
+        # 4. Build the core output dictionary
+        output = {
+            "ids": to_cpu(ids_sorted),
+            "dataset_id": to_cpu(ids_datasets_sorted),
+            "lengths": to_cpu(lengths_sorted),
+            "mask": to_cpu(mask_pad),
+            "css": to_cpu(css_sorted),
+            "y": to_cpu(prof_pad),
+            "mu_obs": to_cpu(mu),
+            "phi": to_cpu(phi),
+            "tweedie_p": to_cpu(p),
+        }
+
+        # 5. Safely unpack all biological internals from the 'extras' dictionary
+        if isinstance(extras, dict):
+            for key, val in extras.items():
+                if val is not None:
+                    output[key] = to_cpu(val)
+
+        return output
+
 
     def configure_optimizers(self):
         opt = torch.optim.AdamW(

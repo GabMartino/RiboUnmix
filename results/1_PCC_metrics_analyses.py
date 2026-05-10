@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import glob
-import os
 from pathlib import Path
 
 import numpy as np
@@ -45,25 +44,6 @@ def fisher_weighted_pcc(
     target_list,
     alpha: float = 0.05,
 ) -> dict[str, float]:
-    """
-    Aggregates per-transcript PCC values using Fisher-Z weighting.
-
-    Returns:
-        mean_pcc:
-            Fisher-Z weighted mean PCC.
-
-        ci_lower, ci_upper:
-            Approximate confidence interval.
-
-        n_transcripts:
-            Number of valid transcript-level PCC values.
-
-        median_pcc:
-            Median transcript-level PCC.
-
-        unweighted_mean_pcc:
-            Simple mean of transcript-level PCC values.
-    """
     pcc_s = []
     n_s = []
 
@@ -72,6 +52,7 @@ def fisher_weighted_pcc(
         target = np.asarray(target, dtype=np.float64).reshape(-1)
 
         L = min(pred.size, target.size)
+
         if L < 4:
             continue
 
@@ -79,6 +60,7 @@ def fisher_weighted_pcc(
         target = target[:L]
 
         r = safe_pearsonr(pred, target)
+
         if not np.isfinite(r):
             continue
 
@@ -121,32 +103,32 @@ def fisher_weighted_pcc(
     }
 
 
+def empty_metrics() -> dict[str, float]:
+    return {
+        "mean_pcc": np.nan,
+        "ci_lower": np.nan,
+        "ci_upper": np.nan,
+        "n_transcripts": 0,
+        "median_pcc": np.nan,
+        "unweighted_mean_pcc": np.nan,
+    }
+
+
 def component_metrics(
     df: pd.DataFrame,
     component: str,
     target_col: str = "target",
 ) -> dict[str, float]:
     if component not in df.columns:
-        return {
-            "mean_pcc": np.nan,
-            "ci_lower": np.nan,
-            "ci_upper": np.nan,
-            "n_transcripts": 0,
-            "median_pcc": np.nan,
-            "unweighted_mean_pcc": np.nan,
-        }
+        return empty_metrics()
+
+    if target_col not in df.columns:
+        return empty_metrics()
 
     valid_df = df[[component, target_col]].dropna()
 
     if len(valid_df) == 0:
-        return {
-            "mean_pcc": np.nan,
-            "ci_lower": np.nan,
-            "ci_upper": np.nan,
-            "n_transcripts": 0,
-            "median_pcc": np.nan,
-            "unweighted_mean_pcc": np.nan,
-        }
+        return empty_metrics()
 
     return fisher_weighted_pcc(
         pred_list=valid_df[component].values,
@@ -155,15 +137,32 @@ def component_metrics(
 
 
 def load_prediction_folder(folder: Path) -> pd.DataFrame | None:
-    parquet_files = sorted(glob.glob(str(folder / "comprehensive_predictions_rank*.parquet")))
+    parquet_files = []
+
+    patterns = [
+        "predictions_*.parquet",
+        "comprehensive_predictions_rank*.parquet",
+        "*.parquet",
+    ]
+
+    for pattern in patterns:
+        parquet_files.extend(glob.glob(str(folder / pattern)))
+
+    parquet_files = sorted(set(parquet_files))
 
     if not parquet_files:
         return None
 
-    return pd.concat(
+    df = pd.concat(
         [pd.read_parquet(f) for f in parquet_files],
         ignore_index=True,
     )
+
+    # New prediction format.
+    if "target" not in df.columns and "y" in df.columns:
+        df["target"] = df["y"]
+
+    return df
 
 
 def add_metrics_row(
@@ -192,6 +191,54 @@ def add_metrics_row(
         )
 
 
+def discover_individual_prediction_folders(
+    *,
+    base_path: Path,
+    run_name: str,
+    mixed_dataset_signature: str,
+) -> dict[str, Path]:
+    """
+    Expected layout:
+
+        riboai_queueing/
+            cui_2024/
+                NoPCGrad/
+                    predictions_cui_2024.parquet
+
+            grimson_2019/
+                NoPCGrad/
+                    predictions_grimson_2019.parquet
+
+            33_datasets_mix_6e5e33/
+                NoPCGrad/
+                    predictions_33_datasets_mix_6e5e33.parquet
+    """
+    out = {}
+
+    for dataset_dir in sorted(base_path.iterdir()):
+        if not dataset_dir.is_dir():
+            continue
+
+        dataset_name = dataset_dir.name
+
+        if dataset_name == mixed_dataset_signature:
+            continue
+
+        run_dir = dataset_dir / run_name
+
+        if not run_dir.is_dir():
+            continue
+
+        df = load_prediction_folder(run_dir)
+
+        if df is None:
+            continue
+
+        out[dataset_name] = run_dir
+
+    return out
+
+
 def plot_component_comparison(
     res_df: pd.DataFrame,
     *,
@@ -205,26 +252,28 @@ def plot_component_comparison(
         print(f"[WARN] No valid results for component={component}. Skipping plot.")
         return
 
-    pivot = sub.pivot(index="dataset", columns="run_type", values="pcc")
-    sub = sub.sort_values("pcc", ascending=True)
-
     datasets = sorted(sub["dataset"].unique())
 
-    # Sort by mixed performance if available; otherwise by individual.
     sort_values = []
-    for d in datasets:
-        d_sub = sub[sub["dataset"] == d]
-        mix_val = d_sub.loc[d_sub["run_type"] == "mixed", "pcc"]
-        indiv_val = d_sub.loc[d_sub["run_type"] == "individual", "pcc"]
 
-        if len(mix_val) > 0 and np.isfinite(mix_val.iloc[0]):
-            sort_values.append((d, mix_val.iloc[0]))
+    for dataset in datasets:
+        d_sub = sub[sub["dataset"] == dataset]
+
+        mixed_val = d_sub.loc[d_sub["run_type"] == "mixed_multi_dataset", "pcc"]
+        indiv_val = d_sub.loc[d_sub["run_type"] == "individual_single_dataset", "pcc"]
+
+        if len(mixed_val) > 0 and np.isfinite(mixed_val.iloc[0]):
+            sort_values.append((dataset, mixed_val.iloc[0]))
         elif len(indiv_val) > 0 and np.isfinite(indiv_val.iloc[0]):
-            sort_values.append((d, indiv_val.iloc[0]))
+            sort_values.append((dataset, indiv_val.iloc[0]))
         else:
-            sort_values.append((d, np.nan))
+            sort_values.append((dataset, np.nan))
 
-    sort_values = sorted(sort_values, key=lambda x: np.inf if not np.isfinite(x[1]) else x[1])
+    sort_values = sorted(
+        sort_values,
+        key=lambda x: np.inf if not np.isfinite(x[1]) else x[1],
+    )
+
     datasets = [x[0] for x in sort_values]
 
     y_indices = np.arange(len(datasets))
@@ -232,16 +281,31 @@ def plot_component_comparison(
 
     fig, ax = plt.subplots(figsize=(12, max(5, 0.45 * len(datasets))))
 
-    for offset, run_type, color, label in [
-        (-bar_width / 2, "individual", "lightsteelblue", "Individual"),
-        (+bar_width / 2, "mixed", "navy", "Mixed"),
-    ]:
+    plot_specs = [
+        (
+            -bar_width / 2,
+            "individual_single_dataset",
+            "lightsteelblue",
+            "Individual model",
+        ),
+        (
+            +bar_width / 2,
+            "mixed_multi_dataset",
+            "navy",
+            "Mixed multi-dataset model",
+        ),
+    ]
+
+    for offset, run_type, color, label in plot_specs:
         values = []
         err_lower = []
         err_upper = []
 
         for dataset in datasets:
-            row = sub[(sub["dataset"] == dataset) & (sub["run_type"] == run_type)]
+            row = sub[
+                (sub["dataset"] == dataset)
+                & (sub["run_type"] == run_type)
+            ]
 
             if len(row) == 0:
                 values.append(np.nan)
@@ -250,9 +314,10 @@ def plot_component_comparison(
                 continue
 
             r = row.iloc[0]
+
             values.append(r["pcc"])
-            err_lower.append(r["pcc"] - r["ci_lower"])
-            err_upper.append(r["ci_upper"] - r["pcc"])
+            err_lower.append(max(0.0, r["pcc"] - r["ci_lower"]))
+            err_upper.append(max(0.0, r["ci_upper"] - r["pcc"]))
 
         values = np.asarray(values, dtype=np.float64)
         xerr = np.asarray([err_lower, err_upper], dtype=np.float64)
@@ -283,67 +348,77 @@ def plot_component_comparison(
 def main():
     base_path = Path("./riboai_queueing")
 
-    mixed_folder_name = "eichhorn_2014_grimson_2019"
+    run_name = "NoPCGrad"
+    mixed_dataset_signature = "33_datasets_mix_6e5e33"
+    mixed_folder = base_path / mixed_dataset_signature / run_name
+
     dataset_encoding_path = Path("../Datasets/encodings/dataset_encoding.yaml")
 
     components = [
-        "mu_obs",       # final predicted mean
-        "mu_base",      # before additive residual
-        "L_queue",      # raw biological branch
-        "L_effective",  # shifted biological branch
+        "mu_obs",
+        "mu_base",
+        "L_queue",
+        "L_effective",
     ]
 
     with dataset_encoding_path.open("r", encoding="utf-8") as f:
         dataset_encoding = yaml.safe_load(f)
 
-    id2dataset = {int(v): str(k) for k, v in dataset_encoding.items()}
+    id2dataset = {
+        int(v): str(k)
+        for k, v in dataset_encoding.items()
+    }
 
     rows = []
 
     # ------------------------------------------------------------
-    # 1. Individual runs
+    # 1. Individual single-dataset runs
     # ------------------------------------------------------------
-    folders = [
-        d for d in base_path.iterdir()
-        if d.is_dir()
-    ]
+    individual_folders = discover_individual_prediction_folders(
+        base_path=base_path,
+        run_name=run_name,
+        mixed_dataset_signature=mixed_dataset_signature,
+    )
 
-    for folder in folders:
-        folder_name = folder.name
-
-        if folder_name == mixed_folder_name:
-            continue
+    print("\n=== Individual prediction folders ===")
+    for dataset_name, folder in individual_folders.items():
+        print(f"{dataset_name}: {folder}")
 
         df = load_prediction_folder(folder)
+
         if df is None:
             continue
 
-        # Assumption: individual run folder name is the dataset name.
-        dataset_name = folder_name
-
         if "target" not in df.columns:
-            print(f"[WARN] Missing target column in {folder}. Skipping.")
+            print(f"[WARN] Missing target/y column in {folder}. Skipping.")
             continue
 
         add_metrics_row(
             rows,
             dataset=dataset_name,
-            run_type="individual",
+            run_type="individual_single_dataset",
             df=df,
             components=components,
         )
 
     # ------------------------------------------------------------
-    # 2. Mixed run, split by dataset_id
+    # 2. Mixed multi-dataset run, split by dataset_id
     # ------------------------------------------------------------
-    mixed_folder = base_path / mixed_folder_name
     df_mix = load_prediction_folder(mixed_folder)
 
     if df_mix is None:
-        raise FileNotFoundError(f"No prediction parquet files found in: {mixed_folder}")
+        raise FileNotFoundError(
+            f"No prediction parquet files found in: {mixed_folder}"
+        )
 
     if "dataset_id" not in df_mix.columns:
         raise KeyError("Mixed dataframe does not contain dataset_id column.")
+
+    if "target" not in df_mix.columns:
+        raise KeyError("Mixed dataframe does not contain target or y column.")
+
+    print("\n=== Mixed multi-dataset run ===")
+    print(mixed_folder)
 
     for dataset_id in sorted(df_mix["dataset_id"].unique()):
         dataset_id = int(dataset_id)
@@ -354,13 +429,13 @@ def main():
         add_metrics_row(
             rows,
             dataset=dataset_name,
-            run_type="mixed",
+            run_type="mixed_multi_dataset",
             df=subset,
             components=components,
         )
 
     # ------------------------------------------------------------
-    # 3. Save metrics table
+    # 3. Metrics table
     # ------------------------------------------------------------
     res_df = pd.DataFrame(rows)
 
@@ -369,9 +444,14 @@ def main():
         ascending=True,
     ).reset_index(drop=True)
 
+    print("\n=== Metrics ===")
     print(res_df)
 
-    out_csv = base_path / f"metrics_individual_vs_mixed_{mixed_folder_name}.csv"
+    out_csv = base_path / (
+        f"metrics_individual_vs_mixed_"
+        f"{mixed_dataset_signature}_{run_name}.csv"
+    )
+
     res_df.to_csv(out_csv, index=False)
     print(f"\nSaved metrics table to: {out_csv}")
 
@@ -381,7 +461,7 @@ def main():
     plot_component_comparison(
         res_df,
         component="mu_obs",
-        title="Final prediction: mixed vs individual runs\nPCC(mu_obs, target)",
+        title="Final prediction: individual single-dataset model vs mixed multi-dataset model\nPCC(mu_obs, target)",
     )
 
     plot_component_comparison(

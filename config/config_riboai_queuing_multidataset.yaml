@@ -5,8 +5,8 @@ defaults:
   - _self_
 
 experiment:
-  from_checkpoint: False
-  train: True
+  from_checkpoint: True
+  train: False
   predict: True
   dataset: ["grimson_2019", "eichhorn_2014"]
   seed: 42
@@ -89,7 +89,7 @@ optim:
   lr: 1.0e-3
   weight_decay: 1.0e-8
 
-  use_pcgrad: True
+  use_pcgrad: False
   pcgrad_biology_only: true
   pcgrad_every_n_steps: 4
   pcgrad_alpha: 1.0
@@ -108,7 +108,7 @@ trainer:
   accelerator: gpu
   precision: 16-mixed
   accumulate_grad_batches: 1
-  max_epochs: 300
+  max_epochs: 1
   log_every_n_steps: 1
   gradient_clip_val: 1.0
   gradient_clip_algorithm: norm
