@@ -1,69 +1,71 @@
+from __future__ import annotations
+
 import torch
 from torch import nn
 
 
 class DatasetMultiplicativeBiasHead(nn.Module):
-    def __init__(self, config_params: dict):
+    """
+    Dataset/protocol multiplicative correction head.
+
+    Produces a bounded log-space multiplier:
+
+        beta_i = f(x_i)
+        beta_centered_i = beta_i - mean_valid(beta)
+        log_b_i = log_b_max * tanh(beta_centered_i / tanh_temperature)
+        b_i = exp(log_b_i)
+
+    Therefore:
+
+        b_i in [exp(-log_b_max), exp(log_b_max)]
+
+    Neutral initialization gives b_i = 1.
+    """
+
+    def __init__(self, config_params: dict, input_size: int) -> None:
         super().__init__()
 
-        self.num_datasets = config_params["num_datasets"]
-        self.dataset_embeddings_size = config_params["dataset_embeddings_size"]
-        self.num_codons = config_params["num_codons"]
-        self.codon_embeddings_size = config_params["codon_embeddings_size"]
-        self.hidden_size = config_params["hidden_size"]
-        self.dropout = config_params["dropout"]
-
-        self.dataset_embedding = nn.Embedding(self.num_datasets, self.dataset_embeddings_size)
-        self.codon_embedding = nn.Embedding(self.num_codons,self.codon_embeddings_size)
-
-        ff_in_dim = self.dataset_embeddings_size + self.codon_embeddings_size
+        self.hidden_size = int(config_params["hidden_size"])
+        self.dropout = float(config_params.get("dropout", 0.0))
+        self.log_b_max = float(config_params.get("log_b_max", 0.1))
+        self.tanh_temperature = float(config_params.get("tanh_temperature", 3.0))
 
         self.bias_ff = nn.Sequential(
-            nn.Linear(ff_in_dim, self.hidden_size),
+            nn.Linear(input_size, self.hidden_size),
             nn.GELU(),
             nn.Dropout(p=self.dropout),
             nn.Linear(self.hidden_size, self.hidden_size),
             nn.GELU(),
             nn.Dropout(p=self.dropout),
-            nn.Linear(self.hidden_size, 1),
+            nn.Linear(self.hidden_size, 1, bias=False),
         )
 
-        # Start with no multiplicative bias.
         nn.init.zeros_(self.bias_ff[-1].weight)
-        nn.init.zeros_(self.bias_ff[-1].bias)
 
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        mask_b = mask.bool()
+        mask_f = mask_b.to(dtype=x.dtype)
 
+        x = x * mask_f.unsqueeze(-1)
 
-    def forward(self, dataset_ids: torch.Tensor, codon_ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        beta = self.bias_ff(x).squeeze(-1)
+        beta = beta * mask_f
 
-        B, T = codon_ids.shape
+        valid_lengths = mask_f.sum(dim=1, keepdim=True).clamp_min(1.0)
 
+        beta_mean = beta.sum(dim=1, keepdim=True) / valid_lengths
+        beta_centered = (beta - beta_mean) * mask_f
 
-        codon_embeddings = self.codon_embedding(codon_ids)  # [B, T, C]
-        dataset_embeddings = self.dataset_embedding(dataset_ids)  # [B, D]
+        log_b = self.log_b_max * torch.tanh(
+            beta_centered / self.tanh_temperature
+        )
+        log_b = log_b * mask_f
 
-        dataset_embeddings = dataset_embeddings.unsqueeze(1).expand(B, T, -1)
+        b = torch.exp(log_b)
+        b = torch.where(mask_b, b, torch.ones_like(b))
 
-        ff_input = torch.cat([codon_embeddings, dataset_embeddings], dim=-1)
-        ff_input = ff_input * mask.unsqueeze(-1)
-
-        b = self.bias_ff(ff_input).squeeze(-1)
-        b = b * mask
-
-        valid_lengths = mask.sum(dim=1, keepdim=True).clamp_min(1.0)
-
-        # Center before clipping.
-        b_mean = b.sum(dim=1, keepdim=True) / valid_lengths
-        b = (b - b_mean) * mask
-
-
-        exp_b = torch.exp(b) * mask
-
-        # Zero-centered b does not imply mean(exp(b)) = 1.
-        # This normalization keeps the multiplicative branch mostly redistributive.
-        exp_b_mean = exp_b.sum(dim=1, keepdim=True) / valid_lengths
-        exp_b = exp_b / exp_b_mean
-        exp_b = exp_b * mask
-
-        return exp_b, b
-
+        return b, log_b, beta_centered

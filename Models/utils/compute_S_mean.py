@@ -30,3 +30,26 @@ def compute_S_mean(
     S_mean = total_reads / counts
 
     return S_mean
+
+
+@torch.no_grad()
+def compute_S_trimmed_mean(y, mask, trim_top_frac=0.02, eps=1e-8):
+    mask_b = mask.bool()
+    out = []
+
+    for i in range(y.shape[0]):
+        vals = y[i][mask_b[i]].float()
+        vals = vals[torch.isfinite(vals)]
+
+        if vals.numel() == 0:
+            out.append(torch.tensor(eps, device=y.device, dtype=y.dtype))
+            continue
+
+        vals = vals.sort().values
+        k = int((1.0 - trim_top_frac) * vals.numel())
+        k = max(1, k)
+
+        vals = vals[:k]
+        out.append(vals.mean().clamp_min(eps))
+
+    return torch.stack(out)

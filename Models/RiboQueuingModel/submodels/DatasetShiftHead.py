@@ -107,4 +107,4 @@ class DatasetShiftHead(nn.Module):
 
         L_effective = L_effective * mask_f
 
-        return L_effective, shift_weights_used, shift_weights_soft
+        return L_queue, shift_weights_used, shift_weights_soft

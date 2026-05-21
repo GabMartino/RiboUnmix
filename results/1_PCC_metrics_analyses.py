@@ -68,14 +68,7 @@ def fisher_weighted_pcc(
         n_s.append(L)
 
     if len(pcc_s) == 0:
-        return {
-            "mean_pcc": np.nan,
-            "ci_lower": np.nan,
-            "ci_upper": np.nan,
-            "n_transcripts": 0,
-            "median_pcc": np.nan,
-            "unweighted_mean_pcc": np.nan,
-        }
+        return empty_metrics()
 
     pcc_array = np.asarray(pcc_s, dtype=np.float64)
     n_array = np.asarray(n_s, dtype=np.float64)
@@ -158,11 +151,27 @@ def load_prediction_folder(folder: Path) -> pd.DataFrame | None:
         ignore_index=True,
     )
 
-    # New prediction format.
     if "target" not in df.columns and "y" in df.columns:
         df["target"] = df["y"]
 
     return df
+
+
+def resolve_run_folder(dataset_folder: Path, run_name: str) -> Path:
+    aliases = {
+        "NoPCGrad": ["NoPCGrad", "NOPCGrad", "no_pcgrad", "nopcgrad"],
+        "NOPCGrad": ["NOPCGrad", "NoPCGrad", "no_pcgrad", "nopcgrad"],
+        "PCGrad": ["PCGrad", "pcgrad"],
+    }
+
+    candidates = aliases.get(run_name, [run_name])
+
+    for candidate in candidates:
+        folder = dataset_folder / candidate
+        if folder.is_dir():
+            return folder
+
+    return dataset_folder / candidates[0]
 
 
 def add_metrics_row(
@@ -197,22 +206,6 @@ def discover_individual_prediction_folders(
     run_name: str,
     mixed_dataset_signature: str,
 ) -> dict[str, Path]:
-    """
-    Expected layout:
-
-        riboai_queueing/
-            cui_2024/
-                NoPCGrad/
-                    predictions_cui_2024.parquet
-
-            grimson_2019/
-                NoPCGrad/
-                    predictions_grimson_2019.parquet
-
-            33_datasets_mix_6e5e33/
-                NoPCGrad/
-                    predictions_33_datasets_mix_6e5e33.parquet
-    """
     out = {}
 
     for dataset_dir in sorted(base_path.iterdir()):
@@ -224,7 +217,7 @@ def discover_individual_prediction_folders(
         if dataset_name == mixed_dataset_signature:
             continue
 
-        run_dir = dataset_dir / run_name
+        run_dir = resolve_run_folder(dataset_dir, run_name)
 
         if not run_dir.is_dir():
             continue
@@ -259,13 +252,16 @@ def plot_component_comparison(
     for dataset in datasets:
         d_sub = sub[sub["dataset"] == dataset]
 
-        mixed_val = d_sub.loc[d_sub["run_type"] == "mixed_multi_dataset", "pcc"]
-        indiv_val = d_sub.loc[d_sub["run_type"] == "individual_single_dataset", "pcc"]
+        mixed_pcgrad = d_sub.loc[d_sub["run_type"] == "mixed_PCGrad", "pcc"]
+        mixed_nopcgrad = d_sub.loc[d_sub["run_type"] == "mixed_NOPCGrad", "pcc"]
+        indiv_nopcgrad = d_sub.loc[d_sub["run_type"] == "individual_NOPCGrad", "pcc"]
 
-        if len(mixed_val) > 0 and np.isfinite(mixed_val.iloc[0]):
-            sort_values.append((dataset, mixed_val.iloc[0]))
-        elif len(indiv_val) > 0 and np.isfinite(indiv_val.iloc[0]):
-            sort_values.append((dataset, indiv_val.iloc[0]))
+        if len(mixed_pcgrad) > 0 and np.isfinite(mixed_pcgrad.iloc[0]):
+            sort_values.append((dataset, mixed_pcgrad.iloc[0]))
+        elif len(mixed_nopcgrad) > 0 and np.isfinite(mixed_nopcgrad.iloc[0]):
+            sort_values.append((dataset, mixed_nopcgrad.iloc[0]))
+        elif len(indiv_nopcgrad) > 0 and np.isfinite(indiv_nopcgrad.iloc[0]):
+            sort_values.append((dataset, indiv_nopcgrad.iloc[0]))
         else:
             sort_values.append((dataset, np.nan))
 
@@ -277,22 +273,28 @@ def plot_component_comparison(
     datasets = [x[0] for x in sort_values]
 
     y_indices = np.arange(len(datasets))
-    bar_width = 0.35
+    bar_width = 0.24
 
-    fig, ax = plt.subplots(figsize=(12, max(5, 0.45 * len(datasets))))
+    fig, ax = plt.subplots(figsize=(13, max(5, 0.50 * len(datasets))))
 
     plot_specs = [
         (
-            -bar_width / 2,
-            "individual_single_dataset",
+            -bar_width,
+            "individual_NOPCGrad",
             "lightsteelblue",
-            "Individual model",
+            "Individual NOPCGrad",
         ),
         (
-            +bar_width / 2,
-            "mixed_multi_dataset",
+            0.0,
+            "mixed_NOPCGrad",
+            "darkorange",
+            "Mixed NOPCGrad",
+        ),
+        (
+            +bar_width,
+            "mixed_PCGrad",
             "navy",
-            "Mixed multi-dataset model",
+            "Mixed PCGrad",
         ),
     ]
 
@@ -348,10 +350,10 @@ def plot_component_comparison(
 def main():
     base_path = Path("./riboai_queueing")
 
-    run_name = "NoPCGrad"
-    mixed_dataset_signature = "33_datasets_mix_6e5e33"
-    mixed_folder = base_path / mixed_dataset_signature / run_name
+    individual_run_name = "NOPCGrad"
+    mixed_run_names = ["NOPCGrad", "PCGrad"]
 
+    mixed_dataset_signature = "33_datasets_mix_6e5e33"
     dataset_encoding_path = Path("../Datasets/encodings/dataset_encoding.yaml")
 
     components = [
@@ -372,15 +374,16 @@ def main():
     rows = []
 
     # ------------------------------------------------------------
-    # 1. Individual single-dataset runs
+    # 1. Individual NOPCGrad single-dataset runs
     # ------------------------------------------------------------
     individual_folders = discover_individual_prediction_folders(
         base_path=base_path,
-        run_name=run_name,
+        run_name=individual_run_name,
         mixed_dataset_signature=mixed_dataset_signature,
     )
 
-    print("\n=== Individual prediction folders ===")
+    print("\n=== Individual NOPCGrad prediction folders ===")
+
     for dataset_name, folder in individual_folders.items():
         print(f"{dataset_name}: {folder}")
 
@@ -396,43 +399,51 @@ def main():
         add_metrics_row(
             rows,
             dataset=dataset_name,
-            run_type="individual_single_dataset",
+            run_type="individual_NOPCGrad",
             df=df,
             components=components,
         )
 
     # ------------------------------------------------------------
-    # 2. Mixed multi-dataset run, split by dataset_id
+    # 2. Mixed multi-dataset runs: NOPCGrad and PCGrad
     # ------------------------------------------------------------
-    df_mix = load_prediction_folder(mixed_folder)
+    print("\n=== Mixed multi-dataset runs ===")
 
-    if df_mix is None:
-        raise FileNotFoundError(
-            f"No prediction parquet files found in: {mixed_folder}"
+    for mixed_run_name in mixed_run_names:
+        mixed_folder = resolve_run_folder(
+            base_path / mixed_dataset_signature,
+            mixed_run_name,
         )
 
-    if "dataset_id" not in df_mix.columns:
-        raise KeyError("Mixed dataframe does not contain dataset_id column.")
+        df_mix = load_prediction_folder(mixed_folder)
 
-    if "target" not in df_mix.columns:
-        raise KeyError("Mixed dataframe does not contain target or y column.")
+        if df_mix is None:
+            print(f"[WARN] No prediction parquet files found in: {mixed_folder}. Skipping.")
+            continue
 
-    print("\n=== Mixed multi-dataset run ===")
-    print(mixed_folder)
+        if "dataset_id" not in df_mix.columns:
+            raise KeyError(f"Mixed dataframe does not contain dataset_id column: {mixed_folder}")
 
-    for dataset_id in sorted(df_mix["dataset_id"].unique()):
-        dataset_id = int(dataset_id)
-        dataset_name = id2dataset.get(dataset_id, f"dataset_{dataset_id}")
+        if "target" not in df_mix.columns:
+            raise KeyError(f"Mixed dataframe does not contain target or y column: {mixed_folder}")
 
-        subset = df_mix[df_mix["dataset_id"] == dataset_id]
+        print(f"{mixed_run_name}: {mixed_folder}")
 
-        add_metrics_row(
-            rows,
-            dataset=dataset_name,
-            run_type="mixed_multi_dataset",
-            df=subset,
-            components=components,
-        )
+        run_type = f"mixed_{mixed_run_name}"
+
+        for dataset_id in sorted(df_mix["dataset_id"].unique()):
+            dataset_id = int(dataset_id)
+            dataset_name = id2dataset.get(dataset_id, f"dataset_{dataset_id}")
+
+            subset = df_mix[df_mix["dataset_id"] == dataset_id]
+
+            add_metrics_row(
+                rows,
+                dataset=dataset_name,
+                run_type=run_type,
+                df=subset,
+                components=components,
+            )
 
     # ------------------------------------------------------------
     # 3. Metrics table
@@ -448,8 +459,8 @@ def main():
     print(res_df)
 
     out_csv = base_path / (
-        f"metrics_individual_vs_mixed_"
-        f"{mixed_dataset_signature}_{run_name}.csv"
+        f"metrics_individual_NOPCGrad_vs_mixed_NOPCGrad_PCGrad_"
+        f"{mixed_dataset_signature}.csv"
     )
 
     res_df.to_csv(out_csv, index=False)
@@ -461,25 +472,41 @@ def main():
     plot_component_comparison(
         res_df,
         component="mu_obs",
-        title="Final prediction: individual single-dataset model vs mixed multi-dataset model\nPCC(mu_obs, target)",
+        title=(
+            "Final prediction\n"
+            "Individual NOPCGrad vs Mixed NOPCGrad vs Mixed PCGrad\n"
+            "PCC(mu_obs, target)"
+        ),
     )
 
     plot_component_comparison(
         res_df,
         component="mu_base",
-        title="Base model before additive residual\nPCC(mu_base, target)",
+        title=(
+            "Base model before additive residual\n"
+            "Individual NOPCGrad vs Mixed NOPCGrad vs Mixed PCGrad\n"
+            "PCC(mu_base, target)"
+        ),
     )
 
     plot_component_comparison(
         res_df,
         component="L_queue",
-        title="Raw biological queueing branch\nPCC(L_queue, target)",
+        title=(
+            "Raw biological queueing branch\n"
+            "Individual NOPCGrad vs Mixed NOPCGrad vs Mixed PCGrad\n"
+            "PCC(L_queue, target)"
+        ),
     )
 
     plot_component_comparison(
         res_df,
         component="L_effective",
-        title="Shift-corrected biological branch\nPCC(L_effective, target)",
+        title=(
+            "Shift-corrected biological branch\n"
+            "Individual NOPCGrad vs Mixed NOPCGrad vs Mixed PCGrad\n"
+            "PCC(L_effective, target)"
+        ),
     )
 
 

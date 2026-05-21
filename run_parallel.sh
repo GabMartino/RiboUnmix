@@ -30,7 +30,7 @@ run_queue() {
         # We explicitly enforce trainer.devices=[0] here because to this isolated process,
         # its assigned GPU is always index 0.
         # We pipe the output to a unique log file so the outputs don't interleave in the terminal.
-        python main_ribo_queueing_modeling_multi_dataset.py experiment.dataset="['$DS']" trainer.devices=[0] > "run_log_GPU${gpu_id}_${DS}.txt" 2>&1
+        python main_ribo_queueing_modeling_multi_dataset.py optim.use_pcgrad="False" experiment.dataset="['$DS']" trainer.devices=[0] > "run_log_GPU${gpu_id}_${DS}.txt" 2>&1
 
         if [ $? -ne 0 ]; then
             echo "[Queue GPU $gpu_id] ERROR: Failed on $DS. Halting this queue."

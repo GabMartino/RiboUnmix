@@ -5,10 +5,10 @@ defaults:
   - _self_
 
 experiment:
-  from_checkpoint: True
-  train: False
+  from_checkpoint: False
+  train: True
   predict: True
-  dataset: ["grimson_2019", "eichhorn_2014"]
+  dataset: ["kutay_2021", "green_2020", "wangHEK_2022", "grimson_2019"]
   seed: 42
   split_size: 0.9
 
@@ -26,10 +26,10 @@ paths:
     datasets: "Datasets/encodings/dataset_encoding.yaml"
 
 data:
-  batch_size: 8
+  batch_size: 64
   num_workers: 4
   balanced_train_sampling: True
-  dataset_balance_gamma: 1.0
+  dataset_balance_gamma: .5
 
   dataset_aware_batching: True
   datasets_per_batch: 4
@@ -40,67 +40,74 @@ model:
     input_size: 97
     hidden_size: 256
     num_layers: 2
-    dropout: 0.1
+    dropout: 0.0
     w_temperature: 1.0
 
   dataset_bias_params:
-    dataset_shift_submodule_params:
-      num_datasets: 33
-      shifts: [-1, 0, 1]
-      temperature: 1.0
-      init_strength: 1
-      hard_eval: True
-      straight_through_train: False
+    position_features: [ "abs_pos", "rel_pos", "dist_to_stop", "dist_to_start"]
+    position_scale: 5000.0
+    num_datasets: 33
+    dataset_embeddings_size: 32
+    num_codons: 64
+    codon_embeddings_size: 32
+    num_filters: 32
+    kernel_size: 5
+
 
     dataset_multiplicative_bias_submodule_params:
-      num_datasets: 33
-      dataset_embeddings_size: 16
-      num_codons: 64
-      codon_embeddings_size: 16
       hidden_size: 128
       dropout: 0.0
+      log_b_max: 0.1
+
 
     dataset_additive_bias_submodule_params:
-      num_datasets: 33
-      dataset_embeddings_size: 16
-      num_codons: 64
-      codon_embeddings_size: 16
       hidden_size: 128
       dropout: 0.0
+      lambda_max: 1.0
+      lambda_init: 0.01
 
     dataset_dispersion_submodule_params:
-      num_datasets: 33
-      dataset_embeddings_size: 16
-      num_codons: 64
-      codon_embeddings_size: 16
       hidden_size: 128
       dropout: 0.0
-      phi_min: 0.02
+      phi_min: 0.01
       phi_max: 2.0
+
+    dataset_tweedie_power_params:
+      hidden_size: 128
+      dropout: 0.0
+      p_min: 1.1
+      p_max: 1.9
+      local_delta_max: 0.25
 
 loss:
   eps: 1.0e-8
   censor_threshold: 0.0
   zero_censor_to_zero: True
   include_log_phi: True
-  lambda_additive_l1: 0.05
+  lambda_mass_match: 0.0
+  lambda_bias_log_l2: 0.001
+  nll_soft_cap: 100
+  phi_reg_alpha: 1.0
 
 optim:
-  lr: 1.0e-3
+  lr: 5e-3
+
+  lr_biological: 1e-3
+  lr_rest: 1e-3
   weight_decay: 1.0e-8
 
   use_pcgrad: False
   pcgrad_biology_only: true
   pcgrad_every_n_steps: 4
-  pcgrad_alpha: 1.0
+  pcgrad_alpha: 0.3
   pcgrad_rescale_to_mean_norm: true
-  pcgrad_max_datasets_per_step: 2
+  pcgrad_max_datasets_per_step: 4
 
   scheduler:
     monitor: val_loss
     mode: min
     factor: 0.9
-    patience: 10
+    patience: 0
     min_lr: 1.0e-6
 
 trainer:
@@ -108,13 +115,13 @@ trainer:
   accelerator: gpu
   precision: 16-mixed
   accumulate_grad_batches: 1
-  max_epochs: 1
+  max_epochs: 200
   log_every_n_steps: 1
   gradient_clip_val: 1.0
   gradient_clip_algorithm: norm
 
 callbacks:
-  early_stopping_patience: 25
+  early_stopping_patience: 10
 
 predict:
   example_idx: 0

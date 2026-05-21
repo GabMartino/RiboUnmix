@@ -1,4 +1,5 @@
 import torch
+from entmax import entmax15
 from torch import nn
 from torch.nn.utils.rnn import pad_packed_sequence
 
@@ -29,8 +30,8 @@ class QueuingBiologicalModel(nn.Module):
             nn.Linear(feat_dim, feat_dim),
             nn.GELU(),
             nn.Dropout(p=self.dropout),
-            nn.Linear(feat_dim, feat_dim),
-            nn.GELU(),
+            #nn.Linear(feat_dim, feat_dim),
+            #nn.GELU(),
             nn.Linear(feat_dim, 1),
         )
 
@@ -38,8 +39,8 @@ class QueuingBiologicalModel(nn.Module):
             nn.Linear(h_dim, h_dim),
             nn.GELU(),
             nn.Dropout(p=self.dropout),
-            nn.Linear(h_dim, h_dim),
-            nn.GELU(),
+            #nn.Linear(h_dim, h_dim),
+            #nn.GELU(),
             nn.Linear(h_dim, 1),
             nn.Softplus(),
         )
@@ -58,19 +59,19 @@ class QueuingBiologicalModel(nn.Module):
 
         temperature = max(float(self.w_temperature), 1e-6)
 
-        w_prob = torch.softmax(w_logits / temperature, dim=1)
+        #w_prob = torch.softmax(w_logits / temperature, dim=1)
+        w_prob = entmax15(w_logits, dim=1)
         w_prob = w_prob * mask_f
 
         h_n_flat = h_n.permute(1, 0, 2).reshape(B, -1)
         J = self.ff_J_conditioned(h_n_flat).clamp(1e-6, 100.0)
 
-        safe_w_prob = w_prob.clamp_min(1e-10)
         L_seq = lengths.unsqueeze(1).to(dtype=x.dtype)
 
-        x_flux = J * L_seq * safe_w_prob
-        x_flux = x_flux.clamp_max(12.0)
+        x_flux = J * L_seq * w_prob
+        x_flux = x_flux.clamp_max(5.0)
 
-        L_queue = torch.expm1(x_flux) * mask_f
+        L_queue  = torch.expm1(x_flux) * mask_f
         rho_diagnostic = (1.0 - torch.exp(-x_flux)) * mask_f
 
         return L_queue, rho_diagnostic, w_prob, J
@@ -83,7 +84,6 @@ class QueuingBiologicalModel(nn.Module):
         device = out.device
         lengths = lengths.to(device)
         B, T, _ = out.shape
-        #x_padded, out, h_n, mask, mask_f, B, T, lengths = self.rnn_out(x_packed)
         arange = torch.arange(T, device=device)
         mask = arange[None, :] < lengths[:, None]
         mask_f = mask.to(dtype=out.dtype)

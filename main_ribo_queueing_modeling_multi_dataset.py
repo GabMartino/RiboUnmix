@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import os.path
 from pathlib import Path
 from typing import Any
 
@@ -30,11 +29,6 @@ from Utils.checkpoints import find_checkpoint
 from Utils.splits import conserved_stalling_sites_aware_split
 
 
-# ==========================================================
-# PyTorch 2.6 safe globals for older Hydra-containing ckpts.
-# Future ckpts should be cleaner because config is ignored in
-# LightningModule.save_hyperparameters().
-# ==========================================================
 safe_globals = [
     np.dtype,
     DictConfig,
@@ -100,21 +94,28 @@ def make_dataset_signature(datasets: list[str]) -> str:
     return f"{len(datasets)}_datasets_mix_{short_hash}"
 
 
+def make_run_tag(cfg: DictConfig) -> str:
+    return "PCGrad" if bool(cfg.optim.use_pcgrad) else "NOPCGrad"
+
+
 def load_weights_only(
     lit_model: pl.LightningModule,
     ckpt_path: str | Path,
 ) -> None:
     """
-    Loads model weights from a Lightning checkpoint saved with save_weights_only=True.
+    Loads only model weights.
 
-    This intentionally does NOT restore optimizer/scheduler state.
+    This is correct for checkpoints saved with:
+        save_weights_only=True
+
+    It intentionally does not restore optimizer/scheduler state.
     """
-    ckpt_path = str(ckpt_path)
+    ckpt_path = Path(ckpt_path)
 
     ckpt = torch.load(
-        ckpt_path,
+        str(ckpt_path),
         map_location="cpu",
-        weights_only=False,  # safe only for your own checkpoints
+        weights_only=False,
     )
 
     state_dict = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
@@ -124,23 +125,20 @@ def load_weights_only(
         strict=False,
     )
 
-    n_missing = len(incompatible.missing_keys)
-    n_unexpected = len(incompatible.unexpected_keys)
-
     print(f"Loaded weights from: {ckpt_path}")
 
-    if n_missing > 0:
-        print(f"Missing keys: {n_missing}")
+    if len(incompatible.missing_keys) > 0:
+        print(f"Missing keys: {len(incompatible.missing_keys)}")
 
-    if n_unexpected > 0:
-        print(f"Unexpected keys: {n_unexpected}")
+    if len(incompatible.unexpected_keys) > 0:
+        print(f"Unexpected keys: {len(incompatible.unexpected_keys)}")
 
 
 def choose_checkpoint(
     *,
     checkpoint_callback: ModelCheckpoint,
     ckpt_dir: Path,
-    paths_checkpoints: Path,
+    run_checkpoint_root: Path,
     prefer: str = "best",
 ) -> str | None:
     if checkpoint_callback.best_model_path:
@@ -151,7 +149,7 @@ def choose_checkpoint(
     if ckpt_found is not None:
         return str(ckpt_found)
 
-    ckpt_found = find_checkpoint(str(paths_checkpoints), prefer=prefer)
+    ckpt_found = find_checkpoint(str(run_checkpoint_root), prefer=prefer)
 
     if ckpt_found is not None:
         return str(ckpt_found)
@@ -320,6 +318,7 @@ def predictions_to_parquet(
 )
 def main(cfg: DictConfig) -> None:
     seed = int(cfg.experiment.seed)
+
     pl.seed_everything(seed, workers=True)
     torch.manual_seed(seed)
 
@@ -338,11 +337,19 @@ def main(cfg: DictConfig) -> None:
     )
 
     dataset_str = make_dataset_signature(datasets)
-    print(f"Tracking experiment under dataset signature: {dataset_str}")
+    run_tag = make_run_tag(cfg)
 
-    paths_logs = Path(cfg.paths.logs) / dataset_str
-    paths_results = Path(cfg.paths.results) / dataset_str
-    paths_checkpoints = Path(cfg.paths.checkpoints) / dataset_str
+    print(f"Tracking dataset signature: {dataset_str}")
+    print(f"Run tag: {run_tag}")
+
+    # Final layout:
+    #
+    # logs/riboai_queueing/<dataset_str>/<run_tag>/version_x
+    # checkpoints/riboai_queueing/<dataset_str>/<run_tag>/version_x
+    # results/riboai_queueing/<dataset_str>/<run_tag>/predictions_<dataset_str>.parquet
+    paths_logs = Path(cfg.paths.logs) / dataset_str / run_tag
+    paths_results = Path(cfg.paths.results) / dataset_str / run_tag
+    paths_checkpoints = Path(cfg.paths.checkpoints) / dataset_str / run_tag
 
     dataset_encoding = open_file(cfg.paths.encodings.datasets)
 
@@ -384,15 +391,18 @@ def main(cfg: DictConfig) -> None:
     )
 
     exp_name = Path(tb_logger.log_dir or tb_logger.save_dir).name
+
     ckpt_dir = paths_checkpoints / exp_name
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     monitor = str(cfg.optim.scheduler.monitor)
     metric_mode = str(cfg.optim.scheduler.mode)
 
+    filename = "{epoch}-{" + monitor + ":.4f}"
+
     checkpoint_callback = ModelCheckpoint(
         dirpath=str(ckpt_dir),
-        filename="{epoch}-{val_loss:.4f}",
+        filename=filename,
         save_top_k=1,
         save_last=True,
         save_weights_only=True,
@@ -408,21 +418,27 @@ def main(cfg: DictConfig) -> None:
 
     lr_monitor = LearningRateMonitor(logging_interval="epoch")
 
-    trainer = pl.Trainer(
-        accelerator=cfg.trainer.accelerator,
-        devices=cfg.trainer.devices,
-        precision=cfg.trainer.precision,
-        max_epochs=int(cfg.trainer.max_epochs),
-        logger=tb_logger,
-        log_every_n_steps=int(cfg.trainer.log_every_n_steps),
-        callbacks=[
+    trainer_kwargs = {
+        "accelerator": cfg.trainer.accelerator,
+        "devices": cfg.trainer.devices,
+        "precision": cfg.trainer.precision,
+        "max_epochs": int(cfg.trainer.max_epochs),
+        "logger": tb_logger,
+        "log_every_n_steps": int(cfg.trainer.log_every_n_steps),
+        "callbacks": [
             checkpoint_callback,
             early_stopping,
             lr_monitor,
         ],
-        gradient_clip_val=float(cfg.trainer.gradient_clip_val) if not cfg.optim.use_pcgrad else None,
-        gradient_clip_algorithm=str(cfg.trainer.gradient_clip_algorithm) if not cfg.optim.use_pcgrad else None,
-    )
+    }
+
+    # Automatic optimization can use Lightning clipping.
+    # PCGrad/manual optimization should clip inside the LightningModule.
+    if not bool(cfg.optim.use_pcgrad):
+        trainer_kwargs["gradient_clip_val"] = float(cfg.trainer.gradient_clip_val)
+        trainer_kwargs["gradient_clip_algorithm"] = str(cfg.trainer.gradient_clip_algorithm)
+
+    trainer = pl.Trainer(**trainer_kwargs)
 
     do_train = bool(cfg.experiment.train)
     do_predict = bool(cfg.experiment.predict)
@@ -432,10 +448,11 @@ def main(cfg: DictConfig) -> None:
 
     if from_checkpoint:
         prefer = "latest" if do_train else "best"
+
         selected_ckpt = choose_checkpoint(
             checkpoint_callback=checkpoint_callback,
             ckpt_dir=ckpt_dir,
-            paths_checkpoints=paths_checkpoints,
+            run_checkpoint_root=paths_checkpoints,
             prefer=prefer,
         )
 
@@ -466,13 +483,7 @@ def main(cfg: DictConfig) -> None:
     # Prediction
     # ------------------------------------------------------------
     if do_predict:
-        if not cfg.optim.use_pcgrad:
-            paths_results = os.path.join(paths_results, "NoPCGrad")
-        else:
-            paths_results = os.path.join(paths_results, "PCGrad")
-        out_dir = Path(paths_results)
-
-        out_dir.mkdir(parents=True, exist_ok=True)
+        paths_results.mkdir(parents=True, exist_ok=True)
 
         ckpt_to_use = checkpoint_callback.best_model_path or selected_ckpt
 
@@ -480,7 +491,7 @@ def main(cfg: DictConfig) -> None:
             ckpt_to_use = choose_checkpoint(
                 checkpoint_callback=checkpoint_callback,
                 ckpt_dir=ckpt_dir,
-                paths_checkpoints=paths_checkpoints,
+                run_checkpoint_root=paths_checkpoints,
                 prefer="best",
             )
 
@@ -505,15 +516,14 @@ def main(cfg: DictConfig) -> None:
 
         print("Processing and trimming padded predictions...")
 
-
-        out_file = os.path.join(out_dir, f"predictions_{dataset_str}.parquet")
+        out_file = paths_results / f"predictions_{dataset_str}.parquet"
 
         predictions_to_parquet(
             predictions=predictions,
             out_file=out_file,
         )
 
-        print("Prediction complete.")
+        print(f"Prediction complete: {out_file}")
 
 
 if __name__ == "__main__":
