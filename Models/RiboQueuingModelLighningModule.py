@@ -14,13 +14,6 @@ from Models.utils.PCGrad_utils import (
     pcgrad_combine,
     assign_flat_grads,
 )
-from Models.utils.advanced_metrics import (
-    masked_mae,
-    masked_auprc_peak_caller,
-    masked_1d_wasserstein,
-    physics_asymmetry_ratio,
-)
-from Models.utils.masked_pearson import MaskedPearsonCorrelation
 from Models.utils.ribo_lightning_helpers import flatten_current_grads
 from Models.utils.tweedie_deviance_loss import TweedieDevianceLoss
 
@@ -48,12 +41,10 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         self.use_pcgrad = bool(self._cfg("optim.use_pcgrad", False))
         self.automatic_optimization = not self.use_pcgrad
 
+        self.log_sync_dist = bool(self._cfg("trainer.sync_dist_logs", False))
+
         if self.use_pcgrad:
             print("Training is using PCGrad.")
-
-        self.masked_pcc = MaskedPearsonCorrelation(
-            eps=float(self._cfg("loss.eps", 1e-8)),
-        )
 
         self._val_plot_logged_this_epoch = False
 
@@ -79,6 +70,9 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
         return cur
 
+    def _dataset_name(self, ds_id: int) -> str:
+        return self.dataset_id_to_name.get(int(ds_id), f"dataset_{int(ds_id)}")
+
     # ============================================================
     # Loss helpers
     # ============================================================
@@ -100,7 +94,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 y_true=target.float(),
                 mask=mask.bool(),
                 return_per_sample=True,
-                phi_reg_alpha= self._cfg("loss.phi_reg_alpha", 1),
+                phi_reg_alpha=float(self._cfg("loss.phi_reg_alpha", 1.0)),
             )
 
     def _soft_cap_loss_per_sample(
@@ -123,10 +117,10 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         return cap * torch.log1p(loss_per_sample / cap)
 
     def _dataset_balanced_scalar_loss(
-        self,
-        *,
-        loss_per_sample: torch.Tensor,
-        dataset_ids: torch.Tensor,
+            self,
+            *,
+            loss_per_sample: torch.Tensor,
+            dataset_ids: torch.Tensor,
     ) -> torch.Tensor:
         dataset_losses = per_dataset_losses(
             loss_per_sample=loss_per_sample,
@@ -134,7 +128,24 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         )
 
         if len(dataset_losses) > 0:
-            return torch.stack(dataset_losses).mean()
+            stacked_losses = torch.stack(dataset_losses)
+
+            # 1. Calculate the target magnitude (detached so it doesn't absorb gradients)
+            # This is the average loss scale across the current batch.
+            target_magnitude = stacked_losses.detach().mean().clamp_min(1e-8)
+
+            # 2. Calculate a scale factor for each dataset
+            # If Kutay = 500 and Grimson = 10, target = 255.
+            # Kutay scale = 255/500 (0.51). Grimson scale = 255/10 (25.5).
+            scale_factors = target_magnitude / stacked_losses.detach().clamp_min(1e-8)
+
+            # 3. Apply the scale factors
+            # Now both datasets report a loss magnitude of 255 to the optimizer,
+            # meaning a 1% relative improvement in Grimson is valued exactly the same
+            # as a 1% improvement in Kutay.
+            balanced_losses = stacked_losses * scale_factors
+
+            return balanced_losses.mean()
 
         return loss_per_sample.mean()
 
@@ -157,22 +168,37 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         return (torch.log(pred_mass) - torch.log(target_mass)).pow(2)
 
     def bias_log_regularization(
-        self,
-        *,
-        extras: dict,
-        mask: torch.Tensor,
-        eps: float,
+            self,
+            *,
+            extras: dict,
+            mask: torch.Tensor,
+            eps: float,
     ) -> torch.Tensor:
         mask_b = mask.bool()
         regs = []
 
-        exp_b = extras.get("exp_b")
+        # 1. Multiplicative Bias (b) Penalty
+        # PREVENT THE TRAP: We use the 'control' signal (stored in log_b)
+        # so that exact zeros don't trigger a log(1e-8) explosion.
+        control = extras.get("control")
+
+        if control is not None:
+            regs.append((control[mask_b] ** 2).mean())
+        else:
+            # Fallback only for older heads that don't output the control signal
+            exp_b = self._get_b_multiplier(extras=extras, mask=mask)
+            if exp_b is not None:
+                log_exp_b = torch.log(exp_b.float().clamp_min(eps))
+                regs.append((log_exp_b[mask_b] ** 2).mean())
+
+        # 2. Additive Background (lambda_bg) Penalty
+        lambda_bg = extras.get("lambda_bg")
+        if lambda_bg is not None:
+            #regs.append((lambda_bg.float() ** 2).mean())
+            regs.append((lambda_bg.float().abs()).mean())
+
+        # Backward compatibility for old heads (if still used)
         beta = extras.get("beta_per_position")
-
-        if exp_b is not None:
-            log_exp_b = torch.log(exp_b.float().clamp_min(eps))
-            regs.append((log_exp_b[mask_b] ** 2).mean())
-
         if beta is not None:
             log_beta = torch.log(beta.float().clamp_min(eps))
             regs.append((log_beta[mask_b] ** 2).mean())
@@ -183,17 +209,15 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         return torch.stack(regs).sum()
 
     def _build_loss_terms(
-        self,
-        *,
-        mu: torch.Tensor,
-        p: torch.Tensor,
-        phi: torch.Tensor,
-        target: torch.Tensor,
-        mask: torch.Tensor,
-        extras: dict,
+            self,
+            *,
+            mu: torch.Tensor,
+            p: torch.Tensor,
+            phi: torch.Tensor,
+            target: torch.Tensor,
+            mask: torch.Tensor,
+            extras: dict,
     ) -> dict[str, torch.Tensor]:
-        eps = float(self._cfg("loss.eps", 1e-8))
-
         raw_nll_per_sample = self._compute_raw_nll_per_sample(
             mu=mu,
             p=p,
@@ -204,163 +228,612 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
         nll_per_sample = self._soft_cap_loss_per_sample(raw_nll_per_sample)
 
-        lambda_mass = float(self._cfg("loss.lambda_mass_match", 0.0))
-        lambda_bias = float(self._cfg("loss.lambda_bias_log_l2", 0.0))
+        # Apply Bias Regularization
+        reg_weight = float(self._cfg("loss.lambda_bias_log_l2", 0.0))
+        extra_loss = torch.zeros((), device=mu.device)
 
-        mass_loss_per_sample = self.mass_matching_loss(
-            mu=mu,
-            target=target,
-            mask=mask,
-            eps=eps,
-        )
-
-        loss_per_sample = nll_per_sample + lambda_mass * mass_loss_per_sample
-
-        bias_reg = self.bias_log_regularization(
-            extras=extras,
-            mask=mask,
-            eps=eps,
-        )
-
-        extra_loss = lambda_bias * bias_reg
+        if reg_weight > 0.0:
+            extra_loss = reg_weight * self.bias_log_regularization(
+                extras=extras,
+                mask=mask,
+                eps=float(self._cfg("loss.eps", 1e-8))
+            )
 
         return {
             "raw_nll_per_sample": raw_nll_per_sample,
             "nll_per_sample": nll_per_sample,
-            "mass_loss_per_sample": mass_loss_per_sample,
-            "loss_per_sample": loss_per_sample,
-            "bias_reg": bias_reg,
+            "loss_per_sample": nll_per_sample,
             "extra_loss": extra_loss,
         }
 
     # ============================================================
-    # Generic metric helpers
+    # Logging helpers
     # ============================================================
 
-    def _normalize_profile(
-        self,
-        x: torch.Tensor,
-        mask: torch.Tensor,
-        eps: float,
-    ) -> torch.Tensor:
-        mask_f = mask.bool().to(dtype=x.dtype)
-        x = x.float().clamp_min(0.0) * mask_f
-        mass = x.sum(dim=1, keepdim=True).clamp_min(eps)
-        return x / mass
+    def _finite_mean(self, x: torch.Tensor) -> torch.Tensor | None:
+        if x is None:
+            return None
 
-    def _masked_mae_scalar(
+        x = x.detach().float().reshape(-1)
+        finite = torch.isfinite(x)
+
+        if not finite.any():
+            return None
+
+        return x[finite].mean()
+
+    def _log_scalar(
         self,
+        name: str,
+        value: torch.Tensor | float,
+        *,
+        batch_size: int,
+        prog_bar: bool = False,
+    ) -> None:
+        if value is None:
+            return
+
+        if not torch.is_tensor(value):
+            value = torch.tensor(float(value), device=self.device)
+
+        value = value.detach().float()
+
+        if value.numel() != 1:
+            value = value.reshape(-1)
+            finite = torch.isfinite(value)
+
+            if not finite.any():
+                return
+
+            value = value[finite].mean()
+
+        if not torch.isfinite(value):
+            return
+
+        self.log(
+            name,
+            value,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=prog_bar,
+            logger=True,
+            batch_size=batch_size,
+            sync_dist=self.log_sync_dist,
+        )
+
+    def _masked_pcc_per_sample(
+        self,
+        *,
         pred: torch.Tensor,
         target: torch.Tensor,
         mask: torch.Tensor,
-    ) -> torch.Tensor:
-        mask_f = mask.bool().to(dtype=pred.dtype)
-        err = (pred.float() - target.float()).abs() * mask_f.float()
-        return err.sum() / mask_f.sum().clamp_min(1.0)
+    ) -> torch.Tensor | None:
+        if pred is None:
+            return None
 
-    def _log_basic_state(
+        if pred.shape != target.shape:
+            return None
+
+        eps = float(self._cfg("loss.eps", 1e-8))
+
+        mask_b = mask.bool()
+        mask_f = mask_b.float()
+
+        x = pred.detach().float()
+        y = target.detach().float()
+
+        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        y = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+
+        valid_count = mask_f.sum(dim=1).clamp_min(1.0)
+
+        x_mean = (x * mask_f).sum(dim=1) / valid_count
+        y_mean = (y * mask_f).sum(dim=1) / valid_count
+
+        x_centered = (x - x_mean.unsqueeze(1)) * mask_f
+        y_centered = (y - y_mean.unsqueeze(1)) * mask_f
+
+        cov = (x_centered * y_centered).sum(dim=1)
+
+        x_var = (x_centered ** 2).sum(dim=1)
+        y_var = (y_centered ** 2).sum(dim=1)
+
+        denom = torch.sqrt(x_var * y_var).clamp_min(eps)
+        pcc = cov / denom
+
+        valid = (mask_f.sum(dim=1) >= 2) & torch.isfinite(pcc)
+        pcc = torch.where(valid, pcc, torch.nan)
+
+        return pcc
+
+    def _log_vector_global_and_by_dataset(
         self,
         *,
         stage: str,
-        mu: torch.Tensor,
-        p: torch.Tensor,
-        phi: torch.Tensor,
-        extras: dict,
+        name: str,
+        values: torch.Tensor,
+        dataset_ids: torch.Tensor,
+        batch_size: int,
+        log_global: bool = True,
+        log_by_dataset: bool = True,
+        prog_bar: bool = False,
+    ) -> None:
+        values = values.detach().float()
+
+        if log_global:
+            mean_value = self._finite_mean(values)
+
+            if mean_value is not None:
+                self._log_scalar(
+                    f"{stage}_{name}",
+                    mean_value,
+                    batch_size=batch_size,
+                    prog_bar=prog_bar,
+                )
+
+        if not log_by_dataset:
+            return
+
+        for ds_id in torch.unique(dataset_ids).detach().cpu().tolist():
+            ds_id = int(ds_id)
+            ds_mask = dataset_ids == ds_id
+            ds_count = int(ds_mask.sum().detach().cpu().item())
+
+            if ds_count == 0:
+                continue
+
+            ds_mean = self._finite_mean(values[ds_mask])
+
+            if ds_mean is None:
+                continue
+
+            self._log_scalar(
+                f"{stage}_{name}_by_dataset/{self._dataset_name(ds_id)}",
+                ds_mean,
+                batch_size=ds_count,
+            )
+
+    def _log_pcc_by_dataset(
+        self,
+        *,
+        stage: str,
+        name: str,
+        pred: torch.Tensor,
+        target: torch.Tensor,
         mask: torch.Tensor,
+        dataset_ids: torch.Tensor,
+        batch_size: int,
+        log_global: bool = True,
+        prog_bar: bool = False,
+    ) -> None:
+        pcc_per_sample = self._masked_pcc_per_sample(
+            pred=pred,
+            target=target,
+            mask=mask,
+        )
+
+        if pcc_per_sample is None:
+            return
+
+        self._log_vector_global_and_by_dataset(
+            stage=stage,
+            name=f"{name}_pcc",
+            values=pcc_per_sample,
+            dataset_ids=dataset_ids,
+            batch_size=batch_size,
+            log_global=log_global,
+            log_by_dataset=(stage == "val"),
+            prog_bar=prog_bar,
+        )
+
+    def _log_p_diagnostics(
+        self,
+        *,
+        stage: str,
+        p: torch.Tensor,
+        mask: torch.Tensor,
+        dataset_ids: torch.Tensor,
         batch_size: int,
     ) -> None:
         mask_b = mask.bool()
+        mask_f = mask_b.float()
 
         with torch.no_grad():
-            self.log(
-                f"{stage}_tweedie_p",
-                p.detach().float().mean(),
-                on_step=False,
-                on_epoch=True,
-                logger=True,
-                batch_size=batch_size,
-            )
+            if p.ndim == 2 and p.shape == mask.shape:
+                p_valid = p.detach().float()[mask_b]
 
-            self.log(
-                f"{stage}_phi_mean",
-                phi.detach().float()[mask_b].mean(),
-                on_step=False,
-                on_epoch=True,
-                logger=True,
-                batch_size=batch_size,
-            )
+                p_per_sample = (
+                    (p.detach().float() * mask_f).sum(dim=1)
+                    / mask_f.sum(dim=1).clamp_min(1.0)
+                )
+            else:
+                p_flat = p.detach().float().reshape(p.shape[0], -1)
+                p_per_sample = p_flat.mean(dim=1)
+                p_valid = p_per_sample
 
-            self.log(
-                f"{stage}_mu_mean",
-                mu.detach().float()[mask_b].mean(),
-                on_step=False,
-                on_epoch=True,
-                logger=True,
-                batch_size=batch_size,
-            )
+            p_mean = self._finite_mean(p_valid)
 
-            exp_b = extras.get("exp_b")
-            beta = extras.get("beta_per_position")
-
-            if exp_b is not None:
-                log_exp_b = torch.log(exp_b.detach().float().clamp_min(1e-8))
-                self.log(
-                    f"{stage}_exp_b_abs_log_mean",
-                    log_exp_b[mask_b].abs().mean(),
-                    on_step=False,
-                    on_epoch=True,
-                    logger=True,
+            if p_mean is not None:
+                self._log_scalar(
+                    f"{stage}_tweedie_p",
+                    p_mean,
                     batch_size=batch_size,
                 )
 
-            if beta is not None:
-                log_beta = torch.log(beta.detach().float().clamp_min(1e-8))
-                self.log(
-                    f"{stage}_beta_abs_log_mean",
-                    log_beta[mask_b].abs().mean(),
-                    on_step=False,
-                    on_epoch=True,
-                    logger=True,
+            if stage == "val":
+                self._log_vector_global_and_by_dataset(
+                    stage=stage,
+                    name="tweedie_p",
+                    values=p_per_sample,
+                    dataset_ids=dataset_ids,
                     batch_size=batch_size,
+                    log_global=False,
+                    log_by_dataset=True,
                 )
 
-    def _log_nll_diagnostics(
+    # ============================================================
+    # Component helpers
+    # ============================================================
+
+    def _safe_component(self, extras: dict, *keys: str) -> torch.Tensor | None:
+        for key in keys:
+            value = extras.get(key)
+
+            if value is not None:
+                return value
+
+        return None
+
+    def _get_b_multiplier(
         self,
         *,
-        stage: str,
-        raw_nll_per_sample: torch.Tensor,
-        nll_per_sample: torch.Tensor,
+        extras: dict,
+        mask: torch.Tensor,
+    ) -> torch.Tensor | None:
+        b = self._safe_component(extras, "exp_b", "b_multiplier")
+
+        if b is not None:
+            return b
+
+        log_b = extras.get("log_b")
+
+        if log_b is not None:
+            return torch.exp(log_b)
+
+        # Ambiguous fallback: some older versions used "b".
+        # If it is strictly positive, treat as multiplier.
+        # Otherwise, treat as log-bias.
+        b_raw = extras.get("b")
+
+        if b_raw is None:
+            return None
+
+        mask_b = mask.bool()
+
+        with torch.no_grad():
+            valid = b_raw.detach().float()[mask_b]
+            finite = valid[torch.isfinite(valid)]
+
+            if finite.numel() == 0:
+                return None
+
+            looks_positive_multiplier = bool((finite > 0).all().item())
+
+        if looks_positive_multiplier:
+            return b_raw
+
+        return torch.exp(b_raw)
+
+    def _make_bio_only_mu(
+        self,
+        *,
+        extras: dict,
+        target: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor | None:
+        mask_b = mask.bool()
+        mask_f = mask_b.to(dtype=target.dtype)
+
+        bio_q = extras.get("bio_q")
+
+        if bio_q is None:
+            L_queue = extras.get("L_queue")
+            b = self._get_b_multiplier(extras=extras, mask=mask_b)
+
+            if L_queue is None or b is None:
+                return None
+
+            bio_q = L_queue.detach().float().clamp_min(0.0) * b.detach().float().clamp_min(0.0)
+
+        total_mass = extras.get("total_mass")
+
+        if total_mass is None:
+            total_mass = (
+                target.float().clamp_min(0.0) * mask_f.float()
+            ).sum(dim=1, keepdim=True).detach()
+        else:
+            total_mass = total_mass.detach().float()
+
+            if total_mass.ndim == 1:
+                total_mass = total_mass.reshape(-1, 1)
+
+        eps = float(self._cfg("loss.eps", 1e-8))
+
+        bio_q = bio_q.detach().float().clamp_min(0.0) * mask_f.float()
+        bio_mass = bio_q.sum(dim=1, keepdim=True).clamp_min(eps)
+
+        mu_bio_only = total_mass * bio_q / bio_mass
+        mu_bio_only = mu_bio_only * mask_f.float()
+
+        return mu_bio_only
+
+    # ============================================================
+    # Main validation diagnostics
+    # ============================================================
+
+    def _log_core_validation_metrics(
+        self,
+        *,
+        target: torch.Tensor,
+        mask: torch.Tensor,
+        dataset_ids: torch.Tensor,
+        mu: torch.Tensor,
+        extras: dict,
         batch_size: int,
     ) -> None:
-        with torch.no_grad():
-            raw_nll = raw_nll_per_sample.detach().float()
-            nll = nll_per_sample.detach().float()
+        L_queue = extras.get("L_queue")
 
-            self.log(
-                f"{stage}_raw_nll_mean",
-                raw_nll.mean(),
-                on_step=False,
-                on_epoch=True,
-                logger=True,
+        if L_queue is not None:
+            self._log_pcc_by_dataset(
+                stage="val",
+                name="L_queue",
+                pred=L_queue,
+                target=target,
+                mask=mask,
+                dataset_ids=dataset_ids,
                 batch_size=batch_size,
+                log_global=True,
+                prog_bar=True,
             )
 
-            self.log(
-                f"{stage}_raw_nll_p99",
-                torch.quantile(raw_nll, 0.99),
-                on_step=False,
-                on_epoch=True,
-                logger=True,
+        self._log_pcc_by_dataset(
+            stage="val",
+            name="mu",
+            pred=mu,
+            target=target,
+            mask=mask,
+            dataset_ids=dataset_ids,
+            batch_size=batch_size,
+            log_global=True,
+            prog_bar=True,
+        )
+
+    def _log_bias_leakage_diagnostics(
+        self,
+        *,
+        target: torch.Tensor,
+        mask: torch.Tensor,
+        dataset_ids: torch.Tensor,
+        mu: torch.Tensor,
+        extras: dict,
+        batch_size: int,
+    ) -> None:
+        mask_b = mask.bool()
+        mask_f = mask_b.float()
+
+        b = self._get_b_multiplier(extras=extras, mask=mask_b)
+        R_shape = extras.get("R_shape")
+        additive_noise = extras.get("additive_noise")
+        L_queue = extras.get("L_queue")
+        bio_q = extras.get("bio_q")
+        lambda_bg = extras.get("lambda_bg")
+
+        # ------------------------------------------------------------
+        # Leakage: does b itself track y?
+        # ------------------------------------------------------------
+        if b is not None:
+            self._log_pcc_by_dataset(
+                stage="val",
+                name="b_vs_y",
+                pred=b,
+                target=target,
+                mask=mask_b,
+                dataset_ids=dataset_ids,
                 batch_size=batch_size,
+                log_global=True,
             )
 
-            self.log(
-                f"{stage}_nll_mean",
-                nll.mean(),
-                on_step=False,
-                on_epoch=True,
-                logger=True,
+        # ------------------------------------------------------------
+        # Leakage: does R itself track y?
+        # ------------------------------------------------------------
+        if R_shape is not None:
+            self._log_pcc_by_dataset(
+                stage="val",
+                name="R_shape_vs_y",
+                pred=R_shape,
+                target=target,
+                mask=mask_b,
+                dataset_ids=dataset_ids,
                 batch_size=batch_size,
+                log_global=True,
+            )
+
+        if additive_noise is not None:
+            self._log_pcc_by_dataset(
+                stage="val",
+                name="additive_noise_vs_y",
+                pred=additive_noise,
+                target=target,
+                mask=mask_b,
+                dataset_ids=dataset_ids,
+                batch_size=batch_size,
+                log_global=True,
+            )
+
+        # ------------------------------------------------------------
+        # Bio-only mu vs full mu
+        # ------------------------------------------------------------
+        mu_bio_only = self._make_bio_only_mu(
+            extras=extras,
+            target=target,
+            mask=mask_b,
+        )
+
+        if mu_bio_only is not None:
+            self._log_pcc_by_dataset(
+                stage="val",
+                name="mu_bio_only",
+                pred=mu_bio_only,
+                target=target,
+                mask=mask_b,
+                dataset_ids=dataset_ids,
+                batch_size=batch_size,
+                log_global=True,
+            )
+
+            mu_pcc = self._masked_pcc_per_sample(
+                pred=mu,
+                target=target,
+                mask=mask_b,
+            )
+
+            bio_pcc = self._masked_pcc_per_sample(
+                pred=mu_bio_only,
+                target=target,
+                mask=mask_b,
+            )
+
+            if mu_pcc is not None and bio_pcc is not None:
+                delta = mu_pcc - bio_pcc
+
+                self._log_vector_global_and_by_dataset(
+                    stage="val",
+                    name="mu_full_minus_bio_only_pcc",
+                    values=delta,
+                    dataset_ids=dataset_ids,
+                    batch_size=batch_size,
+                    log_global=True,
+                    log_by_dataset=True,
+                )
+
+        # ------------------------------------------------------------
+        # b/R alignment with L_queue
+        # ------------------------------------------------------------
+        if L_queue is not None and b is not None:
+            self._log_pcc_by_dataset(
+                stage="val",
+                name="b_vs_L_queue",
+                pred=b,
+                target=L_queue,
+                mask=mask_b,
+                dataset_ids=dataset_ids,
+                batch_size=batch_size,
+                log_global=True,
+            )
+
+        if L_queue is not None and R_shape is not None:
+            self._log_pcc_by_dataset(
+                stage="val",
+                name="R_shape_vs_L_queue",
+                pred=R_shape,
+                target=L_queue,
+                mask=mask_b,
+                dataset_ids=dataset_ids,
+                batch_size=batch_size,
+                log_global=True,
+            )
+
+        # ------------------------------------------------------------
+        # Background fraction
+        # ------------------------------------------------------------
+        if bio_q is None and L_queue is not None and b is not None:
+            bio_q = L_queue.detach().float().clamp_min(0.0) * b.detach().float().clamp_min(0.0)
+
+        if bio_q is not None and additive_noise is not None:
+            bio_mass = (
+                bio_q.detach().float().clamp_min(0.0) * mask_f
+            ).sum(dim=1)
+
+            bg_mass = (
+                additive_noise.detach().float().clamp_min(0.0) * mask_f
+            ).sum(dim=1)
+
+            eps = float(self._cfg("loss.eps", 1e-8))
+            bg_frac = bg_mass / (bio_mass + bg_mass).clamp_min(eps)
+
+            self._log_vector_global_and_by_dataset(
+                stage="val",
+                name="bg_frac",
+                values=bg_frac,
+                dataset_ids=dataset_ids,
+                batch_size=batch_size,
+                log_global=True,
+                log_by_dataset=True,
+            )
+
+        # ------------------------------------------------------------
+        # R support fraction. Useful especially if R uses entmax/sparsemax.
+        # ------------------------------------------------------------
+        if R_shape is not None:
+            eps_support = float(self._cfg("metrics.R_support_eps", 1e-8))
+
+            R_support_frac = (
+                ((R_shape.detach().float() > eps_support) & mask_b).float().sum(dim=1)
+                / mask_f.sum(dim=1).clamp_min(1.0)
+            )
+
+            self._log_vector_global_and_by_dataset(
+                stage="val",
+                name="R_support_frac",
+                values=R_support_frac,
+                dataset_ids=dataset_ids,
+                batch_size=batch_size,
+                log_global=True,
+                log_by_dataset=True,
+            )
+
+        # ------------------------------------------------------------
+        # b strength
+        # ------------------------------------------------------------
+        log_b = extras.get("log_b")
+
+        if log_b is None and b is not None:
+            log_b = torch.log(b.detach().float().clamp_min(float(self._cfg("loss.eps", 1e-8))))
+
+        if log_b is not None:
+            b_abs_log_mean = (
+                log_b.detach().float().abs() * mask_f
+            ).sum(dim=1) / mask_f.sum(dim=1).clamp_min(1.0)
+
+            self._log_vector_global_and_by_dataset(
+                stage="val",
+                name="b_abs_log_mean",
+                values=b_abs_log_mean,
+                dataset_ids=dataset_ids,
+                batch_size=batch_size,
+                log_global=True,
+                log_by_dataset=True,
+            )
+
+        # ------------------------------------------------------------
+        # Lambda
+        # ------------------------------------------------------------
+        if lambda_bg is not None:
+            lambda_bg = lambda_bg.detach().float()
+
+            if lambda_bg.ndim > 1:
+                lambda_per_sample = lambda_bg.reshape(lambda_bg.shape[0], -1).mean(dim=1)
+            else:
+                lambda_per_sample = lambda_bg.reshape(-1)
+
+            self._log_vector_global_and_by_dataset(
+                stage="val",
+                name="lambda_bg",
+                values=lambda_per_sample,
+                dataset_ids=dataset_ids,
+                batch_size=batch_size,
+                log_global=True,
+                log_by_dataset=True,
             )
 
     # ============================================================
@@ -388,7 +861,10 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
         if arr.dtype == torch.bool:
             arr_b = arr[:L]
-            return [int(i) for i in torch.nonzero(arr_b, as_tuple=False).reshape(-1).tolist()]
+            return [
+                int(i)
+                for i in torch.nonzero(arr_b, as_tuple=False).reshape(-1).tolist()
+            ]
 
         arr_f = arr.float()
         arr_f = arr_f[torch.isfinite(arr_f)]
@@ -445,7 +921,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         x = torch.where(finite, x, torch.full_like(x, -float("inf")))
 
         ordered = torch.argsort(x, descending=True).tolist()
-
         selected: list[int] = []
 
         for idx in ordered:
@@ -478,167 +953,151 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
         return hits
 
-
-    def _log_profile_diagnostics(
-            self,
-            *,
-            stage: str,
-            target: torch.Tensor,
-            mask: torch.Tensor,
-            css: list,
-            dataset_ids: torch.Tensor,
-            mu: torch.Tensor,
-            L_queue: torch.Tensor,
-            batch_size: int,
-    ) -> None:
-        dataset_ids = dataset_ids.detach()
-        mask_b = mask.bool()
-        mask_f = mask.float()
-
-        # We only care about tracking the final observation (mu) and pure biology (L_queue)
-        components_to_track = {"mu": mu.detach(), "L_queue": L_queue.detach()}
-
-        with torch.no_grad():
-            # 1. Global PCC
-            for name, comp in components_to_track.items():
-                pcc_per_sample = self.masked_pcc(pred=comp, target=target, mask=mask_b)
-                self.log(
-                    f"{stage}_{name}_pcc",
-                    pcc_per_sample.mean(),
-                    on_step=False, on_epoch=True, logger=True, batch_size=batch_size,
-                )
-
-            # 2. Core Observation Metrics (Only on mu)
-            self.log(f"{stage}_mu_eval_MAE", masked_mae(components_to_track["mu"], target, mask_f),
-                     on_epoch=True, logger=True, batch_size=batch_size)
-
-            # 3. Per-Dataset PCC (Only track PCC per dataset to avoid massive metric bloat)
-            unique_ids = torch.unique(dataset_ids).cpu().tolist()
-            for ds_id in unique_ids:
-                ds_id = int(ds_id)
-                dataset_name = self.dataset_id_to_name.get(ds_id, f"dataset_{ds_id}")
-                ds_mask = dataset_ids == ds_id
-                ds_count = int(ds_mask.sum().item())
-
-                if ds_count == 0: continue
-
-                for name, comp in components_to_track.items():
-                    pcc_per_sample = self.masked_pcc(pred=comp, target=target, mask=mask_b)
-                    self.log(
-                        f"{stage}_{name}_pcc_by_dataset/{dataset_name}",
-                        pcc_per_sample[ds_mask].mean(),
-                        on_epoch=True, logger=True, batch_size=ds_count,
-                    )
-
-    # ============================================================
-    # CSS recall helpers (CLEANED)
-    # ============================================================
-
     def _log_css_recall_diagnostics(
-            self,
-            *,
-            stage: str,
-            target: torch.Tensor,
-            mask: torch.Tensor,
-            css: list,
-            dataset_ids: torch.Tensor,
-            mu: torch.Tensor,
-            L_queue: torch.Tensor,
-            batch_size: int,
+        self,
+        *,
+        target: torch.Tensor,
+        mask: torch.Tensor,
+        css: list,
+        mu: torch.Tensor,
+        L_queue: torch.Tensor | None,
+        batch_size: int,
     ) -> None:
-        if css is None: return
+        if css is None or L_queue is None:
+            return
 
         tolerance = int(self._cfg("metrics.css_recall_tolerance", 1))
         nms_radius = int(self._cfg("metrics.css_peak_nms_radius", tolerance))
         device = target.device
         mask_b = mask.bool()
 
-        # Track only target, mu, and L_queue
-        recalls = {"target": [], "mu": [], "L_queue": []}
-        components = {"mu": mu, "L_queue": L_queue}
+        recalls = {"mu": [], "L_queue": []}
+        components = {
+            "mu": mu,
+            "L_queue": L_queue,
+        }
 
         with torch.no_grad():
             B = int(target.shape[0])
+
             for i in range(B):
                 mask_i = mask_b[i].cpu()
                 L = int(mask_i.sum().item())
-                if L < 2: continue
+
+                if L < 2:
+                    continue
 
                 css_i = css[i] if i < len(css) else None
                 css_positions = self._normalize_css_positions(css_i, L)
-                if not css_positions: continue
+
+                if not css_positions:
+                    continue
 
                 k = self._peak_budget(L)
-                y_valid = target[i].float().cpu()[mask_i]
+                y_valid = target[i].detach().float().cpu()[mask_i]
 
-                # Target Baseline
-                y_peaks = self._topk_peak_positions_1d(y_valid, k=k, nms_radius=nms_radius)
-                y_supported_css = [c for c in css_positions if any(abs(c - yp) <= tolerance for yp in y_peaks)]
-                recalls["target"].append(float(len(y_supported_css)) / max(len(css_positions), 1))
+                y_peaks = self._topk_peak_positions_1d(
+                    y_valid,
+                    k=k,
+                    nms_radius=nms_radius,
+                )
 
-                if not y_supported_css: continue
+                y_supported_css = [
+                    c
+                    for c in css_positions
+                    if any(abs(c - yp) <= tolerance for yp in y_peaks)
+                ]
 
-                # Model Predictions
+                if not y_supported_css:
+                    continue
+
                 for name, comp in components.items():
-                    comp_valid = comp[i].float().cpu()[mask_i]
-                    pred_peaks = self._topk_peak_positions_1d(comp_valid, k=k, nms_radius=nms_radius)
-                    hits = self._positions_hit_count(reference_positions=y_supported_css,
-                                                     predicted_positions=pred_peaks, tolerance=tolerance)
+                    comp_valid = comp[i].detach().float().cpu()[mask_i]
+
+                    pred_peaks = self._topk_peak_positions_1d(
+                        comp_valid,
+                        k=k,
+                        nms_radius=nms_radius,
+                    )
+
+                    hits = self._positions_hit_count(
+                        reference_positions=y_supported_css,
+                        predicted_positions=pred_peaks,
+                        tolerance=tolerance,
+                    )
+
                     recalls[name].append(float(hits) / max(len(y_supported_css), 1))
 
-            # Log global averages only
             for name, vals in recalls.items():
                 if vals:
-                    self.log(f"{stage}_{name}_css_recall", torch.tensor(vals, device=device).mean(),
-                             on_epoch=True, logger=True, batch_size=batch_size)
+                    self._log_scalar(
+                        f"val_{name}_css_recall",
+                        torch.tensor(vals, device=device).mean(),
+                        batch_size=batch_size,
+                        prog_bar=(name == "L_queue"),
+                    )
 
     # ============================================================
-    # Shift diagnostics (CLEANED)
+    # Example plot
     # ============================================================
-
-    def _log_shift_diagnostics(
-            self,
-            *,
-            stage: str,
-            dataset_ids: torch.Tensor,
-            extras: dict,
-    ) -> None:
-        shift_weights_soft = extras.get("shift_weights_soft")
-        if shift_weights_soft is None or not hasattr(self.model, "dataset_bias_model"): return
-
-        shift_head = self.model.dataset_bias_model.dataset_shift_head
-        shifts = torch.tensor(shift_head.shifts, device=shift_weights_soft.device, dtype=shift_weights_soft.dtype)
-
-        expected_shift = (shift_weights_soft * shifts.reshape(1, -1)).sum(dim=1)
-
-        # Removed the loop that logs every single shift weight value (massive bloat)
-        for ds_id in torch.unique(dataset_ids).cpu().tolist():
-            ds_mask = dataset_ids == int(ds_id)
-            ds_count = int(ds_mask.sum().item())
-            if ds_count == 0: continue
-
-            dataset_name = self.dataset_id_to_name.get(int(ds_id), f"dataset_{int(ds_id)}")
-            self.log(
-                f"{stage}_expected_shift_by_dataset/{dataset_name}",
-                expected_shift[ds_mask].mean(),
-                on_epoch=True, logger=True, batch_size=ds_count,
-            )
 
     def on_validation_epoch_start(self):
         self._val_plot_logged_this_epoch = False
 
-    def _log_example_profile_plot(
+    def _seq_to_np_for_plot(
         self,
+        x: torch.Tensor | None,
         *,
-        ids: list,
-        dataset_ids: torch.Tensor,
-        target: torch.Tensor,
-        mu: torch.Tensor,
-        phi: torch.Tensor,
-        p: torch.Tensor,
-        mask: torch.Tensor,
-        extras: dict,
-        batch_idx: int,
+        sample_idx: int,
+        mask_i: torch.Tensor,
+        L: int,
+    ):
+        if x is None:
+            return None
+
+        if not torch.is_tensor(x):
+            return None
+
+        x = x.detach().float().cpu()
+
+        if x.ndim == 0:
+            return torch.full((L,), float(x.item())).numpy()
+
+        if x.ndim == 1:
+            if x.shape[0] == L:
+                return x[:L].numpy()
+
+            if x.shape[0] > sample_idx:
+                return torch.full((L,), float(x[sample_idx].item())).numpy()
+
+            return None
+
+        if x.ndim == 2:
+            if x.shape[0] <= sample_idx:
+                return None
+
+            if x.shape[1] == 1:
+                return torch.full((L,), float(x[sample_idx, 0].item())).numpy()
+
+            return x[sample_idx][mask_i].numpy()
+
+        if x.ndim >= 3:
+            return None
+
+        return None
+
+    def _log_example_profile_plot(
+            self,
+            *,
+            ids: list,
+            dataset_ids: torch.Tensor,
+            target: torch.Tensor,
+            mu: torch.Tensor,
+            phi: torch.Tensor,
+            p: torch.Tensor,
+            mask: torch.Tensor,
+            extras: dict,
+            batch_idx: int,
     ) -> None:
         if self._val_plot_logged_this_epoch:
             return
@@ -653,122 +1112,141 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             return
 
         experiment = getattr(self.logger, "experiment", None)
-
         if experiment is None:
             return
 
-        sample_idx = int(self._cfg("predict.example_idx", 0))
         B = int(target.shape[0])
-        sample_idx = max(0, min(sample_idx, B - 1))
-
-        mask_i = mask[sample_idx].detach().bool().cpu()
-        L = int(mask_i.sum().item())
-
-        if L < 2:
+        if B < 2:
             return
 
-        def seq_to_np(x):
-            if x is None:
-                return None
-            return x[sample_idx].detach().float().cpu()[mask_i].numpy()
+        # -------------------------------------------------------------------
+        # INTELLECTUAL SPARRING: THE "APPLES TO APPLES" SCANNER
+        # To truly see dataset bias adaptation, we must find the exact SAME
+        # transcript appearing in TWO DIFFERENT datasets within this batch.
+        # -------------------------------------------------------------------
+        idx1 = 0
+        idx2 = 1
+        found_perfect_match = False
 
-        y_np = seq_to_np(target)
-        mu_np = seq_to_np(mu)
-        phi_np = seq_to_np(phi)
+        for i in range(B):
+            for j in range(i + 1, B):
+                if ids[i] == ids[j] and dataset_ids[i] != dataset_ids[j]:
+                    idx1 = i
+                    idx2 = j
+                    found_perfect_match = True
+                    break
+            if found_perfect_match:
+                break
 
-        L_queue_np = seq_to_np(extras.get("L_queue"))
-        L_effective_np = seq_to_np(extras.get("L_effective"))
-        L_shape_np = seq_to_np(extras.get("L_shape"))
+        # Fallback: If no perfect match exists, just grab two different datasets
+        if not found_perfect_match:
+            for i in range(1, B):
+                if dataset_ids[i] != dataset_ids[0]:
+                    idx2 = i
+                    break
 
-        mu_base_np = seq_to_np(extras.get("mu_base"))
-        corrected_shape_np = seq_to_np(extras.get("corrected_shape"))
-        exp_b_np = seq_to_np(extras.get("exp_b"))
-        beta_np = seq_to_np(extras.get("beta_per_position"))
-        b_np = seq_to_np(extras.get("b"))
+        indices_to_plot = [idx1, idx2]
 
-        x = torch.arange(L).cpu().numpy()
+        b_multiplier = self._get_b_multiplier(extras=extras, mask=mask)
+        mu_bio_only = self._make_bio_only_mu(extras=extras, target=target, mask=mask)
 
-        dataset_id = int(dataset_ids[sample_idx].detach().cpu().item())
-        dataset_name = self.dataset_id_to_name.get(dataset_id, f"dataset_{dataset_id}")
-        transcript_id = ids[sample_idx]
-
+        # Create a 4x2 grid. Share the X-axis per column so zooming remains locked per transcript.
         fig, axes = plt.subplots(
-            4,
-            1,
-            figsize=(16, 11),
-            sharex=True,
-            gridspec_kw={"height_ratios": [1.4, 1.0, 1.0, 1.0]},
+            4, 2, figsize=(24, 11), sharex="col", gridspec_kw={"height_ratios": [1.4, 1.0, 1.0, 1.0]}
         )
 
-        p_value = float(p.detach().float().mean().cpu())
+        for col, sample_idx in enumerate(indices_to_plot):
+            mask_i = mask[sample_idx].detach().bool().cpu()
+            L = int(mask_i.sum().item())
 
-        fig.suptitle(
-            f"Validation profile diagnostic | dataset={dataset_name} | "
-            f"transcript={transcript_id} | L={L} | Tweedie p={p_value:.4f}",
-            fontsize=12,
-        )
+            if L < 2:
+                continue
 
-        axes[0].plot(x, y_np, label="target y", linewidth=1.0)
-        axes[0].plot(x, mu_np, label="mu", linewidth=1.0)
+            y_np = self._seq_to_np_for_plot(target, sample_idx=sample_idx, mask_i=mask_i, L=L)
+            mu_np = self._seq_to_np_for_plot(mu, sample_idx=sample_idx, mask_i=mask_i, L=L)
+            mu_bio_only_np = self._seq_to_np_for_plot(mu_bio_only, sample_idx=sample_idx, mask_i=mask_i, L=L)
 
-        if mu_base_np is not None:
-            axes[0].plot(x, mu_base_np, label="mu_base", linewidth=1.0)
+            L_queue_np = self._seq_to_np_for_plot(extras.get("L_queue"), sample_idx=sample_idx, mask_i=mask_i, L=L)
+            bio_q_np = self._seq_to_np_for_plot(extras.get("bio_q"), sample_idx=sample_idx, mask_i=mask_i, L=L)
 
-        axes[0].set_title("Observed target vs predicted mean")
-        axes[0].set_ylabel("profile")
-        axes[0].grid(True, alpha=0.3)
-        axes[0].legend(loc="upper right")
+            additive_noise_np = self._seq_to_np_for_plot(extras.get("additive_noise"), sample_idx=sample_idx,
+                                                         mask_i=mask_i, L=L)
+            R_shape_np = self._seq_to_np_for_plot(extras.get("R_shape"), sample_idx=sample_idx, mask_i=mask_i, L=L)
 
-        if L_queue_np is not None:
-            axes[1].plot(x, L_queue_np, label="L_queue", linewidth=1.0)
+            exp_b_np = self._seq_to_np_for_plot(b_multiplier, sample_idx=sample_idx, mask_i=mask_i, L=L)
+            log_b_np = self._seq_to_np_for_plot(extras.get("log_b"), sample_idx=sample_idx, mask_i=mask_i, L=L)
 
-        if L_effective_np is not None:
-            axes[1].plot(x, L_effective_np, label="L_effective", linewidth=1.0)
+            phi_np = self._seq_to_np_for_plot(phi, sample_idx=sample_idx, mask_i=mask_i, L=L)
+            p_np = self._seq_to_np_for_plot(p, sample_idx=sample_idx, mask_i=mask_i, L=L)
 
-        if L_shape_np is not None:
-            axes[1].plot(x, L_shape_np, label="L_shape", linewidth=1.0)
+            x_axis = torch.arange(L).cpu().numpy()
 
-        axes[1].set_title("Biological branch")
-        axes[1].set_ylabel("biology")
-        axes[1].grid(True, alpha=0.3)
-        axes[1].legend(loc="upper right")
+            dataset_id = int(dataset_ids[sample_idx].detach().cpu().item())
+            dataset_name = self._dataset_name(dataset_id)
+            transcript_id = ids[sample_idx]
 
-        if corrected_shape_np is not None:
-            axes[2].plot(x, corrected_shape_np, label="corrected_shape", linewidth=1.0)
+            # Safe mean calculation regardless of Tweedie tensor shape
+            p_val_tensor = p[sample_idx] if p.ndim > 1 else p
+            p_value = float(p_val_tensor.detach().float().mean().cpu())
 
-        if exp_b_np is not None:
-            ax2 = axes[2].twinx()
-            ax2.plot(x, exp_b_np, label="exp_b", linewidth=0.8, linestyle="--")
-            ax2.set_ylabel("exp_b")
-            ax2.legend(loc="upper left")
+            # Title flags if this is an apples-to-apples comparison
+            match_status = "PERFECT MATCH" if found_perfect_match else "MISMATCHED TRANSCRIPT"
+            axes[0, col].set_title(
+                f"[{match_status}]\nDataset: {dataset_name} | ID: {transcript_id} | L={L} | p={p_value:.4f}")
 
-        axes[2].set_title("Shape correction")
-        axes[2].set_ylabel("shape")
-        axes[2].grid(True, alpha=0.3)
-        axes[2].legend(loc="upper right")
+            if y_np is not None:
+                axes[0, col].plot(x_axis, y_np, label="target y", linewidth=1.0)
+            if mu_np is not None:
+                axes[0, col].plot(x_axis, mu_np, label="mu full", linewidth=1.0)
+            if mu_bio_only_np is not None:
+                axes[0, col].plot(x_axis, mu_bio_only_np, label="mu bio-only", linewidth=1.0)
 
-        if phi_np is not None:
-            axes[3].plot(x, phi_np, label="phi", linewidth=0.8)
+            if col == 0: axes[0, col].set_ylabel("profile")
+            axes[0, col].grid(True, alpha=0.3)
+            axes[0, col].legend(loc="upper right")
 
-        if beta_np is not None:
-            ax3 = axes[3].twinx()
-            ax3.plot(x, beta_np, label="beta", linewidth=0.8, linestyle="--")
-            ax3.set_ylabel("beta")
-            ax3.legend(loc="upper left")
+            if L_queue_np is not None:
+                axes[1, col].plot(x_axis, L_queue_np, label="L_queue", linewidth=1.0)
+            if bio_q_np is not None:
+                axes[1, col].plot(x_axis, bio_q_np, label="bio_q = L*b", linewidth=1.0)
 
-        if b_np is not None:
-            axes[3].plot(x, b_np, label="b", linewidth=0.8)
+            if col == 0: axes[1, col].set_ylabel("biology")
+            axes[1, col].grid(True, alpha=0.3)
+            axes[1, col].legend(loc="upper right")
 
-        axes[3].set_title("Dispersion and residual multipliers")
-        axes[3].set_ylabel("value")
-        axes[3].set_xlabel("codon position")
-        axes[3].grid(True, alpha=0.3)
-        axes[3].legend(loc="upper right")
+            if R_shape_np is not None:
+                axes[2, col].plot(x_axis, R_shape_np, label="R_shape", linewidth=1.0)
+            if additive_noise_np is not None:
+                axes[2, col].plot(x_axis, additive_noise_np, label="additive_noise", linewidth=1.0)
 
-        fig.tight_layout(rect=(0, 0, 1, 0.94))
+            if exp_b_np is not None:
+                ax2 = axes[2, col].twinx()
+                ax2.plot(x_axis, exp_b_np, label="exp_b", linewidth=0.8, linestyle="--", color='purple', alpha=0.7)
+                if col == 1: ax2.set_ylabel("exp_b")
+                ax2.legend(loc="upper left")
 
-        tag = "val/example_profile"
+            if col == 0: axes[2, col].set_ylabel("residual")
+            axes[2, col].grid(True, alpha=0.3)
+            axes[2, col].legend(loc="upper right")
 
+            if phi_np is not None:
+                axes[3, col].plot(x_axis, phi_np, label="phi", linewidth=0.8)
+            if p_np is not None:
+                ax3 = axes[3, col].twinx()
+                ax3.plot(x_axis, p_np, label="Tweedie p", linewidth=0.8, linestyle="--", color='purple', alpha=0.7)
+                if col == 1: ax3.set_ylabel("p")
+                ax3.legend(loc="upper left")
+            if log_b_np is not None:
+                axes[3, col].plot(x_axis, log_b_np, label="log_b", linewidth=0.8)
+
+            if col == 0: axes[3, col].set_ylabel("value")
+            axes[3, col].set_xlabel("codon position")
+            axes[3, col].grid(True, alpha=0.3)
+            axes[3, col].legend(loc="upper right")
+
+        fig.tight_layout()
+
+        tag = "val/example_profile_comparison"
         if hasattr(experiment, "add_figure"):
             experiment.add_figure(tag, fig, global_step=self.global_step)
         elif hasattr(experiment, "log_figure"):
@@ -783,11 +1261,11 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
     # ============================================================
 
     def pcgrad_optimize(
-            self,
-            *,
-            loss_per_sample: torch.Tensor,
-            dataset_ids: torch.Tensor,
-            extra_loss: torch.Tensor | None = None,
+        self,
+        *,
+        loss_per_sample: torch.Tensor,
+        dataset_ids: torch.Tensor,
+        extra_loss: torch.Tensor | None = None,
     ) -> torch.Tensor:
         opt = self.optimizers()
         opt.zero_grad(set_to_none=True)
@@ -809,10 +1287,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         else:
             scalar_loss = loss_per_sample.mean()
 
-        if extra_loss is not None:
-            full_loss = scalar_loss + extra_loss
-        else:
-            full_loss = scalar_loss
+        full_loss = scalar_loss + extra_loss if extra_loss is not None else scalar_loss
 
         if len(dataset_losses) <= 1 or len(biological_model_params) == 0:
             self.manual_backward(full_loss)
@@ -849,24 +1324,13 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         raw_grads = torch.stack(raw_flat_dataset_grads, dim=0)
         unit_grads = torch.stack(unit_flat_dataset_grads, dim=0)
 
-        # ------------------------------------------------------------
-        # PCGrad direction is computed on unit-normalized dataset grads.
-        # This removes dataset dominance due only to gradient magnitude.
-        # ------------------------------------------------------------
         pcgrad_flat = pcgrad_combine(unit_flat_dataset_grads).detach()
-
         mean_unit_grad = unit_grads.mean(dim=0)
 
         alpha = float(self._cfg("optim.pcgrad_alpha", 1.0))
 
-        pcgrad_flat = (
-                alpha * pcgrad_flat
-                + (1.0 - alpha) * mean_unit_grad
-        )
+        pcgrad_flat = alpha * pcgrad_flat + (1.0 - alpha) * mean_unit_grad
 
-        # ------------------------------------------------------------
-        # Rescale final direction to the average original dataset-grad norm.
-        # ------------------------------------------------------------
         if bool(self._cfg("optim.pcgrad_rescale_to_mean_norm", True)):
             target_norm = raw_grads.norm(dim=1).mean().clamp_min(1e-12)
             pcgrad_norm = pcgrad_flat.norm().clamp_min(1e-12)
@@ -874,20 +1338,20 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
         opt.zero_grad(set_to_none=True)
 
-        # Normal gradients for all parameters.
         self.manual_backward(full_loss)
 
-        # Replace only biological-model gradients with normalized-PCGrad result.
         assign_flat_grads(
             params=biological_model_params,
-            flat_grad=pcgrad_flat,
+            flat_grad=pcgrad_flat.detach(),
         )
+
         del raw_flat_dataset_grads
         del unit_flat_dataset_grads
         del raw_grads
         del unit_grads
         del pcgrad_flat
         del mean_unit_grad
+
         return scalar_loss.detach()
 
     # ============================================================
@@ -916,7 +1380,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         return {
             "dataset_ids": ids_datasets_sorted,
             "ids": ids_sorted,
-            "seq_packed": seq_packed,
             "target": prof_pad,
             "lengths": lengths_sorted,
             "mask": mask_pad,
@@ -930,7 +1393,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         out = self._forward_batch(batch)
-
         batch_size = int(out["target"].shape[0])
 
         loss_terms = self._build_loss_terms(
@@ -949,69 +1411,20 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
         loss = scalar_loss + loss_terms["extra_loss"]
 
-        self.log(
+        self._log_scalar(
             "train_loss",
-            loss.detach(),
-            on_step=False,
-            on_epoch=True,
+            loss,
+            batch_size=batch_size,
             prog_bar=True,
-            logger=True,
-            batch_size=batch_size,
         )
 
-        self.log(
-            "train_raw_nll",
-            loss_terms["raw_nll_per_sample"].mean().detach(),
-            on_step=False,
-            on_epoch=True,
-            logger=True,
+        self._log_p_diagnostics(
+            stage="train",
+            p=out["p"],
+            mask=out["mask"],
+            dataset_ids=out["dataset_ids"],
             batch_size=batch_size,
         )
-
-        self.log(
-            "train_nll",
-            loss_terms["nll_per_sample"].mean().detach(),
-            on_step=False,
-            on_epoch=True,
-            logger=True,
-            batch_size=batch_size,
-        )
-
-        self.log(
-            "train_mass_match_loss",
-            loss_terms["mass_loss_per_sample"].mean().detach(),
-            on_step=False,
-            on_epoch=True,
-            logger=True,
-            batch_size=batch_size,
-        )
-
-        self.log(
-            "train_bias_log_l2",
-            loss_terms["bias_reg"].detach(),
-            on_step=False,
-            on_epoch=True,
-            logger=True,
-            batch_size=batch_size,
-        )
-
-        if batch_idx == 0:
-            self._log_basic_state(
-                stage="train",
-                mu=out["mu"],
-                p=out["p"],
-                phi=out["phi"],
-                extras=out["extras"],
-                mask=out["mask"],
-                batch_size=batch_size,
-            )
-
-            self._log_nll_diagnostics(
-                stage="train",
-                raw_nll_per_sample=loss_terms["raw_nll_per_sample"],
-                nll_per_sample=loss_terms["nll_per_sample"],
-                batch_size=batch_size,
-            )
 
         if not self.use_pcgrad:
             return loss
@@ -1019,11 +1432,21 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         opt = self.optimizers()
         opt.zero_grad(set_to_none=True)
 
-        pcgrad_loss = self.pcgrad_optimize(
-            loss_per_sample=loss_terms["loss_per_sample"],
-            dataset_ids=out["dataset_ids"],
-            extra_loss=loss_terms["extra_loss"],
+        pcgrad_every_n_steps = int(self._cfg("optim.pcgrad_every_n_steps", 1))
+        use_pcgrad_this_step = (
+            pcgrad_every_n_steps <= 1
+            or self.global_step % pcgrad_every_n_steps == 0
         )
+
+        if use_pcgrad_this_step:
+            step_loss = self.pcgrad_optimize(
+                loss_per_sample=loss_terms["loss_per_sample"],
+                dataset_ids=out["dataset_ids"],
+                extra_loss=loss_terms["extra_loss"],
+            )
+        else:
+            self.manual_backward(loss)
+            step_loss = scalar_loss.detach()
 
         grad_clip_val = float(self._cfg("trainer.gradient_clip_val", 0.0))
 
@@ -1037,11 +1460,10 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         opt.step()
         opt.zero_grad(set_to_none=True)
 
-        return pcgrad_loss.detach()
+        return step_loss.detach()
 
     def validation_step(self, batch, batch_idx):
         out = self._forward_batch(batch)
-
         batch_size = int(out["target"].shape[0])
 
         loss_terms = self._build_loss_terms(
@@ -1053,71 +1475,55 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             extras=out["extras"],
         )
 
-        loss_sample_mean = loss_terms["loss_per_sample"].mean()
-
-        loss_dataset_balanced = self._dataset_balanced_scalar_loss(
+        val_loss = self._dataset_balanced_scalar_loss(
             loss_per_sample=loss_terms["loss_per_sample"],
             dataset_ids=out["dataset_ids"],
         )
 
-        loss_dataset_balanced = loss_dataset_balanced + loss_terms["extra_loss"]
+        val_loss = val_loss + loss_terms["extra_loss"]
 
-        components = {
-            "mu": out["mu"],
-            "mu_base": out["extras"].get("mu_base"),
-            "L_queue": out["extras"].get("L_queue"),
-            "L_effective": out["extras"].get("L_effective"),
-            "L_shape": out["extras"].get("L_shape"),
-            "base_shape": out["extras"].get("base_shape"),
-            "corrected_shape": out["extras"].get("corrected_shape"),
-        }
+        self._log_scalar(
+            "val_loss",
+            val_loss,
+            batch_size=batch_size,
+            prog_bar=True,
+        )
 
-        self._log_basic_state(
+        self._log_p_diagnostics(
             stage="val",
-            mu=out["mu"],
             p=out["p"],
-            phi=out["phi"],
-            extras=out["extras"],
             mask=out["mask"],
-            batch_size=batch_size,
-        )
-
-        self._log_nll_diagnostics(
-            stage="val",
-            raw_nll_per_sample=loss_terms["raw_nll_per_sample"],
-            nll_per_sample=loss_terms["nll_per_sample"],
-            batch_size=batch_size,
-        )
-
-        self._log_shift_diagnostics(
-            stage="val",
             dataset_ids=out["dataset_ids"],
-            extras=out["extras"],
+            batch_size=batch_size,
         )
 
-        # Replace the old dictionary and method calls with this:
-
-        self._log_profile_diagnostics(
-            stage="val",
+        self._log_core_validation_metrics(
             target=out["target"],
             mask=out["mask"],
-            css=out["css"],
             dataset_ids=out["dataset_ids"],
             mu=out["mu"],
-            L_queue=out["extras"].get("L_queue"),
+            extras=out["extras"],
             batch_size=batch_size,
         )
 
         self._log_css_recall_diagnostics(
-            stage="val",
             target=out["target"],
             mask=out["mask"],
             css=out["css"],
-            dataset_ids=out["dataset_ids"],
             mu=out["mu"],
             L_queue=out["extras"].get("L_queue"),
             batch_size=batch_size,
         )
+
+        self._log_bias_leakage_diagnostics(
+            target=out["target"],
+            mask=out["mask"],
+            dataset_ids=out["dataset_ids"],
+            mu=out["mu"],
+            extras=out["extras"],
+            batch_size=batch_size,
+        )
+
         self._log_example_profile_plot(
             ids=out["ids"],
             dataset_ids=out["dataset_ids"],
@@ -1130,62 +1536,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             batch_idx=batch_idx,
         )
 
-        self.log(
-            "val_loss",
-            loss_dataset_balanced.detach(),
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-            batch_size=batch_size,
-        )
-
-        self.log(
-            "val_loss_sample_mean",
-            loss_sample_mean.detach(),
-            on_step=False,
-            on_epoch=True,
-            logger=True,
-            batch_size=batch_size,
-        )
-
-        self.log(
-            "val_raw_nll",
-            loss_terms["raw_nll_per_sample"].mean().detach(),
-            on_step=False,
-            on_epoch=True,
-            logger=True,
-            batch_size=batch_size,
-        )
-
-        self.log(
-            "val_nll",
-            loss_terms["nll_per_sample"].mean().detach(),
-            on_step=False,
-            on_epoch=True,
-            logger=True,
-            batch_size=batch_size,
-        )
-
-        self.log(
-            "val_mass_match_loss",
-            loss_terms["mass_loss_per_sample"].mean().detach(),
-            on_step=False,
-            on_epoch=True,
-            logger=True,
-            batch_size=batch_size,
-        )
-
-        self.log(
-            "val_bias_log_l2",
-            loss_terms["bias_reg"].detach(),
-            on_step=False,
-            on_epoch=True,
-            logger=True,
-            batch_size=batch_size,
-        )
-
-        return loss_dataset_balanced
+        return val_loss
 
     def on_validation_epoch_end(self):
         if not self.use_pcgrad:
@@ -1215,8 +1566,10 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         def to_cpu(x):
             if torch.is_tensor(x):
                 return x.detach().cpu()
+
             if isinstance(x, (list, tuple)):
                 return [to_cpu(v) for v in x]
+
             return x
 
         output = {
@@ -1263,18 +1616,25 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             else:
                 rest_params.append(param)
 
-        param_groups = [
-            {
-                "params": biological_params,
-                "lr": bio_lr,
-                "weight_decay": weight_decay,
-            },
-            {
-                "params": rest_params,
-                "lr": rest_lr,
-                "weight_decay": weight_decay,
-            },
-        ]
+        param_groups = []
+
+        if biological_params:
+            param_groups.append(
+                {
+                    "params": biological_params,
+                    "lr": bio_lr,
+                    "weight_decay": weight_decay,
+                }
+            )
+
+        if rest_params:
+            param_groups.append(
+                {
+                    "params": rest_params,
+                    "lr": rest_lr,
+                    "weight_decay": weight_decay,
+                }
+            )
 
         opt = torch.optim.AdamW(param_groups)
 

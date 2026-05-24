@@ -8,18 +8,16 @@ class DatasetMultiplicativeBiasHead(nn.Module):
     """
     Dataset/protocol multiplicative correction head.
 
-    Produces a bounded log-space multiplier:
+    Produces a bounded multiplier that supports exact zeros.
 
-        beta_i = f(x_i)
-        beta_centered_i = beta_i - mean_valid(beta)
-        log_b_i = log_b_max * tanh(beta_centered_i / tanh_temperature)
-        b_i = exp(log_b_i)
+    Let c_i = log_b_max * tanh(beta_centered_i / tanh_temperature)
 
-    Therefore:
+    To allow massive spikes but also exact zeros, we use a C1-continuous piecewise activation:
+        If c_i >= 0: b_i = exp(c_i)         # Range: [1, exp(log_b_max)]
+        If c_i <  0: b_i = ReLU(1.0 + c_i)  # Range: [0, 1)
 
-        b_i in [exp(-log_b_max), exp(log_b_max)]
-
-    Neutral initialization gives b_i = 1.
+    b_i = 0 is achieved exactly when c_i <= -1.
+    Neutral initialization (c_i = 0) gives b_i = 1.
     """
 
     def __init__(self, config_params: dict, input_size: int) -> None:
@@ -27,7 +25,7 @@ class DatasetMultiplicativeBiasHead(nn.Module):
 
         self.hidden_size = int(config_params["hidden_size"])
         self.dropout = float(config_params.get("dropout", 0.0))
-        self.log_b_max = float(config_params.get("log_b_max", 0.1))
+        self.log_b_max = float(config_params.get("log_b_max", 5.0))
         self.tanh_temperature = float(config_params.get("tanh_temperature", 3.0))
 
         self.bias_ff = nn.Sequential(
@@ -43,9 +41,9 @@ class DatasetMultiplicativeBiasHead(nn.Module):
         nn.init.zeros_(self.bias_ff[-1].weight)
 
     def forward(
-        self,
-        x: torch.Tensor,
-        mask: torch.Tensor,
+            self,
+            x: torch.Tensor,
+            mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         mask_b = mask.bool()
         mask_f = mask_b.to(dtype=x.dtype)
@@ -60,12 +58,19 @@ class DatasetMultiplicativeBiasHead(nn.Module):
         beta_mean = beta.sum(dim=1, keepdim=True) / valid_lengths
         beta_centered = (beta - beta_mean) * mask_f
 
-        log_b = self.log_b_max * torch.tanh(
+        # 1. Calculate the bounded control signal
+        control = self.log_b_max * torch.tanh(
             beta_centered / self.tanh_temperature
         )
-        log_b = log_b * mask_f
+        control = control * mask_f
 
-        b = torch.exp(log_b)
+        # 2. Apply C1-continuous piecewise mapping
+        b_pos = torch.exp(control)  # Exponential growth for spikes
+        b_neg = torch.relu(1.0 + control)  # Linear decay to exact zero
+
+        b = torch.where(control >= 0.0, b_pos, b_neg)
         b = torch.where(mask_b, b, torch.ones_like(b))
 
-        return b, log_b, beta_centered
+        # We return 'control' as the second argument instead of actual log(b).
+        # See the critical warning below.
+        return b, control, beta_centered
