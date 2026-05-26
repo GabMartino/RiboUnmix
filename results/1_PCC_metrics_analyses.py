@@ -353,7 +353,7 @@ def main():
     individual_run_name = "NOPCGrad"
     mixed_run_names = ["NOPCGrad", "PCGrad"]
 
-    mixed_dataset_signature = "33_datasets_mix_6e5e33"
+    mixed_dataset_signature = "30_datasets_mix_3546d4"
     dataset_encoding_path = Path("../Datasets/encodings/dataset_encoding.yaml")
 
     components = [

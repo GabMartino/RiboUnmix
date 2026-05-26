@@ -541,7 +541,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             collate_fn=self.train_dataset_obj.collate_fn,
             persistent_workers=(self.num_workers > 0),
             worker_init_fn=self.worker_init_fn,
-            pin_memory=False,
+            pin_memory=True,
         )
 
     def val_dataloader(self):

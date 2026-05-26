@@ -59,8 +59,8 @@ class QueuingBiologicalModel(nn.Module):
 
         temperature = max(float(self.w_temperature), 1e-6)
 
-        #w_prob = torch.softmax(w_logits / temperature, dim=1)
-        w_prob = entmax15(w_logits, dim=1)
+        w_prob = torch.softmax(w_logits / temperature, dim=1)
+        #w_prob = entmax15(w_logits, dim=1)
         w_prob = w_prob * mask_f
 
         h_n_flat = h_n.permute(1, 0, 2).reshape(B, -1)

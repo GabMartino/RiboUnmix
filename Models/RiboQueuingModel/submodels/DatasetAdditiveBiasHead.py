@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import entmax
 import torch
 import torch.nn as nn
 from entmax import entmax15
@@ -8,35 +7,42 @@ from entmax import entmax15
 
 class DatasetAdditiveBiasHead(nn.Module):
     """
-    Dataset/protocol additive background head.
+    Dataset/protocol additive relative-background head.
 
-    This is NOT multiplicative.
+    This head does NOT directly output final additive support.
 
     It predicts:
 
-        R_i = T * softmax(r_i)
+        R_i = T * entmax/softmax(r_i)
 
     so:
 
         mean_valid(R) = 1
 
-    and a non-negative transcript-level amplitude:
+    and a non-negative transcript-level relative amplitude:
 
-        lambda_bg = lambda_max * sigmoid(lambda_raw)
+        lambda_frac = lambda_max * sigmoid(lambda_raw)
 
-    The additive observation support is:
+    The returned relative additive shape is:
 
-        additive_noise_i = lambda_bg * R_i
+        additive_rel_i = lambda_frac * R_i
 
-    Intended usage:
+    Intended usage in the full model:
 
-        bio_q = L_queue * b
-        q     = bio_q + additive_noise
-        mu    = total_mass * q / sum(q)
+        bio_q_smooth_i = L_i * b_i
 
-    Neutral-ish initialization:
-        R is uniform.
-        lambda_bg starts small.
+        bio_mean = mean_valid(bio_q_smooth).detach()
+
+        additive_noise_i = additive_rel_i * bio_mean
+
+        q_i = keep_gate_i * (bio_q_smooth_i + additive_noise_i)
+
+    Therefore lambda_frac is interpretable as an approximate additive/background
+    fraction relative to the biological support scale.
+
+    Example:
+        lambda_frac = 0.05 means additive support is roughly 5% of the
+        mean biological support per valid position.
     """
 
     def __init__(self, config_params: dict, input_size: int):
@@ -45,8 +51,11 @@ class DatasetAdditiveBiasHead(nn.Module):
         self.hidden_size = int(config_params["hidden_size"])
         self.dropout = float(config_params.get("dropout", 0.0))
 
-        self.lambda_max = float(config_params.get("lambda_max", 1.0))
-        self.lambda_init = float(config_params.get("lambda_init", 0.01))
+        # Now interpreted as maximum relative amplitude, not absolute support.
+        self.lambda_max = float(config_params.get("lambda_max", 0.05))
+        self.lambda_init = float(config_params.get("lambda_init", 0.001))
+
+        self.use_entmax = bool(config_params.get("use_entmax", True))
 
         self.r_ff = nn.Sequential(
             nn.Linear(input_size, self.hidden_size),
@@ -69,11 +78,11 @@ class DatasetAdditiveBiasHead(nn.Module):
         )
 
         # R uniform at initialization:
-        # r_logits = 0 -> softmax uniform -> R_i = 1 over valid positions.
+        # r_logits = 0 -> uniform -> R_i = 1 over valid positions.
         nn.init.zeros_(self.r_ff[-1].weight)
         nn.init.zeros_(self.r_ff[-1].bias)
 
-        # lambda starts small.
+        # lambda_frac starts small.
         nn.init.zeros_(self.lambda_ff[-1].weight)
 
         init_frac = self.lambda_init / max(self.lambda_max, 1e-8)
@@ -92,16 +101,19 @@ class DatasetAdditiveBiasHead(nn.Module):
         x = x * mask_f.unsqueeze(-1)
 
         B, T, _ = x.shape
-
         valid_lengths = mask_f.sum(dim=1, keepdim=True).clamp_min(1.0)
 
         # ------------------------------------------------------------
-        # 1. Background shape R
+        # 1. Relative background shape R
         # ------------------------------------------------------------
         r_logits = self.r_ff(x).squeeze(-1)
         r_logits = r_logits.masked_fill(~mask_b, -torch.inf)
 
-        r_prob = entmax15(r_logits, dim=1)
+        if self.use_entmax:
+            r_prob = entmax15(r_logits, dim=1)
+        else:
+            r_prob = torch.softmax(r_logits, dim=1)
+
         r_prob = r_prob * mask_f
 
         # Mean-one background shape.
@@ -109,15 +121,16 @@ class DatasetAdditiveBiasHead(nn.Module):
         R_shape = R_shape * mask_f
 
         # ------------------------------------------------------------
-        # 2. Background amplitude lambda
+        # 2. Relative amplitude lambda_frac
         # ------------------------------------------------------------
         pooled_x = (x * mask_f.unsqueeze(-1)).sum(dim=1) / valid_lengths
 
         lambda_raw = self.lambda_ff(pooled_x).squeeze(-1)
-        lambda_bg = self.lambda_max * torch.sigmoid(lambda_raw)
-        lambda_bg = lambda_bg.reshape(B, 1)
+        lambda_frac = self.lambda_max * torch.sigmoid(lambda_raw)
+        lambda_frac = lambda_frac.reshape(B, 1)
 
-        additive_noise = lambda_bg * R_shape
-        additive_noise = additive_noise * mask_f
+        # Dimensionless relative additive shape.
+        additive_rel = lambda_frac * R_shape
+        additive_rel = additive_rel * mask_f
 
-        return additive_noise, R_shape, lambda_bg, r_logits, lambda_raw
+        return additive_rel, R_shape, lambda_frac, r_logits, lambda_raw

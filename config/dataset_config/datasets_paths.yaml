@@ -1,14 +1,14 @@
 
 _name_: ribo_only
-
+## commented out the shifted dataset for now
 dataset_path:
   green_2020: "Datasets/data/filtered_datasets_ribo_only_with_css/green_2020.parquet"
-  eichhorn_2014: "Datasets/data/filtered_datasets_ribo_only_with_css/eichhorn_2014.parquet"
-  ingolia_2014: "Datasets/data/filtered_datasets_ribo_only_with_css/ingolia_2014.parquet"
+  #eichhorn_2014: "Datasets/data/filtered_datasets_ribo_only_with_css/eichhorn_2014.parquet"
+  #ingolia_2014: "Datasets/data/filtered_datasets_ribo_only_with_css/ingolia_2014.parquet"
   kulakovskiy_2024: "Datasets/data/filtered_datasets_ribo_only_with_css/kulakovskiy_2024.parquet"
   kutay_2021: "Datasets/data/filtered_datasets_ribo_only_with_css/kutay_2021.parquet"
   sauer_2019: "Datasets/data/filtered_datasets_ribo_only_with_css/sauer_2019.parquet"
-  tsvetanova_2025: "Datasets/data/filtered_datasets_ribo_only_with_css/tsvetanova_2025.parquet"
+  #tsvetanova_2025: "Datasets/data/filtered_datasets_ribo_only_with_css/tsvetanova_2025.parquet"
   wakigawa_2025: "Datasets/data/filtered_datasets_ribo_only_with_css/wakigawa_2025.parquet"
   wan_2019: "Datasets/data/filtered_datasets_ribo_only_with_css/wan_2019.parquet"
   wang_2016: "Datasets/data/filtered_datasets_ribo_only_with_css/wang_2016.parquet"
