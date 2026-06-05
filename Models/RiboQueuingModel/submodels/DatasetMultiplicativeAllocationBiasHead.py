@@ -1,92 +1,22 @@
 from __future__ import annotations
 
-import math
-
 import torch
-import torch.nn.functional as F
 from torch import nn
-
-
-def inv_softplus(x: float) -> float:
-    """
-    Numerically stable inverse softplus.
-
-    Returns y such that:
-
-        softplus(y) = x
-
-    Requires x > 0.
-    """
-    x = float(x)
-
-    if x <= 0.0:
-        raise ValueError(f"inv_softplus requires x > 0, got {x}.")
-
-    if x > 20.0:
-        return x
-
-    return math.log(math.expm1(x))
-
-
-def logit(p: float) -> float:
-    """
-    Numerically stable scalar logit.
-    """
-    p = float(p)
-    p = min(max(p, 1.0e-6), 1.0 - 1.0e-6)
-    return math.log(p / (1.0 - p))
 
 
 class DatasetMultiplicativeAllocationBiasHead(nn.Module):
     """
-    Dataset/protocol multiplicative allocation-bias head.
+    Anchor-free continuous dataset visibility head.
 
-    Single-score gated-amplitude formulation.
+    Despite the legacy class name, this no longer owns dropout/gating. It only
+    predicts a bounded log visibility correction per position. The outer model
+    applies the identifiability gauge by centering this correction under the
+    biological profile before forming:
 
-    It predicts one scalar score per position:
+        p_visible_i proportional to p_bio_i * exp(log_visibility_bias_i)
 
-        beta_i = f_d(x_i)
-
-    Then:
-
-        amp_i = amp_min + softplus(beta_i)
-
-        keep_prob_i = sigmoid((beta_i - gate_cutoff) / gate_temperature)
-
-        keep_gate_i =
-            keep_prob_i                         if soft/continuous
-            hard 0/1 with straight-through       if hard_forward=True during training
-            hard 0/1                             if hard_eval=True during eval
-
-        b_raw_i = keep_gate_i * amp_i
-
-    The outer model should normalize:
-
-        b_eff_i = b_raw_i / sum_j w_bio_j b_raw_j
-
-        w_obs_i = w_bio_i * b_eff_i
-
-    Therefore:
-
-        sum_i w_obs_i = 1
-
-    Why this version is cleaner than two independent heads:
-        - low beta means low amplitude and low keep probability
-        - high beta means high amplitude and high keep probability
-        - the gate is a thresholded amplitude score, not an independent
-          second multiplicative branch
-        - exact zeros remain possible when keep_gate is hard 0
-
-    Neutral initialization:
-        beta_0 is chosen so that:
-
-            amp = 1
-
-        gate_cutoff is chosen so that:
-
-            keep_prob = init_keep_prob
-
-        at beta = beta_0.
+    Separating visibility from dropout keeps dataset zeros out of the shared
+    biological queueing support.
     """
 
     def __init__(
@@ -96,92 +26,15 @@ class DatasetMultiplicativeAllocationBiasHead(nn.Module):
     ) -> None:
         super().__init__()
 
+        config_params = dict(config_params or {})
+
         self.hidden_size = int(config_params.get("hidden_size", 128))
         self.dropout = float(config_params.get("dropout", 0.0))
+        self.log_bias_max = float(config_params.get("log_bias_max", 3.0))
 
-        # ------------------------------------------------------------
-        # Amplitude transform
-        # ------------------------------------------------------------
-        # amp = amp_min + softplus(beta)
-        #
-        # Use amp_min self.hidden_size = int(config_params.get("hidden_size", 128))
-        self.dropout = float(config_params.get("dropout", 0.0))
+        if self.log_bias_max <= 0.0:
+            raise ValueError(f"log_bias_max must be > 0, got {self.log_bias_max}.")
 
-        # ------------------------------------------------------------
-        # Am=0.0 for maximum multiplicative capacity.
-        # Use amp_min>0 only if you explicitly want the hard gate to be the
-        # only mechanism capable of reaching exact/near-zero visibility.
-        self.amp_min = float(config_params.get("amp_min", 0.0))
-        self.amp_max = float(config_params.get("amp_max", 20.0))
-        self.amp_eps = float(config_params.get("amp_eps", 1.0e-8))
-
-        if not (0.0 <= self.amp_min < 1.0):
-            raise ValueError(
-                f"amp_min must be in [0, 1) so neutral amp=1 is possible. "
-                f"Got amp_min={self.amp_min}."
-            )
-
-        if self.amp_max > 0.0 and self.amp_max < 1.0:
-            raise ValueError(
-                f"amp_max must be >= 1 if enabled, otherwise neutral amp=1 "
-                f"would be clipped. Got amp_max={self.amp_max}."
-            )
-
-        if self.amp_eps <= 0.0:
-            raise ValueError(f"amp_eps must be > 0. Got {self.amp_eps}.")
-
-        # Neutral beta gives amp = 1:
-        #
-        #   amp_min + softplus(beta_0) = 1
-        #
-        self.beta_neutral = inv_softplus(1.0 - self.amp_min)
-
-        # ------------------------------------------------------------
-        # Gate transform from the same beta
-        # ------------------------------------------------------------
-        self.gate_temperature = max(
-            float(config_params.get("gate_temperature", 0.5)),
-            1.0e-6,
-        )
-
-        self.gate_threshold = float(config_params.get("gate_threshold", 0.5))
-        self.init_keep_prob = float(config_params.get("init_keep_prob", 0.95))
-
-        if not (0.0 < self.gate_threshold < 1.0):
-            raise ValueError(
-                f"gate_threshold must be in (0, 1). Got {self.gate_threshold}."
-            )
-
-        if not (0.0 < self.init_keep_prob < 1.0):
-            raise ValueError(
-                f"init_keep_prob must be in (0, 1). Got {self.init_keep_prob}."
-            )
-
-        # Choose cutoff such that:
-        #
-        #   sigmoid((beta_neutral - gate_cutoff) / tau) = init_keep_prob
-        #
-        # Therefore:
-        #
-        #   gate_cutoff = beta_neutral - tau * logit(init_keep_prob)
-        #
-        self.gate_cutoff = (
-            self.beta_neutral
-            - self.gate_temperature * logit(self.init_keep_prob)
-        )
-
-        # Recommended for performance first:
-        #   hard_forward=False
-        #   hard_eval=False
-        #
-        # Recommended only for exact-zero diagnostic:
-        #   hard_eval=True
-        self.hard_forward = bool(config_params.get("hard_forward", False))
-        self.hard_eval = bool(config_params.get("hard_eval", False))
-
-        # ------------------------------------------------------------
-        # Network
-        # ------------------------------------------------------------
         self.shared = nn.Sequential(
             nn.Linear(input_size, self.hidden_size),
             nn.GELU(),
@@ -191,25 +44,16 @@ class DatasetMultiplicativeAllocationBiasHead(nn.Module):
             nn.Dropout(p=self.dropout),
         )
 
-        # One score controls both amplitude and gate.
-        self.bias_score_head = nn.Linear(self.hidden_size, 1)
-
+        self.log_bias_head = nn.Linear(self.hidden_size, 1)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        """
-        Initialize to neutral observation bias:
+        # Neutral visibility: exp(log_bias)=1 before outer centering.
+        nn.init.zeros_(self.log_bias_head.weight)
+        nn.init.zeros_(self.log_bias_head.bias)
 
-            beta = beta_neutral
-            amp = 1
-            keep_prob = init_keep_prob
-            b_raw ≈ init_keep_prob
-
-        Since the outer model normalizes b_raw by its w_bio-weighted mass,
-        a constant b_raw is neutral for w_obs.
-        """
-        nn.init.zeros_(self.bias_score_head.weight)
-        nn.init.constant_(self.bias_score_head.bias, self.beta_neutral)
+    def _bound_log_bias(self, raw: torch.Tensor) -> torch.Tensor:
+        return self.log_bias_max * torch.tanh(raw / self.log_bias_max)
 
     def forward(
         self,
@@ -231,128 +75,40 @@ class DatasetMultiplicativeAllocationBiasHead(nn.Module):
         mask_b = mask.bool()
         mask_f = mask_b.to(dtype=x.dtype)
 
-        x = x * mask_f.unsqueeze(-1)
+        h = self.shared(x * mask_f.unsqueeze(-1))
+        log_bias_raw = self._bound_log_bias(self.log_bias_head(h).squeeze(-1))
+        log_bias_raw = log_bias_raw * mask_f
 
-        h = self.shared(x)
-
-        # ============================================================
-        # Single visibility score
-        # ============================================================
-        beta = self.bias_score_head(h).squeeze(-1)
-
-        # ============================================================
-        # Amplitude from beta
-        # ============================================================
-        amp = self.amp_min + F.softplus(beta)
-        amp = amp.clamp_min(self.amp_eps)
-
-        if self.amp_max > 0.0:
-            amp = amp.clamp_max(self.amp_max)
-
-        amp = amp * mask_f
-
-        # ============================================================
-        # Gate from same beta
-        # ============================================================
-        gate_logits = (beta - self.gate_cutoff) / self.gate_temperature
-
-        keep_prob = torch.sigmoid(gate_logits)
-        keep_prob = keep_prob * mask_f
-
-        keep_hard = (keep_prob > self.gate_threshold).to(dtype=x.dtype)
-        keep_hard = keep_hard * mask_f
-
-        if self.training:
-            if self.hard_forward:
-                # Straight-through estimator:
-                #
-                # forward: hard 0/1
-                # backward: soft keep_prob gradient
-                keep_gate = keep_hard + keep_prob - keep_prob.detach()
-            else:
-                keep_gate = keep_prob
-        else:
-            keep_gate = keep_hard if self.hard_eval else keep_prob
-
-        keep_gate = keep_gate * mask_f
-
-        # Single-score gated amplitude.
-        b_raw = keep_gate * amp
-        b_raw = b_raw * mask_f
-
-        # ============================================================
-        # Padding-neutral diagnostic outputs
-        # ============================================================
-        beta_diag = torch.where(
+        log_bias_diag = torch.where(
             mask_b,
-            beta,
-            torch.full_like(beta, self.beta_neutral),
+            log_bias_raw,
+            torch.zeros_like(log_bias_raw),
         )
+        beta_diag = torch.exp(log_bias_diag)
 
-        amp_diag = torch.where(
-            mask_b,
-            amp,
-            torch.ones_like(amp),
-        )
+        ones = torch.ones_like(beta_diag)
+        zeros = torch.zeros_like(beta_diag)
 
-        keep_prob_diag = torch.where(
-            mask_b,
-            keep_prob,
-            torch.ones_like(keep_prob),
-        )
-
-        keep_hard_diag = torch.where(
-            mask_b,
-            keep_hard,
-            torch.ones_like(keep_hard),
-        )
-
-        keep_gate_diag = torch.where(
-            mask_b,
-            keep_gate,
-            torch.ones_like(keep_gate),
-        )
-
-        gate_logits_diag = torch.where(
-            mask_b,
-            gate_logits,
-            torch.zeros_like(gate_logits),
-        )
-
-        b_raw_diag = torch.where(
-            mask_b,
-            b_raw,
-            torch.ones_like(b_raw),
-        )
-
-        # Keep backward-compatible keys:
-        #   obs_bias_amp_logits now means beta / visibility score.
-        #   obs_bias_gate_logits means the actual pre-sigmoid gate logit.
         return {
-            "obs_bias_raw": b_raw_diag,
-
-            "obs_bias_beta": beta_diag,
-            "obs_bias_score": beta_diag,
-
-            "obs_bias_amp": amp_diag,
-            "obs_bias_amp_logits": beta_diag,
-
-            "obs_bias_keep_prob": keep_prob_diag,
-            "obs_bias_keep_gate": keep_gate_diag,
-            "obs_bias_keep_hard": keep_hard_diag,
-            "obs_bias_gate_logits": gate_logits_diag,
-
-            # Useful constants for diagnostics/debugging.
-            "obs_bias_beta_neutral": torch.full(
+            # Main visibility outputs. The outer model performs p_bio-weighted
+            # centering and normalization.
+            "log_visibility_bias_raw": log_bias_diag,
+            "log_visibility_bias": log_bias_diag,
+            "obs_beta": beta_diag,
+            "obs_bias_raw": beta_diag,
+            "obs_bias_amp": beta_diag,
+            "obs_bias_amp_logits": log_bias_diag,
+            "obs_bias_geomean": torch.ones(
                 (x.shape[0],),
-                float(self.beta_neutral),
                 dtype=x.dtype,
                 device=x.device,
             ),
-            "obs_bias_gate_cutoff": torch.full(
-                (x.shape[0],),
-                float(self.gate_cutoff),
-                dtype=x.dtype,
-                device=x.device,
-            ),
+
+            # Compatibility diagnostics. Dropout is modeled by a separate head;
+            # visibility no longer has a keep gate.
+            "obs_bias_keep_prob": ones,
+            "obs_bias_keep_gate": ones,
+            "obs_bias_keep_gate_effective": ones,
+            "obs_bias_keep_hard": ones,
+            "obs_bias_gate_logits": zeros,
         }

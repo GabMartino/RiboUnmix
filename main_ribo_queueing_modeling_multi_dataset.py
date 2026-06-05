@@ -166,17 +166,51 @@ def make_dataset_signature(datasets: list[str]) -> str:
 
 
 def make_run_tag(cfg: DictConfig) -> str:
-    tag = "PCGrad" if bool(cfg.optim.use_pcgrad) else "NOPCGrad"
+    if bool(cfg_get(cfg, "optim.use_cagrad", False)):
+        tag = "CAGradBio"
+    else:
+        tag = "NOPCGrad"
 
     sampling = str(cfg_get(cfg, "data.train_sampling_strategy", "default"))
     dataset_balanced_loss = bool(cfg_get(cfg, "loss.dataset_balanced_loss", False))
+    pcc_target = str(cfg_get(cfg, "loss.pcc_target", "rho"))
+    alpha_learnable = bool(
+        cfg_get(
+            cfg,
+            "model.queue_propagation_params.queue_propagation_learnable",
+            False,
+        )
+    )
 
     if sampling not in {"", "default", "None", "none"}:
         tag += f"_{sampling}"
 
+    tag += f"_{pcc_target}PCC"
+    if pcc_target == "q":
+        tag += "_alphaLearn" if alpha_learnable else "_alphaFixed"
+
     tag += "_DBLoss" if dataset_balanced_loss else "_SampleMeanLoss"
 
     return tag
+
+
+def sync_queue_propagation_with_pcc_target(cfg: DictConfig) -> None:
+    pcc_target = cfg.loss.pcc_target
+    use_queue = pcc_target == "q"
+
+    OmegaConf.set_struct(cfg, False)
+    cfg.model.queue_propagation_params.use_queue_propagation = use_queue
+    OmegaConf.set_struct(cfg, True)
+
+    alpha_learnable = bool(cfg.model.queue_propagation_params.queue_propagation_learnable)
+    alpha_state = "trainable" if use_queue and alpha_learnable else "fixed/disabled"
+
+    print(
+        "Queue prediction mode: "
+        f"pcc_target={pcc_target}, "
+        f"use_queue_propagation={use_queue}, "
+        f"alpha_t={alpha_state}."
+    )
 
 
 def dataset_name_from_path(path: str | Path) -> str:
@@ -642,6 +676,9 @@ def predictions_to_parquet(
         "target",
         "mu",
         "mu_obs",
+        "mu_positive",
+        "mu_unconditional",
+        "mu_unconditional_raw",
         "mu_total",
         "mu_base",
 
@@ -658,6 +695,7 @@ def predictions_to_parquet(
         "w_prob",
         "h_bio",
         "rho_bio",
+        "q_bio",
         "L_bio",
         "L_queue",
         "bio_q_base",
@@ -672,6 +710,9 @@ def predictions_to_parquet(
         "q",
         "q_for_profile",
         "profile_prob",
+        "p_bio",
+        "p_visible",
+        "lambda_pre_dropout",
 
         # Multiplicative observation bias
         "obs_bias_raw",
@@ -972,6 +1013,7 @@ def main(cfg: DictConfig) -> None:
 
     dataset_str = make_dataset_signature(experiment_datasets)
     split_universe_str = make_dataset_signature(split_universe_datasets)
+    sync_queue_propagation_with_pcc_target(cfg)
     run_tag = make_run_tag(cfg)
 
     print(f"\nTracking dataset signature: {dataset_str}")
@@ -1034,6 +1076,12 @@ def main(cfg: DictConfig) -> None:
     tb_logger = TensorBoardLogger(save_dir=str(paths_logs), name="")
     exp_name = Path(tb_logger.log_dir or tb_logger.save_dir).name
 
+    # Save full resolved config next to the TensorBoard events file so each
+    # version_N directory is self-contained and traceable without Hydra outputs.
+    tb_log_dir = Path(tb_logger.log_dir)
+    tb_log_dir.mkdir(parents=True, exist_ok=True)
+    OmegaConf.save(cfg, tb_log_dir / "config.yaml")
+
     ckpt_dir = paths_checkpoints / exp_name
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1077,11 +1125,10 @@ def main(cfg: DictConfig) -> None:
         "callbacks": [checkpoint_callback, early_stopping, lr_monitor],
     }
 
-    # Automatic optimization can use Lightning clipping.
-    # PCGrad/manual optimization clips inside the LightningModule.
-    if not bool(cfg.optim.use_pcgrad):
-        trainer_kwargs["gradient_clip_val"] = float(cfg.trainer.gradient_clip_val)
-        trainer_kwargs["gradient_clip_algorithm"] = str(cfg.trainer.gradient_clip_algorithm)
+    # CAGrad uses manual optimization and clips inside the LightningModule.
+    if not bool(cfg_get(cfg, "optim.use_cagrad", False)):
+        trainer_kwargs["gradient_clip_val"] = cfg_get(cfg, "trainer.gradient_clip_val", 0.0)
+        trainer_kwargs["gradient_clip_algorithm"] = cfg_get(cfg, "trainer.gradient_clip_algorithm", "norm")
 
     trainer = pl.Trainer(**trainer_kwargs)
 

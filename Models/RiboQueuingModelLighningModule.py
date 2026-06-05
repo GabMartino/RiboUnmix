@@ -1,1822 +1,659 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from typing import Any
 
 import lightning as pl
-import numpy as np
+import matplotlib
 import torch
 import torch.nn as nn
+
+matplotlib.use("Agg")
+
 from matplotlib import pyplot as plt
 
-from Models.utils.PCGrad_utils import (
-    assign_flat_grads,
-    pcgrad_combine,
-    per_dataset_losses,
-)
-from Models.utils.dirichlet_multinomial_profile_loss import DirichletMultinomialProfileLoss
-from Models.utils.multinomial_profile_loss import MultinomialProfileLoss
-from Models.utils.ribo_lightning_helpers import flatten_current_grads
 
+# ============================================================
+# Loss
+# ============================================================
 
-class RiboQueuingModelLightningModule(pl.LightningModule):
+class ZeroInflatedLogNormalNB2Loss(nn.Module):
     """
-    Lightning wrapper for the multiplicative allocation-bias queueing model.
+    Simplified zero-inflated log-normal NLL with positive-component NB2 variance.
 
-    Expected torch model output:
-        - (mu, kappa_input, extras)
-        - or (mu, profile_aux, kappa_input, extras)
+    Model:
 
-    Current model semantics:
-        Biological branch:
-            w_bio_i = biological allocation
-            h_bio_i = J_t * T_t * w_bio_i
-            L_bio_i = exp(h_bio_i) - 1
+        P(Y = 0) = pi_zero
 
-        Dataset/protocol observation branch:
-            b_raw_i = keep_gate_i * amplitude_i
-            b_eff_i = b_raw_i / sum_j w_bio_j b_raw_j
-            w_obs_i = w_bio_i * b_eff_i
+        Y | Y > 0 ~ LogNormal(log_loc, log_sigma)
 
-        Observed support:
-            h_obs_i = J_t * T_t * w_obs_i
-            L_obs_i = exp(h_obs_i) - 1
+    Mu convention:
 
-        Profile mean:
-            mu_i = total_mass * L_obs_i / sum_j L_obs_j
+        positive_mean:
 
-    Active regularizers:
-        1. obs_bias_log_l2:
-            mixed-position penalty on log(b_eff)^2.
+            mu = E[Y | Y > 0]
 
-        2. obs_gate_mean_floor:
-            preferred gate regularizer for sparse zeros. It prevents global gate
-            collapse but allows individual positions to close:
+        unconditional_mean:
 
-                ReLU(g_min - sum_i p_mix_i keep_prob_i)^2
+            mu = E[Y]
+            E[Y | Y > 0] = mu / (1 - pi_zero)
 
-        3. obs_gate_open:
-            optional legacy per-position open penalty on -log(keep_prob).
-            Keep this at 0.0 if you want sparse gate closures.
+        median:
 
-        4. optional kappa_log_l2.
+            mu = median[Y | Y > 0] = exp(log_loc)
+
+    Positive-component variance target:
+
+        Var[Y | Y > 0] = E[Y | Y > 0] + phi * E[Y | Y > 0]^2
+
+    Conversion:
+
+        For mean parameterizations:
+            log_sigma^2 = log(1 + Var / E[Y | Y > 0]^2)
+            log_loc = log(E[Y | Y > 0]) - 0.5 * log_sigma^2
+
+        For median parameterization:
+            solve r^3 - (1 + phi) * r - 1 / median = 0,
+            where r = exp(log_sigma^2 / 2), then
+            log_sigma^2 = 2 * log(r)
+            log_loc = log(mu)
     """
 
     def __init__(
         self,
-        torch_model: nn.Module,
-        *,
-        config: Any,
-        dataset_encoding: dict | None = None,
+        eps: float = 1.0e-8,
+        mu_min: float = 1.0e-8,
+        mu_max: float = 1.0e8,
+        phi_min: float = 1.0e-4,
+        phi_max: float = 10.0,
+        log_sigma_min: float = 0.05,
+        log_sigma_max: float = 2.0,
+        censor_threshold: float = 0.0,
+        zero_input_is_logits: bool = True,
+        phi_input_is_log: bool = False,
+        detach_mu_for_zero_branch: bool = True,
+        mu_input_is_positive_mean: bool = True,
+        mu_parameterization: str | None = None,
     ):
         super().__init__()
-        self.save_hyperparameters(ignore=["torch_model", "config", "dataset_encoding"])
 
-        self.model = torch_model
-        self.config = config
+        self.eps = float(eps)
+        self.mu_min = float(mu_min)
+        self.mu_max = float(mu_max)
 
-        self.loss_type = str(
-            self._cfg("loss.type", "dirichlet_multinomial_profile")
-        ).lower()
-        self.loss_fn = self._build_profile_loss()
+        self.phi_min = float(phi_min)
+        self.phi_max = float(phi_max)
 
-        enc = dataset_encoding or {}
-        self.dataset_id_to_name = {int(v): str(k) for k, v in enc.items()}
+        self.log_sigma_min = float(log_sigma_min)
+        self.log_sigma_max = float(log_sigma_max)
 
-        self.dataset_balanced_loss = bool(
-            self._cfg("loss.dataset_balanced_loss", False)
-        )
-
-        self.use_pcgrad = bool(self._cfg("optim.use_pcgrad", False))
-        self.automatic_optimization = not self.use_pcgrad
-
-        self.log_sync_dist = bool(self._cfg("trainer.sync_dist_logs", False))
-        self._val_plot_logged_this_epoch = False
-
-        if self.dataset_balanced_loss:
-            print("Loss aggregation: dataset-balanced mean of per-dataset losses.")
-        else:
-            print("Loss aggregation: ordinary per-sample mean.")
-
-        if self.use_pcgrad:
-            print("Training is using PCGrad.")
-
-    # ============================================================
-    # Config / names
-    # ============================================================
-
-    def _cfg(self, path: str, default: Any = None) -> Any:
-        cur = self.config
-
-        for key in path.split("."):
-            if cur is None:
-                return default
-
-            if isinstance(cur, dict):
-                if key not in cur:
-                    return default
-                cur = cur[key]
-            else:
-                if not hasattr(cur, key):
-                    return default
-                cur = getattr(cur, key)
-
-        return cur
-
-    def _dataset_name(self, ds_id: int) -> str:
-        return self.dataset_id_to_name.get(int(ds_id), f"dataset_{int(ds_id)}")
+        self.censor_threshold = float(censor_threshold)
+        self.zero_input_is_logits = bool(zero_input_is_logits)
+        self.phi_input_is_log = bool(phi_input_is_log)
+        self.detach_mu_for_zero_branch = bool(detach_mu_for_zero_branch)
+        self.mu_input_is_positive_mean = bool(mu_input_is_positive_mean)
+        if mu_parameterization is None:
+            mu_parameterization = (
+                "positive_mean"
+                if self.mu_input_is_positive_mean
+                else "unconditional_mean"
+            )
+        self.mu_parameterization = str(mu_parameterization)
+        valid_parameterizations = {
+            "positive_mean",
+            "unconditional_mean",
+            "median",
+        }
+        if self.mu_parameterization not in valid_parameterizations:
+            raise ValueError(
+                "mu_parameterization must be one of "
+                f"{sorted(valid_parameterizations)}, got {self.mu_parameterization!r}."
+            )
 
     @staticmethod
-    def _component(extras: dict, *keys: str):
-        for key in keys:
-            value = extras.get(key)
-            if value is not None:
-                return value
-        return None
+    def _log_normal_cdf_standard(z: torch.Tensor) -> torch.Tensor:
+        if hasattr(torch.special, "log_ndtr"):
+            return torch.special.log_ndtr(z)
 
-    # ============================================================
-    # Loss
-    # ============================================================
+        return torch.log(
+            0.5 * torch.erfc(-z / math.sqrt(2.0))
+        ).clamp_min(-1.0e30)
 
-    def _build_profile_loss(self) -> nn.Module:
-        eps = float(self._cfg("loss.eps", 1.0e-8))
-        normalize_by_total = bool(self._cfg("loss.normalize_by_total", True))
+    def zero_prob_from_param(self, zero_param: torch.Tensor) -> torch.Tensor:
+        if self.zero_input_is_logits:
+            pi = torch.sigmoid(zero_param)
+        else:
+            pi = zero_param
 
-        if self.loss_type in {"multinomial", "multinomial_profile", "profile_ce"}:
-            return MultinomialProfileLoss(
-                eps=eps,
-                normalize_by_total=normalize_by_total,
-            )
+        return pi.clamp(min=self.eps, max=1.0 - self.eps)
 
-        if self.loss_type in {
-            "dirichlet_multinomial",
-            "dirichlet_multinomial_profile",
-            "dm",
-            "dm_profile",
-        }:
-            fixed_kappa = self._cfg("loss.kappa", None)
-            fixed_kappa = None if fixed_kappa is None else float(fixed_kappa)
+    def _prepare_phi(self, phi: torch.Tensor) -> torch.Tensor:
+        if self.phi_input_is_log:
+            phi = torch.exp(phi)
 
-            return DirichletMultinomialProfileLoss(
-                eps=eps,
-                kappa=fixed_kappa,
-                kappa_min=float(self._cfg("loss.kappa_min", 1.0e-2)),
-                kappa_max=float(self._cfg("loss.kappa_max", 1.0e5)),
-                normalize_by_total=normalize_by_total,
-                include_multinomial_constant=bool(
-                    self._cfg("loss.include_multinomial_constant", False)
-                ),
-                pool_position_kappa=str(self._cfg("loss.pool_position_kappa", "mean")),
-            )
+        return phi.clamp(min=self.phi_min, max=self.phi_max)
 
-        raise ValueError(
-            f"Unsupported loss.type={self.loss_type!r}. Use "
-            "'multinomial_profile' or 'dirichlet_multinomial_profile'."
-        )
-
-    def _compute_kappa(
-        self,
-        *,
-        kappa_input: torch.Tensor | None,
-        mask: torch.Tensor,
-    ) -> torch.Tensor | float | None:
-        if self.loss_type in {"multinomial", "multinomial_profile", "profile_ce"}:
-            return None
-
-        source = str(self._cfg("loss.kappa_source", "model_inverse")).lower()
-
-        if source == "fixed":
-            return None
-
-        if kappa_input is None:
-            return None
-
-        x = kappa_input.float()
-
-        if source in {"model_direct", "direct", "kappa"}:
-            return x
-
-        if source in {
-            "model_inverse",
-            "inverse",
-            "phi_inverse",
-            "dispersion_inverse",
-        }:
-            scale = float(self._cfg("loss.kappa_scale", 100.0))
-            min_disp = float(self._cfg("loss.kappa_input_min", 1.0e-4))
-            return scale / x.clamp_min(min_disp)
-
-        raise ValueError(
-            f"Unsupported loss.kappa_source={source!r}. Use 'fixed', "
-            "'model_direct', or 'model_inverse'."
-        )
-
-    def _profile_nll_per_sample(
+    def _lognormal_params(
         self,
         *,
         mu: torch.Tensor,
-        kappa_input: torch.Tensor | None,
-        target: torch.Tensor,
-        mask: torch.Tensor,
-    ) -> torch.Tensor:
-        with torch.autocast(device_type=mu.device.type, enabled=False):
-            if self.loss_type in {"multinomial", "multinomial_profile", "profile_ce"}:
-                loss = self.loss_fn(
-                    mu=mu.float(),
-                    y_true=target.float(),
-                    mask=mask.bool(),
-                    return_per_sample=True,
-                )
-            else:
-                loss = self.loss_fn(
-                    mu=mu.float(),
-                    kappa=self._compute_kappa(
-                        kappa_input=kappa_input,
-                        mask=mask,
-                    ),
-                    y_true=target.float(),
-                    mask=mask.bool(),
-                    return_per_sample=True,
-                )
-
-        cap = float(self._cfg("loss.nll_soft_cap", -1.0))
-        if cap > 0.0:
-            loss = cap * torch.log1p(loss / cap)
-
-        return loss
-
-    def _scalar_profile_loss(
-        self,
-        *,
-        loss_per_sample: torch.Tensor,
-        dataset_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        if not self.dataset_balanced_loss:
-            return loss_per_sample.mean()
-
-        dataset_losses = per_dataset_losses(
-            loss_per_sample=loss_per_sample,
-            dataset_ids=dataset_ids,
-        )
-
-        if len(dataset_losses) == 0:
-            return loss_per_sample.mean()
-
-        return torch.stack(dataset_losses).mean()
-
-    # ============================================================
-    # Regularization
-    # ============================================================
-
-    def _mixed_position_weights_from_w_bio(
-        self,
-        *,
-        extras: dict,
-        mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Mixed regularization weights:
-
-            p_mix = (1 - alpha) * w_bio + alpha * uniform
-
-        This prevents unregularized behavior at positions where w_bio is tiny.
-        """
-        eps = float(self._cfg("loss.eps", 1.0e-8))
-        alpha = float(self._cfg("loss.obs_bias_uniform_weight", 0.05))
-        alpha = min(max(alpha, 0.0), 1.0)
-
-        mask_b = mask.bool()
-        mask_f = mask_b.float()
-
-        uniform = mask_f / mask_f.sum(dim=1, keepdim=True).clamp_min(1.0)
-
-        w_bio = self._component(extras, "w_bio", "w_prob")
-
-        if torch.is_tensor(w_bio) and w_bio.shape == mask.shape:
-            w = w_bio.detach().float().clamp_min(0.0) * mask_f
-            w = w / w.sum(dim=1, keepdim=True).clamp_min(eps)
+        pi_zero: torch.Tensor,
+        phi: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.mu_parameterization == "unconditional_mean":
+            one_minus_pi = (1.0 - pi_zero).clamp_min(self.eps)
+            mu_ref = mu / one_minus_pi
         else:
-            w = uniform
-
-        weights = (1.0 - alpha) * w + alpha * uniform
-        weights = weights * mask_f
-        weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(eps)
-
-        return weights
-
-    def _obs_bias_regularization(
-        self,
-        *,
-        extras: dict,
-        mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Penalizes effective multiplicative bias away from neutral:
-
-            sum_i p_mix_i * log(b_eff_i)^2
-
-        Neutral state:
-
-            b_eff_i = 1
-        """
-        device = mask.device
-        eps = float(self._cfg("loss.eps", 1.0e-8))
-
-        b_eff = self._component(extras, "obs_bias_effective", "b_effective", "b_shape")
-
-        if not torch.is_tensor(b_eff) or b_eff.shape != mask.shape:
-            return torch.zeros((), device=device)
-
-        mask_f = mask.bool().float()
-        weights = self._mixed_position_weights_from_w_bio(
-            extras=extras,
-            mask=mask,
-        ).detach()
-
-        log_b = torch.log(b_eff.float().clamp_min(eps))
-        reg_per_sample = (weights * log_b.pow(2) * mask_f).sum(dim=1)
-
-        return reg_per_sample.mean()
-
-    def _obs_gate_open_regularization(
-        self,
-        *,
-        extras: dict,
-        mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Optional legacy per-position gate-open penalty:
-
-            sum_i p_mix_i * [-log(keep_prob_i)]
-
-        This discourages every individual closure. If you want sparse gate zeros,
-        keep loss.lambda_obs_gate_open = 0.0 and use
-        loss.lambda_obs_gate_mean_floor instead.
-        """
-        device = mask.device
-        eps = float(self._cfg("loss.eps", 1.0e-8))
-
-        keep_prob = self._component(extras, "obs_bias_keep_prob", "keep_prob")
-
-        if not torch.is_tensor(keep_prob) or keep_prob.shape != mask.shape:
-            return torch.zeros((), device=device)
-
-        mask_f = mask.bool().float()
-        weights = self._mixed_position_weights_from_w_bio(
-            extras=extras,
-            mask=mask,
-        ).detach()
-
-        g = keep_prob.float().clamp(min=eps, max=1.0)
-        reg_per_sample = (weights * (-torch.log(g)) * mask_f).sum(dim=1)
-
-        return reg_per_sample.mean()
-
-    def _obs_gate_mean_floor_regularization(
-        self,
-        *,
-        extras: dict,
-        mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Preferred gate regularizer for sparse zeros.
-
-        It penalizes only transcripts whose weighted mean keep probability falls
-        below a configured floor:
-
-            mean_t ReLU(g_min - sum_i p_mix_i keep_prob_i)^2
-
-        This prevents global gate collapse while allowing individual positions
-        to close.
-        """
-        device = mask.device
-
-        keep_prob = self._component(extras, "obs_bias_keep_prob", "keep_prob")
-
-        if not torch.is_tensor(keep_prob) or keep_prob.shape != mask.shape:
-            return torch.zeros((), device=device)
-
-        weights = self._mixed_position_weights_from_w_bio(
-            extras=extras,
-            mask=mask,
-        ).detach()
-
-        keep_prob = keep_prob.float().clamp(0.0, 1.0)
-        mean_open = (weights * keep_prob).sum(dim=1)
-
-        min_open = float(self._cfg("loss.obs_gate_min_open", 0.95))
-        min_open = min(max(min_open, 0.0), 1.0)
-
-        return torch.relu(min_open - mean_open).pow(2).mean()
-
-    def _per_sample_mean(self, x: torch.Tensor | float | None, mask: torch.Tensor):
-        if x is None:
-            return None
-
-        if not torch.is_tensor(x):
-            return torch.full((mask.shape[0],), float(x), device=mask.device)
-
-        x = x.float()
-        mask_f = mask.bool().float()
-
-        if x.ndim == 0:
-            return x.reshape(1).expand(mask.shape[0])
-
-        if x.ndim == 1:
-            if x.shape[0] == mask.shape[0]:
-                return x
-            return x.reshape(1).expand(mask.shape[0])
-
-        if x.ndim == 2 and x.shape == mask.shape:
-            return (x * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp_min(1.0)
-
-        if x.ndim == 2 and x.shape[1] == 1:
-            return x.squeeze(1)
-
-        return x.reshape(x.shape[0], -1).mean(dim=1)
-
-    def _regularization_terms(
-        self,
-        *,
-        extras: dict,
-        kappa_input: torch.Tensor | None,
-        mask: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        device = mask.device
-
-        terms: dict[str, torch.Tensor] = {}
-
-        lambda_obs_bias = float(self._cfg("loss.lambda_obs_bias_log_l2", 0.0))
-        obs_bias_reg_raw = self._obs_bias_regularization(
-            extras=extras,
-            mask=mask,
-        )
-        terms["obs_bias_log_l2"] = lambda_obs_bias * obs_bias_reg_raw
-
-        # Legacy per-position open penalty. Set to 0.0 for sparse zeros.
-        lambda_obs_gate = float(self._cfg("loss.lambda_obs_gate_open", 0.0))
-        obs_gate_reg_raw = self._obs_gate_open_regularization(
-            extras=extras,
-            mask=mask,
-        )
-        terms["obs_gate_open"] = lambda_obs_gate * obs_gate_reg_raw
-
-        # New mean-open floor penalty. This is the recommended gate regularizer.
-        lambda_gate_floor = float(
-            self._cfg("loss.lambda_obs_gate_mean_floor", 0.0)
-        )
-        gate_floor_reg_raw = self._obs_gate_mean_floor_regularization(
-            extras=extras,
-            mask=mask,
-        )
-        terms["obs_gate_mean_floor"] = lambda_gate_floor * gate_floor_reg_raw
-
-        lambda_kappa = float(self._cfg("loss.lambda_kappa_log_l2", 0.0))
-        kappa_reg = torch.zeros((), device=device)
-
-        if lambda_kappa > 0.0:
-            kappa = self._compute_kappa(kappa_input=kappa_input, mask=mask)
-
-            if kappa is not None:
-                if not torch.is_tensor(kappa):
-                    kappa_t = torch.full((mask.shape[0],), float(kappa), device=device)
-                else:
-                    kappa_t = self._per_sample_mean(kappa, mask)
-
-                kappa_ref = float(
-                    self._cfg("loss.kappa_reference", self._cfg("loss.kappa", 500.0))
-                )
-
-                log_ref = torch.log(
-                    torch.tensor(kappa_ref, device=device, dtype=torch.float32)
-                )
-
-                kappa_reg = (
-                    torch.log(kappa_t.float().clamp_min(1.0e-8)) - log_ref
-                ).pow(2).mean()
-
-        terms["kappa_log_l2"] = lambda_kappa * kappa_reg
-
-        total = torch.zeros((), device=device)
-        for value in terms.values():
-            total = total + value
-
-        terms["total"] = total
-
-        return terms
-
-    def _loss_terms(self, out: dict) -> dict[str, torch.Tensor]:
-        nll = self._profile_nll_per_sample(
-            mu=out["mu"],
-            kappa_input=out["kappa_input"],
-            target=out["target"],
-            mask=out["mask"],
-        )
-
-        profile_loss = self._scalar_profile_loss(
-            loss_per_sample=nll,
-            dataset_ids=out["dataset_ids"],
-        )
-
-        reg_terms = self._regularization_terms(
-            extras=out["extras"],
-            kappa_input=out["kappa_input"],
-            mask=out["mask"],
-        )
-
-        extra_loss = reg_terms["total"]
-        total_loss = profile_loss + extra_loss
-
-        return {
-            "nll_per_sample": nll,
-            "profile_loss": profile_loss,
-            "extra_loss": extra_loss,
-            "total_loss": total_loss,
-            "reg_obs_bias_log_l2": reg_terms["obs_bias_log_l2"],
-            "reg_obs_gate_open": reg_terms["obs_gate_open"],
-            "reg_obs_gate_mean_floor": reg_terms["obs_gate_mean_floor"],
-            "reg_kappa_log_l2": reg_terms["kappa_log_l2"],
-        }
-
-    # ============================================================
-    # Logging helpers
-    # ============================================================
-
-    def _log_scalar(
-        self,
-        name: str,
-        value: torch.Tensor | float | None,
-        *,
-        batch_size: int,
-        prog_bar: bool = False,
-        on_step: bool = False,
-        on_epoch: bool = True,
-    ) -> None:
-        if value is None:
-            return
-
-        if not torch.is_tensor(value):
-            value = torch.tensor(float(value), device=self.device)
-
-        value = value.detach().float()
-
-        if value.numel() != 1:
-            value = value.reshape(-1)
-            finite = torch.isfinite(value)
-            if not finite.any():
-                return
-            value = value[finite].mean()
-
-        if not torch.isfinite(value):
-            return
-
-        self.log(
-            name,
-            value,
-            on_step=on_step,
-            on_epoch=on_epoch,
-            prog_bar=prog_bar,
-            logger=True,
-            batch_size=max(int(batch_size), 1),
-            sync_dist=self.log_sync_dist,
-        )
-
-    def _finite_mean(self, x: torch.Tensor | None):
-        if x is None:
-            return None
-
-        x = x.detach().float().reshape(-1)
-        finite = torch.isfinite(x)
-
-        if not finite.any():
-            return None
-
-        return x[finite].mean()
-
-    def _masked_quantile_per_sample(
-        self,
-        x: torch.Tensor,
-        mask: torch.Tensor,
-        q: float,
-    ) -> torch.Tensor:
-        if x.shape != mask.shape:
-            raise ValueError(
-                f"x and mask must have same shape, got "
-                f"x={tuple(x.shape)}, mask={tuple(mask.shape)}."
+            mu_ref = mu
+
+        mu_ref = mu_ref.clamp(min=self.mu_min, max=self.mu_max)
+
+        if self.mu_parameterization == "median":
+            log_sigma2 = self._median_log_sigma2_from_nb2_dispersion(
+                median=mu_ref,
+                phi=phi,
+            )
+        else:
+            var_pos = mu_ref + phi * mu_ref.pow(2)
+            var_pos = var_pos.clamp_min(self.eps)
+            log_sigma2 = torch.log1p(
+                var_pos / mu_ref.pow(2).clamp_min(self.eps)
             )
 
-        q = float(min(max(q, 0.0), 1.0))
-        mask_b = mask.bool()
-        values = []
-
-        for i in range(x.shape[0]):
-            xi = x[i][mask_b[i]].detach().float()
-            if xi.numel() == 0:
-                values.append(torch.full((), float("nan"), device=x.device))
-            else:
-                values.append(torch.quantile(xi, q))
-
-        return torch.stack(values, dim=0)
-
-    def _log_vector(
-        self,
-        *,
-        stage: str,
-        name: str,
-        values: torch.Tensor | None,
-        dataset_ids: torch.Tensor,
-        batch_size: int,
-        by_dataset: bool = True,
-        prog_bar: bool = False,
-    ) -> None:
-        if values is None:
-            return
-
-        values = values.detach().float()
-
-        self._log_scalar(
-            f"{stage}_{name}",
-            self._finite_mean(values),
-            batch_size=batch_size,
-            prog_bar=prog_bar,
+        log_sigma = torch.sqrt(log_sigma2.clamp_min(self.eps))
+        log_sigma = log_sigma.clamp(
+            min=self.log_sigma_min,
+            max=self.log_sigma_max,
         )
 
-        if not by_dataset:
-            return
+        if self.mu_parameterization == "median":
+            log_loc = torch.log(mu_ref.clamp_min(self.eps))
+        else:
+            log_loc = torch.log(mu_ref.clamp_min(self.eps)) - 0.5 * log_sigma.pow(2)
 
-        for ds_id in torch.unique(dataset_ids).detach().cpu().tolist():
-            ds_id = int(ds_id)
-            ds_mask = dataset_ids == ds_id
-            ds_mean = self._finite_mean(values[ds_mask])
+        return log_loc, log_sigma
 
-            if ds_mean is not None:
-                self._log_scalar(
-                    f"{stage}_{name}_by_dataset/{self._dataset_name(ds_id)}",
-                    ds_mean,
-                    batch_size=int(ds_mask.sum().item()),
+    def _median_log_sigma2_from_nb2_dispersion(
+        self,
+        *,
+        median: torch.Tensor,
+        phi: torch.Tensor,
+    ) -> torch.Tensor:
+        """Convert NB2 mean-variance dispersion to log-normal sigma^2.
+
+        For median m and r = exp(sigma^2 / 2), the positive mean is m * r.
+        Equating log-normal variance to mean + phi * mean^2 yields:
+
+            r^3 - (1 + phi) * r - 1 / m = 0
+        """
+        a = 1.0 + phi.clamp_min(self.eps)
+        b = 1.0 / median.clamp_min(self.eps)
+
+        lower = torch.sqrt(a).clamp_min(1.0 + self.eps)
+        small_b_approx = lower + b / (2.0 * a.clamp_min(self.eps))
+        large_b_approx = b.clamp_min(self.eps).pow(1.0 / 3.0)
+        r = torch.maximum(small_b_approx, large_b_approx).clamp_min(lower)
+
+        for _ in range(8):
+            f = r.pow(3) - a * r - b
+            fp = (3.0 * r.pow(2) - a).clamp_min(self.eps)
+            r = (r - f / fp).clamp_min(lower)
+
+        return 2.0 * torch.log(r.clamp_min(1.0 + self.eps))
+
+    def positive_mean_from_params(
+        self,
+        *,
+        mu: torch.Tensor,
+        pi_zero: torch.Tensor,
+        phi: torch.Tensor,
+    ) -> torch.Tensor:
+        log_loc, log_sigma = self._lognormal_params(
+            mu=mu,
+            pi_zero=pi_zero,
+            phi=phi,
+        )
+        mean = torch.exp(log_loc + 0.5 * log_sigma.pow(2))
+        return mean.clamp(min=self.mu_min, max=self.mu_max)
+
+    def forward(
+        self,
+        mu_phys: torch.Tensor,
+        zero_param: torch.Tensor,
+        phi: torch.Tensor,
+        y_true: torch.Tensor,
+        mask: torch.Tensor,
+        return_per_sample: bool = False,
+    ) -> torch.Tensor:
+        with torch.amp.autocast(device_type=mu_phys.device.type, enabled=False):
+            y = y_true.to(torch.float64).clamp_min(0.0)
+
+            mu = mu_phys.to(torch.float64).clamp(
+                min=self.mu_min,
+                max=self.mu_max,
+            )
+
+            pi_zero = self.zero_prob_from_param(
+                zero_param.to(torch.float64)
+            )
+
+            phi_t = self._prepare_phi(
+                phi.to(torch.float64)
+            )
+
+            pi_zero = torch.broadcast_to(pi_zero, y.shape)
+            phi_t = torch.broadcast_to(phi_t, y.shape)
+
+            log_loc, log_sigma = self._lognormal_params(
+                mu=mu,
+                pi_zero=pi_zero,
+                phi=phi_t,
+            )
+
+            one_minus_pi = (1.0 - pi_zero).clamp_min(self.eps)
+
+            # Positive log-normal branch.
+            log_y = torch.log(y.clamp_min(self.eps))
+            z = (log_y - log_loc) / log_sigma
+
+            positive_nll = (
+                -torch.log(one_minus_pi)
+                + log_y
+                + torch.log(log_sigma.clamp_min(self.eps))
+                + 0.5 * math.log(2.0 * math.pi)
+                + 0.5 * z.pow(2)
+            )
+
+            # Zero / censored-zero branch.
+            if self.censor_threshold > 0.0:
+                c = torch.tensor(
+                    self.censor_threshold,
+                    device=y.device,
+                    dtype=torch.float64,
+                ).clamp_min(self.eps)
+
+                if self.detach_mu_for_zero_branch:
+                    # Dataset zeros train the dropout/zero branch, not the
+                    # biological queueing support or visibility mean. Detach pi
+                    # only inside the log-normal CDF parameters; the mixture
+                    # probability below still learns from zeros.
+                    log_loc_zero, log_sigma_zero = self._lognormal_params(
+                        mu=mu.detach(),
+                        pi_zero=pi_zero.detach(),
+                        phi=phi_t.detach(),
+                    )
+                else:
+                    log_loc_zero = log_loc
+                    log_sigma_zero = log_sigma
+
+                z_c = (torch.log(c) - log_loc_zero) / log_sigma_zero
+                log_cdf = self._log_normal_cdf_standard(z_c)
+                if self.detach_mu_for_zero_branch:
+                    log_cdf = log_cdf.detach()
+
+                log_zero_mass = torch.logaddexp(
+                    torch.log(pi_zero.clamp_min(self.eps)),
+                    torch.log(one_minus_pi) + log_cdf,
                 )
 
-    # ============================================================
-    # PCC diagnostics
-    # ============================================================
+                zero_nll = -log_zero_mass
+                is_zero = y <= self.censor_threshold
 
-    def _masked_pcc(
+            else:
+                zero_nll = -torch.log(pi_zero.clamp_min(self.eps))
+                is_zero = y <= 0.0
+
+            nll = torch.where(is_zero, zero_nll, positive_nll)
+
+            nll = torch.nan_to_num(
+                nll,
+                nan=0.0,
+                posinf=1.0e8,
+                neginf=1.0e8,
+            )
+
+            mask_f = mask.bool().to(torch.float64)
+            valid_len = mask_f.sum(dim=1).clamp_min(1.0)
+
+            loss_per_sample = (nll * mask_f).sum(dim=1) / valid_len
+            loss_per_sample = loss_per_sample.to(torch.float32)
+
+        if return_per_sample:
+            return loss_per_sample
+
+        return loss_per_sample.mean()
+
+
+class ZeroInflatedNegativeBinomialLoss(nn.Module):
+    """
+    Zero-inflated NB2 NLL.
+
+    Positive component:
+
+        Y | not_dropout ~ NB2(mean=mu_pos, var=mu_pos + phi * mu_pos^2)
+
+    Zero-inflated mixture:
+
+        P(Y=0) = pi_zero + (1 - pi_zero) * NB2(Y=0)
+        P(Y>0) = (1 - pi_zero) * NB2(Y)
+
+    target_transform controls how non-integer targets are handled:
+
+        real : gamma-function continuation of NB to non-negative real values.
+        floor : floor target before NB.
+        round : round target before NB.
+    """
+
+    def __init__(
         self,
-        pred: torch.Tensor | None,
-        target: torch.Tensor,
-        mask: torch.Tensor,
+        eps: float = 1.0e-8,
+        mu_min: float = 1.0e-8,
+        mu_max: float = 1.0e8,
+        phi_min: float = 1.0e-4,
+        phi_max: float = 10.0,
+        zero_input_is_logits: bool = True,
+        phi_input_is_log: bool = False,
+        detach_mu_for_zero_branch: bool = True,
+        mu_input_is_positive_mean: bool = True,
+        target_transform: str = "real",
+        zero_threshold: float = 0.0,
     ):
-        if pred is None or pred.shape != target.shape:
-            return None
+        super().__init__()
 
-        eps = float(self._cfg("loss.eps", 1.0e-8))
+        self.eps = float(eps)
+        self.mu_min = float(mu_min)
+        self.mu_max = float(mu_max)
+        self.phi_min = float(phi_min)
+        self.phi_max = float(phi_max)
+        self.zero_input_is_logits = bool(zero_input_is_logits)
+        self.phi_input_is_log = bool(phi_input_is_log)
+        self.detach_mu_for_zero_branch = bool(detach_mu_for_zero_branch)
+        self.mu_input_is_positive_mean = bool(mu_input_is_positive_mean)
+        self.target_transform = str(target_transform).lower()
+        self.zero_threshold = float(zero_threshold)
 
-        mask_f = mask.bool().float()
-        valid_count = mask_f.sum(dim=1).clamp_min(1.0)
+        allowed = {"real", "floor", "round"}
+        if self.target_transform not in allowed:
+            raise ValueError(
+                f"target_transform must be one of {sorted(allowed)}, "
+                f"got {self.target_transform!r}."
+            )
 
-        x = torch.nan_to_num(
-            pred.detach().float(),
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-        y = torch.nan_to_num(
-            target.detach().float(),
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
+    def zero_prob_from_param(self, zero_param: torch.Tensor) -> torch.Tensor:
+        if self.zero_input_is_logits:
+            pi = torch.sigmoid(zero_param)
+        else:
+            pi = zero_param
 
-        x_mean = (x * mask_f).sum(dim=1) / valid_count
-        y_mean = (y * mask_f).sum(dim=1) / valid_count
+        return pi.clamp(min=self.eps, max=1.0 - self.eps)
 
-        xc = (x - x_mean.unsqueeze(1)) * mask_f
-        yc = (y - y_mean.unsqueeze(1)) * mask_f
+    def _prepare_phi(self, phi: torch.Tensor) -> torch.Tensor:
+        if self.phi_input_is_log:
+            phi = torch.exp(phi)
 
-        cov = (xc * yc).sum(dim=1)
-        x_var = xc.pow(2).sum(dim=1)
-        y_var = yc.pow(2).sum(dim=1)
+        return phi.clamp(min=self.phi_min, max=self.phi_max)
 
-        pcc = cov / torch.sqrt(x_var * y_var).clamp_min(eps)
-        valid = (mask_f.sum(dim=1) >= 2) & torch.isfinite(pcc)
+    def _prepare_target(self, y: torch.Tensor) -> torch.Tensor:
+        y = y.clamp_min(0.0)
 
-        return torch.where(valid, pcc, torch.nan)
+        if self.target_transform == "floor":
+            return torch.floor(y)
 
-    def _log_pcc(
+        if self.target_transform == "round":
+            return torch.round(y)
+
+        return y
+
+    def _positive_mean(
         self,
         *,
-        stage: str,
-        name: str,
-        pred: torch.Tensor | None,
-        target: torch.Tensor,
-        mask: torch.Tensor,
-        dataset_ids: torch.Tensor,
-        batch_size: int,
-        prog_bar: bool = False,
-    ):
-        pcc = self._masked_pcc(pred, target, mask)
+        mu: torch.Tensor,
+        pi_zero: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.mu_input_is_positive_mean:
+            mu_pos = mu
+        else:
+            mu_pos = mu / (1.0 - pi_zero).clamp_min(self.eps)
 
-        self._log_vector(
-            stage=stage,
-            name=f"{name}_pcc",
-            values=pcc,
-            dataset_ids=dataset_ids,
-            batch_size=batch_size,
-            by_dataset=(stage == "val"),
-            prog_bar=prog_bar,
-        )
+        return mu_pos.clamp(min=self.mu_min, max=self.mu_max)
 
-        return pcc
-
-    def _total_mass(
+    def _nb_log_prob(
         self,
-        extras: dict,
-        target: torch.Tensor,
-        mask: torch.Tensor,
-    ):
-        total_mass = extras.get("total_mass")
+        *,
+        y: torch.Tensor,
+        mu: torch.Tensor,
+        phi: torch.Tensor,
+    ) -> torch.Tensor:
+        mu = mu.clamp(min=self.mu_min, max=self.mu_max)
+        phi = phi.clamp(min=self.phi_min, max=self.phi_max)
 
-        if total_mass is None:
-            return (
-                target.float().clamp_min(0.0) * mask.bool().float()
-            ).sum(dim=1, keepdim=True).detach()
-
-        total_mass = total_mass.detach().float()
-        return total_mass.reshape(-1, 1) if total_mass.ndim == 1 else total_mass
-
-    def _mu_from_support(self, support: torch.Tensor | None, out: dict):
-        if support is None or support.shape != out["target"].shape:
-            return None
-
-        eps = float(self._cfg("loss.eps", 1.0e-8))
-        mask_f = out["mask"].bool().float()
-        q = support.detach().float().clamp_min(0.0) * mask_f
-        total_mass = self._total_mass(out["extras"], out["target"], out["mask"])
-
-        return total_mass * q / q.sum(dim=1, keepdim=True).clamp_min(eps) * mask_f
-
-    # ============================================================
-    # CSS / peak-recall diagnostics
-    # ============================================================
-
-    def _flatten_css_values(self, x: Any) -> list[Any]:
-        if x is None:
-            return []
-
-        if torch.is_tensor(x):
-            x = x.detach().cpu().numpy()
-
-        if isinstance(x, np.ndarray):
-            if x.ndim == 0:
-                return self._flatten_css_values(x.item())
-
-            out: list[Any] = []
-            for v in x.reshape(-1).tolist():
-                out.extend(self._flatten_css_values(v))
-            return out
-
-        if isinstance(x, (list, tuple)):
-            out: list[Any] = []
-            for v in x:
-                out.extend(self._flatten_css_values(v))
-            return out
-
-        return [x]
-
-    def _css_positions_from_item(self, css_item: Any, valid_len: int) -> list[int]:
-        if css_item is None or valid_len <= 0:
-            return []
-
-        if torch.is_tensor(css_item):
-            css_item = css_item.detach().cpu().numpy()
-
-        try:
-            arr = np.asarray(css_item)
-        except Exception:
-            arr = None
-
-        if arr is not None and arr.size > 0:
-            if arr.ndim == 1 and arr.shape[0] == valid_len and arr.dtype == bool:
-                return np.flatnonzero(arr).astype(int).tolist()
-
-            if arr.ndim == 1 and arr.shape[0] == valid_len:
-                try:
-                    arr_float = arr.astype(float)
-                    finite = np.isfinite(arr_float)
-                    unique = set(np.unique(arr_float[finite]).tolist())
-
-                    if unique.issubset({0.0, 1.0}):
-                        return np.flatnonzero(arr_float > 0.5).astype(int).tolist()
-                except Exception:
-                    pass
-
-        raw_values = self._flatten_css_values(css_item)
-        positions: list[int] = []
-
-        for v in raw_values:
-            try:
-                if v is None:
-                    continue
-
-                if isinstance(v, str):
-                    s = v.strip()
-
-                    if s in {"", "nan", "None", "null", "[]"}:
-                        continue
-
-                    if s.startswith("[") and s.endswith("]"):
-                        s = s.strip("[]")
-                        for piece in s.split(","):
-                            piece = piece.strip()
-                            if piece:
-                                raw_values.append(piece)
-                        continue
-
-                    v = s
-
-                fv = float(v)
-
-                if math.isnan(fv) or math.isinf(fv):
-                    continue
-
-                p = int(round(fv))
-
-            except Exception:
-                continue
-
-            if 0 <= p < valid_len:
-                positions.append(p)
-
-        return sorted(set(positions))
-
-    def _css_z_thresholds(self) -> list[float]:
-        raw = self._cfg("metrics.css_z_thresholds", [1.0, 2.0, 3.0, 4.0, 5.0])
-
-        if isinstance(raw, (int, float)):
-            return [float(raw)]
-
-        return [float(x) for x in list(raw)]
-
-    @staticmethod
-    def _z_label(tau: float) -> str:
-        tau = float(tau)
-        return f"z{int(tau)}" if tau.is_integer() else "z" + str(tau).replace(".", "p")
-
-    def _zscore_1d(
-        self,
-        score: torch.Tensor,
-        valid_len: int,
-    ) -> torch.Tensor | None:
-        if valid_len <= 1:
-            return None
-
-        eps = float(self._cfg("metrics.css_z_eps", 1.0e-6))
-        x = score.detach().float()[:valid_len].cpu()
-        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-        std = x.std(unbiased=False)
-
-        if not torch.isfinite(std) or float(std.item()) < eps:
-            return None
-
-        return (x - x.mean()) / std.clamp_min(eps)
-
-    @staticmethod
-    def _peak_indices_from_z(
-        z: torch.Tensor,
-        z_threshold: float,
-    ) -> list[int]:
-        L = int(z.numel())
-        if L <= 0:
-            return []
-
-        z = torch.nan_to_num(
-            z.float(),
-            nan=-float("inf"),
-            posinf=float("inf"),
-            neginf=-float("inf"),
-        )
-
-        left = torch.empty_like(z)
-        right = torch.empty_like(z)
-
-        left[0] = -float("inf")
-        left[1:] = z[:-1]
-
-        right[-1] = -float("inf")
-        right[:-1] = z[1:]
-
-        peak_mask = (z >= float(z_threshold)) & (z >= left) & (z >= right)
+        size = (1.0 / phi).clamp_min(self.eps)
+        log_total = torch.log(size + mu)
 
         return (
-            torch.nonzero(peak_mask, as_tuple=False)
-            .reshape(-1)
-            .cpu()
-            .numpy()
-            .astype(int)
-            .tolist()
+            torch.lgamma(y + size)
+            - torch.lgamma(size)
+            - torch.lgamma(y + 1.0)
+            + size * (torch.log(size.clamp_min(self.eps)) - log_total)
+            + y * (torch.log(mu.clamp_min(self.eps)) - log_total)
         )
 
-    def _css_metrics_for_scores(
+    def forward(
         self,
-        *,
-        scores: torch.Tensor | None,
-        css_items: list[Any],
+        mu_phys: torch.Tensor,
+        zero_param: torch.Tensor,
+        phi: torch.Tensor,
+        y_true: torch.Tensor,
         mask: torch.Tensor,
-    ) -> dict[float, dict[str, torch.Tensor]] | None:
-        if scores is None or not torch.is_tensor(scores) or scores.shape != mask.shape:
-            return None
-
-        device = mask.device
-        B = mask.shape[0]
-        tol = int(self._cfg("metrics.css_recall_tolerance", 1))
-        thresholds = self._css_z_thresholds()
-
-        out: dict[float, dict[str, torch.Tensor]] = {}
-
-        for tau in thresholds:
-            out[float(tau)] = {
-                "recall": torch.full((B,), float("nan"), device=device),
-                "precision": torch.full((B,), float("nan"), device=device),
-                "f1": torch.full((B,), float("nan"), device=device),
-                "css_site_count": torch.zeros((B,), dtype=torch.float32, device=device),
-                "css_hit_count": torch.zeros((B,), dtype=torch.float32, device=device),
-                "peak_count": torch.zeros((B,), dtype=torch.float32, device=device),
-                "peak_hit_count": torch.zeros((B,), dtype=torch.float32, device=device),
-            }
-
-        for i in range(B):
-            valid_len = int(mask[i].detach().bool().sum().item())
-            if valid_len <= 1:
-                continue
-
-            css_pos = self._css_positions_from_item(css_items[i], valid_len)
-            css_n = len(css_pos)
-            z = self._zscore_1d(scores[i], valid_len)
-
-            if z is None:
-                continue
-
-            for tau in thresholds:
-                tau = float(tau)
-                metrics_tau = out[tau]
-                metrics_tau["css_site_count"][i] = float(css_n)
-
-                peaks = self._peak_indices_from_z(z, tau)
-                peak_n = len(peaks)
-                metrics_tau["peak_count"][i] = float(peak_n)
-
-                if css_n == 0:
-                    continue
-
-                css_hits = 0
-                for c in css_pos:
-                    lo = max(0, int(c) - tol)
-                    hi = min(valid_len, int(c) + tol + 1)
-                    if bool((z[lo:hi] >= tau).any().item()):
-                        css_hits += 1
-
-                peak_hits = 0
-                for p in peaks:
-                    if any(abs(int(p) - int(c)) <= tol for c in css_pos):
-                        peak_hits += 1
-
-                metrics_tau["css_hit_count"][i] = float(css_hits)
-                metrics_tau["peak_hit_count"][i] = float(peak_hits)
-
-                rec = css_hits / max(css_n, 1)
-                prec = peak_hits / max(peak_n, 1) if peak_n > 0 else 0.0
-
-                metrics_tau["recall"][i] = float(rec)
-                metrics_tau["precision"][i] = float(prec)
-                metrics_tau["f1"][i] = (
-                    0.0 if (rec + prec) <= 0 else float(2.0 * rec * prec / (rec + prec))
-                )
-
-        return out
-
-    def _log_css_branch_metrics(
-        self,
-        *,
-        stage: str,
-        branch_name: str,
-        scores: torch.Tensor | None,
-        out: dict,
-        batch_size: int,
-    ) -> None:
-        metrics_by_tau = self._css_metrics_for_scores(
-            scores=scores,
-            css_items=out["css"],
-            mask=out["mask"],
-        )
-
-        if metrics_by_tau is None:
-            return
-
-        dataset_ids = out["dataset_ids"]
-
-        for tau, metrics in metrics_by_tau.items():
-            zlab = self._z_label(tau)
-
-            self._log_vector(
-                stage=stage,
-                name=f"css_recall_{branch_name}_{zlab}_macro",
-                values=metrics["recall"],
-                dataset_ids=dataset_ids,
-                batch_size=batch_size,
-                by_dataset=(stage == "val"),
-            )
-
-            self._log_vector(
-                stage=stage,
-                name=f"css_precision_{branch_name}_{zlab}_macro",
-                values=metrics["precision"],
-                dataset_ids=dataset_ids,
-                batch_size=batch_size,
-                by_dataset=(stage == "val"),
-            )
-
-            self._log_vector(
-                stage=stage,
-                name=f"css_f1_{branch_name}_{zlab}_macro",
-                values=metrics["f1"],
-                dataset_ids=dataset_ids,
-                batch_size=batch_size,
-                by_dataset=(stage == "val"),
-            )
-
-            hit_total = metrics["css_hit_count"].sum()
-            site_total = metrics["css_site_count"].sum()
-
-            if float(site_total.detach().cpu().item()) > 0:
-                self._log_scalar(
-                    f"{stage}_css_recall_{branch_name}_{zlab}_micro",
-                    hit_total / site_total.clamp_min(1.0),
-                    batch_size=int(site_total.detach().cpu().item()),
-                )
-
-            peak_hit_total = metrics["peak_hit_count"].sum()
-            peak_total = metrics["peak_count"].sum()
-
-            if float(peak_total.detach().cpu().item()) > 0:
-                self._log_scalar(
-                    f"{stage}_css_precision_{branch_name}_{zlab}_micro",
-                    peak_hit_total / peak_total.clamp_min(1.0),
-                    batch_size=int(peak_total.detach().cpu().item()),
-                )
-
-            if stage == "val":
-                for ds_id in torch.unique(dataset_ids).detach().cpu().tolist():
-                    ds_id = int(ds_id)
-                    ds_mask = dataset_ids == ds_id
-
-                    ds_hits = metrics["css_hit_count"][ds_mask].sum()
-                    ds_sites = metrics["css_site_count"][ds_mask].sum()
-
-                    if float(ds_sites.detach().cpu().item()) > 0:
-                        self._log_scalar(
-                            f"{stage}_css_recall_{branch_name}_{zlab}_micro_by_dataset/"
-                            f"{self._dataset_name(ds_id)}",
-                            ds_hits / ds_sites.clamp_min(1.0),
-                            batch_size=int(ds_sites.detach().cpu().item()),
-                        )
-
-    def _log_css_metrics(
-        self,
-        out: dict,
-        *,
-        stage: str,
-        batch_size: int,
-    ) -> None:
-        if not bool(self._cfg("metrics.log_css_recall", True)):
-            return
-
-        extras = out["extras"]
-        bio_scores = self._component(extras, "L_bio", "L_queue", "bio_q_base")
-        obs_scores = self._component(extras, "L_obs", "L_queue_obs", "bio_q_obs", "q")
-
-        for branch_name, scores in [
-            ("target", out["target"]),
-            ("bio", bio_scores),
-            ("obs", obs_scores),
-            ("full", out["mu"]),
-        ]:
-            self._log_css_branch_metrics(
-                stage=stage,
-                branch_name=branch_name,
-                scores=scores,
-                out=out,
-                batch_size=batch_size,
-            )
-
-        tmp_by_tau = self._css_metrics_for_scores(
-            scores=out["target"],
-            css_items=out["css"],
-            mask=out["mask"],
-        )
-
-        if tmp_by_tau is not None:
-            first_tau = sorted(tmp_by_tau.keys())[0]
-            tmp = tmp_by_tau[first_tau]
-            css_positive = (tmp["css_site_count"] > 0).float()
-
-            self._log_vector(
-                stage=stage,
-                name="css_positive_sample_frac",
-                values=css_positive,
-                dataset_ids=out["dataset_ids"],
-                batch_size=batch_size,
-                by_dataset=(stage == "val"),
-            )
-
-            self._log_vector(
-                stage=stage,
-                name="css_site_count",
-                values=tmp["css_site_count"],
-                dataset_ids=out["dataset_ids"],
-                batch_size=batch_size,
-                by_dataset=(stage == "val"),
-            )
-
-    # ============================================================
-    # Validation diagnostics
-    # ============================================================
-
-    def _log_regularization_diagnostics(
-        self,
-        *,
-        stage: str,
-        loss_terms: dict[str, torch.Tensor],
-        batch_size: int,
-    ) -> None:
-        self._log_scalar(
-            f"{stage}_reg_obs_bias_log_l2",
-            loss_terms.get("reg_obs_bias_log_l2"),
-            batch_size=batch_size,
-        )
-
-        self._log_scalar(
-            f"{stage}_reg_obs_gate_open",
-            loss_terms.get("reg_obs_gate_open"),
-            batch_size=batch_size,
-        )
-
-        self._log_scalar(
-            f"{stage}_reg_obs_gate_mean_floor",
-            loss_terms.get("reg_obs_gate_mean_floor"),
-            batch_size=batch_size,
-        )
-
-        self._log_scalar(
-            f"{stage}_reg_kappa_log_l2",
-            loss_terms.get("reg_kappa_log_l2"),
-            batch_size=batch_size,
-        )
-
-    def _log_observation_bias_diagnostics(
-        self,
-        *,
-        out: dict,
-        stage: str,
-        batch_size: int,
-    ) -> None:
-        extras = out["extras"]
-        dataset_ids = out["dataset_ids"]
-        mask = out["mask"]
-        mask_b = mask.bool()
-        mask_f = mask_b.float()
-        valid_len = mask_f.sum(dim=1).clamp_min(1.0)
-
-        def frac_true(x_bool: torch.Tensor) -> torch.Tensor:
-            return ((x_bool & mask_b).float().sum(dim=1) / valid_len)
-
-        diagnostic_keys = [
-            "delta_w_obs_bio_l1",
-            "w_bio_zero_frac",
-            "w_obs_zero_frac",
-            "L_bio_zero_frac",
-            "L_obs_zero_frac",
-            "b_abs_log_mean",
-            "b_abs_log_w_bio_weighted",
-            "obs_bias_weighted_mass",
-            "hazard_cap_frac",
-            "hazard_cap_frac_bio",
-            "hazard_cap_frac_obs",
-        ]
-
-        for key in diagnostic_keys:
-            val = self._component(extras, key)
-            if torch.is_tensor(val):
-                self._log_vector(
-                    stage=stage,
-                    name=key,
-                    values=val.reshape(-1),
-                    dataset_ids=dataset_ids,
-                    batch_size=batch_size,
-                    by_dataset=(stage == "val"),
-                )
-
-        for key in [
-            "obs_bias_amp",
-            "obs_bias_keep_prob",
-            "obs_bias_keep_gate",
-            "obs_bias_keep_hard",
-            "obs_bias_effective",
-        ]:
-            val = self._component(extras, key)
-            if torch.is_tensor(val) and val.shape == mask.shape:
-                mean_val = (val.detach().float() * mask_f).sum(dim=1) / valid_len
-                self._log_vector(
-                    stage=stage,
-                    name=f"{key}_mean",
-                    values=mean_val,
-                    dataset_ids=dataset_ids,
-                    batch_size=batch_size,
-                    by_dataset=(stage == "val"),
-                )
-
-        gate_threshold = float(
-            self._cfg(
-                "model.dataset_bias_params."
-                "dataset_multiplicative_allocation_bias_submodule_params."
-                "gate_threshold",
-                0.5,
-            )
-        )
-
-        keep_prob = self._component(extras, "obs_bias_keep_prob", "keep_prob")
-        keep_gate = self._component(extras, "obs_bias_keep_gate", "keep_gate")
-        keep_hard = self._component(extras, "obs_bias_keep_hard", "keep_hard")
-        gate_logits = self._component(extras, "obs_bias_gate_logits", "gate_logits")
-
-        if torch.is_tensor(keep_prob) and keep_prob.shape == mask.shape:
-            kp = keep_prob.detach().float().clamp(0.0, 1.0)
-
-            self._log_vector(
-                stage=stage,
-                name="obs_bias_keep_prob_min",
-                values=torch.where(mask_b, kp, torch.ones_like(kp)).min(dim=1).values,
-                dataset_ids=dataset_ids,
-                batch_size=batch_size,
-                by_dataset=(stage == "val"),
-            )
-
-            for q, label in [(0.01, "p01"), (0.05, "p05"), (0.10, "p10")]:
-                self._log_vector(
-                    stage=stage,
-                    name=f"obs_bias_keep_prob_{label}",
-                    values=self._masked_quantile_per_sample(kp, mask_b, q),
-                    dataset_ids=dataset_ids,
-                    batch_size=batch_size,
-                    by_dataset=(stage == "val"),
-                )
-
-            self._log_vector(
-                stage=stage,
-                name="obs_bias_keep_prob_below_threshold_frac",
-                values=frac_true(kp < gate_threshold),
-                dataset_ids=dataset_ids,
-                batch_size=batch_size,
-                by_dataset=(stage == "val"),
-            )
-
-            weights = self._mixed_position_weights_from_w_bio(
-                extras=extras,
-                mask=mask,
-            ).detach()
-            weighted_mean_open = (weights * kp).sum(dim=1)
-
-            self._log_vector(
-                stage=stage,
-                name="obs_bias_keep_prob_weighted_mean",
-                values=weighted_mean_open,
-                dataset_ids=dataset_ids,
-                batch_size=batch_size,
-                by_dataset=(stage == "val"),
-            )
-
-        if torch.is_tensor(keep_gate) and keep_gate.shape == mask.shape:
-            kg = keep_gate.detach().float()
-            zero_frac = frac_true(kg <= 0.0)
-
-            self._log_vector(
-                stage=stage,
-                name="obs_bias_keep_gate_zero_frac",
-                values=zero_frac,
-                dataset_ids=dataset_ids,
-                batch_size=batch_size,
-                by_dataset=(stage == "val"),
-            )
-
-            # Backward-compatible name.
-            self._log_vector(
-                stage=stage,
-                name="obs_bias_gate_closed_frac",
-                values=zero_frac,
-                dataset_ids=dataset_ids,
-                batch_size=batch_size,
-                by_dataset=(stage == "val"),
-            )
-
-        if torch.is_tensor(keep_hard) and keep_hard.shape == mask.shape:
-            kh = keep_hard.detach().float()
-            self._log_vector(
-                stage=stage,
-                name="obs_bias_keep_hard_zero_frac",
-                values=frac_true(kh <= 0.0),
-                dataset_ids=dataset_ids,
-                batch_size=batch_size,
-                by_dataset=(stage == "val"),
-            )
-
-        if torch.is_tensor(gate_logits) and gate_logits.shape == mask.shape:
-            gl = gate_logits.detach().float()
-
-            self._log_vector(
-                stage=stage,
-                name="obs_bias_gate_logits_mean",
-                values=(gl * mask_f).sum(dim=1) / valid_len,
-                dataset_ids=dataset_ids,
-                batch_size=batch_size,
-                by_dataset=(stage == "val"),
-            )
-
-            self._log_vector(
-                stage=stage,
-                name="obs_bias_gate_logits_p01",
-                values=self._masked_quantile_per_sample(gl, mask_b, 0.01),
-                dataset_ids=dataset_ids,
-                batch_size=batch_size,
-                by_dataset=(stage == "val"),
-            )
-
-        amp = self._component(extras, "obs_bias_amp")
-        b_eff = self._component(extras, "obs_bias_effective", "b_effective", "b_shape")
-        b_raw = self._component(extras, "obs_bias_raw", "b_raw")
-
-        if torch.is_tensor(amp) and amp.shape == mask.shape:
-            amp = amp.detach().float()
-
-            self._log_vector(
-                stage=stage,
-                name="obs_bias_amp_min",
-                values=torch.where(mask_b, amp, torch.full_like(amp, float("inf"))).min(dim=1).values,
-                dataset_ids=dataset_ids,
-                batch_size=batch_size,
-                by_dataset=(stage == "val"),
-            )
-
-            for q, label in [(0.01, "p01"), (0.05, "p05"), (0.10, "p10")]:
-                self._log_vector(
-                    stage=stage,
-                    name=f"obs_bias_amp_{label}",
-                    values=self._masked_quantile_per_sample(amp, mask_b, q),
-                    dataset_ids=dataset_ids,
-                    batch_size=batch_size,
-                    by_dataset=(stage == "val"),
-                )
-
-        if torch.is_tensor(b_eff) and b_eff.shape == mask.shape:
-            b_eff = b_eff.detach().float()
-
-            for q, label in [(0.01, "p01"), (0.05, "p05"), (0.10, "p10")]:
-                self._log_vector(
-                    stage=stage,
-                    name=f"obs_bias_effective_{label}",
-                    values=self._masked_quantile_per_sample(b_eff, mask_b, q),
-                    dataset_ids=dataset_ids,
-                    batch_size=batch_size,
-                    by_dataset=(stage == "val"),
-                )
-
-        if torch.is_tensor(b_raw) and b_raw.shape == mask.shape:
-            br = b_raw.detach().float()
-            self._log_vector(
-                stage=stage,
-                name="obs_bias_raw_zero_frac",
-                values=frac_true(br <= 0.0),
-                dataset_ids=dataset_ids,
-                batch_size=batch_size,
-                by_dataset=(stage == "val"),
-            )
-
-        w_obs = self._component(extras, "w_obs")
-        L_obs = self._component(extras, "L_obs", "L_queue_obs", "q")
-
-        if torch.is_tensor(w_obs) and w_obs.shape == mask.shape:
-            wo = w_obs.detach().float()
-            self._log_vector(
-                stage=stage,
-                name="w_obs_exact_zero_frac",
-                values=frac_true(wo <= 0.0),
-                dataset_ids=dataset_ids,
-                batch_size=batch_size,
-                by_dataset=(stage == "val"),
-            )
-
-        if torch.is_tensor(L_obs) and L_obs.shape == mask.shape:
-            lo = L_obs.detach().float()
-            self._log_vector(
-                stage=stage,
-                name="L_obs_exact_zero_frac",
-                values=frac_true(lo <= 0.0),
-                dataset_ids=dataset_ids,
-                batch_size=batch_size,
-                by_dataset=(stage == "val"),
-            )
-
-    def _log_validation_metrics(
-        self,
-        out: dict,
-        *,
-        batch_size: int,
-    ) -> None:
-        target = out["target"]
-        mask = out["mask"]
-        dataset_ids = out["dataset_ids"]
-        extras = out["extras"]
-
-        pcc_mu = self._log_pcc(
-            stage="val",
-            name="mu",
-            pred=out["mu"],
-            target=target,
-            mask=mask,
-            dataset_ids=dataset_ids,
-            batch_size=batch_size,
-            prog_bar=True,
-        )
-
-        mu_L_bio = self._component(extras, "mu_L_bio", "mu_L_only")
-        mu_L_obs = self._component(extras, "mu_L_obs", "mu_bio_only", "mu_obs")
-
-        if mu_L_bio is None:
-            mu_L_bio = self._mu_from_support(
-                self._component(extras, "L_bio", "L_queue", "bio_q_base"),
-                out,
-            )
-
-        if mu_L_obs is None:
-            mu_L_obs = self._mu_from_support(
-                self._component(extras, "L_obs", "L_queue_obs", "q", "bio_q"),
-                out,
-            )
-
-        pcc_bio = self._log_pcc(
-            stage="val",
-            name="mu_L_bio",
-            pred=mu_L_bio,
-            target=target,
-            mask=mask,
-            dataset_ids=dataset_ids,
-            batch_size=batch_size,
-        )
-
-        pcc_obs = self._log_pcc(
-            stage="val",
-            name="mu_L_obs",
-            pred=mu_L_obs,
-            target=target,
-            mask=mask,
-            dataset_ids=dataset_ids,
-            batch_size=batch_size,
-        )
-
-        if pcc_bio is not None and pcc_obs is not None:
-            self._log_vector(
-                stage="val",
-                name="obs_bias_gain_pcc",
-                values=pcc_obs - pcc_bio,
-                dataset_ids=dataset_ids,
-                batch_size=batch_size,
-            )
-
-        if pcc_mu is not None and pcc_obs is not None:
-            self._log_vector(
-                stage="val",
-                name="full_minus_L_obs_pcc",
-                values=pcc_mu - pcc_obs,
-                dataset_ids=dataset_ids,
-                batch_size=batch_size,
-            )
-
-        self._log_observation_bias_diagnostics(
-            out=out,
-            stage="val",
-            batch_size=batch_size,
-        )
-
-        self._log_css_metrics(
-            out,
-            stage="val",
-            batch_size=batch_size,
-        )
-
-    # ============================================================
-    # Optional gradient diagnostics
-    # ============================================================
-
-    def _pcgrad_params(self) -> list[torch.nn.Parameter]:
-        biology_only = bool(self._cfg("optim.pcgrad_biology_only", True))
-
-        if biology_only and hasattr(self.model, "biological_model"):
-            return [
-                p
-                for p in self.model.biological_model.parameters()
-                if p.requires_grad
-            ]
-
-        return [p for p in self.model.parameters() if p.requires_grad]
-
-    def _log_gradient_diagnostics(self) -> None:
-        every_n = int(self._cfg("metrics.grad_log_every_n_steps", 0))
-
-        if every_n <= 0 or int(self.global_step) % every_n != 0:
-            return
-
-        params = [
-            p for p in self.model.parameters()
-            if p.requires_grad and p.grad is not None
-        ]
-
-        if not params:
-            return
-
-        grad_norm = torch.stack(
-            [p.grad.detach().float().norm() for p in params]
-        ).norm()
-
-        self.log(
-            "grad/global_norm",
-            grad_norm,
-            on_step=True,
-            on_epoch=False,
-            logger=True,
-        )
-
-    def on_after_backward(self) -> None:
-        if not self.use_pcgrad:
-            self._log_gradient_diagnostics()
-
-    # ============================================================
-    # Optional validation plot
-    # ============================================================
-
-    def on_validation_epoch_start(self):
-        self._val_plot_logged_this_epoch = False
-
-    def _seq_np(
-        self,
-        x,
-        sample_idx: int,
-        mask_i: torch.Tensor,
-        L: int,
-    ):
-        if x is None or not torch.is_tensor(x):
-            return None
-
-        x = x.detach().float().cpu()
-
-        if x.ndim == 0:
-            return torch.full((L,), float(x.item())).numpy()
-
-        if x.ndim == 1:
-            if x.shape[0] == L:
-                return x[:L].numpy()
-
-            if x.shape[0] > sample_idx:
-                return torch.full((L,), float(x[sample_idx].item())).numpy()
-
-            return None
-
-        if x.ndim == 2:
-            if x.shape[0] <= sample_idx:
-                return None
-
-            if x.shape[1] == 1:
-                return torch.full((L,), float(x[sample_idx, 0].item())).numpy()
-
-            return x[sample_idx][mask_i].numpy()
-
-        return None
-
-    @staticmethod
-    def _same_id(a, b) -> bool:
-        return str(a) == str(b)
-
-    def _plot_validation_example(
-        self,
-        out: dict,
-        *,
-        batch_idx: int,
-    ) -> None:
-        if not bool(self._cfg("metrics.log_example_plot", True)):
-            return
-
-        if self._val_plot_logged_this_epoch or batch_idx != 0:
-            return
-
-        if not getattr(self.trainer, "is_global_zero", True):
-            return
-
-        if self.logger is None or getattr(self.logger, "experiment", None) is None:
-            return
-
-        ids = out["ids"]
-        dataset_ids = out["dataset_ids"]
-        B = len(ids)
-
-        if B < 1:
-            return
-
-        idx1, idx2 = 0, min(1, B - 1)
-        perfect_match = False
-
-        for i in range(B):
-            for j in range(i + 1, B):
-                if self._same_id(ids[i], ids[j]) and dataset_ids[i] != dataset_ids[j]:
-                    idx1, idx2 = i, j
-                    perfect_match = True
-                    break
-            if perfect_match:
-                break
-
-        extras = out["extras"]
-
-        L_bio = self._component(extras, "L_bio", "L_queue", "bio_q_base")
-        L_obs = self._component(extras, "L_obs", "L_queue_obs", "q", "bio_q")
-
-        w_bio = self._component(extras, "w_bio")
-        w_obs = self._component(extras, "w_obs")
-
-        b_eff = self._component(extras, "obs_bias_effective")
-        keep_prob = self._component(extras, "obs_bias_keep_prob")
-        keep_gate = self._component(extras, "obs_bias_keep_gate")
-        keep_hard = self._component(extras, "obs_bias_keep_hard")
-        amp = self._component(extras, "obs_bias_amp")
-
-        mu_L_bio = self._component(extras, "mu_L_bio", "mu_L_only")
-        mu_L_obs = self._component(extras, "mu_L_obs", "mu_bio_only")
-
-        if mu_L_bio is None:
-            mu_L_bio = self._mu_from_support(L_bio, out)
-
-        if mu_L_obs is None:
-            mu_L_obs = self._mu_from_support(L_obs, out)
-
-        fig, axes = plt.subplots(3, 2, figsize=(24, 9), sharex="col")
-
-        for col, sample_idx in enumerate([idx1, idx2]):
-            mask_i = out["mask"][sample_idx].detach().bool().cpu()
-            L = int(mask_i.sum().item())
-
-            if L < 2:
-                continue
-
-            x_axis = torch.arange(L).numpy()
-            ds_id = int(dataset_ids[sample_idx].detach().cpu().item())
-            title = "PAIRED" if perfect_match else "EXAMPLE"
-
-            axes[0, col].set_title(
-                f"[{title}] Dataset: {self._dataset_name(ds_id)} | "
-                f"ID: {ids[sample_idx]} | L={L}"
-            )
-
-            for tensor, label, lw in [
-                (out["target"], "target y", 1.0),
-                (out["mu"], "mu full / mu L_obs", 1.0),
-                (mu_L_obs, "mu L_obs", 0.9),
-                (mu_L_bio, "mu L_bio", 0.8),
-            ]:
-                arr = self._seq_np(tensor, sample_idx, mask_i, L)
-                if arr is not None:
-                    axes[0, col].plot(x_axis, arr, label=label, linewidth=lw)
-
-            css_pos = self._css_positions_from_item(out["css"][sample_idx], L)
-            for c in css_pos:
-                axes[0, col].axvline(c, linestyle="--", alpha=0.25, linewidth=0.8)
-
-            axes[0, col].set_ylabel("profile" if col == 0 else "")
-            axes[0, col].grid(True, alpha=0.3)
-            axes[0, col].legend(loc="upper right")
-
-            for tensor, label in [(L_bio, "L_bio"), (L_obs, "L_obs")]:
-                arr = self._seq_np(tensor, sample_idx, mask_i, L)
-                if arr is not None:
-                    axes[1, col].plot(x_axis, arr, label=label, linewidth=0.9)
-
-            for c in css_pos:
-                axes[1, col].axvline(c, linestyle="--", alpha=0.25, linewidth=0.8)
-
-            axes[1, col].set_ylabel("support" if col == 0 else "")
-            axes[1, col].grid(True, alpha=0.3)
-            axes[1, col].legend(loc="upper right")
-
-            for tensor, label in [
-                (w_bio, "w_bio"),
-                (w_obs, "w_obs"),
-                (b_eff, "b_eff"),
-                (amp, "amp"),
-                (keep_prob, "keep_prob"),
-                (keep_gate, "keep_gate"),
-                (keep_hard, "keep_hard"),
-            ]:
-                arr = self._seq_np(tensor, sample_idx, mask_i, L)
-                if arr is not None:
-                    axes[2, col].plot(x_axis, arr, label=label, linewidth=0.8)
-
-            axes[2, col].set_ylabel("allocation / bias" if col == 0 else "")
-            axes[2, col].set_xlabel("codon position")
-            axes[2, col].grid(True, alpha=0.3)
-            axes[2, col].legend(loc="upper right")
-
-        fig.tight_layout()
-        exp = self.logger.experiment
-
-        if hasattr(exp, "add_figure"):
-            exp.add_figure(
-                "val/example_profile_comparison",
-                fig,
-                global_step=self.global_step,
-            )
-        elif hasattr(exp, "log_figure"):
-            exp.log_figure(
-                figure_name="val/example_profile_comparison",
-                figure=fig,
-                step=self.global_step,
-            )
-
-        plt.close(fig)
-        self._val_plot_logged_this_epoch = True
-
-    # ============================================================
-    # PCGrad
-    # ============================================================
-
-    def _pcgrad_step(
-        self,
-        out: dict,
-        loss_terms: dict[str, torch.Tensor],
+        return_per_sample: bool = False,
     ) -> torch.Tensor:
-        opt = self.optimizers()
-        opt.zero_grad(set_to_none=True)
+        with torch.amp.autocast(device_type=mu_phys.device.type, enabled=False):
+            y = self._prepare_target(y_true.to(torch.float64))
 
-        params = self._pcgrad_params()
-        profile_scalar = loss_terms["profile_loss"]
-        full_loss = loss_terms["total_loss"]
+            mu = mu_phys.to(torch.float64).clamp(
+                min=self.mu_min,
+                max=self.mu_max,
+            )
+            pi_zero = self.zero_prob_from_param(zero_param.to(torch.float64))
+            phi_t = self._prepare_phi(phi.to(torch.float64))
 
-        ds_losses = per_dataset_losses(
-            loss_per_sample=loss_terms["nll_per_sample"],
-            dataset_ids=out["dataset_ids"],
+            pi_zero = torch.broadcast_to(pi_zero, y.shape)
+            phi_t = torch.broadcast_to(phi_t, y.shape)
+
+            mu_pos = self._positive_mean(mu=mu, pi_zero=pi_zero)
+            one_minus_pi = (1.0 - pi_zero).clamp_min(self.eps)
+
+            log_nb_y = self._nb_log_prob(y=y, mu=mu_pos, phi=phi_t)
+            positive_nll = -(torch.log(one_minus_pi) + log_nb_y)
+
+            if self.detach_mu_for_zero_branch:
+                mu_zero = mu_pos.detach()
+                phi_zero = phi_t.detach()
+            else:
+                mu_zero = mu_pos
+                phi_zero = phi_t
+
+            y_zero = torch.zeros_like(y)
+            log_nb_zero = self._nb_log_prob(y=y_zero, mu=mu_zero, phi=phi_zero)
+            if self.detach_mu_for_zero_branch:
+                log_nb_zero = log_nb_zero.detach()
+
+            log_zero_mass = torch.logaddexp(
+                torch.log(pi_zero.clamp_min(self.eps)),
+                torch.log(one_minus_pi) + log_nb_zero,
+            )
+            zero_nll = -log_zero_mass
+
+            is_zero = y <= self.zero_threshold
+            nll = torch.where(is_zero, zero_nll, positive_nll)
+            nll = torch.nan_to_num(
+                nll,
+                nan=0.0,
+                posinf=1.0e8,
+                neginf=1.0e8,
+            )
+
+            mask_f = mask.bool().to(torch.float64)
+            valid_len = mask_f.sum(dim=1).clamp_min(1.0)
+
+            loss_per_sample = (nll * mask_f).sum(dim=1) / valid_len
+            loss_per_sample = loss_per_sample.to(torch.float32)
+
+        if return_per_sample:
+            return loss_per_sample
+
+        return loss_per_sample.mean()
+
+
+# ============================================================
+# Lightning module
+# ============================================================
+
+class RiboQueuingModelLightningModule(pl.LightningModule):
+    """
+    Minimal LightningModule for:
+
+        mu = S_dt * support * beta
+
+    where support is rho_bio or q_bio depending on loss.pcc_target.
+    """
+
+    DATASET_DIAGNOSTIC_KEYS = (
+        "rho_mean",
+        "q_mean",
+        "q_max",
+        "q_zero_frac",
+        "queue_alpha",
+        "queue_propagation_enabled",
+        "queue_alpha_trainable",
+        "p_bio_mean",
+        "p_visible_mean",
+        "beta_mean",
+        "mu_mass",
+        "lambda_mass",
+        "mu_unconditional_mass",
+        "dropout_prob_mean",
+        "visibility_log_abs_mean",
+        "visibility_log_q_weighted_mean",
+        "visibility_log_center_abs",
+        "rho_zero_frac",
+        "beta_zero_frac",
+        "mu_zero_frac",
+        "J",
+        "scale_dt",
+        "log_scale_dt",
+        "dataset_scale",
+        "transcript_scale",
+    )
+
+    # Scalar objective/diagnostic metrics. _log_stage logs each only when
+    # present, so pcc_only mode does not require likelihood metrics.
+    OPTIONAL_SCALAR_METRICS = (
+        "nll",
+        "pcc_loss",
+        "mu_unconditional_pcc_loss",
+        "mu_mse",
+        "mu_unconditional_mse",
+        "mu_log1p_mse",
+        "mu_unconditional_log1p_mse",
+        "ziln_mean_pcc",
+        "ziln_unconditional_mean_pcc",
+        "ziln_mean_log1p_mse",
+        "ziln_unconditional_mean_log1p_mse",
+        "target_zero_frac",
+        "zero_prob_on_zero",
+        "zero_prob_on_positive",
+        "zero_prob_gap",
+        "j_centering_loss",
+    )
+
+    PROFILE_PLOT_GROUPS = (
+        ("biology/support", ("rho_bio", "q_bio", "p_visible")),
+        ("dropout", ("zero_prob",)),
+        ("visibility", ("obs_beta", "log_visibility_bias")),
+        (
+            "mean/scale",
+            ("mu_bio", "lambda_pre_dropout", "mu_positive", "mu_unconditional"),
+        ),
+        (
+            "likelihood",
+            (
+                "phi",
+                "likelihood_sd",
+                "likelihood_shape",
+                "likelihood_positive_mean",
+                "likelihood_unconditional_mean",
+            ),
+        ),
+    )
+
+    def __init__(
+        self,
+        torch_model: nn.Module,
+        config: Any,
+        dataset_encoding: dict,
+    ):
+        super().__init__()
+
+        self.save_hyperparameters(
+            ignore=["torch_model", "config", "dataset_encoding"]
         )
 
-        if len(ds_losses) <= 1 or len(params) == 0:
-            self.manual_backward(full_loss)
-            self._log_gradient_diagnostics()
-            return profile_scalar.detach()
+        self.model = torch_model
+        self.config = config
+        self.loss_fn = self._build_loss()
 
-        max_datasets = int(
-            self._cfg("optim.pcgrad_max_datasets_per_step", len(ds_losses))
-        )
+        self.dataset_id_to_name = {int(v): str(k) for k, v in dataset_encoding.items()}
+        self.use_cagrad = self.config.optim.use_cagrad
+        self.automatic_optimization = not self.use_cagrad
+        self._val_profile_plot_logged_this_epoch = False
 
-        if len(ds_losses) > max_datasets:
-            perm = torch.randperm(len(ds_losses), device=profile_scalar.device)[:max_datasets]
-            ds_losses = [ds_losses[int(i)] for i in perm.detach().cpu().tolist()]
+    def _build_loss(self) -> nn.Module:
+        loss_cfg = self.config.loss
 
-        raw_grads = []
-        unit_grads = []
+        common_kwargs = {
+            "eps": loss_cfg.eps,
+            "mu_min": loss_cfg.mu_min,
+            "mu_max": loss_cfg.mu_max,
+            "phi_min": loss_cfg.phi_min,
+            "phi_max": loss_cfg.phi_max,
+            "zero_input_is_logits": loss_cfg.zero_input_is_logits,
+            "phi_input_is_log": loss_cfg.phi_input_is_log,
+            "detach_mu_for_zero_branch": loss_cfg.detach_mu_for_zero_branch,
+            # mu_input_is_positive_mean is not read from config: for ZILN the active
+            # parameterization is set by ziln_mu_parameterization (explicit overrides
+            # the bool default); for ZINB the code default (True) is correct since
+            # mu = scale_dt * support * beta is always the pre-dropout positive mean.
+            "mu_input_is_positive_mean": True,
+        }
 
-        for ds_loss in ds_losses:
-            opt.zero_grad(set_to_none=True)
-            self.manual_backward(ds_loss, retain_graph=True)
-            g = flatten_current_grads(params).detach()
-            raw_grads.append(g)
-            unit_grads.append(g / g.norm().clamp_min(1.0e-12))
+        loss_builders = {
+            "ziln": lambda: ZeroInflatedLogNormalNB2Loss(
+                **common_kwargs,
+                mu_parameterization=getattr(
+                    loss_cfg,
+                    "ziln_mu_parameterization",
+                    None,
+                ),
+                log_sigma_min=loss_cfg.log_sigma_min,
+                log_sigma_max=loss_cfg.log_sigma_max,
+                censor_threshold=loss_cfg.censor_threshold,
+            ),
+            "zinb": lambda: ZeroInflatedNegativeBinomialLoss(
+                **common_kwargs,
+                target_transform=loss_cfg.zinb_target_transform,
+                zero_threshold=loss_cfg.zinb_zero_threshold,
+            ),
+        }
 
-        raw_grads_t = torch.stack(raw_grads, dim=0)
-        unit_grads_t = torch.stack(unit_grads, dim=0)
-
-        pcgrad = pcgrad_combine(unit_grads).detach()
-        mean_grad = unit_grads_t.mean(dim=0)
-
-        alpha = float(self._cfg("optim.pcgrad_alpha", 1.0))
-        pcgrad = alpha * pcgrad + (1.0 - alpha) * mean_grad
-
-        if bool(self._cfg("optim.pcgrad_rescale_to_mean_norm", True)):
-            target_norm = raw_grads_t.norm(dim=1).mean().clamp_min(1.0e-12)
-            pcgrad = pcgrad * (target_norm / pcgrad.norm().clamp_min(1.0e-12))
-
-        opt.zero_grad(set_to_none=True)
-        self.manual_backward(full_loss)
-        assign_flat_grads(params=params, flat_grad=pcgrad.detach())
-        self._log_gradient_diagnostics()
-
-        return profile_scalar.detach()
+        return loss_builders[loss_cfg.profile_likelihood]()
 
     # ============================================================
-    # Steps
+    # Forward / batch handling
     # ============================================================
 
-    def _forward_batch(self, batch) -> dict:
+    def _forward_batch(self, batch) -> dict[str, Any]:
         (
             dataset_ids,
             ids,
@@ -1828,177 +665,1203 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             css,
         ) = batch
 
-        model_out = self.model(seq_packed, codon_ids, dataset_ids, target)
-
-        if isinstance(model_out, tuple) and len(model_out) == 4:
-            mu, profile_aux, kappa_input, extras = model_out
-        elif isinstance(model_out, tuple) and len(model_out) == 3:
-            mu, kappa_input, extras = model_out
-            profile_aux = None
-        else:
-            raise RuntimeError(
-                "Expected model output (mu, kappa_input, extras) or "
-                "(mu, profile_aux, kappa_input, extras)."
-            )
+        mu, phi, extras = self.model(
+            x_packed=seq_packed,
+            codon_ids=codon_ids,
+            id_datasets=dataset_ids,
+            mask=mask,
+        )
 
         return {
             "dataset_ids": dataset_ids,
             "ids": ids,
-            "target": target,
             "lengths": lengths,
-            "mask": mask,
+            "mask": mask.bool(),
+            "target": target,
             "codon_ids": codon_ids,
             "css": css,
             "mu": mu,
-            "profile_aux": profile_aux,
-            "kappa_input": kappa_input,
-            "extras": extras if isinstance(extras, dict) else {},
+            "phi": phi,
+            "extras": extras,
         }
 
-    def training_step(self, batch, batch_idx):
-        out = self._forward_batch(batch)
-        batch_size = int(out["target"].shape[0])
-        loss_terms = self._loss_terms(out)
+    def forward_batch(self, batch) -> dict[str, Any]:
+        return self._forward_batch(batch)
 
-        self._log_scalar("train_loss", loss_terms["total_loss"], batch_size=batch_size, prog_bar=True)
-        self._log_scalar("train_profile_loss", loss_terms["profile_loss"], batch_size=batch_size)
-        self._log_scalar("train_extra_loss", loss_terms["extra_loss"], batch_size=batch_size)
+    # ============================================================
+    # Zero inflation
+    # ============================================================
 
-        self._log_regularization_diagnostics(
-            stage="train",
-            loss_terms=loss_terms,
-            batch_size=batch_size,
+    def _zero_param_from_out(self, out: dict[str, Any]) -> torch.Tensor:
+        """
+        Priority:
+            1. loss.zero_fixed_prob, if provided.
+            2. extras["zero_logits"]
+        """
+        target = out["target"]
+        mask = out["mask"].bool()
+        extras = out["extras"]
+
+        dtype = target.dtype
+        device = target.device
+
+        fixed_prob = self.config.loss.zero_fixed_prob
+
+        if fixed_prob is not None:
+            p = float(fixed_prob)
+            p = min(max(p, 1.0e-6), 1.0 - 1.0e-6)
+
+            prob = torch.full_like(
+                target,
+                fill_value=p,
+                dtype=dtype,
+                device=device,
+            )
+
+            prob = torch.where(
+                mask,
+                prob,
+                torch.full_like(prob, 1.0e-6),
+            )
+
+            if self.config.loss.zero_input_is_logits:
+                return torch.logit(prob.clamp(1.0e-6, 1.0 - 1.0e-6))
+
+            return prob
+
+        zero_logits = extras["zero_logits"].to(device=device, dtype=dtype)
+
+        if self.config.loss.zero_input_is_logits:
+            return zero_logits
+
+        return torch.sigmoid(zero_logits)
+
+    # ============================================================
+    # Loss / metrics
+    # ============================================================
+
+    def _profile_nll_per_sample(self, out: dict[str, Any]) -> torch.Tensor:
+        zero_param = self._zero_param_from_out(out)
+
+        return self.loss_fn(
+            mu_phys=out["mu"].float(),
+            zero_param=zero_param.float(),
+            phi=out["phi"].float(),
+            y_true=out["target"].float(),
+            mask=out["mask"].bool(),
+            return_per_sample=True,
         )
 
-        if not self.use_pcgrad:
-            return loss_terms["total_loss"]
+    def _aggregate_per_sample(
+        self,
+        values: torch.Tensor,
+        dataset_ids: torch.Tensor,
+        _ds_split: "tuple[torch.Tensor, int] | None" = None,
+    ) -> torch.Tensor:
+        if not self.config.loss.dataset_balanced_loss:
+            return values.mean()
 
+        if _ds_split is None:
+            _, inverse = torch.unique(
+                dataset_ids.to(device=values.device), return_inverse=True
+            )
+            K = int(inverse.max().item()) + 1
+        else:
+            inverse, K = _ds_split
+            inverse = inverse.to(device=values.device)
+
+        sums = torch.zeros(K, device=values.device, dtype=values.dtype).scatter_add_(
+            0, inverse, values
+        )
+        counts = torch.bincount(inverse, minlength=K).to(dtype=values.dtype)
+        return (sums / counts.clamp_min(1.0)).mean()
+
+    def _pearson_per_sample(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        mask: torch.Tensor,
+        eps: float = 1.0e-8,
+    ) -> torch.Tensor:
+        mask_b = mask.bool()
+        mask_f = mask_b.to(dtype=pred.dtype)
+
+        pred = pred.float() * mask_f
+        target = target.float() * mask_f
+
+        valid_len = mask_f.sum(dim=1).clamp_min(1.0)
+
+        pred_mean = pred.sum(dim=1, keepdim=True) / valid_len.unsqueeze(1)
+        target_mean = target.sum(dim=1, keepdim=True) / valid_len.unsqueeze(1)
+
+        pred_centered = (pred - pred_mean) * mask_f
+        target_centered = (target - target_mean) * mask_f
+
+        numerator = (pred_centered * target_centered).sum(dim=1)
+
+        pred_var = pred_centered.pow(2).sum(dim=1)
+        target_var = target_centered.pow(2).sum(dim=1)
+
+        denom = torch.sqrt(pred_var * target_var).clamp_min(eps)
+
+        pcc = numerator / denom
+
+        valid = (pred_var > eps) & (target_var > eps)
+        pcc = torch.where(valid, pcc, torch.zeros_like(pcc))
+
+        return pcc
+
+    def _dataset_name(self, dataset_id: int) -> str:
+        name = self.dataset_id_to_name.get(int(dataset_id), str(int(dataset_id)))
+        return name.replace("/", "_").replace(" ", "_")
+
+    def _zero_probability_from_out(self, out: dict[str, Any]) -> torch.Tensor:
+        zero_param = self._zero_param_from_out(out)
+
+        if self.config.loss.zero_input_is_logits:
+            return torch.sigmoid(zero_param)
+
+        return zero_param
+
+    def _likelihood_curves_for_plot(
+        self,
+        out: dict[str, Any],
+        zero_prob: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        mu = out["mu"].detach().float()
+        phi = out["phi"].detach().float().clamp_min(self.loss_fn.eps)
+
+        if self.config.loss.profile_likelihood == "ziln":
+            with torch.no_grad():
+                log_loc, log_sigma = self.loss_fn._lognormal_params(
+                    mu=mu,
+                    pi_zero=zero_prob.detach().float(),
+                    phi=phi,
+                )
+                log_sigma2 = log_sigma.pow(2)
+                positive_mean = torch.exp(log_loc + 0.5 * log_sigma2)
+                variance = (
+                    torch.expm1(log_sigma2)
+                    * torch.exp(2.0 * log_loc + log_sigma2)
+                )
+                unconditional_mean = (
+                    (1.0 - zero_prob.detach().float())
+                    * positive_mean
+                )
+            return {
+                "likelihood_sd": variance.clamp_min(self.loss_fn.eps).sqrt(),
+                "likelihood_shape": log_sigma.float(),
+                "likelihood_positive_mean": positive_mean.float(),
+                "likelihood_unconditional_mean": unconditional_mean.float(),
+            }
+
+        variance = mu + phi * mu.pow(2)
+        return {
+            "likelihood_sd": variance.clamp_min(self.loss_fn.eps).sqrt(),
+            "likelihood_shape": (1.0 / phi).clamp_max(1.0e6),
+        }
+
+    def _mean_for_dataset(
+        self,
+        value: torch.Tensor,
+        *,
+        sample_mask: torch.Tensor,
+        position_mask: torch.Tensor,
+        batch_size: int,
+    ) -> torch.Tensor:
+        value = value.detach().float()
+
+        if value.ndim == 0:
+            return value
+
+        if value.ndim == 1 and value.shape[0] == batch_size:
+            return value[sample_mask].mean()
+
+        if value.ndim == 2 and value.shape[0] == batch_size and value.shape[1] == 1:
+            return value[sample_mask].mean()
+
+        if value.ndim == 2 and value.shape == position_mask.shape:
+            dataset_values = value[sample_mask]
+            dataset_position_mask = position_mask[sample_mask]
+
+            return dataset_values[dataset_position_mask].mean()
+
+        return value.mean()
+
+    def _log_scalar(
+        self,
+        name: str,
+        value: torch.Tensor,
+        *,
+        batch_size: int,
+        sync_dist: bool,
+        prog_bar: bool = False,
+        reduce_fx: str = "mean",
+    ) -> None:
+        self.log(
+            name,
+            value,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=prog_bar,
+            batch_size=batch_size,
+            sync_dist=sync_dist,
+            reduce_fx=reduce_fx,
+        )
+
+    def _log_per_dataset_metrics(
+        self,
+        *,
+        stage: str,
+        out: dict[str, Any],
+        metrics: dict[str, torch.Tensor],
+    ) -> None:
+        """
+        Logs per-dataset metrics under the same metric namespace as the
+        global average, so TensorBoard can compare datasets side by side:
+            val_mu_pcc
+            val_mu_pcc/<dataset_name>
+            val_support_pcc
+            val_support_pcc/<dataset_name>
+            val_loss
+            val_loss/<dataset_name>
+        """
+        dataset_ids = out["dataset_ids"].detach().to(device=out["target"].device)
+        unique_dataset_ids = torch.unique(dataset_ids)
+
+        batch_size = int(out["target"].shape[0])
+        sync_dist = self.config.trainer.sync_dist_logs
+
+        extras = out["extras"]
+        mask = out["mask"].bool()
+        zero_probability = self._zero_probability_from_out(out)
+
+        for dataset_id_tensor in unique_dataset_ids:
+            dataset_id = int(dataset_id_tensor.item())
+            dataset_name = self._dataset_name(dataset_id)
+            sample_mask = dataset_ids == dataset_id_tensor
+
+            n_samples = int(sample_mask.sum().item())
+
+            scalar_metrics = {
+                "loss": metrics["loss_per_sample"][sample_mask].mean(),
+                "mu_pcc": metrics["mu_pcc_per_sample"][sample_mask].mean(),
+                "mu_unconditional_pcc": metrics[
+                    "mu_unconditional_pcc_per_sample"
+                ][sample_mask].mean(),
+                "mu_unconditional_pcc_loss": metrics[
+                    "mu_unconditional_pcc_loss_per_sample"
+                ][sample_mask].mean(),
+                "support_pcc": metrics["support_pcc_per_sample"][sample_mask].mean(),
+                "mu_mse": metrics["mu_mse_per_sample"][sample_mask].mean(),
+                "mu_unconditional_mse": metrics[
+                    "mu_unconditional_mse_per_sample"
+                ][sample_mask].mean(),
+                "mu_log1p_mse": metrics["mu_log1p_mse_per_sample"][
+                    sample_mask
+                ].mean(),
+                "mu_unconditional_log1p_mse": metrics[
+                    "mu_unconditional_log1p_mse_per_sample"
+                ][sample_mask].mean(),
+                "target_zero_frac": metrics[
+                    "target_zero_frac_per_sample"
+                ][sample_mask].mean(),
+                "zero_prob_on_zero": metrics[
+                    "zero_prob_on_zero_per_sample"
+                ][sample_mask].mean(),
+                "zero_prob_on_positive": metrics[
+                    "zero_prob_on_positive_per_sample"
+                ][sample_mask].mean(),
+                "zero_prob_gap": metrics[
+                    "zero_prob_gap_per_sample"
+                ][sample_mask].mean(),
+                "n_samples": torch.as_tensor(
+                    float(n_samples),
+                    device=self.device,
+                ),
+                "zero_prob_mean": self._mean_for_dataset(
+                    zero_probability,
+                    sample_mask=sample_mask,
+                    position_mask=mask,
+                    batch_size=batch_size,
+                ),
+                "phi_mean": self._mean_for_dataset(
+                    out["phi"],
+                    sample_mask=sample_mask,
+                    position_mask=mask,
+                    batch_size=batch_size,
+                ),
+            }
+
+            # Optional per-sample metrics exist only on the full ZILN + reg path.
+            for name in self.OPTIONAL_SCALAR_METRICS:
+                key = f"{name}_per_sample"
+                if key in metrics:
+                    scalar_metrics[name] = metrics[key][sample_mask].mean()
+
+            for key in self.DATASET_DIAGNOSTIC_KEYS:
+                scalar_metrics[key] = self._mean_for_dataset(
+                    extras[key],
+                    sample_mask=sample_mask,
+                    position_mask=mask,
+                    batch_size=batch_size,
+                )
+
+            for metric_name, metric_value in scalar_metrics.items():
+                self._log_scalar(
+                    f"{stage}_{metric_name}/{dataset_name}",
+                    metric_value,
+                    batch_size=n_samples,
+                    sync_dist=sync_dist,
+                    reduce_fx="sum" if metric_name == "n_samples" else "mean",
+                )
+
+    def _mse_per_sample(
+        self,
+        *,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        mask: torch.Tensor,
+        log1p: bool = False,
+    ) -> torch.Tensor:
+        mask_f = mask.bool().to(dtype=pred.dtype)
+        valid_len = mask_f.sum(dim=1).clamp_min(1.0)
+
+        pred = pred.float().clamp_min(0.0)
+        target = target.float().clamp_min(0.0)
+
+        if log1p:
+            pred = torch.log1p(pred)
+            target = torch.log1p(target)
+
+        return ((pred - target).pow(2) * mask_f).sum(dim=1) / valid_len
+
+    def _zero_threshold_for_metrics(self) -> float:
+        if self.config.loss.profile_likelihood == "ziln":
+            return float(self.config.loss.censor_threshold)
+
+        return float(self.config.loss.zinb_zero_threshold)
+
+    def _zero_diagnostics_per_sample(
+        self,
+        *,
+        out: dict[str, Any],
+        zero_probability: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        target = out["target"].float()
+        mask = out["mask"].bool()
+        mask_f = mask.to(dtype=target.dtype)
+
+        zero_threshold = self._zero_threshold_for_metrics()
+        zero_mask = (target <= zero_threshold) & mask
+        positive_mask = (target > zero_threshold) & mask
+
+        valid_len = mask_f.sum(dim=1).clamp_min(1.0)
+        zero_count = zero_mask.to(dtype=target.dtype).sum(dim=1)
+        positive_count = positive_mask.to(dtype=target.dtype).sum(dim=1)
+
+        zero_prob = zero_probability.float()
+        zero_prob_on_zero = (
+            zero_prob * zero_mask.to(dtype=zero_prob.dtype)
+        ).sum(dim=1) / zero_count.clamp_min(1.0)
+        zero_prob_on_positive = (
+            zero_prob * positive_mask.to(dtype=zero_prob.dtype)
+        ).sum(dim=1) / positive_count.clamp_min(1.0)
+
+        zero_prob_on_zero = torch.where(
+            zero_count > 0.0,
+            zero_prob_on_zero,
+            torch.zeros_like(zero_prob_on_zero),
+        )
+        zero_prob_on_positive = torch.where(
+            positive_count > 0.0,
+            zero_prob_on_positive,
+            torch.zeros_like(zero_prob_on_positive),
+        )
+
+        return {
+            "target_zero_frac_per_sample": zero_count / valid_len,
+            "zero_prob_on_zero_per_sample": zero_prob_on_zero,
+            "zero_prob_on_positive_per_sample": zero_prob_on_positive,
+            "zero_prob_gap_per_sample": zero_prob_on_zero - zero_prob_on_positive,
+        }
+
+    def _compute_loss_and_metrics(
+        self,
+        out: dict[str, Any],
+    ) -> dict[str, torch.Tensor]:
+        mode = self.config.loss.mode
+        dataset_ids = out["dataset_ids"]
+
+        # Pre-compute dataset grouping once; passed to every _aggregate_per_sample call
+        # to avoid 15 redundant torch.unique() calls per training step.
+        _ds_split: tuple[torch.Tensor, int] | None = None
+        if self.config.loss.dataset_balanced_loss:
+            _, _ds_inv = torch.unique(
+                dataset_ids.to(device=out["target"].device), return_inverse=True
+            )
+            _ds_split = (_ds_inv, int(_ds_inv.max().item()) + 1)
+
+        # Quantity correlated against normalized profile shape:
+        #   rho = raw local occupancy (baseline)
+        #   q   = occupancy AFTER causal queue propagation. This is the ONLY path
+        #         by which the queue coupling (and a learnable alpha) reaches the
+        #         loss; with propagation off, q_bio == rho_bio.
+        support = out["extras"][
+            {"q": "q_bio", "rho": "rho_bio"}[self.config.loss.pcc_target]
+        ]
+
+        target = out["target"]
+        mask = out["mask"].bool()
+        mask_f = mask.to(dtype=support.dtype)
+
+        # Normalize target per-transcript: y_norm_i = y_i / max_j(y_j), in [0, 1].
+        # clamp_min(1.0) keeps zero-profile transcripts from producing NaN.
+        target_max = (target * mask_f).max(dim=1, keepdim=True).values.clamp_min(1.0)
+        target_norm = (target / target_max * mask_f).clamp(0.0, 1.0)
+
+        support_pcc_per_sample = self._pearson_per_sample(
+            pred=support,
+            target=target_norm,
+            mask=mask,
+        )
+        mu_pcc_per_sample = self._pearson_per_sample(
+            pred=out["mu"].float(),
+            target=target.float(),
+            mask=mask,
+        )
+        mu_unconditional_pcc_per_sample = self._pearson_per_sample(
+            pred=out["extras"]["mu_unconditional"].float(),
+            target=target.float(),
+            mask=mask,
+        )
+        mu_mse_per_sample = self._mse_per_sample(
+            pred=out["mu"],
+            target=target,
+            mask=mask,
+        )
+        mu_unconditional_mse_per_sample = self._mse_per_sample(
+            pred=out["extras"]["mu_unconditional"],
+            target=target,
+            mask=mask,
+        )
+        mu_log1p_mse_per_sample = self._mse_per_sample(
+            pred=out["mu"],
+            target=target,
+            mask=mask,
+            log1p=True,
+        )
+        mu_unconditional_log1p_mse_per_sample = self._mse_per_sample(
+            pred=out["extras"]["mu_unconditional"],
+            target=target,
+            mask=mask,
+            log1p=True,
+        )
+
+        zero_probability = self._zero_probability_from_out(out)
+        zero_metrics = self._zero_diagnostics_per_sample(
+            out=out,
+            zero_probability=zero_probability,
+        )
+        ziln_mean_metrics = {}
+        if self.config.loss.profile_likelihood == "ziln":
+            with torch.no_grad():
+                ziln_positive_mean = self.loss_fn.positive_mean_from_params(
+                    mu=out["mu"].detach().float(),
+                    pi_zero=zero_probability.detach().float(),
+                    phi=out["phi"].detach().float(),
+                ).float()
+                ziln_unconditional_mean = (
+                    (1.0 - zero_probability.detach().float())
+                    * ziln_positive_mean
+                )
+
+            ziln_mean_pcc_per_sample = self._pearson_per_sample(
+                pred=ziln_positive_mean,
+                target=target.float(),
+                mask=mask,
+            )
+            ziln_unconditional_mean_pcc_per_sample = self._pearson_per_sample(
+                pred=ziln_unconditional_mean,
+                target=target.float(),
+                mask=mask,
+            )
+            ziln_mean_log1p_mse_per_sample = self._mse_per_sample(
+                pred=ziln_positive_mean,
+                target=target,
+                mask=mask,
+                log1p=True,
+            )
+            ziln_unconditional_mean_log1p_mse_per_sample = self._mse_per_sample(
+                pred=ziln_unconditional_mean,
+                target=target,
+                mask=mask,
+                log1p=True,
+            )
+            ziln_mean_metrics = {
+                "ziln_mean_pcc": self._aggregate_per_sample(
+                    ziln_mean_pcc_per_sample, dataset_ids, _ds_split,
+                ),
+                "ziln_mean_pcc_per_sample": ziln_mean_pcc_per_sample,
+                "ziln_unconditional_mean_pcc": self._aggregate_per_sample(
+                    ziln_unconditional_mean_pcc_per_sample, dataset_ids, _ds_split,
+                ),
+                "ziln_unconditional_mean_pcc_per_sample": (
+                    ziln_unconditional_mean_pcc_per_sample
+                ),
+                "ziln_mean_log1p_mse": self._aggregate_per_sample(
+                    ziln_mean_log1p_mse_per_sample, dataset_ids, _ds_split,
+                ),
+                "ziln_mean_log1p_mse_per_sample": ziln_mean_log1p_mse_per_sample,
+                "ziln_unconditional_mean_log1p_mse": self._aggregate_per_sample(
+                    ziln_unconditional_mean_log1p_mse_per_sample, dataset_ids, _ds_split,
+                ),
+                "ziln_unconditional_mean_log1p_mse_per_sample": (
+                    ziln_unconditional_mean_log1p_mse_per_sample
+                ),
+            }
+
+        # Loss = 1 - PCC so that minimising loss maximises correlation.
+        pcc_loss_per_sample = 1.0 - support_pcc_per_sample
+        mu_unconditional_pcc_loss_per_sample = 1.0 - mu_unconditional_pcc_per_sample
+        pcc_loss = self._aggregate_per_sample(pcc_loss_per_sample, dataset_ids)
+        mu_unconditional_pcc_loss = self._aggregate_per_sample(
+            mu_unconditional_pcc_loss_per_sample,
+            dataset_ids,
+        )
+        support_pcc = self._aggregate_per_sample(support_pcc_per_sample, dataset_ids)
+        mu_pcc = self._aggregate_per_sample(mu_pcc_per_sample, dataset_ids)
+        mu_unconditional_pcc = self._aggregate_per_sample(
+            mu_unconditional_pcc_per_sample,
+            dataset_ids,
+        )
+        mu_mse = self._aggregate_per_sample(mu_mse_per_sample, dataset_ids)
+        mu_unconditional_mse = self._aggregate_per_sample(
+            mu_unconditional_mse_per_sample,
+            dataset_ids,
+        )
+        mu_log1p_mse = self._aggregate_per_sample(
+            mu_log1p_mse_per_sample,
+            dataset_ids,
+        )
+        mu_unconditional_log1p_mse = self._aggregate_per_sample(
+            mu_unconditional_log1p_mse_per_sample,
+            dataset_ids,
+        )
+
+        metrics = {
+            "pcc_loss": pcc_loss,
+            "pcc_loss_per_sample": pcc_loss_per_sample,
+            "mu_unconditional_pcc_loss": mu_unconditional_pcc_loss,
+            "mu_unconditional_pcc_loss_per_sample": (
+                mu_unconditional_pcc_loss_per_sample
+            ),
+            "support_pcc": support_pcc,
+            "support_pcc_per_sample": support_pcc_per_sample,
+            "mu_pcc": mu_pcc,
+            "mu_pcc_per_sample": mu_pcc_per_sample,
+            "mu_unconditional_pcc": mu_unconditional_pcc,
+            "mu_unconditional_pcc_per_sample": mu_unconditional_pcc_per_sample,
+            "mu_mse": mu_mse,
+            "mu_mse_per_sample": mu_mse_per_sample,
+            "mu_unconditional_mse": mu_unconditional_mse,
+            "mu_unconditional_mse_per_sample": mu_unconditional_mse_per_sample,
+            "mu_log1p_mse": mu_log1p_mse,
+            "mu_log1p_mse_per_sample": mu_log1p_mse_per_sample,
+            "mu_unconditional_log1p_mse": mu_unconditional_log1p_mse,
+            "mu_unconditional_log1p_mse_per_sample": (
+                mu_unconditional_log1p_mse_per_sample
+            ),
+        }
+        for name, value in zero_metrics.items():
+            metrics[name] = value
+            metrics[name.removesuffix("_per_sample")] = self._aggregate_per_sample(
+                value,
+                dataset_ids,
+            )
+        metrics.update(ziln_mean_metrics)
+
+        # Batch-mean log(J) centering — breaks the J/scale_dt identifiability degeneracy.
+        # J is a per-transcript biological scale (ribosome flux amplitude). Without this
+        # constraint, the optimizer slides along the flat J×scale_dt manifold, pushing J→0
+        # and scale_dt→∞ while leaving mu unchanged. Penalising the BATCH MEAN of log(J)
+        # drifting away from 0 prevents global collapse while leaving per-transcript
+        # J variation (the biological signal) completely free.
+        j_centering_weight = float(getattr(self.config.loss, "j_centering_weight", 0.0))
+        j_centering_loss = torch.zeros((), device=support.device, dtype=support.dtype)
+        if j_centering_weight > 0.0:
+            J = out["extras"]["J"].float()  # [B, 1]
+            log_J_mean = torch.log(J.clamp_min(1e-6)).mean()
+            j_centering_loss = j_centering_weight * log_J_mean.pow(2)
+            metrics["j_centering_loss"] = j_centering_loss
+
+        if mode == "pcc_only":
+            metrics["loss"] = pcc_loss + mu_unconditional_pcc_loss + j_centering_loss
+            metrics["loss_per_sample"] = (
+                pcc_loss_per_sample + mu_unconditional_pcc_loss_per_sample
+            )
+            return metrics
+
+        nll_per_sample = self._profile_nll_per_sample(out)
+        nll = self._aggregate_per_sample(nll_per_sample, dataset_ids)
+
+        metrics["nll"] = nll
+        metrics["nll_per_sample"] = nll_per_sample
+
+        if mode == "likelihood_only":
+            metrics["loss"] = nll + j_centering_loss
+            metrics["loss_per_sample"] = nll_per_sample
+            return metrics
+
+        if mode == "pcc_likelihood":
+            metrics["loss"] = pcc_loss + mu_unconditional_pcc_loss + nll + j_centering_loss
+            metrics["loss_per_sample"] = (
+                pcc_loss_per_sample
+                + mu_unconditional_pcc_loss_per_sample
+                + nll_per_sample
+            )
+            return metrics
+
+        raise KeyError(mode)
+
+    # ============================================================
+    # Logging helpers
+    # ============================================================
+
+    def _log_stage(
+        self,
+        *,
+        stage: str,
+        out: dict[str, Any],
+        metrics: dict[str, torch.Tensor],
+    ) -> None:
+        batch_size = int(out["target"].shape[0])
+        sync_dist = self.config.trainer.sync_dist_logs
+
+        self.log(
+            f"{stage}_loss",
+            metrics["loss"],
+            on_step=(stage == "train"),
+            on_epoch=True,
+            prog_bar=True,
+            batch_size=batch_size,
+            sync_dist=sync_dist,
+        )
+
+        self.log(
+            f"{stage}_mu_pcc",
+            metrics["mu_pcc"],
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            batch_size=batch_size,
+            sync_dist=sync_dist,
+        )
+
+        self.log(
+            f"{stage}_mu_unconditional_pcc",
+            metrics["mu_unconditional_pcc"],
+            on_step=False,
+            on_epoch=True,
+            prog_bar=False,
+            batch_size=batch_size,
+            sync_dist=sync_dist,
+        )
+
+        self.log(
+            f"{stage}_support_pcc",
+            metrics["support_pcc"],
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            batch_size=batch_size,
+            sync_dist=sync_dist,
+        )
+
+        # Optional scalar metrics produced only by the active objective terms.
+        # In pcc_only mode the likelihood NLL is absent.
+        for name in self.OPTIONAL_SCALAR_METRICS:
+            if name in metrics:
+                self.log(
+                    f"{stage}_{name}",
+                    metrics[name],
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=False,
+                    batch_size=batch_size,
+                    sync_dist=sync_dist,
+                )
+
+        extras = out["extras"]
+
+        for key in self.DATASET_DIAGNOSTIC_KEYS:
+            self.log(
+                f"{stage}_{key}",
+                extras[key].float().mean(),
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size,
+                sync_dist=sync_dist,
+            )
+
+        zero_probability = self._zero_probability_from_out(out)
+        self.log(
+            f"{stage}_zero_prob_mean",
+            zero_probability.float()[out["mask"].bool()].mean(),
+            on_step=False,
+            on_epoch=True,
+            prog_bar=False,
+            batch_size=batch_size,
+            sync_dist=sync_dist,
+        )
+
+        self.log(
+            f"{stage}_phi_mean",
+            out["phi"].float()[out["mask"].bool()].mean(),
+            on_step=False,
+            on_epoch=True,
+            prog_bar=False,
+            batch_size=batch_size,
+            sync_dist=sync_dist,
+        )
+        self._log_per_dataset_metrics(
+            stage=stage,
+            out=out,
+            metrics=metrics,
+        )
+
+    # ============================================================
+    # Profile plots
+    # ============================================================
+
+    def on_validation_epoch_start(self) -> None:
+        self._val_profile_plot_logged_this_epoch = False
+
+    def _sequence_for_plot(
+        self,
+        value: torch.Tensor,
+        *,
+        sample_idx: int,
+        mask_i: torch.Tensor,
+    ):
+        value = value.detach().float().cpu()
+        mask_i = mask_i.detach().bool().cpu()
+        length = int(mask_i.sum().item())
+
+        if value.ndim == 0:
+            return torch.full((length,), float(value.item())).numpy()
+
+        if value.ndim == 1:
+            if value.shape[0] == mask_i.shape[0]:
+                return value[mask_i].numpy()
+
+            return torch.full(
+                (length,),
+                float(value[sample_idx].item()),
+            ).numpy()
+
+        if value.ndim == 2:
+            sample_value = value[sample_idx]
+
+            if sample_value.ndim == 1 and sample_value.shape[0] == mask_i.shape[0]:
+                return sample_value[mask_i].numpy()
+
+            if sample_value.numel() == 1:
+                return torch.full(
+                    (length,),
+                    float(sample_value.reshape(-1)[0].item()),
+                ).numpy()
+
+        return value.reshape(-1)[:length].numpy()
+
+    def _plot_profile_example(
+        self,
+        out: dict[str, Any],
+        *,
+        batch_idx: int,
+    ) -> None:
+        if not self.config.metrics.log_example_plot:
+            return
+
+        if self._val_profile_plot_logged_this_epoch or batch_idx != 0:
+            return
+
+        if not getattr(self.trainer, "is_global_zero", True):
+            return
+
+        if self.logger is None or getattr(self.logger, "experiment", None) is None:
+            return
+
+        dataset_ids = out["dataset_ids"].detach().cpu()
+        max_plots = int(self.config.metrics.example_plot_max_datasets)
+        selected_indices = []
+        seen_dataset_ids = set()
+
+        for sample_idx, dataset_id in enumerate(dataset_ids.tolist()):
+            dataset_id = int(dataset_id)
+
+            if dataset_id in seen_dataset_ids:
+                continue
+
+            seen_dataset_ids.add(dataset_id)
+            selected_indices.append(sample_idx)
+
+            if len(selected_indices) >= max_plots:
+                break
+
+        for sample_idx in selected_indices:
+            self._plot_profile_sample(out, sample_idx=sample_idx)
+
+        self._val_profile_plot_logged_this_epoch = True
+
+    def _plot_profile_sample(
+        self,
+        out: dict[str, Any],
+        *,
+        sample_idx: int,
+    ) -> None:
+        mask_i = out["mask"][sample_idx].detach().bool().cpu()
+        length = int(mask_i.sum().item())
+
+        extras = dict(out["extras"])
+        zero_prob = self._zero_probability_from_out(out)
+        extras["zero_prob"] = zero_prob
+        extras["phi"] = out["phi"]
+        extras.update(self._likelihood_curves_for_plot(out, zero_prob))
+
+        x_axis = torch.arange(length).numpy()
+        dataset_id = int(out["dataset_ids"][sample_idx].detach().cpu().item())
+        dataset_name = self._dataset_name(dataset_id)
+        n_axes = 1 + len(self.PROFILE_PLOT_GROUPS)
+
+        fig, axes = plt.subplots(
+            n_axes,
+            1,
+            figsize=(14, 2.6 * n_axes),
+            sharex=True,
+            constrained_layout=True,
+        )
+
+        target = self._sequence_for_plot(
+            out["target"],
+            sample_idx=sample_idx,
+            mask_i=mask_i,
+        )
+        prediction = self._sequence_for_plot(
+            out["mu"],
+            sample_idx=sample_idx,
+            mask_i=mask_i,
+        )
+
+        axes[0].plot(x_axis, target, label="target", linewidth=1.2)
+        axes[0].plot(x_axis, prediction, label="prediction", linewidth=1.2)
+        if "mu_unconditional" in extras:
+            mu_unconditional = self._sequence_for_plot(
+                extras["mu_unconditional"],
+                sample_idx=sample_idx,
+                mask_i=mask_i,
+            )
+            axes[0].plot(
+                x_axis,
+                mu_unconditional,
+                label="mu_unconditional",
+                linewidth=1.0,
+                linestyle="--",
+            )
+
+        axes[0].set_title(
+            " | ".join(
+                (
+                    f"Dataset: {dataset_name}",
+                    f"sample: {out['ids'][sample_idx]}",
+                    f"length: {length}",
+                    f"likelihood: {self.config.loss.profile_likelihood}",
+                )
+            )
+        )
+        axes[0].set_ylabel("profile")
+        axes[0].legend(loc="upper right")
+        axes[0].grid(True, alpha=0.3)
+
+        for axis, (ylabel, keys) in zip(
+            axes[1:],
+            self.PROFILE_PLOT_GROUPS,
+            strict=True,
+        ):
+            for key in keys:
+                curve = self._sequence_for_plot(
+                    extras[key],
+                    sample_idx=sample_idx,
+                    mask_i=mask_i,
+                )
+
+                axis.plot(x_axis, curve, label=key, linewidth=1.0)
+
+            axis.set_ylabel(ylabel)
+            if ylabel == "dropout":
+                axis.set_ylim(-0.05, 1.05)
+            axis.grid(True, alpha=0.3)
+            axis.legend(loc="upper right")
+
+        axes[-1].set_xlabel("codon position")
+
+        experiment = self.logger.experiment
+        tag = f"val_profile/{dataset_name}"
+
+        if hasattr(experiment, "add_figure"):
+            experiment.add_figure(tag, fig, global_step=self.global_step)
+        elif hasattr(experiment, "log_figure"):
+            experiment.log_figure(
+                figure_name=tag,
+                figure=fig,
+                step=self.global_step,
+            )
+
+        log_dir = getattr(self.logger, "log_dir", None)
+        if log_dir is not None:
+            plot_dir = Path(log_dir) / "profile_plots"
+            plot_dir.mkdir(parents=True, exist_ok=True)
+            fig.savefig(
+                plot_dir
+                / (
+                    f"epoch_{int(self.current_epoch):04d}_"
+                    f"step_{int(self.global_step):08d}_{dataset_name}.png"
+                ),
+                dpi=140,
+            )
+
+        plt.close(fig)
+
+    # ============================================================
+    # CAGrad-style biological gradient aggregation
+    # ============================================================
+
+    @staticmethod
+    def _is_biological_parameter_name(name: str) -> bool:
+        return name.startswith("biological_model.") or name == "queue_raw_alpha"
+
+    def _bio_parameters(self) -> list[torch.nn.Parameter]:
+        return [
+            param
+            for name, param in self.model.named_parameters()
+            if param.requires_grad and self._is_biological_parameter_name(name)
+        ]
+
+    def _dataset_losses_from_per_sample(
+        self,
+        *,
+        loss_per_sample: torch.Tensor,
+        dataset_ids: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        dataset_ids = dataset_ids.to(device=loss_per_sample.device)
+        losses = []
+
+        for dataset_id in torch.unique(dataset_ids):
+            sample_mask = dataset_ids == dataset_id
+            if torch.any(sample_mask):
+                losses.append(loss_per_sample[sample_mask].mean())
+
+        return losses
+
+    @staticmethod
+    def _flatten_autograd_grads(
+        grads: tuple[torch.Tensor | None, ...],
+        params: list[torch.nn.Parameter],
+    ) -> torch.Tensor:
+        flat = []
+
+        for grad, param in zip(grads, params, strict=True):
+            if grad is None:
+                flat.append(torch.zeros_like(param).reshape(-1))
+            else:
+                flat.append(grad.reshape(-1))
+
+        if len(flat) == 0:
+            raise RuntimeError("Cannot flatten an empty parameter list.")
+
+        return torch.cat(flat)
+
+    @staticmethod
+    def _assign_flat_grads(
+        *,
+        params: list[torch.nn.Parameter],
+        flat_grad: torch.Tensor,
+    ) -> None:
+        offset = 0
+
+        for param in params:
+            n = param.numel()
+            grad_view = flat_grad[offset : offset + n].view_as(param)
+
+            if param.grad is None:
+                param.grad = grad_view.detach().clone()
+            else:
+                param.grad.detach().copy_(grad_view)
+
+            offset += n
+
+        if offset != flat_grad.numel():
+            raise RuntimeError("Flat gradient size did not match parameter sizes.")
+
+    @staticmethod
+    def _project_simplex(v: torch.Tensor) -> torch.Tensor:
+        if v.ndim != 1:
+            raise ValueError(f"Expected vector, got {tuple(v.shape)}.")
+
+        n = v.numel()
+        u, _ = torch.sort(v, descending=True)
+        cssv = torch.cumsum(u, dim=0) - 1.0
+        ind = torch.arange(1, n + 1, device=v.device, dtype=v.dtype)
+        cond = u - cssv / ind > 0
+
+        if not torch.any(cond):
+            return torch.full_like(v, 1.0 / float(n))
+
+        rho = torch.nonzero(cond, as_tuple=False)[-1, 0]
+        theta = cssv[rho] / (rho.to(dtype=v.dtype) + 1.0)
+        return torch.clamp(v - theta, min=0.0)
+
+    def _cagrad_style_combine(self, grads: torch.Tensor) -> torch.Tensor:
+        if grads.ndim != 2:
+            raise ValueError(f"Expected grads [K, P], got {tuple(grads.shape)}.")
+
+        if grads.shape[0] == 1:
+            return grads[0]
+
+        mean_grad = grads.mean(dim=0)
+
+        # MGDA-style minimum-norm convex combination over dataset gradients,
+        # blended with the mean gradient. This is the practical CAGrad-like
+        # conflict-averse update used only for shared biological parameters.
+        gram = grads @ grads.t()
+        k = grads.shape[0]
+        weights = torch.full(
+            (k,),
+            1.0 / float(k),
+            device=grads.device,
+            dtype=grads.dtype,
+        )
+
+        trace = torch.trace(gram).abs().clamp_min(1.0e-12)
+        step_size = 1.0 / trace
+        n_iter = self.config.optim.cagrad_iterations
+
+        for _ in range(max(n_iter, 1)):
+            grad_w = 2.0 * (gram @ weights)
+            weights = self._project_simplex(weights - step_size * grad_w)
+
+        conflict_grad = weights @ grads
+        alpha = self.config.optim.cagrad_alpha
+        alpha = min(max(alpha, 0.0), 1.0)
+        combined = (1.0 - alpha) * mean_grad + alpha * conflict_grad
+
+        if self.config.optim.cagrad_rescale_to_mean_norm:
+            target_norm = mean_grad.norm().clamp_min(1.0e-12)
+            combined = combined * (target_norm / combined.norm().clamp_min(1.0e-12))
+
+        return combined
+
+    def _manual_cagrad_training_step(
+        self,
+        out: dict[str, Any],
+        metrics: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
         opt = self.optimizers()
         opt.zero_grad(set_to_none=True)
 
-        every_n = int(self._cfg("optim.pcgrad_every_n_steps", 1))
-        warmup_steps = int(self._cfg("optim.pcgrad_warmup_steps", 0))
-        do_pcgrad = (
-            int(self.global_step) >= warmup_steps
-            and (every_n <= 1 or int(self.global_step) % every_n == 0)
+        # Ordinary dataset-balanced loss updates all non-biological heads.
+        self.manual_backward(metrics["loss"], retain_graph=True)
+
+        bio_params = self._bio_parameters()
+        dataset_losses = self._dataset_losses_from_per_sample(
+            loss_per_sample=metrics["loss_per_sample"],
+            dataset_ids=out["dataset_ids"],
         )
 
-        if do_pcgrad:
-            step_loss = self._pcgrad_step(out, loss_terms)
-        else:
-            self.manual_backward(loss_terms["total_loss"])
-            self._log_gradient_diagnostics()
-            step_loss = loss_terms["profile_loss"].detach()
+        if len(bio_params) > 0 and len(dataset_losses) > 1:
+            flat_grads = []
 
-        grad_clip_val = float(self._cfg("trainer.gradient_clip_val", 0.0))
+            for dataset_loss in dataset_losses:
+                grads = torch.autograd.grad(
+                    dataset_loss,
+                    bio_params,
+                    retain_graph=True,
+                    allow_unused=True,
+                )
+                flat_grads.append(self._flatten_autograd_grads(grads, bio_params))
+
+            combined = self._cagrad_style_combine(torch.stack(flat_grads, dim=0))
+            self._assign_flat_grads(params=bio_params, flat_grad=combined.detach())
+
+        grad_clip_val = self.config.trainer.gradient_clip_val
 
         if grad_clip_val > 0.0:
             self.clip_gradients(
                 opt,
                 gradient_clip_val=grad_clip_val,
-                gradient_clip_algorithm=str(self._cfg("trainer.gradient_clip_algorithm", "norm")),
+                gradient_clip_algorithm=str(
+                    self.config.trainer.gradient_clip_algorithm
+                ),
             )
 
         opt.step()
         opt.zero_grad(set_to_none=True)
-        return step_loss
+
+        return metrics["loss"].detach()
+
+    # ============================================================
+    # Steps
+    # ============================================================
+
+    def training_step(self, batch, batch_idx):
+        out = self._forward_batch(batch)
+        metrics = self._compute_loss_and_metrics(out)
+
+        self._log_stage(
+            stage="train",
+            out=out,
+            metrics=metrics,
+        )
+
+        if self.use_cagrad:
+            return self._manual_cagrad_training_step(out, metrics)
+
+        return metrics["loss"]
 
     def validation_step(self, batch, batch_idx):
         out = self._forward_batch(batch)
-        batch_size = int(out["target"].shape[0])
-        loss_terms = self._loss_terms(out)
+        metrics = self._compute_loss_and_metrics(out)
 
-        self._log_scalar("val_loss", loss_terms["total_loss"], batch_size=batch_size, prog_bar=True)
-        self._log_scalar("val_profile_loss", loss_terms["profile_loss"], batch_size=batch_size)
-        self._log_scalar("val_extra_loss", loss_terms["extra_loss"], batch_size=batch_size)
+        self._log_stage(
+            stage="val",
+            out=out,
+            metrics=metrics,
+        )
+        self._plot_profile_example(out, batch_idx=batch_idx)
 
-        self._log_regularization_diagnostics(stage="val", loss_terms=loss_terms, batch_size=batch_size)
-        self._log_validation_metrics(out, batch_size=batch_size)
-        self._plot_validation_example(out, batch_idx=batch_idx)
-        return loss_terms["total_loss"]
+        return metrics["loss"]
 
-    def on_validation_epoch_end(self):
-        if not self.use_pcgrad:
+    def on_validation_epoch_end(self) -> None:
+        if not self.use_cagrad:
             return
 
-        sched = self.lr_schedulers()
-        monitor = str(self._cfg("optim.scheduler.monitor", "val_loss"))
+        scheduler = self.lr_schedulers()
+        monitor = self.config.optim.scheduler.monitor
+        metric = self.trainer.callback_metrics.get(monitor)
 
-        if monitor in self.trainer.callback_metrics:
-            sched.step(self.trainer.callback_metrics[monitor])
-
-    def predict_step(
-        self,
-        batch: Any,
-        batch_idx: int,
-        dataloader_idx: int = 0,
-    ) -> dict[str, Any]:
-        out = self._forward_batch(batch)
-
-        def to_cpu(x):
-            if torch.is_tensor(x):
-                return x.detach().cpu()
-            if isinstance(x, (list, tuple)):
-                return [to_cpu(v) for v in x]
-            return x
-
-        result = {
-            "ids": to_cpu(out["ids"]),
-            "dataset_id": to_cpu(out["dataset_ids"]),
-            "lengths": to_cpu(out["lengths"]),
-            "mask": to_cpu(out["mask"]),
-            "css": to_cpu(out["css"]),
-            "y": to_cpu(out["target"]),
-            "mu_obs": to_cpu(out["mu"]),
-        }
-
-        if bool(self._cfg("predict.export_kappa", False)):
-            kappa = self._compute_kappa(kappa_input=out["kappa_input"], mask=out["mask"])
-            result["profile_kappa"] = to_cpu(kappa)
-            result["kappa_input"] = to_cpu(out["kappa_input"])
-
-        export_all = bool(self._cfg("predict.export_all_extras", False))
-
-        important = [
-            # Biological branch
-            "w_logits", "w_bio", "w_prob", "h_bio", "rho_bio",
-            "L_queue", "L_bio", "bio_q_base", "J",
-
-            # Multiplicative observation bias
-            "obs_bias_raw", "obs_bias_effective", "obs_bias_weighted_mass",
-            "obs_bias_amp", "obs_bias_amp_logits", "obs_bias_keep_prob",
-            "obs_bias_keep_gate", "obs_bias_keep_hard", "obs_bias_gate_logits",
-
-            # Observed branch
-            "w_obs", "h_obs", "rho_obs", "L_obs", "L_queue_obs",
-            "bio_q", "q", "profile_prob",
-
-            # Mean profiles
-            "total_mass", "mu_L_only", "mu_L_bio", "mu_L_obs",
-            "mu_bio_smooth", "mu_bio_only",
-
-            # Diagnostics from the model extras
-            "w_bio_zero_frac", "w_obs_zero_frac", "L_bio_zero_frac",
-            "L_obs_zero_frac", "delta_w_obs_bio_l1", "b_abs_log_mean",
-            "b_abs_log_w_bio_weighted", "hazard_cap_frac",
-            "hazard_cap_frac_bio", "hazard_cap_frac_obs",
-        ]
-
-        for key, val in out["extras"].items():
-            if val is not None and (export_all or key in important):
-                result[key] = to_cpu(val)
-
-        return result
+        if metric is not None:
+            scheduler.step(metric)
 
     # ============================================================
     # Optimizer
     # ============================================================
 
     def configure_optimizers(self):
-        base_lr = float(self._cfg("optim.lr", 1.0e-3))
-        bio_lr = float(self._cfg("optim.lr_biological", base_lr))
-        rest_lr = float(self._cfg("optim.lr_rest", base_lr))
-        weight_decay = float(self._cfg("optim.weight_decay", 1.0e-8))
+        base_lr = self.config.optim.lr
+        bio_lr = self.config.optim.lr_biological
+        rest_lr = self.config.optim.lr_rest
+        weight_decay = self.config.optim.weight_decay
 
         bio_params = []
         rest_params = []
@@ -2007,7 +1870,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             if not param.requires_grad:
                 continue
 
-            if name.startswith("biological_model."):
+            if self._is_biological_parameter_name(name):
                 bio_params.append(param)
             else:
                 rest_params.append(param)
@@ -2015,29 +1878,46 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         param_groups = []
 
         if bio_params:
-            param_groups.append({"params": bio_params, "lr": bio_lr, "weight_decay": weight_decay})
+            param_groups.append(
+                {
+                    "params": bio_params,
+                    "lr": bio_lr,
+                    "weight_decay": weight_decay,
+                    "name": "biological",
+                }
+            )
 
         if rest_params:
-            param_groups.append({"params": rest_params, "lr": rest_lr, "weight_decay": weight_decay})
+            param_groups.append(
+                {
+                    "params": rest_params,
+                    "lr": rest_lr,
+                    "weight_decay": weight_decay,
+                    "name": "rest",
+                }
+            )
 
         if not param_groups:
             raise RuntimeError("No trainable parameters found.")
 
-        opt = torch.optim.AdamW(param_groups)
+        opt = torch.optim.AdamW(
+            param_groups,
+        )
 
-        sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        scheduler_config = self.config.optim.scheduler
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             opt,
-            mode=str(self._cfg("optim.scheduler.mode", "min")),
-            factor=float(self._cfg("optim.scheduler.factor", 0.9)),
-            patience=int(self._cfg("optim.scheduler.patience", 10)),
-            min_lr=float(self._cfg("optim.scheduler.min_lr", 1.0e-6)),
+            mode=str(scheduler_config.mode),
+            factor=float(scheduler_config.factor),
+            patience=int(scheduler_config.patience),
+            min_lr=float(scheduler_config.min_lr),
         )
 
         return {
             "optimizer": opt,
             "lr_scheduler": {
-                "scheduler": sched,
-                "monitor": str(self._cfg("optim.scheduler.monitor", "val_loss")),
+                "scheduler": scheduler,
+                "monitor": str(scheduler_config.monitor),
                 "interval": "epoch",
                 "frequency": 1,
             },

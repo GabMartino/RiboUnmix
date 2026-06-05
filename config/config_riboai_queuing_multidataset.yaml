@@ -8,7 +8,7 @@ experiment:
   from_checkpoint: false
   train: true
   predict: true
-  dataset: ["grimson_2019", "kutay_2021"]
+  dataset: ["kutay_2021"]
   seed: 42
   split_size: 0.9
 
@@ -35,150 +35,160 @@ paths:
 
 data:
   batch_size: 32
-  num_workers: 4
+  num_workers: 2
 
-  # Keep this for now to avoid confounding the architecture change
-  # with the flat-pair objective.
-  train_sampling_strategy: random_dataset_per_transcript
-
-  balanced_train_sampling: false
-  dataset_balance_gamma: 0.0
-
-  dataset_aware_batching: false
-  datasets_per_batch: 2
+  train_sampling_strategy: dataset_aware_balanced_pairs
+  dataset_balance_gamma: 1.0
   train_samples_per_epoch: null
 
-  pin_memory: true
-  prefetch_factor: 4
+  datasets_per_batch: 2
+
+  pin_memory: false
+  prefetch_factor: 2
 
 model:
+  # true = mu uses dataset/protocol heads:
+  #   mu = scale_dt * support * beta
+  # where support is rho or causal q depending on loss.pcc_target.
+  use_dataset_bias: true
+
   biological_params:
     input_size: 97
     hidden_size: 256
     num_layers: 2
     dropout: 0.0
 
-    # For the first ablation, softmax isolates the effect of the new
-    # multiplicative observation bias. Switch to entmax15 later if you also
-    # want true biological zeros.
-    w_transform: softmax
-    w_temperature: 1.0
-
-    J_min: 1.0e-6
-    J_max: 10.0
-
-    # L = exp(h) - 1. h=8 gives L≈2980.
+    J_min: 2.0e-2
+    J_max: 8.0
+    init_J: 0.5
+    init_local_hazard_factor: 1.0
     hazard_max: 8.0
+    rho_max: 1.0
+
+  queue_propagation_params:
+    # Overridden at startup from loss.pcc_target:
+    #   rho -> false, raw occupancy prediction
+    #   q   -> true, causal queue propagation prediction
+    use_queue_propagation: true
+    # Init near "no coupling" but with a live gradient. Do NOT use 0.0: at the
+    # alpha_min boundary sigmoid'(raw) ~ 0, so alpha would be frozen there.
+    queue_propagation_alpha: 0.5
+    # Effective only when loss.pcc_target is q.
+    queue_propagation_learnable: true
+    queue_propagation_alpha_min: 0.0
+    queue_propagation_alpha_max: 0.95
+    queue_propagation_q_max: 10.0
 
   dataset_bias_params:
-    position_features: ["rel_pos", "abs_pos_log", "dist_to_start", "dist_to_stop", "start_window", "stop_window"]
+    position_features:
+      - rel_pos
+      - abs_pos_log
+      - dist_to_start
+      - dist_to_stop
+      - start_window
+      - stop_window
+
     position_edge_tau: 30.0
     position_scale: 5000.0
-    use_biological_context: false
+
     num_datasets: 33
-    dataset_embeddings_size: 32
+    dataset_embeddings_size: 48
 
     num_codons: 64
-    codon_embeddings_size: 32
+    codon_embeddings_size: 48
 
-    num_filters: 32
-    kernel_size: 51
+    num_filters: 64
+    kernel_size: 15
+    context_cnn_dilations: [1, 2, 4, 8, 16, 32]
+    context_cnn_dropout: 0.05
+    context_cnn_gated: true
+    context_cnn_residual_scale: 1.0
 
-    # Active observation-bias branch:
-    #
-    #   b_raw_i = keep_gate_i * amp_i
-    #   b_eff_i = b_raw_i / sum_j w_bio_j b_raw_j
-    #   w_obs_i = w_bio_i * b_eff_i
-    #
-    # Therefore sum_i w_obs_i = 1.
+    # Legacy key name; this is now a continuous visibility log-bias head.
     dataset_multiplicative_allocation_bias_submodule_params:
       hidden_size: 128
-      dropout: 0.0
+      dropout: 0.1
+      log_bias_max: 2.0
 
-      amp_min: 0.0
-      amp_max: 20.0
-      amp_eps: 1.0e-8
-
-      init_keep_prob: 0.001
-      gate_temperature: 0.25
-      gate_threshold: 0.5
-
-      hard_forward: false
-      hard_eval: true
+    dataset_dropout_submodule_params:
+      hidden_size: 96
+      dropout: 0.05
+      init_dropout_prob: 0.05
+      logit_min: -8.0
+      logit_max: null
 
     dataset_dispersion_submodule_params:
       hidden_size: 128
       dropout: 0.0
-      phi_min: 0.01
-      phi_max: 100.0
+      phi_min: 0.001
+      phi_max: 10.0
       init_phi: 0.5
+
+    dataset_transcript_scale_factor_params:
+      dataset_scale_embedding_size: 16
+      hidden_size: 128
+      dropout: 0.0
+
+      log_global_scale_max: 3.0
+      log_dataset_scale_max: 1.5
+      log_transcript_scale_max: 3.0
+
+      detach_context: true
+      init_global_log_scale: 0.0
+
 loss:
-  type: dirichlet_multinomial_profile
+  # pcc_only, likelihood_only, or pcc_likelihood.
+  # PCC is applied to rho/q support and observed mu_unconditional.
+  # Likelihood is applied to full positive-component mu.
+  mode: pcc_likelihood
+
+  # Quantity correlated against the observed profile and used to set queue mode:
+  #   rho = raw local occupancy, no causal propagation
+  #   q   = occupancy after causal queue propagation
+  pcc_target: q
+
+  profile_likelihood: ziln
+  # positive_mean reproduces the previous ZILN behavior; median decouples the
+  # log-normal location from dispersion so phi changes do not shift the center.
+  ziln_mu_parameterization: median
+  zinb_target_transform: real
+  zinb_zero_threshold: 0.0
   eps: 1.0e-8
-  normalize_by_total: true
-  include_multinomial_constant: false
 
-  dataset_balanced_loss: false
+  mu_min: 1.0e-8
+  mu_max: 1.0e8
 
-  # Kappa / overdispersion.
-  kappa_source: model_inverse
-  kappa: 500.0
-  kappa_min: 1.0e-2
-  kappa_max: 1.0e5
-  kappa_scale: 100.0
-  kappa_input_min: 1.0e-4
-  pool_position_kappa: mean
+  phi_min: 0.001
+  phi_max: 10.0
 
-  lambda_kappa_log_l2: 0.0
-  kappa_reference: 500.0
+  log_sigma_min: 0.05
+  log_sigma_max: 2.0
 
-  nll_soft_cap: -1
+  censor_threshold: 0.5
 
-  # ------------------------------------------------------------
-  # Single-score gated-amplitude observation bias
-  # ------------------------------------------------------------
-  # Regularizes the EFFECTIVE multiplicative correction:
-  #
-  #   b_eff_i =plitude observation bias
-  # ------------------------------------------------------------
-  # b_raw_i / sum_j w_bio_j b_raw_j
-  #
-  # not the raw beta/amp scale.
-  #
-  # Start more relaxed than 1e-3 because the previous model looked
-  # under-capacitated / correction-limited.
-  lambda_obs_bias_log_l2: 3.0e-4
-
-  # Keep OFF for the single-score formulation.
-  # Otherwise this fights low beta / suppression.
-  lambda_obs_gate_open: 0.0
-
-  # Keep OFF unless you use hard gates and see collapse.
-  lambda_obs_gate_mean_floor: 0.0
-  obs_gate_min_open: 0.90
-
-  # Keep this. It prevents almost-unregularized corrections at positions
-  # where w_bio is extremely small.
-  obs_bias_uniform_weight: 0.05
+  zero_fixed_prob: 0.001
+  zero_input_is_logits: true
+  phi_input_is_log: false
+  detach_mu_for_zero_branch: false
+  dataset_balanced_loss: true
+  # Soft penalty on the batch-mean of log(J) drifting away from 0.
+  # Prevents the J/scale_dt degeneracy (J→0, scale_dt→∞) while preserving
+  # per-transcript J variation (the biological signal).
+  j_centering_weight: 0.05
 
 optim:
   lr: 5.0e-4
-
-  lr_biological: 5.0e-4
-  lr_rest: 1.0e-3
-
+  lr_biological: 1.0e-4
+  lr_rest: 2.0e-4
   weight_decay: 1.0e-8
 
-  use_pcgrad: false
-  pcgrad_biology_only: true
-  pcgrad_every_n_steps: 2
-  pcgrad_alpha: 0.25
-  pcgrad_rescale_to_mean_norm: true
-  pcgrad_max_datasets_per_step: 2
-  pcgrad_warmup_steps: 0
+  use_cagrad: false
+  cagrad_alpha: 0.5
+  cagrad_iterations: 25
+  cagrad_rescale_to_mean_norm: true
 
   scheduler:
-    monitor: val_mu_pcc
+    monitor: val_mu_unconditional_pcc
     mode: max
     factor: 0.9
     patience: 5
@@ -187,32 +197,18 @@ optim:
 trainer:
   devices: [0]
   accelerator: gpu
-  precision: 16-mixed
+  precision: 32-true
 
   accumulate_grad_batches: 1
   max_epochs: 200
   log_every_n_steps: 1
-
+  sync_dist_logs: false
   gradient_clip_val: 0.5
   gradient_clip_algorithm: norm
 
 callbacks:
   early_stopping_patience: 10
-  early_stopping_monitor: val_mu_pcc
-  early_stopping_mode: max
 
 metrics:
-  grad_log_every_n_steps: 0
-
-  log_train_kappa: false
   log_example_plot: true
-
-  log_css_recall: true
-  css_recall_tolerance: 1
-  css_z_thresholds: [1, 2, 3, 4, 5]
-  css_z_eps: 1.0e-6
-
-predict:
-  example_idx: 0
-  export_kappa: false
-  export_all_extras: false
+  example_plot_max_datasets: 4

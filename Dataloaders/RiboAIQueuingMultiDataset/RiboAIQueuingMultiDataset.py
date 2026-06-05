@@ -231,6 +231,9 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         if self.precompute_ribo:
             self._precompute_ribo_profiles()
 
+        if self.precompute_features and self.precompute_ribo:
+            self._validate_lengths()
+
     # ============================================================
     # Basic dataset API
     # ============================================================
@@ -486,6 +489,35 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
                 self._ribo_cache[key] = np.ascontiguousarray(
                     np.asarray(profile, dtype=np.float32)
                 )
+
+    def _validate_lengths(self) -> None:
+        """
+        Validate that ribo profile lengths match sequence lengths for all precomputed pairs.
+        Runs at setup time so bad transcripts raise immediately rather than mid-epoch.
+        """
+        mismatches = []
+        for i in range(len(self.flat_transcript_ids)):
+            tid = str(self.flat_transcript_ids[i])
+            dataset_name = str(self.flat_dataset_names[i])
+            global_idx = int(self.flat_global_indices[i])
+
+            encoded = self._feature_cache[global_idx]
+            ribo = self._ribo_cache.get((tid, dataset_name))
+
+            if encoded is None or ribo is None:
+                continue
+
+            if len(ribo) != encoded.shape[0]:
+                mismatches.append(
+                    f"  transcript_id={tid}, dataset={dataset_name}: "
+                    f"seq_len={encoded.shape[0]}, ribo_len={len(ribo)}"
+                )
+
+        if mismatches:
+            detail = "\n".join(mismatches[:20])
+            raise RuntimeError(
+                f"Length mismatches found in {len(mismatches)} transcript-dataset pair(s):\n{detail}"
+            )
 
     def _get_encoded_and_codon_ids(self, global_idx: int) -> tuple[np.ndarray, np.ndarray]:
         encoded = self._feature_cache[global_idx]

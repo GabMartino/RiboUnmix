@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import math
+import warnings
+
 import torch
 import torch.nn as nn
 
@@ -7,91 +10,206 @@ from Models.RiboQueuingModel.DatasetBiasSubmodel import DatasetBiasSubmodel
 from Models.RiboQueuingModel.QueuingBiologicalModel import QueuingBiologicalModel
 
 
+def _safe_logit(p: float) -> float:
+    p = min(max(float(p), 1.0e-6), 1.0 - 1.0e-6)
+    return math.log(p / (1.0 - p))
+
+
+def upstream_queue_propagation(
+    rho: torch.Tensor,
+    mask: torch.Tensor,
+    alpha: float | torch.Tensor,
+    q_max: float = 10.0,
+) -> torch.Tensor:
+    """
+    Causal downstream-to-upstream queue propagation.
+
+        q_i = rho_i + alpha * (1 - rho_i) * q_{i+1}
+
+    Codon index increases from start to stop, so downstream bottlenecks
+    propagate upstream by scanning right-to-left.
+    """
+    if rho.ndim != 2:
+        raise ValueError(f"Expected rho [B, T], got {tuple(rho.shape)}.")
+
+    if mask.ndim != 2:
+        raise ValueError(f"Expected mask [B, T], got {tuple(mask.shape)}.")
+
+    if mask.shape != rho.shape:
+        raise ValueError(
+            f"mask/rho shape mismatch: mask={tuple(mask.shape)}, rho={tuple(rho.shape)}."
+        )
+
+    B, T = rho.shape
+    dtype = rho.dtype
+    device = rho.device
+
+    mask_b = mask.bool()
+    mask_f = mask_b.to(dtype=dtype)
+
+    if torch.is_tensor(alpha):
+        alpha_t = alpha.to(device=device, dtype=dtype)
+    else:
+        alpha_t = torch.tensor(float(alpha), device=device, dtype=dtype)
+
+    if alpha_t.numel() != 1:
+        raise ValueError(f"Expected scalar alpha, got shape {tuple(alpha_t.shape)}.")
+
+    alpha_t = alpha_t.reshape(())
+    q_max = float(max(q_max, 0.0))
+
+    nan_rho = int(torch.isnan(rho).sum().item())
+    if nan_rho > 0:
+        warnings.warn(
+            f"upstream_queue_propagation: {nan_rho} NaN(s) in rho input — clamping to 0.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    rho = torch.nan_to_num(
+        rho.to(dtype=dtype),
+        nan=0.0,
+        posinf=1.0,
+        neginf=0.0,
+    ).clamp(min=0.0, max=1.0)
+    rho = rho * mask_f
+
+    q = torch.zeros_like(rho)
+    carry = torch.zeros((B,), device=device, dtype=dtype)
+
+    for i in range(T - 1, -1, -1):
+        rho_i = rho[:, i]
+        q_i = rho_i + alpha_t * (1.0 - rho_i) * carry
+        q_i = torch.where(mask_b[:, i], q_i, torch.zeros_like(q_i))
+        q[:, i] = q_i
+        carry = q_i
+
+    nan_q = int(torch.isnan(q).sum().item())
+    if nan_q > 0:
+        warnings.warn(
+            f"upstream_queue_propagation: {nan_q} NaN(s) in q after propagation — clamping to 0.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    q = torch.nan_to_num(
+        q,
+        nan=0.0,
+        posinf=q_max,
+        neginf=0.0,
+    )
+
+    if q_max > 0.0:
+        q = q.clamp(min=0.0, max=q_max)
+    else:
+        q = q.clamp_min(0.0)
+
+    q = q * mask_f
+
+    if q.shape != rho.shape:
+        raise RuntimeError(f"Expected q [B, T], got {tuple(q.shape)}.")
+
+    return q
+
+
 class RiboQueuingModel(nn.Module):
     """
-    Queue-length-support model with multiplicative dataset allocation bias.
+    Anchor-free queueing biology plus dataset observation model.
 
-    Biological branch:
+    Shared biological queueing support:
 
-        a_t       = biological allocation logits
-        w_bio     = entmax(a_t)
-        h_bio_i   = J_t * T_t * w_bio_i
-        L_bio_i   = exp(h_bio_i) - 1
+        rho_ti = 1 - exp(-h_ti)
+        q_ti = rho_ti + alpha * (1 - rho_ti) * q_t,i+1
 
-    Dataset/protocol branch:
+    Dataset observation model:
 
-        b_raw_{d,t,i} = gate_{d,t,i} * amplitude_{d,t,i}
+        log_b_dti = centered dataset visibility correction
+        beta_dti = exp(log_b_dti)
+        lambda_dti = scale_dt * q_ti * beta_dti
+        mu_unconditional_dti = (1 - dropout_prob_dti) * lambda_dti
 
-        b_eff_{d,t,i}
-            = b_raw_{d,t,i} / sum_j w_bio_{t,j} b_raw_{d,t,j}
-
-        w_obs_{d,t,i}
-            = w_bio_{t,i} * b_eff_{d,t,i}
-
-    Therefore:
-
-        sum_i w_obs_{d,t,i} = 1
-
-    Observation support:
-
-        h_obs_i = J_t * T_t * w_obs_i
-        L_obs_i = exp(h_obs_i) - 1
-
-    Profile mean:
-
-        mu_i = total_mass * L_obs_i / sum_j L_obs_j
-
-    Important:
-        L_bio is the shared biological signal.
-        L_obs is the dataset-observed signal after multiplicative allocation bias.
+    Dropout/zero inflation is dataset-specific and separate from biological
+    support. This prevents dataset zeros from becoming biological zeros.
     """
 
     def __init__(
         self,
         model_configs: dict,
-        eps: float = 1e-8,
-        mu_max: float = 1e8,
+        eps: float = 1.0e-8,
+        mu_max: float = 1.0e8,
     ):
         super().__init__()
 
         self.eps = float(eps)
         self.mu_max = float(mu_max)
 
+        # When False, the dataset bias heads are bypassed in forward() and all
+        # bias terms are forced to identity (beta=1, scale=1, zero_prob~0, phi=1).
+        self.use_dataset_bias = bool(model_configs.get("use_dataset_bias", True))
+
         dataset_bias_params = model_configs["dataset_bias_params"]
         biological_params = model_configs["biological_params"]
+        queue_params = dict(biological_params)
+        queue_params.update(dict(model_configs.get("queue_propagation_params", {})))
 
         self.position_features = list(dataset_bias_params["position_features"])
         self.position_scale = float(dataset_bias_params.get("position_scale", 5000.0))
         self.position_edge_tau = float(dataset_bias_params.get("position_edge_tau", 30.0))
 
-        self.hazard_max = float(
-            biological_params.get(
-                "hazard_max",
-                dataset_bias_params.get("hazard_max", 8.0),
-            )
-        )
-
         self.biological_model = QueuingBiologicalModel(
             config_params=biological_params,
         )
 
-        use_biological_context = bool(
-            dataset_bias_params.get("use_biological_context", True)
+        biological_context_size = (
+            int(biological_params["num_layers"])
+            * 2
+            * int(biological_params["hidden_size"])
         )
-
-        if use_biological_context:
-            biological_context_size = (
-                    int(biological_params["num_layers"])
-                    * 2
-                    * int(biological_params["hidden_size"])
-            )
-        else:
-            biological_context_size = 0
 
         self.dataset_bias_model = DatasetBiasSubmodel(
             config_params=dataset_bias_params,
             biological_context_size=biological_context_size,
         )
+
+        self.use_queue_propagation = bool(
+            queue_params.get("use_queue_propagation", False)
+        )
+        self.queue_alpha_min = float(
+            queue_params.get("queue_propagation_alpha_min", 0.0)
+        )
+        self.queue_alpha_max = float(
+            queue_params.get("queue_propagation_alpha_max", 0.95)
+        )
+        self.queue_q_max = float(queue_params.get("queue_propagation_q_max", 10.0))
+        self.queue_alpha_learnable = self.use_queue_propagation and bool(
+            queue_params.get("queue_propagation_learnable", False)
+        )
+
+        if self.queue_alpha_min > self.queue_alpha_max:
+            raise ValueError(
+                "queue_propagation_alpha_min must be <= queue_propagation_alpha_max, "
+                f"got {self.queue_alpha_min} > {self.queue_alpha_max}."
+            )
+
+        init_alpha = float(queue_params.get("queue_propagation_alpha", 0.5))
+        init_alpha = min(max(init_alpha, self.queue_alpha_min), self.queue_alpha_max)
+
+        if self.queue_alpha_learnable:
+            span = max(self.queue_alpha_max - self.queue_alpha_min, 1.0e-6)
+            alpha_unit = (init_alpha - self.queue_alpha_min) / span
+            self.queue_raw_alpha = nn.Parameter(
+                torch.tensor(_safe_logit(alpha_unit), dtype=torch.float32)
+            )
+            self.register_buffer(
+                "queue_alpha_fixed",
+                torch.tensor(init_alpha, dtype=torch.float32),
+                persistent=False,
+            )
+        else:
+            self.queue_raw_alpha = None
+            self.register_buffer(
+                "queue_alpha_fixed",
+                torch.tensor(init_alpha, dtype=torch.float32),
+                persistent=False,
+            )
 
     # ============================================================
     # Position features
@@ -149,166 +267,71 @@ class RiboQueuingModel(nn.Module):
             dim=-1,
         )
 
-        x_pos = x_pos * mask_b.unsqueeze(-1).to(dtype=dtype)
-
-        return x_pos
+        return x_pos * mask_b.unsqueeze(-1).to(dtype=dtype)
 
     # ============================================================
-    # Support/profile helpers
+    # Normalization helpers
     # ============================================================
 
-    def _profile_from_support(
-        self,
-        *,
-        q: torch.Tensor,
-        fallback_q: torch.Tensor,
-        y_raw_target: torch.Tensor,
-        mask: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        mask_b = mask.bool()
-        mask_f = mask_b.to(dtype=q.dtype)
-
-        q = q.clamp_min(0.0) * mask_f
-        fallback_q = fallback_q.clamp_min(0.0) * mask_f
-
-        q_mass_raw = q.sum(dim=1, keepdim=True)
-        use_q = q_mass_raw > self.eps
-
-        fallback_mass = fallback_q.sum(dim=1, keepdim=True)
-        use_fallback = (~use_q) & (fallback_mass > self.eps)
-
-        q_uniform = mask_f
-
-        q_for_profile = torch.where(
-            use_q,
-            q,
-            torch.where(use_fallback, fallback_q, q_uniform),
-        )
-
-        q_for_profile = q_for_profile * mask_f
-        q_mass = q_for_profile.sum(dim=1, keepdim=True).clamp_min(self.eps)
-
-        profile_prob = q_for_profile / q_mass
-        profile_prob = profile_prob * mask_f
-
-        total_mass = (
-            y_raw_target.float().clamp_min(0.0) * mask_f.float()
-        ).sum(dim=1, keepdim=True).detach().clamp_min(self.eps)
-
-        mu = total_mass * profile_prob
-        mu = mu * mask_f
-
-        mu = torch.nan_to_num(
-            mu,
-            nan=self.eps,
-            posinf=self.mu_max,
-            neginf=self.eps,
-        )
-
-        mu = mu.clamp(min=self.eps, max=self.mu_max)
-        mu = torch.where(mask_b, mu, torch.ones_like(mu))
-
-        return {
-            "mu": mu,
-            "profile_prob": profile_prob,
-            "q_for_profile": q_for_profile,
-            "q_mass": q_mass,
-            "q_mass_raw": q_mass_raw,
-            "total_mass": total_mass,
-            "q_used_fallback": use_fallback.reshape(-1).float(),
-            "q_used_uniform_fallback": ((~use_q) & (~use_fallback)).reshape(-1).float(),
-        }
-
-    def _mu_from_support(
-        self,
-        *,
-        support: torch.Tensor,
-        total_mass: torch.Tensor,
-        mask: torch.Tensor,
-    ) -> torch.Tensor:
-        mask_f = mask.bool().to(dtype=support.dtype)
-
-        support = support.clamp_min(0.0) * mask_f
-        mass = support.sum(dim=1, keepdim=True).clamp_min(self.eps)
-
-        return total_mass * support / mass * mask_f
-
-    def _zero_frac(
+    def _masked_normalize(
         self,
         x: torch.Tensor,
         mask: torch.Tensor,
-        threshold: float = 0.0,
+        fallback: torch.Tensor | None = None,
     ) -> torch.Tensor:
         mask_b = mask.bool()
-        mask_f = mask_b.float()
+        mask_f = mask_b.to(dtype=x.dtype)
 
-        return (
-            ((x <= threshold) & mask_b).float().sum(dim=1)
-            / mask_f.sum(dim=1).clamp_min(1.0)
-        )
+        x = x.clamp_min(0.0) * mask_f
+        mass = x.sum(dim=1, keepdim=True)
 
-    # ============================================================
-    # Multiplicative allocation-bias helper
-    # ============================================================
+        uniform = mask_f / mask_f.sum(dim=1, keepdim=True).clamp_min(1.0)
 
-    def _apply_multiplicative_allocation_bias(
+        if fallback is not None:
+            fallback = fallback.to(device=x.device, dtype=x.dtype).clamp_min(0.0) * mask_f
+            fallback_mass = fallback.sum(dim=1, keepdim=True)
+            fallback = torch.where(
+                fallback_mass > self.eps,
+                fallback / fallback_mass.clamp_min(self.eps),
+                uniform,
+            )
+        else:
+            fallback = uniform
+
+        out = torch.where(mass > self.eps, x / mass.clamp_min(self.eps), fallback)
+        return out * mask_f
+
+    def _center_log_visibility_bias(
         self,
-        *,
-        w_bio: torch.Tensor,
-        b_raw: torch.Tensor,
+        log_bias_raw: torch.Tensor,
+        p_bio: torch.Tensor,
         mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Applies multiplicative dataset bias to biological allocation.
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        mask_f = mask.bool().to(dtype=log_bias_raw.dtype)
 
-        Given:
+        # Gauge: no transcript-wide scale is allowed to hide inside the
+        # positional visibility correction. The scale head owns that degree of
+        # freedom. Detaching p_bio keeps this constraint from pushing biology.
+        weights = p_bio.detach().to(dtype=log_bias_raw.dtype) * mask_f
+        weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(self.eps)
 
-            sum_i w_bio_i = 1
+        center = (log_bias_raw * weights).sum(dim=1, keepdim=True)
+        log_bias = (log_bias_raw - center) * mask_f
+        return log_bias, center.reshape(-1)
 
-        and positive/gated raw bias b_raw_i, define:
+    def _queue_alpha(self, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        if self.queue_alpha_learnable:
+            if self.queue_raw_alpha is None:
+                raise RuntimeError("queue_alpha_learnable=True but queue_raw_alpha is None.")
 
-            b_eff_i = b_raw_i / sum_j w_bio_j b_raw_j
+            alpha_unit = torch.sigmoid(self.queue_raw_alpha.to(device=device, dtype=dtype))
+            alpha = self.queue_alpha_min + (
+                self.queue_alpha_max - self.queue_alpha_min
+            ) * alpha_unit
+        else:
+            alpha = self.queue_alpha_fixed.to(device=device, dtype=dtype)
 
-            w_obs_i = w_bio_i * b_eff_i
-
-        Then:
-
-            sum_i w_obs_i = 1
-
-        If all gates close and weighted_b_mass is zero, falls back to w_bio.
-        """
-        mask_b = mask.bool()
-        mask_f = mask_b.to(dtype=w_bio.dtype)
-
-        w = w_bio.clamp_min(0.0) * mask_f
-        b = b_raw.to(dtype=w_bio.dtype).clamp_min(0.0) * mask_f
-
-        # Biological allocation should already sum to 1, but renormalize
-        # defensively to avoid numerical drift.
-        w = w / w.sum(dim=1, keepdim=True).clamp_min(self.eps)
-        w = w * mask_f
-
-        weighted_b_mass = (w * b).sum(dim=1, keepdim=True)
-        has_mass = weighted_b_mass > self.eps
-
-        b_eff = b / weighted_b_mass.clamp_min(self.eps)
-        w_obs_candidate = w * b_eff
-        w_obs_candidate = w_obs_candidate * mask_f
-
-        w_obs = torch.where(
-            has_mass,
-            w_obs_candidate,
-            w,
-        )
-
-        w_obs = w_obs * mask_f
-        w_obs = w_obs / w_obs.sum(dim=1, keepdim=True).clamp_min(self.eps)
-        w_obs = w_obs * mask_f
-
-        # For diagnostics, padding should be neutral.
-        b_eff_diag = torch.where(mask_b, b_eff, torch.ones_like(b_eff))
-
-        return w_obs, b_eff_diag, weighted_b_mass.reshape(-1)
+        return alpha.clamp(min=self.queue_alpha_min, max=self.queue_alpha_max)
 
     # ============================================================
     # Forward
@@ -319,287 +342,364 @@ class RiboQueuingModel(nn.Module):
         x_packed,
         codon_ids: torch.Tensor,
         id_datasets: torch.Tensor,
-        y_raw_target: torch.Tensor,
+        mask: torch.Tensor,
     ):
         # ------------------------------------------------------------
-        # 1. Shared biological branch
+        # 1. Shared biological queueing branch
         # ------------------------------------------------------------
-        bio = self.biological_model(x_packed)
+        rho, J, h_bio, h_n = self.biological_model(x_packed, mask)
 
-        if not isinstance(bio, dict):
-            raise RuntimeError(
-                "This RiboQueuingModel expects QueuingBiologicalModel to return a dict "
-                "with keys: w_bio, J, lengths, mask, h_bio, rho_bio, L_bio."
+        if rho.ndim != 2:
+            raise ValueError(f"Expected rho [B, T], got {tuple(rho.shape)}.")
+
+        mask_b = mask.bool()
+
+        if mask_b.shape != rho.shape:
+            raise ValueError(
+                f"mask shape {tuple(mask_b.shape)} does not match rho shape {tuple(rho.shape)}."
             )
 
-        w_bio = bio["w_bio"]
-        J = bio["J"]
-        lengths = bio["lengths"]
-        mask = bio["mask"]
+        if codon_ids.shape[:2] != rho.shape:
+            raise ValueError(
+                f"codon_ids shape {tuple(codon_ids.shape)} does not match rho shape {tuple(rho.shape)}."
+            )
 
-        h_bio = bio["h_bio"]
-        rho_bio = bio["rho_bio"]
-        L_bio = bio["L_bio"]
+        dtype = rho.dtype
+        device = rho.device
+        mask_f = mask_b.to(dtype=dtype)
 
-        B, T = mask.shape
-        mask_b = mask.bool()
-        mask_f = mask_b.to(dtype=w_bio.dtype)
+        rho = rho.to(dtype=dtype).clamp(min=0.0, max=1.0) * mask_f
+        h_bio = h_bio.to(device=device, dtype=dtype).clamp_min(0.0) * mask_f
+
+        alpha = self._queue_alpha(device=device, dtype=dtype)
+
+        if self.use_queue_propagation:
+            q = upstream_queue_propagation(
+                rho=rho,
+                mask=mask_b,
+                alpha=alpha,
+                q_max=self.queue_q_max,
+            )
+        else:
+            q = torch.nan_to_num(
+                rho,
+                nan=0.0,
+                posinf=self.queue_q_max,
+                neginf=0.0,
+            )
+            q = q.clamp(min=0.0, max=self.queue_q_max) * mask_f
+
+        if q.shape != rho.shape:
+            raise RuntimeError(f"Expected q [B, T], got {tuple(q.shape)}.")
+
+        # Compatibility plotting keys. These are no longer probability
+        # distributions; they are local occupancy/support signals.
+        p_bio = rho
 
         # ------------------------------------------------------------
-        # 2. Dataset/protocol multiplicative allocation bias
+        # 2. Dataset/protocol observation heads
         # ------------------------------------------------------------
         position_features = self.make_position_features(
             mask=mask_b,
-            dtype=w_bio.dtype,
+            dtype=dtype,
         )
 
-        h_n = bio.get("h_n", None)
+        if self.use_dataset_bias:
+            bias = self.dataset_bias_model(
+                dataset_ids=id_datasets,
+                mask=mask_b,
+                codon_ids=codon_ids,
+                position_features=position_features,
+                biological_context=h_n,
+            )
+        else:
+            # Identity bias: beta=1 (log_visibility=0), scale_dt=1, zero_prob~0,
+            # phi=1. scale_dt / zero_prob / phi fall through to the identity
+            # fallbacks below; the *_scale keys are provided so the diagnostic
+            # pass-through in extras does not see None.
+            zeros_bt = torch.zeros_like(rho)
+            ones_b1 = torch.ones((rho.shape[0], 1), device=device, dtype=dtype)
+            zeros_b1 = torch.zeros((rho.shape[0], 1), device=device, dtype=dtype)
+            bias = {
+                "log_visibility_bias_raw": zeros_bt,
+                "log_scale_dt": zeros_b1,
+                "global_log_scale": zeros_b1,
+                "dataset_log_scale": zeros_b1,
+                "transcript_log_scale": zeros_b1,
+                "dataset_scale": ones_b1,
+                "transcript_scale": ones_b1,
+            }
 
-        if h_n is None and getattr(self.dataset_bias_model, "biological_context_size", 0) > 0:
-            raise RuntimeError(
-                "Dataset bias model expects biological_context, but biological model "
-                "did not return 'h_n'."
+        log_visibility_raw = bias.get("log_visibility_bias_raw")
+
+        if not torch.is_tensor(log_visibility_raw):
+            beta_fallback = bias.get("obs_beta", bias.get("obs_bias_raw"))
+            if not torch.is_tensor(beta_fallback):
+                raise KeyError(
+                    "Dataset bias model must return log_visibility_bias_raw or obs_beta."
+                )
+            log_visibility_raw = torch.log(
+                beta_fallback.to(device=device, dtype=dtype).clamp_min(self.eps)
+            )
+        else:
+            log_visibility_raw = log_visibility_raw.to(device=device, dtype=dtype)
+
+        if log_visibility_raw.shape != rho.shape:
+            raise ValueError(
+                "log_visibility_bias_raw shape "
+                f"{tuple(log_visibility_raw.shape)} does not match rho shape {tuple(rho.shape)}."
             )
 
-        bias = self.dataset_bias_model(
-            dataset_ids=id_datasets,
-            codon_ids=codon_ids,
-            mask=mask_b,
-            position_features=position_features,
-            biological_context=h_n.detach() if h_n is not None else None,
-        )
-
-        b_raw = bias["obs_bias_raw"].to(dtype=w_bio.dtype)
-        b_raw = b_raw.clamp_min(0.0) * mask_f
-
-        w_obs, b_eff, weighted_b_mass = self._apply_multiplicative_allocation_bias(
-            w_bio=w_bio,
-            b_raw=b_raw,
+        log_visibility_raw = log_visibility_raw * mask_f
+        log_visibility_bias, log_visibility_center = self._center_log_visibility_bias(
+            log_bias_raw=log_visibility_raw,
+            p_bio=q,
             mask=mask_b,
         )
 
-        # ------------------------------------------------------------
-        # 3. Observed hazard/support
-        # ------------------------------------------------------------
-        h_obs = self.biological_model.hazard_from_allocation(
-            w=w_obs,
-            J=J,
-            lengths=lengths,
-            mask=mask_b,
-        )
+        beta = torch.exp(log_visibility_bias).clamp_min(self.eps) * mask_f
 
-        rho_obs = self.biological_model.rho_from_hazard(
-            h_obs,
-            mask_b,
-        )
-
-        L_obs = self.biological_model.L_queue_from_hazard(
-            h_obs,
-            mask_b,
-        )
+        visible_support = q * beta
+        p_visible = visible_support * mask_f
 
         # ------------------------------------------------------------
-        # 4. Profile mean from observed support
+        # 3. Dataset-transcript scale
         # ------------------------------------------------------------
-        prof = self._profile_from_support(
-            q=L_obs,
-            fallback_q=L_bio,
-            y_raw_target=y_raw_target,
-            mask=mask_b,
-        )
+        scale_dt = bias.get("scale_dt", None)
 
-        mu = prof["mu"]
-        total_mass = prof["total_mass"]
-
-        # ------------------------------------------------------------
-        # 5. Dispersion / kappa input
-        # ------------------------------------------------------------
-        phi_raw = bias["phi"].to(dtype=w_bio.dtype)
-
-        if phi_raw.shape == mask.shape:
-            phi = torch.where(mask_b, phi_raw, torch.ones_like(phi_raw))
+        if torch.is_tensor(scale_dt):
+            scale_dt = scale_dt.to(device=device, dtype=dtype)
+            if scale_dt.ndim == 1:
+                scale_dt = scale_dt.reshape(-1, 1)
+            if scale_dt.shape != (rho.shape[0], 1):
+                raise ValueError(
+                    f"Expected scale_dt [B, 1] or [B], got {tuple(scale_dt.shape)}."
+                )
         else:
-            phi = phi_raw
+            scale_dt = torch.ones((rho.shape[0], 1), device=device, dtype=dtype)
+
+        lambda_pre_dropout = scale_dt * q * beta
+        lambda_pre_dropout = lambda_pre_dropout.clamp(min=self.eps, max=self.mu_max)
+        lambda_pre_dropout = lambda_pre_dropout * mask_f
+
+        mu_bio = (scale_dt * q).clamp(min=self.eps, max=self.mu_max) * mask_f
 
         # ------------------------------------------------------------
-        # 6. Mean-profile diagnostics
+        # 4. Dataset/transcript/position dropout zero inflation
         # ------------------------------------------------------------
-        mu_L_bio = self._mu_from_support(
-            support=L_bio,
-            total_mass=total_mass,
-            mask=mask_b,
-        )
+        zero_prob = bias.get("zero_prob", bias.get("dropout_prob", None))
+        zero_logits = bias.get("zero_logits", bias.get("dropout_logits", None))
 
-        mu_L_obs = self._mu_from_support(
-            support=L_obs,
-            total_mass=total_mass,
-            mask=mask_b,
-        )
+        if torch.is_tensor(zero_prob):
+            zero_prob = zero_prob.to(device=device, dtype=dtype)
+            if zero_prob.shape != rho.shape:
+                raise ValueError(
+                    f"zero_prob shape {tuple(zero_prob.shape)} does not match rho shape {tuple(rho.shape)}."
+                )
+            zero_prob = zero_prob.clamp(1.0e-6, 1.0 - 1.0e-6)
+            zero_prob = torch.where(mask_b, zero_prob, torch.full_like(zero_prob, 1.0e-6))
+        elif torch.is_tensor(zero_logits):
+            zero_logits = zero_logits.to(device=device, dtype=dtype)
+            zero_prob = torch.sigmoid(zero_logits).clamp(1.0e-6, 1.0 - 1.0e-6)
+            zero_prob = torch.where(mask_b, zero_prob, torch.full_like(zero_prob, 1.0e-6))
+        else:
+            zero_prob = torch.full_like(rho, 1.0e-6)
+            zero_prob = torch.where(mask_b, zero_prob, torch.full_like(zero_prob, 1.0e-6))
 
-        # Compatibility aliases for existing Lightning logging.
-        mu_L_only = mu_L_bio
-        mu_bio_smooth = mu_L_obs
-        mu_bio_only = mu_L_obs
+        if torch.is_tensor(zero_logits):
+            zero_logits = zero_logits.to(device=device, dtype=dtype)
+        else:
+            zero_logits = torch.logit(zero_prob.clamp(1.0e-6, 1.0 - 1.0e-6))
+
+        mu_unconditional = (1.0 - zero_prob) * lambda_pre_dropout
+        mu_unconditional = mu_unconditional * mask_f
+
+        # Main prediction is the positive-component intensity. Dropout is a
+        # separate observation process in the likelihood and diagnostics; it
+        # should not erase profile-shape correlation.
+        mu_raw = lambda_pre_dropout * mask_f
+
+        mu = torch.nan_to_num(
+            mu_raw,
+            nan=self.eps,
+            posinf=self.mu_max,
+            neginf=self.eps,
+        )
+        mu = mu.clamp(min=self.eps, max=self.mu_max)
+        mu = torch.where(mask_b, mu, torch.ones_like(mu))
 
         # ------------------------------------------------------------
-        # 7. Mass / zero / stability diagnostics
+        # 5. Dispersion
         # ------------------------------------------------------------
-        L_mass_bio = (L_bio * mask_f).sum(dim=1)
-        L_mass_obs = (L_obs * mask_f).sum(dim=1)
+        phi = bias.get("phi", None)
 
-        h_mass_bio = (h_bio * mask_f).sum(dim=1)
-        h_mass_obs = (h_obs * mask_f).sum(dim=1)
+        if phi is None:
+            phi = torch.ones_like(mu)
+        else:
+            phi = phi.to(device=device, dtype=dtype)
+            if phi.shape != mu.shape:
+                raise ValueError(
+                    f"phi shape {tuple(phi.shape)} does not match mu shape {tuple(mu.shape)}."
+                )
+            phi = torch.where(mask_b, phi, torch.ones_like(phi))
 
-        w_bio_zero_frac = self._zero_frac(w_bio, mask_b, threshold=0.0)
-        w_obs_zero_frac = self._zero_frac(w_obs, mask_b, threshold=0.0)
+        # ------------------------------------------------------------
+        # 6. Diagnostics
+        # ------------------------------------------------------------
+        valid_len = mask_f.sum(dim=1).clamp_min(1.0)
 
-        L_bio_zero_frac = self._zero_frac(L_bio, mask_b, threshold=0.0)
-        L_obs_zero_frac = self._zero_frac(L_obs, mask_b, threshold=0.0)
-
-        hazard_cap_frac_bio = (
-            ((h_bio >= 0.99 * self.hazard_max) & mask_b).float().sum(dim=1)
-            / mask_f.sum(dim=1).clamp_min(1.0)
-        )
-
-        hazard_cap_frac_obs = (
-            ((h_obs >= 0.99 * self.hazard_max) & mask_b).float().sum(dim=1)
-            / mask_f.sum(dim=1).clamp_min(1.0)
-        )
-
-        delta_w_l1 = ((w_obs - w_bio).abs() * mask_f).sum(dim=1)
-
-        log_b_eff = torch.log(b_eff.clamp_min(self.eps))
-
-        b_abs_log_mean = (
-            log_b_eff.abs() * mask_f
-        ).sum(dim=1) / mask_f.sum(dim=1).clamp_min(1.0)
-
-        b_abs_log_w_bio_weighted = (
-            w_bio.detach().float().clamp_min(0.0) * log_b_eff.detach().float().abs() * mask_f
+        rho_mean = (rho * mask_f).sum(dim=1) / valid_len
+        q_mean = (q * mask_f).sum(dim=1) / valid_len
+        q_max_sample = q.masked_fill(~mask_b, 0.0).max(dim=1).values
+        p_bio_mean = (p_bio * mask_f).sum(dim=1) / valid_len
+        p_visible_mean = (p_visible * mask_f).sum(dim=1) / valid_len
+        beta_mean = (beta * mask_f).sum(dim=1) / valid_len
+        mu_mass = (mu_raw * mask_f).sum(dim=1)
+        lambda_mass = (lambda_pre_dropout * mask_f).sum(dim=1)
+        mu_unconditional_mass = (mu_unconditional * mask_f).sum(dim=1)
+        dropout_prob_mean = (zero_prob * mask_f).sum(dim=1) / valid_len
+        visibility_log_abs_mean = (log_visibility_bias.abs() * mask_f).sum(dim=1) / valid_len
+        visibility_weights = q.detach() * mask_f
+        visibility_weights = visibility_weights / visibility_weights.sum(
+            dim=1,
+            keepdim=True,
+        ).clamp_min(self.eps)
+        visibility_log_q_weighted_mean = (
+            log_visibility_bias * visibility_weights
         ).sum(dim=1)
+        visibility_log_center_abs = log_visibility_center.abs()
 
-        obs_bias_keep_prob = bias.get("obs_bias_keep_prob")
-        obs_bias_keep_gate = bias.get("obs_bias_keep_gate")
-        obs_bias_keep_hard = bias.get("obs_bias_keep_hard")
-        obs_bias_amp = bias.get("obs_bias_amp")
-        obs_bias_amp_logits = bias.get("obs_bias_amp_logits")
-        obs_bias_gate_logits = bias.get("obs_bias_gate_logits")
-        h_n_flat = None
-        if h_n is not None:
-            h_n_flat = h_n.detach().permute(1, 0, 2).reshape(B, -1)
-        # ------------------------------------------------------------
-        # 8. Extras
-        # ------------------------------------------------------------
+        rho_zero_frac = ((rho <= 0.0) & mask_b).float().sum(dim=1) / valid_len
+        q_zero_frac = ((q <= 0.0) & mask_b).float().sum(dim=1) / valid_len
+        beta_zero_frac = ((beta <= 0.0) & mask_b).float().sum(dim=1) / valid_len
+        mu_zero_frac = ((mu_raw <= 0.0) & mask_b).float().sum(dim=1) / valid_len
+
+        ones = torch.ones_like(rho)
+        queue_alpha = alpha.reshape(()).expand(rho.shape[0])
+        queue_propagation_enabled = torch.full(
+            (rho.shape[0],),
+            float(self.use_queue_propagation),
+            device=device,
+            dtype=dtype,
+        )
+        queue_alpha_trainable = torch.full(
+            (rho.shape[0],),
+            float(self.queue_alpha_learnable),
+            device=device,
+            dtype=dtype,
+        )
+
         extras = {
-            # --------------------------------------------------------
             # Biological branch
-            # --------------------------------------------------------
-            "w_logits": bio.get("w_logits"),
-            "w_bio": w_bio,
-            "w_prob": w_bio,
-
-            "J": J,
-            "biological_context": h_n_flat,
-            "biological_context_norm": (
-                h_n_flat.float().norm(dim=1) if h_n_flat is not None else None
-            ),
+            "rho_bio": rho,
+            "L_bio": q,
+            "q_bio": q,
             "h_bio": h_bio,
-            "rho_bio": rho_bio,
-            "L_bio": L_bio,
-            "L_queue": L_bio,
-            "bio_q_base": L_bio,
+            "p_bio": p_bio,
+            "mu_bio": torch.where(mask_b, mu_bio, torch.ones_like(mu_bio)),
+            "J": J,
+            "queue_alpha": queue_alpha,
+            "queue_propagation_enabled": queue_propagation_enabled,
+            "queue_alpha_trainable": queue_alpha_trainable,
+            "w_bio": torch.where(mask_b, q, torch.zeros_like(q)),
 
-            # --------------------------------------------------------
-            # Multiplicative observation bias
-            # --------------------------------------------------------
-            "obs_bias_raw": b_raw,
-            "obs_bias_effective": b_eff,
-            "obs_bias_weighted_mass": weighted_b_mass,
+            # Anchor-free visibility branch
+            "log_visibility_bias_raw": torch.where(
+                mask_b,
+                log_visibility_raw,
+                torch.zeros_like(log_visibility_raw),
+            ),
+            "log_visibility_bias": torch.where(
+                mask_b,
+                log_visibility_bias,
+                torch.zeros_like(log_visibility_bias),
+            ),
+            "log_visibility_center": log_visibility_center,
+            "obs_beta": torch.where(mask_b, beta, torch.ones_like(beta)),
+            "obs_bias_raw": torch.where(mask_b, beta, torch.ones_like(beta)),
+            "obs_bias_amp": torch.where(mask_b, beta, torch.ones_like(beta)),
+            "obs_bias_amp_logits": torch.where(
+                mask_b,
+                log_visibility_bias,
+                torch.zeros_like(log_visibility_bias),
+            ),
+            "obs_bias_geomean": torch.ones(
+                (rho.shape[0],),
+                dtype=dtype,
+                device=device,
+            ),
+            "p_visible": p_visible,
+            "lambda_pre_dropout": torch.where(
+                mask_b,
+                lambda_pre_dropout,
+                torch.ones_like(lambda_pre_dropout),
+            ),
+            "mu_visible": torch.where(
+                mask_b,
+                lambda_pre_dropout,
+                torch.ones_like(lambda_pre_dropout),
+            ),
+            "mu_unconditional": torch.where(
+                mask_b,
+                mu_unconditional,
+                torch.ones_like(mu_unconditional),
+            ),
+            "mu_positive": mu,
 
-            "obs_bias_amp": obs_bias_amp,
-            "obs_bias_amp_logits": obs_bias_amp_logits,
+            # Compatibility gate diagnostics. Visibility no longer gates zeros.
+            "obs_bias_keep_prob": torch.where(mask_b, 1.0 - zero_prob, ones),
+            "obs_bias_keep_gate": ones,
+            "obs_bias_keep_gate_effective": ones,
+            "obs_bias_keep_hard": ones,
+            "obs_bias_gate_logits": torch.logit((1.0 - zero_prob).clamp(1.0e-6, 1.0 - 1.0e-6)),
 
-            "obs_bias_keep_prob": obs_bias_keep_prob,
-            "obs_bias_keep_gate": obs_bias_keep_gate,
-            "obs_bias_keep_hard": obs_bias_keep_hard,
-            "obs_bias_gate_logits": obs_bias_gate_logits,
+            # Scale branch
+            "scale_dt": scale_dt.reshape(-1),
+            "log_scale_dt": bias.get("log_scale_dt"),
+            "global_log_scale": bias.get("global_log_scale"),
+            "dataset_log_scale": bias.get("dataset_log_scale"),
+            "transcript_log_scale": bias.get("transcript_log_scale"),
+            "dataset_scale": bias.get("dataset_scale"),
+            "transcript_scale": bias.get("transcript_scale"),
 
-            # Compatibility aliases for existing b/gate diagnostics.
-            "b_shape": b_eff,
-            "b_effective": b_eff,
-            "b_smooth": b_raw,
-            "log_b_shape": log_b_eff,
-            "log_b": log_b_eff,
+            # Dropout / zero inflation
+            "dropout_prob": zero_prob,
+            "dropout_logits": zero_logits,
+            "zero_prob": zero_prob,
+            "zero_logits": zero_logits,
 
-            "keep_gate": obs_bias_keep_gate,
-            "keep_prob": obs_bias_keep_prob,
-            "keep_hard": obs_bias_keep_hard,
-            "gate_logits": obs_bias_gate_logits,
+            # Mean / likelihood
+            "mu_raw": mu_raw,
+            "mu_obs": torch.where(
+                mask_b,
+                mu_unconditional,
+                torch.ones_like(mu_unconditional),
+            ),
+            "mu_unconditional_raw": mu_unconditional,
 
-            # --------------------------------------------------------
-            # Observed branch
-            # --------------------------------------------------------
-            "w_obs": w_obs,
-            "h_obs": h_obs,
-            "rho_obs": rho_obs,
-            "L_obs": L_obs,
-            "L_queue_obs": L_obs,
-
-            "bio_q_smooth": L_obs,
-            "bio_q": L_obs,
-            "q": L_obs,
-            "q_for_profile": prof["q_for_profile"],
-            "q_mass": prof["q_mass"].reshape(B),
-            "q_mass_raw": prof["q_mass_raw"].reshape(B),
-            "profile_prob": prof["profile_prob"],
-
-            "q_used_fallback": prof["q_used_fallback"],
-            "q_used_uniform_fallback": prof["q_used_uniform_fallback"],
-
-            "total_mass": total_mass.reshape(B),
-
-            # --------------------------------------------------------
-            # Mean profiles
-            # --------------------------------------------------------
-            "mu_obs": mu,
-            "mu_L_only": mu_L_only,
-            "mu_L_bio": mu_L_bio,
-            "mu_L_obs": mu_L_obs,
-            "mu_bio_smooth": mu_bio_smooth,
-            "mu_bio_only": mu_bio_only,
-
-            # --------------------------------------------------------
-            # Diagnostics
-            # --------------------------------------------------------
-            "L_mass_bio": L_mass_bio,
-            "L_mass_base": L_mass_bio,
-            "L_mass_obs": L_mass_obs,
-            "L_mass_smooth": L_mass_obs,
-            "L_mass_eff": L_mass_obs,
-
-            "h_mass_bio": h_mass_bio,
-            "h_mass_obs": h_mass_obs,
-
-            "w_bio_zero_frac": w_bio_zero_frac,
-            "w_obs_zero_frac": w_obs_zero_frac,
-            "L_bio_zero_frac": L_bio_zero_frac,
-            "L_obs_zero_frac": L_obs_zero_frac,
-
-            "delta_w_obs_bio_l1": delta_w_l1,
-
-            "b_abs_log_mean": b_abs_log_mean,
-            "b_abs_log_w_bio_weighted": b_abs_log_w_bio_weighted,
-
-            "hazard_cap_frac": hazard_cap_frac_obs,
-            "hazard_cap_frac_bio": hazard_cap_frac_bio,
-            "hazard_cap_frac_obs": hazard_cap_frac_obs,
-
-            # --------------------------------------------------------
-            # Dispersion / kappa input
-            # --------------------------------------------------------
+            # Dispersion
             "phi": phi,
-            "phi_raw": phi_raw,
+            "phi_raw": bias.get("phi"),
             "kappa_input": phi,
+
+            # Simple diagnostics
+            "rho_mean": rho_mean,
+            "q_mean": q_mean,
+            "q_max": q_max_sample,
+            "q_zero_frac": q_zero_frac,
+            "p_bio_mean": p_bio_mean,
+            "p_visible_mean": p_visible_mean,
+            "beta_mean": beta_mean,
+            "mu_mass": mu_mass,
+            "lambda_mass": lambda_mass,
+            "mu_unconditional_mass": mu_unconditional_mass,
+            "dropout_prob_mean": dropout_prob_mean,
+            "visibility_log_abs_mean": visibility_log_abs_mean,
+            "visibility_log_q_weighted_mean": visibility_log_q_weighted_mean,
+            "visibility_log_center_abs": visibility_log_center_abs,
+            "rho_zero_frac": rho_zero_frac,
+            "beta_zero_frac": beta_zero_frac,
+            "mu_zero_frac": mu_zero_frac,
         }
 
         return mu, phi, extras

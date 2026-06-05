@@ -7,10 +7,9 @@ import torch.nn as nn
 
 class DatasetDispersionHead(nn.Module):
     """
-    Dataset/transcript-level dispersion head.
+    Position-level dispersion head.
 
-    Produces one scalar dispersion value per transcript-dataset pair,
-    then broadcasts it over valid positions.
+    Produces one dispersion value per valid transcript position.
 
     Input:
         x:    [B, T, F]
@@ -20,9 +19,8 @@ class DatasetDispersionHead(nn.Module):
         phi: [B, T]
 
     Internally:
-        pooled_x:   [B, F]
-        phi_scalar: [B, 1]
-        phi:        [B, T]
+        phi_unit: [B, T]
+        phi:      [B, T]
     """
 
     def __init__(
@@ -47,7 +45,12 @@ class DatasetDispersionHead(nn.Module):
             nn.Linear(self.hidden_size, 1),
         )
 
-        init_unit = (self.init_phi - self.phi_min) / (self.phi_max - self.phi_min)
+        self.log_phi_min = math.log(self.phi_min)
+        self.log_phi_max = math.log(self.phi_max)
+
+        init_unit = (math.log(self.init_phi) - self.log_phi_min) / (
+            self.log_phi_max - self.log_phi_min
+        )
         init_unit = min(max(init_unit, 1e-6), 1.0 - 1e-6)
         init_raw = math.log(init_unit / (1.0 - init_unit))
 
@@ -62,22 +65,15 @@ class DatasetDispersionHead(nn.Module):
         mask_b = mask.bool()
         mask_f = mask_b.to(dtype=x.dtype)
 
-        B, T, _ = x.shape
-
         x = x * mask_f.unsqueeze(-1)
 
-        valid_lengths = mask_f.sum(dim=1, keepdim=True).clamp_min(1.0)
+        phi_unit = torch.sigmoid(self.ff(x).squeeze(-1))
 
-        # One pooled representation per transcript-dataset pair.
-        pooled_x = x.sum(dim=1) / valid_lengths
+        log_phi = self.log_phi_min + phi_unit * (
+            self.log_phi_max - self.log_phi_min
+        )
+        phi = torch.exp(log_phi).clamp(self.phi_min, self.phi_max)
 
-        phi_unit = torch.sigmoid(self.ff(pooled_x))  # [B, 1]
-
-        phi_scalar = self.phi_min + phi_unit * (self.phi_max - self.phi_min)
-        phi_scalar = phi_scalar.clamp(self.phi_min, self.phi_max)  # [B, 1]
-
-        # Broadcast the same scalar over valid positions.
-        phi = phi_scalar.expand(B, T)
         phi = torch.where(
             mask_b,
             phi,

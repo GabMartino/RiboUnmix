@@ -1,27 +1,31 @@
+from __future__ import annotations
+
+import math
+
 import torch
-from entmax import entmax15
-from torch import nn
+import torch.nn as nn
 from torch.nn.utils.rnn import pad_packed_sequence
+
+
+def inv_softplus(x: float) -> float:
+    x = float(x)
+    if x <= 0.0:
+        raise ValueError(f"inv_softplus requires x > 0, got {x}.")
+    if x > 20.0:
+        return x
+    return math.log(math.expm1(x))
 
 
 class QueuingBiologicalModel(nn.Module):
     """
-    Shared biological allocator + transcript-level hazard model.
+    Local biological hazard model with bounded occupancy support.
 
-    This module produces the shared biological allocation logits a_{t,i}.
+        h_i   >= 0
+        rho_i = 1 - exp(-h_i)
 
-    Biological path:
-
-        a_{t,i} = biological allocation logits
-        w_bio   = entmax(a)
-        h_bio   = J_t * T_t * w_bio
-        L_bio   = exp(h_bio) - 1
-
-    The outer model can then form the dataset-specific observed allocation:
-
-        w_obs = entmax(a + beta_d)
-
-    where beta_d is a centered dataset/protocol logit bias.
+    There is intentionally no transcript-level sum_i w_i = 1 allocation
+    constraint. Each codon gets a local hazard before optional downstream
+    queue propagation in the outer model.
     """
 
     def __init__(self, config_params: dict):
@@ -32,12 +36,24 @@ class QueuingBiologicalModel(nn.Module):
         self.num_layers = int(config_params["num_layers"])
         self.dropout = float(config_params.get("dropout", 0.0))
 
-        self.w_temperature = float(config_params.get("w_temperature", 1.0))
-        self.w_transform = str(config_params.get("w_transform", "entmax15")).lower()
-
-        self.J_min = float(config_params.get("J_min", 1e-6))
+        self.J_min = float(config_params.get("J_min", 1.0e-6))
         self.J_max = float(config_params.get("J_max", 10.0))
+        self.init_J = float(config_params.get("init_J", max(self.J_min, 0.5)))
         self.hazard_max = float(config_params.get("hazard_max", 8.0))
+        self.rho_max = float(config_params.get("rho_max", 1.0))
+        self.init_local_hazard_factor = float(
+            config_params.get("init_local_hazard_factor", 1.0)
+        )
+        # Std of the random init for the final local-hazard weights. Must be > 0
+        # so the per-position hazard is NOT flat at init: a perfectly constant
+        # rho makes a Pearson-correlation loss gradient identically zero (the
+        # PCC validity gate detaches it), which would freeze training on arrival.
+        self.init_local_hazard_weight_std = float(
+            config_params.get("init_local_hazard_weight_std", 1.0e-2)
+        )
+
+        if not (0.0 < self.rho_max <= 1.0):
+            raise ValueError(f"rho_max must be in (0, 1], got {self.rho_max}.")
 
         self.rnn = nn.GRU(
             input_size=self.input_size,
@@ -51,11 +67,12 @@ class QueuingBiologicalModel(nn.Module):
         feat_dim = self.hidden_size * 2
         h_dim = self.num_layers * 2 * self.hidden_size
 
-        self.ff_w_logits = nn.Sequential(
+        self.ff_local_hazard = nn.Sequential(
             nn.Linear(feat_dim, feat_dim),
             nn.GELU(),
             nn.Dropout(p=self.dropout),
             nn.Linear(feat_dim, 1),
+            nn.Softplus(),
         )
 
         self.ff_J_conditioned = nn.Sequential(
@@ -66,141 +83,48 @@ class QueuingBiologicalModel(nn.Module):
             nn.Softplus(),
         )
 
-    def allocation_from_logits(
-        self,
-        logits: torch.Tensor,
-        mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Converts allocation logits into a valid probability allocation.
+        self.reset_parameters()
 
-        With entmax15, exact zeros are possible:
+    def reset_parameters(self) -> None:
+        final_j = self.ff_J_conditioned[-2]
+        if isinstance(final_j, nn.Linear):
+            nn.init.zeros_(final_j.weight)
+            init_j = min(max(self.init_J, self.J_min), self.J_max)
+            nn.init.constant_(final_j.bias, inv_softplus(init_j))
 
-            w_i = 0
-            h_i = 0
-            L_i = 0
+        final_h = self.ff_local_hazard[-2]
+        if isinstance(final_h, nn.Linear):
+            # Small random (not zero) weights so the local hazard varies across
+            # positions at init; the bias still centers the mean factor at
+            # init_local_hazard_factor. See init_local_hazard_weight_std above.
+            std = max(float(self.init_local_hazard_weight_std), 0.0)
+            if std > 0.0:
+                nn.init.normal_(final_h.weight, mean=0.0, std=std)
+            else:
+                nn.init.zeros_(final_h.weight)
+            init_factor = max(float(self.init_local_hazard_factor), 1.0e-6)
+            nn.init.constant_(final_h.bias, inv_softplus(init_factor))
 
-        This is the mechanism we want for biological or observed zero support.
-        """
-        if logits.ndim != 2:
-            raise ValueError(f"Expected logits [B, T], got {tuple(logits.shape)}")
-
-        mask_b = mask.bool()
-        mask_f = mask_b.to(dtype=logits.dtype)
-
-        temperature = max(float(self.w_temperature), 1e-6)
-
-        # Avoid NaNs in mixed precision by using dtype min instead of -inf.
-        neg_large = torch.finfo(logits.dtype).min
-        logits = logits.masked_fill(~mask_b, neg_large)
-
-        z = logits / temperature
-
-        if self.w_transform == "entmax15":
-            w = entmax15(z, dim=1)
-        elif self.w_transform == "softmax":
-            w = torch.softmax(z, dim=1)
-        else:
-            raise ValueError(
-                f"Unknown w_transform={self.w_transform!r}. "
-                "Use 'entmax15' or 'softmax'."
-            )
-
-        w = torch.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)
-        w = w.clamp_min(0.0) * mask_f
-
-        # Numerical safety. For entmax this should already sum to one, but the
-        # renormalization protects against fully masked / underflow cases.
-        w_mass = w.sum(dim=1, keepdim=True)
-        uniform = mask_f / mask_f.sum(dim=1, keepdim=True).clamp_min(1.0)
-
-        w = torch.where(
-            w_mass > 1e-8,
-            w / w_mass.clamp_min(1e-8),
-            uniform,
-        )
-
-        w = w * mask_f
-
-        return w
-
-    def hazard_from_allocation(
-        self,
-        *,
-        w: torch.Tensor,
-        J: torch.Tensor,
-        lengths: torch.Tensor,
-        mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Builds hazard from allocation:
-
-            h_i = J * T * w_i
-
-        Since sum_i w_i = 1, the mean valid hazard is approximately J.
-        """
-        mask_f = mask.bool().to(dtype=w.dtype)
-
-        L_seq = lengths.reshape(-1, 1).to(device=w.device, dtype=w.dtype)
-
-        h = J.to(dtype=w.dtype) * L_seq * w
-        h = torch.nan_to_num(
-            h,
-            nan=0.0,
-            posinf=self.hazard_max,
-            neginf=0.0,
-        )
-        h = h.clamp(min=0.0, max=self.hazard_max)
-        h = h * mask_f
-
-        return h
-
-    def rho_from_hazard(
-        self,
-        h: torch.Tensor,
-        mask: torch.Tensor,
-    ) -> torch.Tensor:
-        mask_f = mask.bool().to(dtype=h.dtype)
-        rho = -torch.expm1(-h.clamp(min=0.0, max=self.hazard_max))
-        return rho * mask_f
-
-    def L_queue_from_hazard(
-        self,
-        h: torch.Tensor,
-        mask: torch.Tensor,
-    ) -> torch.Tensor:
-        mask_f = mask.bool().to(dtype=h.dtype)
-        h = h.clamp(min=0.0, max=self.hazard_max)
-        L = torch.expm1(h)
-        L = torch.nan_to_num(L, nan=0.0, posinf=1e8, neginf=0.0)
-        return L * mask_f
-
-    def forward(self, x_packed) -> dict[str, torch.Tensor]:
+    def forward(self, x_packed, mask) -> tuple:
         out_packed, h_n = self.rnn(x_packed)
-        out, lengths = pad_packed_sequence(out_packed, batch_first=True)
-
-        device = out.device
-        lengths = lengths.to(device)
-
+        out, _ = pad_packed_sequence(out_packed, batch_first=True)
         B, T, _ = out.shape
-
-        arange = torch.arange(T, device=device)
-        mask = arange[None, :] < lengths[:, None]
+        mask_b = mask.bool()
         mask_f = mask.to(dtype=out.dtype)
 
-        # ------------------------------------------------------------
-        # Biological allocation logits a_{t,i}
-        # ------------------------------------------------------------
-        w_logits = self.ff_w_logits(out).squeeze(-1)
-        w_logits = w_logits.masked_fill(~mask, torch.finfo(w_logits.dtype).min)
-
-        w_bio = self.allocation_from_logits(
-            logits=w_logits,
-            mask=mask,
-        )
+        if mask_b.shape != (B, T):
+            raise ValueError(
+                f"mask shape {tuple(mask_b.shape)} does not match RNN output {(B, T)}."
+            )
 
         # ------------------------------------------------------------
-        # Transcript-level biological hazard J_t
+        # 1. Local non-normalized hazard factor
+        # ------------------------------------------------------------
+        local_factor = self.ff_local_hazard(out).squeeze(-1)
+        local_factor = local_factor * mask_f
+
+        # ------------------------------------------------------------
+        # 2. Transcript-level hazard scale
         # ------------------------------------------------------------
         h_n_flat = h_n.permute(1, 0, 2).reshape(B, -1)
 
@@ -208,34 +132,18 @@ class QueuingBiologicalModel(nn.Module):
         J = J.clamp(min=self.J_min, max=self.J_max)
 
         # ------------------------------------------------------------
-        # Biological hazard/support
+        # 3. Local bounded hazard. No sum_i w_i = 1 constraint.
         # ------------------------------------------------------------
-        h_bio = self.hazard_from_allocation(
-            w=w_bio,
-            J=J,
-            lengths=lengths,
-            mask=mask,
+        h_bio = J.to(dtype=out.dtype).reshape(B, 1) * local_factor
+        h_bio = torch.nan_to_num(
+            h_bio,
+            nan=0.0,
+            posinf=self.hazard_max,
+            neginf=0.0,
         )
+        h_bio = h_bio.clamp(min=0.0, max=self.hazard_max) * mask_f
 
-        rho_bio = self.rho_from_hazard(h_bio, mask)
-        L_bio = self.L_queue_from_hazard(h_bio, mask)
+        rho_bio = self.rho_max * (-torch.expm1(-h_bio))
+        rho_bio = rho_bio * mask_f
 
-        w_zero_frac = ((w_bio <= 0.0) & mask).float().sum(dim=1) / mask_f.sum(dim=1).clamp_min(1.0)
-        L_zero_frac = ((L_bio <= 0.0) & mask).float().sum(dim=1) / mask_f.sum(dim=1).clamp_min(1.0)
-
-        return {
-            "encoded": out,
-            "lengths": lengths,
-            "mask": mask,
-
-            "w_logits": w_logits,
-            "w_bio": w_bio,
-            "w_zero_frac_bio": w_zero_frac,
-
-            "J": J,
-            "h_n": h_n,
-            "h_bio": h_bio,
-            "rho_bio": rho_bio,
-            "L_bio": L_bio,
-            "L_zero_frac_bio": L_zero_frac,
-        }
+        return rho_bio, J, h_bio, h_n
