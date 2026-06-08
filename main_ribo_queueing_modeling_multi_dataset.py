@@ -166,10 +166,10 @@ def make_dataset_signature(datasets: list[str]) -> str:
 
 
 def make_run_tag(cfg: DictConfig) -> str:
+    parts = []
+
     if bool(cfg_get(cfg, "optim.use_cagrad", False)):
-        tag = "CAGradBio"
-    else:
-        tag = "NOPCGrad"
+        parts.append("CAGrad")
 
     sampling = str(cfg_get(cfg, "data.train_sampling_strategy", "default"))
     dataset_balanced_loss = bool(cfg_get(cfg, "loss.dataset_balanced_loss", False))
@@ -183,15 +183,15 @@ def make_run_tag(cfg: DictConfig) -> str:
     )
 
     if sampling not in {"", "default", "None", "none"}:
-        tag += f"_{sampling}"
+        parts.append(sampling)
 
-    tag += f"_{pcc_target}PCC"
+    parts.append(f"{pcc_target}PCC")
     if pcc_target == "q":
-        tag += "_alphaLearn" if alpha_learnable else "_alphaFixed"
+        parts.append("alphaLearn" if alpha_learnable else "alphaFixed")
 
-    tag += "_DBLoss" if dataset_balanced_loss else "_SampleMeanLoss"
+    parts.append("DBLoss" if dataset_balanced_loss else "SampleMeanLoss")
 
-    return tag
+    return "_".join(parts)
 
 
 def sync_queue_propagation_with_pcc_target(cfg: DictConfig) -> None:
@@ -710,7 +710,6 @@ def predictions_to_parquet(
         "q",
         "q_for_profile",
         "profile_prob",
-        "p_bio",
         "p_visible",
         "lambda_pre_dropout",
 

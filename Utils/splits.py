@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
+from collections import defaultdict
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Sequence, Tuple
 
 import numpy as np
+import pandas as pd
 
 
 def conserved_stalling_sites_aware_split(
@@ -19,7 +22,6 @@ def conserved_stalling_sites_aware_split(
 
     split_size is the fraction kept for training.
     """
-
     with open(css_split_path, "rb") as f:
         data = json.load(f)
 
@@ -43,19 +45,6 @@ def conserved_stalling_sites_aware_split(
 
     assert len(new_train) + len(new_val) == total_size
     return new_train, new_val
-
-
-
-from __future__ import annotations
-
-import json
-import os
-from pathlib import Path
-from collections import defaultdict
-from typing import Sequence
-
-import numpy as np
-import pandas as pd
 
 
 def _dataset_name_from_path(path: str | Path) -> str:
@@ -83,12 +72,10 @@ def _css_count(x) -> int:
         if s in {"", "[]", "nan", "None"}:
             return 0
 
-        # Try JSON-like list.
         try:
             parsed = json.loads(s)
             return _css_count(parsed)
         except Exception:
-            # Last fallback: comma-separated values.
             s = s.strip("[]()")
             if not s:
                 return 0
@@ -105,7 +92,6 @@ def _css_count(x) -> int:
     if arr.dtype == bool:
         return int(arr.sum())
 
-    # If this is a list of CSS positions, count valid entries.
     count = 0
     for v in arr.reshape(-1):
         try:
@@ -254,16 +240,11 @@ def css_and_availability_aware_splits(
 
     all_ids = sorted(metadata.keys())
 
-    # Load old CSS split. We use it as a CSS-benchmark preference, not as the
-    # only validation definition.
     with open(css_split_path, "r", encoding="utf-8") as f:
         css_split = json.load(f)
 
     old_css_val = set(map(str, css_split.get("validation_set", [])))
 
-    # ------------------------------------------------------------
-    # 1. CSS benchmark candidates
-    # ------------------------------------------------------------
     css_positive = [tid for tid in all_ids if metadata[tid]["has_css"]]
     css_positive_old_val = [tid for tid in css_positive if tid in old_css_val]
     css_positive_other = [tid for tid in css_positive if tid not in old_css_val]
@@ -271,7 +252,6 @@ def css_and_availability_aware_splits(
     n_css_benchmark = int(round(len(all_ids) * css_benchmark_frac))
     n_css_benchmark = min(n_css_benchmark, len(css_positive))
 
-    # Prefer the original CSS validation set, then fill with other CSS-positive.
     rng.shuffle(css_positive_old_val)
     rng.shuffle(css_positive_other)
 
@@ -284,9 +264,6 @@ def css_and_availability_aware_splits(
     css_benchmark_ids = list(map(str, css_benchmark_ids))
     css_benchmark_set = set(css_benchmark_ids)
 
-    # ------------------------------------------------------------
-    # 2. Main validation: representative stratified split from remaining IDs
-    # ------------------------------------------------------------
     remaining = [tid for tid in all_ids if tid not in css_benchmark_set]
 
     strata: dict[tuple[str, str], list[str]] = defaultdict(list)
@@ -297,7 +274,6 @@ def css_and_availability_aware_splits(
     main_val_ids = []
     train_ids = []
 
-    # main_val_frac is defined relative to all data. Convert to remaining-data fraction.
     main_val_target = int(round(len(all_ids) * main_val_frac))
     remaining_val_frac = main_val_target / max(len(remaining), 1)
 
@@ -306,9 +282,6 @@ def css_and_availability_aware_splits(
         train_ids.extend(tr)
         main_val_ids.extend(va)
 
-    # ------------------------------------------------------------
-    # 3. Sanity checks
-    # ------------------------------------------------------------
     train_set = set(train_ids)
     main_val_set = set(main_val_ids)
     css_set = set(css_benchmark_ids)

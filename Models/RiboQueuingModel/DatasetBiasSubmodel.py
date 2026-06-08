@@ -7,7 +7,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from Models.RiboQueuingModel.submodels.DatasetDispersionHead import DatasetDispersionHead
-from Models.RiboQueuingModel.submodels.DatasetDropoutHead import DatasetDropoutHead
 from Models.RiboQueuingModel.submodels.DatasetMultiplicativeAllocationBiasHead import (
     DatasetMultiplicativeAllocationBiasHead,
 )
@@ -191,205 +190,6 @@ class DilatedContextCNN(nn.Module):
         return x
 
 
-class DatasetTranscriptScaleHead(nn.Module):
-    """
-    Predicts a positive dataset-transcript scale for absolute ZILN training.
-
-    The returned scale is transcript-level, not position-level:
-
-        S_{d,t} = exp(s0 + s_d + r_{d,t})
-
-    It should be applied outside the queueing exponential by the outer model:
-
-        mu_{d,t,i} = S_{d,t} * L_bio_{t,i} * b_raw_{d,t,i}
-
-    This head may read the biological h_n context. By default the context is
-    detached, so the absolute scale objective does not reshape the biological
-    encoder directly.
-    """
-
-    def __init__(
-        self,
-        *,
-        num_datasets: int,
-        biological_context_size: int,
-        config_params: dict,
-    ):
-        super().__init__()
-
-        self.num_datasets = int(num_datasets)
-        self.biological_context_size = int(biological_context_size)
-
-        self.dataset_scale_embedding_size = int(
-            config_params.get("dataset_scale_embedding_size", 16)
-        )
-        self.hidden_size = int(config_params.get("hidden_size", 128))
-        self.dropout = float(config_params.get("dropout", 0.0))
-
-        self.log_dataset_scale_max = float(
-            config_params.get("log_dataset_scale_max", 5.0)
-        )
-        self.log_transcript_scale_max = float(
-            config_params.get("log_transcript_scale_max", 5.0)
-        )
-
-        self.detach_biological_context = bool(
-            config_params.get("detach_biological_context", True)
-        )
-
-        self.global_log_scale = nn.Parameter(
-            torch.tensor(
-                float(config_params.get("init_global_log_scale", 0.0)),
-                dtype=torch.float32,
-            )
-        )
-
-        self.dataset_log_scale = nn.Embedding(self.num_datasets, 1)
-        nn.init.zeros_(self.dataset_log_scale.weight)
-
-        self.dataset_embedding = nn.Embedding(
-            self.num_datasets,
-            self.dataset_scale_embedding_size,
-        )
-
-        if self.biological_context_size > 0:
-            self.context_norm = nn.LayerNorm(self.biological_context_size)
-        else:
-            self.context_norm = None
-
-        input_size = self.dataset_scale_embedding_size + self.biological_context_size
-
-        self.residual_head = nn.Sequential(
-            nn.Linear(input_size, self.hidden_size),
-            nn.GELU(),
-            nn.Dropout(p=self.dropout),
-            nn.Linear(self.hidden_size, self.hidden_size),
-            nn.GELU(),
-            nn.Dropout(p=self.dropout),
-            nn.Linear(self.hidden_size, 1),
-        )
-
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        final = self.residual_head[-1]
-        if isinstance(final, nn.Linear):
-            nn.init.zeros_(final.weight)
-            nn.init.zeros_(final.bias)
-
-    @staticmethod
-    def _bound_log_scale(raw: torch.Tensor, max_abs: float) -> torch.Tensor:
-        max_abs = float(max(max_abs, 1.0e-6))
-        return max_abs * torch.tanh(raw / max_abs)
-
-    def _prepare_context(
-        self,
-        *,
-        biological_context: torch.Tensor | None,
-        B: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> torch.Tensor | None:
-        if self.biological_context_size <= 0:
-            return None
-
-        if biological_context is None:
-            raise ValueError(
-                "DatasetTranscriptScaleHead requires biological_context, but received None."
-            )
-
-        ctx = biological_context
-
-        if self.detach_biological_context:
-            ctx = ctx.detach()
-
-        if ctx.ndim == 3:
-            if ctx.shape[1] != B:
-                raise ValueError(
-                    "Expected biological_context h_n with shape "
-                    f"[layers*directions, B, H], got {tuple(ctx.shape)} for B={B}."
-                )
-            ctx = ctx.permute(1, 0, 2).reshape(B, -1)
-        elif ctx.ndim == 2:
-            if ctx.shape[0] != B:
-                raise ValueError(
-                    f"Expected biological_context [B, C], got {tuple(ctx.shape)} for B={B}."
-                )
-        else:
-            raise ValueError(
-                "biological_context must have shape [B, C] or "
-                f"[layers*directions, B, H], got {tuple(ctx.shape)}."
-            )
-
-        if ctx.shape[-1] != self.biological_context_size:
-            raise ValueError(
-                "biological_context dimension mismatch in scale head. "
-                f"Expected {self.biological_context_size}, got {ctx.shape[-1]}."
-            )
-
-        ctx = ctx.to(device=device, dtype=dtype)
-
-        if self.context_norm is not None:
-            ctx = self.context_norm(ctx)
-
-        return ctx
-
-    def forward(
-        self,
-        *,
-        dataset_ids: torch.Tensor,
-        biological_context: torch.Tensor | None,
-        dtype: torch.dtype,
-    ) -> dict[str, torch.Tensor]:
-        B = int(dataset_ids.shape[0])
-        device = dataset_ids.device
-
-        dataset_ids = dataset_ids.to(device=device, dtype=torch.long)
-
-        dataset_log_raw = self.dataset_log_scale(dataset_ids)
-        dataset_log_scale = self._bound_log_scale(
-            dataset_log_raw,
-            self.log_dataset_scale_max,
-        )
-
-        dataset_emb = self.dataset_embedding(dataset_ids)
-
-        ctx = self._prepare_context(
-            biological_context=biological_context,
-            B=B,
-            dtype=dataset_emb.dtype,
-            device=device,
-        )
-
-        if ctx is not None:
-            x = torch.cat([dataset_emb, ctx], dim=-1)
-        else:
-            x = dataset_emb
-
-        transcript_log_raw = self.residual_head(x)
-        transcript_log_scale = self._bound_log_scale(
-            transcript_log_raw,
-            self.log_transcript_scale_max,
-        )
-
-        global_log_scale = self.global_log_scale.to(
-            device=device,
-            dtype=dataset_log_scale.dtype,
-        ).reshape(1, 1)
-
-        log_scale = global_log_scale + dataset_log_scale + transcript_log_scale
-        scale = torch.exp(log_scale)
-
-        return {
-            "scale_dt": scale.to(dtype=dtype),
-            "log_scale_dt": log_scale.to(dtype=dtype),
-            "global_log_scale": global_log_scale.expand(B, 1).to(dtype=dtype),
-            "dataset_log_scale": dataset_log_scale.to(dtype=dtype),
-            "transcript_log_scale": transcript_log_scale.to(dtype=dtype),
-            "dataset_scale": torch.exp(dataset_log_scale).to(dtype=dtype),
-            "transcript_scale": torch.exp(transcript_log_scale).to(dtype=dtype),
-        }
-
 
 class DatasetBiasSubmodel(nn.Module):
 
@@ -421,6 +221,8 @@ class DatasetBiasSubmodel(nn.Module):
             self.codon_embeddings_size,
         )
 
+        self.use_local_context_cnn = bool(config_params.get("use_local_context_cnn", True))
+
         self.local_context_cnn = DilatedContextCNN(
             in_channels=self.codon_embeddings_size,
             out_channels=self.num_filters,
@@ -431,10 +233,9 @@ class DatasetBiasSubmodel(nn.Module):
             residual_scale=float(config_params.get("context_cnn_residual_scale", 1.0)),
         )
 
-
         head_input_size = (
             self.dataset_embeddings_size
-            + self.num_filters
+            + (self.num_filters if self.use_local_context_cnn else self.codon_embeddings_size)
             + self.position_dim
         )
 
@@ -445,15 +246,11 @@ class DatasetBiasSubmodel(nn.Module):
             input_size=head_input_size
         )
 
-        self.dispersion_head = DatasetDispersionHead(
-            config_params=config_params["dataset_dispersion_submodule_params"],
-            input_size=head_input_size,
-        )
+        disp_cfg = dict(config_params["dataset_dispersion_submodule_params"])
+        disp_cfg["num_datasets"] = self.num_datasets
+        disp_cfg["codon_input_size"] = self.codon_embeddings_size
 
-        self.dropout_head = DatasetDropoutHead(
-            config_params=config_params.get("dataset_dropout_submodule_params", {}),
-            input_size=head_input_size,
-        )
+        self.dispersion_head = DatasetDispersionHead(config_params=disp_cfg)
 
         scale_cfg = config_params.get("dataset_transcript_scale_factor_params", None)
 
@@ -463,7 +260,6 @@ class DatasetBiasSubmodel(nn.Module):
 
         self.dataset_transcript_scale = DatasetTranscriptScaleFactorHead(
             config_params=scale_cfg,
-            input_size=head_input_size,
         )
 
 
@@ -493,12 +289,16 @@ class DatasetBiasSubmodel(nn.Module):
         codon_emb = self.codon_embedding(codon_ids).to(dtype=dtype)
         codon_emb = codon_emb * mask_f.unsqueeze(-1)
 
-        local_context = self.local_context_cnn(
-            codon_emb.transpose(1, 2),
-            mask=mask_b,
-        ).transpose(1, 2)
-
-        features = [dataset_emb, local_context, position_features]
+        features = [dataset_emb]
+        if self.use_local_context_cnn:
+            local_context = self.local_context_cnn(
+                codon_emb.transpose(1, 2),
+                mask=mask_b,
+            ).transpose(1, 2)
+            features.append(local_context)
+        else:
+            features.append(codon_emb)
+        features.append(position_features)
 
 
         x = torch.cat(features, dim=-1)
@@ -509,11 +309,15 @@ class DatasetBiasSubmodel(nn.Module):
             mask=mask_b,
         )
 
-        phi = self.dispersion_head(x, mask_b)
+        disp_out = self.dispersion_head(
+            dataset_ids=dataset_ids,
+            codon_embeddings=codon_emb.detach(),
+            mask=mask_b,
+        )
+        phi = disp_out["phi"].expand(B, T)
+        phi = torch.where(mask_b, phi, torch.ones_like(phi))
         out["phi"] = phi
-
-        dropout_out = self.dropout_head(x, mask_b)
-        out.update(dropout_out)
+        out["log_phi"] = disp_out["log_phi"]  # [B, 1] — for phi reg loss
 
         scale_out = self.dataset_transcript_scale(
             dataset_ids=dataset_ids,

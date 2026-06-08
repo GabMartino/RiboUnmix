@@ -8,15 +8,15 @@ experiment:
   from_checkpoint: false
   train: true
   predict: true
-  dataset: ["kutay_2021"]
+  dataset: ["kutay_2021", "grimson_2019"]
   seed: 42
   split_size: 0.9
 
 split:
   master_dataset_universe: ["grimson_2019", "kutay_2021"]
-  train_frac: 0.88
+  train_frac: 0.90
   main_val_frac: 0.10
-  css_benchmark_frac: 0.02
+  css_benchmark_frac: 0.00
 
 paths:
   sequences_path: "./Datasets/data/sequence/sequence_embeddings_with_css.parquet"
@@ -56,7 +56,7 @@ model:
     input_size: 97
     hidden_size: 256
     num_layers: 2
-    dropout: 0.0
+    dropout: 0.05
 
     J_min: 2.0e-2
     J_max: 8.0
@@ -69,12 +69,13 @@ model:
     # Overridden at startup from loss.pcc_target:
     #   rho -> false, raw occupancy prediction
     #   q   -> true, causal queue propagation prediction
-    use_queue_propagation: true
+    use_queue_propagation: false
     # Init near "no coupling" but with a live gradient. Do NOT use 0.0: at the
     # alpha_min boundary sigmoid'(raw) ~ 0, so alpha would be frozen there.
     queue_propagation_alpha: 0.5
     # Effective only when loss.pcc_target is q.
     queue_propagation_learnable: true
+    queue_propagation_per_transcript: true
     queue_propagation_alpha_min: 0.0
     queue_propagation_alpha_max: 0.95
     queue_propagation_q_max: 10.0
@@ -88,20 +89,21 @@ model:
       - start_window
       - stop_window
 
-    position_edge_tau: 30.0
+    position_edge_tau: 100.0
     position_scale: 5000.0
 
     num_datasets: 33
-    dataset_embeddings_size: 48
+    dataset_embeddings_size: 32
 
     num_codons: 64
-    codon_embeddings_size: 48
+    codon_embeddings_size: 32
 
-    num_filters: 64
+    use_local_context_cnn: true
+    num_filters: 32
     kernel_size: 15
-    context_cnn_dilations: [1, 2, 4, 8, 16, 32]
-    context_cnn_dropout: 0.05
-    context_cnn_gated: true
+    context_cnn_dilations: [1, 2, 4, 8, 16, 32, 64]
+    context_cnn_dropout: 0.1
+    context_cnn_gated: false
     context_cnn_residual_scale: 1.0
 
     # Legacy key name; this is now a continuous visibility log-bias head.
@@ -110,49 +112,43 @@ model:
       dropout: 0.1
       log_bias_max: 2.0
 
-    dataset_dropout_submodule_params:
-      hidden_size: 96
-      dropout: 0.05
-      init_dropout_prob: 0.05
-      logit_min: -8.0
-      logit_max: null
-
     dataset_dispersion_submodule_params:
+      dataset_embedding_size: 16
       hidden_size: 128
-      dropout: 0.0
+      dropout: 0.1
       phi_min: 0.001
       phi_max: 10.0
-      init_phi: 0.5
+      init_phi: 5.0
 
     dataset_transcript_scale_factor_params:
       dataset_scale_embedding_size: 16
       hidden_size: 128
-      dropout: 0.0
+      dropout: 0.1
 
-      log_global_scale_max: 3.0
       log_dataset_scale_max: 1.5
       log_transcript_scale_max: 3.0
 
-      detach_context: true
-      init_global_log_scale: 0.0
-
 loss:
   # pcc_only, likelihood_only, or pcc_likelihood.
-  # PCC is applied to rho/q support and observed mu_unconditional.
-  # Likelihood is applied to full positive-component mu.
+  # PCC is applied to rho/q support and the log-normal mean profile.
+  # Likelihood is applied to the full left-censored log-normal profile.
   mode: pcc_likelihood
 
   # Quantity correlated against the observed profile and used to set queue mode:
   #   rho = raw local occupancy, no causal propagation
   #   q   = occupancy after causal queue propagation
-  pcc_target: q
+  pcc_target: rho
+  # Normalization for support-PCC targets. nonzero_quantile computes the scale
+  # only over valid nonzero target positions, then clips normalized targets to 1.
+  # This is more robust than max normalization when one codon has a noisy spike.
+  support_target_normalization: nonzero_quantile
+  support_target_quantile: 0.99
+  support_target_min_scale: 1.0
 
-  profile_likelihood: ziln
-  # positive_mean reproduces the previous ZILN behavior; median decouples the
+  profile_likelihood: left_censored_lognormal
+  # positive_mean makes mu the log-normal mean; median decouples the
   # log-normal location from dispersion so phi changes do not shift the center.
-  ziln_mu_parameterization: median
-  zinb_target_transform: real
-  zinb_zero_threshold: 0.0
+  lognormal_mu_parameterization: median
   eps: 1.0e-8
 
   mu_min: 1.0e-8
@@ -162,36 +158,39 @@ loss:
   phi_max: 10.0
 
   log_sigma_min: 0.05
-  log_sigma_max: 2.0
 
   censor_threshold: 0.5
 
-  zero_fixed_prob: 0.001
-  zero_input_is_logits: true
   phi_input_is_log: false
-  detach_mu_for_zero_branch: false
   dataset_balanced_loss: true
   # Soft penalty on the batch-mean of log(J) drifting away from 0.
   # Prevents the J/scale_dt degeneracy (J→0, scale_dt→∞) while preserving
   # per-transcript J variation (the biological signal).
   j_centering_weight: 0.05
+  # Pins batch-mean of transcript_log_scale near 0, preventing the scale_dt/rho
+  # gauge from oscillating in multi-dataset training.
+  transcript_scale_centering_weight: 0.2
+  # Symmetric L2 penalty in log space keeping phi near phi_reg_target.
+  # Replaces the hard phi_max clamp (which caused gradient deadzone → crash).
+  phi_reg_weight: 0.1
+  phi_reg_target: 10.0
 
 optim:
   lr: 5.0e-4
-  lr_biological: 1.0e-4
-  lr_rest: 2.0e-4
-  weight_decay: 1.0e-8
-
+  lr_biological: 5.0e-4
+  lr_rest: 1.0e-3
+  weight_decay_bio: 1.0e-1
+  weight_decay_rest: 1.0e-8
   use_cagrad: false
   cagrad_alpha: 0.5
   cagrad_iterations: 25
   cagrad_rescale_to_mean_norm: true
 
   scheduler:
-    monitor: val_mu_unconditional_pcc
-    mode: max
+    monitor: val_loss
+    mode: min
     factor: 0.9
-    patience: 5
+    patience: 1
     min_lr: 1.0e-6
 
 trainer:
@@ -210,5 +209,6 @@ callbacks:
   early_stopping_patience: 10
 
 metrics:
+  log_train_per_dataset_metrics: false
   log_example_plot: true
   example_plot_max_datasets: 4

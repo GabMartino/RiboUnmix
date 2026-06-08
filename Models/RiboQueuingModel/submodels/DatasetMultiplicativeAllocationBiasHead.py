@@ -8,15 +8,15 @@ class DatasetMultiplicativeAllocationBiasHead(nn.Module):
     """
     Anchor-free continuous dataset visibility head.
 
-    Despite the legacy class name, this no longer owns dropout/gating. It only
+    Despite the legacy class name, this no longer owns a keep gate. It only
     predicts a bounded log visibility correction per position. The outer model
     applies the identifiability gauge by centering this correction under the
     biological profile before forming:
 
         p_visible_i proportional to p_bio_i * exp(log_visibility_bias_i)
 
-    Separating visibility from dropout keeps dataset zeros out of the shared
-    biological queueing support.
+    Dataset zeros are handled by the left-censored likelihood, not by this
+    visibility head.
     """
 
     def __init__(
@@ -104,7 +104,7 @@ class DatasetMultiplicativeAllocationBiasHead(nn.Module):
                 device=x.device,
             ),
 
-            # Compatibility diagnostics. Dropout is modeled by a separate head;
+            # Compatibility diagnostics for older analysis code; active
             # visibility no longer has a keep gate.
             "obs_bias_keep_prob": ones,
             "obs_bias_keep_gate": ones,

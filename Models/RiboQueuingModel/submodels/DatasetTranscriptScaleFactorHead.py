@@ -11,11 +11,10 @@ class DatasetTranscriptScaleFactorHead(nn.Module):
 
     Predicts one positive scalar per transcript/dataset pair:
 
-        S_{d,t} = exp(s0 + s_d + r_{d,t})
+        S_{d,t} = exp(s_d + r_{d,t})
 
     where:
 
-        s0      = global log scale
         s_d     = dataset-specific log scale
         r_{d,t} = transcript-specific residual log scale
 
@@ -29,40 +28,17 @@ class DatasetTranscriptScaleFactorHead(nn.Module):
     def __init__(
         self,
         config_params: dict,
-        input_size: int,
     ):
         super().__init__()
 
-        biological_context_size = int(
-            config_params.get("biological_context_size", input_size)
-        )
+        biological_context_size = int(config_params["biological_context_size"])
 
         self.num_datasets = int(config_params["num_datasets"])
-        self.dataset_embedding_size = int(
-            config_params.get("dataset_scale_embedding_size", 16)
-        )
-
-        self.hidden_size = int(config_params.get("hidden_size", 64))
-        self.dropout = float(config_params.get("dropout", 0.0))
-
-        self.log_global_scale_max = float(
-            config_params.get("log_global_scale_max", 1.0)
-        )
-
-        self.log_dataset_scale_max = float(
-            config_params.get("log_dataset_scale_max", 5.0)
-        )
-
-        self.log_transcript_scale_max = float(
-            config_params.get("log_transcript_scale_max", 5.0)
-        )
-
-        self.global_log_scale = nn.Parameter(
-            torch.tensor(
-                float(config_params.get("init_global_log_scale", 0.0)),
-                dtype=torch.float32,
-            )
-        )
+        self.dataset_embedding_size = int(config_params["dataset_scale_embedding_size"])
+        self.hidden_size = int(config_params["hidden_size"])
+        self.dropout = float(config_params["dropout"])
+        self.log_dataset_scale_max = float(config_params["log_dataset_scale_max"])
+        self.log_transcript_scale_max = float(config_params["log_transcript_scale_max"])
 
         self.dataset_log_scale = nn.Embedding(self.num_datasets, 1)
         nn.init.zeros_(self.dataset_log_scale.weight)
@@ -92,7 +68,6 @@ class DatasetTranscriptScaleFactorHead(nn.Module):
         """
         Initialize scale neutrally:
 
-            global_log_scale = 0
             dataset_log_scale = 0
             transcript_log_scale = 0
 
@@ -173,20 +148,8 @@ class DatasetTranscriptScaleFactorHead(nn.Module):
             self.log_transcript_scale_max,
         )
 
-        global_log_raw = self.global_log_scale.to(
-            device=device,
-            dtype=dtype,
-        ).reshape(1, 1)
-
-        global_log_scale = self._bound_log_scale(
-            global_log_raw,
-            self.log_global_scale_max,
-        )
-        global_log_scale = global_log_scale.expand(B, 1)
-
         log_scale_dt = (
-            global_log_scale
-            + dataset_log_scale
+            dataset_log_scale
             + transcript_log_scale
         )
 
@@ -195,7 +158,6 @@ class DatasetTranscriptScaleFactorHead(nn.Module):
         return {
             "scale_dt": scale_dt,
             "log_scale_dt": log_scale_dt,
-            "global_log_scale": global_log_scale,
             "dataset_log_scale": dataset_log_scale,
             "transcript_log_scale": transcript_log_scale,
             "dataset_scale": torch.exp(dataset_log_scale),

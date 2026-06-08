@@ -18,15 +18,17 @@ from matplotlib import pyplot as plt
 # Loss
 # ============================================================
 
-class ZeroInflatedLogNormalNB2Loss(nn.Module):
+class LeftCensoredLogNormalNB2Loss(nn.Module):
     """
-    Simplified zero-inflated log-normal NLL with positive-component NB2 variance.
+    Left-censored log-normal NLL with NB2-style variance.
 
-    Model:
+    Model for threshold c > 0:
 
-        P(Y = 0) = pi_zero
+        P(Y <= c) = LogNormalCDF(c; log_loc, log_sigma)
 
-        Y | Y > 0 ~ LogNormal(log_loc, log_sigma)
+        Y | Y > c uses the LogNormal(log_loc, log_sigma) density.
+
+    There is no zero-inflated mixture and no fixed/manual pi parameter.
 
     Mu convention:
 
@@ -34,18 +36,17 @@ class ZeroInflatedLogNormalNB2Loss(nn.Module):
 
             mu = E[Y | Y > 0]
 
-        unconditional_mean:
-
-            mu = E[Y]
-            E[Y | Y > 0] = mu / (1 - pi_zero)
-
         median:
 
             mu = median[Y | Y > 0] = exp(log_loc)
 
     Positive-component variance target:
 
-        Var[Y | Y > 0] = E[Y | Y > 0] + phi * E[Y | Y > 0]^2
+        positive_mean:
+            Var[Y | Y > 0] = E[Y | Y > 0] + phi * E[Y | Y > 0]^2
+
+        median:
+            Var[Y | Y > 0] = median[Y | Y > 0] + phi * median[Y | Y > 0]^2
 
     Conversion:
 
@@ -54,9 +55,8 @@ class ZeroInflatedLogNormalNB2Loss(nn.Module):
             log_loc = log(E[Y | Y > 0]) - 0.5 * log_sigma^2
 
         For median parameterization:
-            solve r^3 - (1 + phi) * r - 1 / median = 0,
-            where r = exp(log_sigma^2 / 2), then
-            log_sigma^2 = 2 * log(r)
+            x = (1 + sqrt(1 + 4 * (1 / median + phi))) / 2
+            log_sigma^2 = log(x)
             log_loc = log(mu)
     """
 
@@ -68,12 +68,8 @@ class ZeroInflatedLogNormalNB2Loss(nn.Module):
         phi_min: float = 1.0e-4,
         phi_max: float = 10.0,
         log_sigma_min: float = 0.05,
-        log_sigma_max: float = 2.0,
         censor_threshold: float = 0.0,
-        zero_input_is_logits: bool = True,
         phi_input_is_log: bool = False,
-        detach_mu_for_zero_branch: bool = True,
-        mu_input_is_positive_mean: bool = True,
         mu_parameterization: str | None = None,
     ):
         super().__init__()
@@ -86,23 +82,16 @@ class ZeroInflatedLogNormalNB2Loss(nn.Module):
         self.phi_max = float(phi_max)
 
         self.log_sigma_min = float(log_sigma_min)
-        self.log_sigma_max = float(log_sigma_max)
 
         self.censor_threshold = float(censor_threshold)
-        self.zero_input_is_logits = bool(zero_input_is_logits)
         self.phi_input_is_log = bool(phi_input_is_log)
-        self.detach_mu_for_zero_branch = bool(detach_mu_for_zero_branch)
-        self.mu_input_is_positive_mean = bool(mu_input_is_positive_mean)
         if mu_parameterization is None:
-            mu_parameterization = (
-                "positive_mean"
-                if self.mu_input_is_positive_mean
-                else "unconditional_mean"
-            )
+            mu_parameterization = "positive_mean"
+        if str(mu_parameterization) == "unconditional_mean":
+            mu_parameterization = "positive_mean"
         self.mu_parameterization = str(mu_parameterization)
         valid_parameterizations = {
             "positive_mean",
-            "unconditional_mean",
             "median",
         }
         if self.mu_parameterization not in valid_parameterizations:
@@ -120,33 +109,19 @@ class ZeroInflatedLogNormalNB2Loss(nn.Module):
             0.5 * torch.erfc(-z / math.sqrt(2.0))
         ).clamp_min(-1.0e30)
 
-    def zero_prob_from_param(self, zero_param: torch.Tensor) -> torch.Tensor:
-        if self.zero_input_is_logits:
-            pi = torch.sigmoid(zero_param)
-        else:
-            pi = zero_param
-
-        return pi.clamp(min=self.eps, max=1.0 - self.eps)
-
     def _prepare_phi(self, phi: torch.Tensor) -> torch.Tensor:
         if self.phi_input_is_log:
             phi = torch.exp(phi)
 
-        return phi.clamp(min=self.phi_min, max=self.phi_max)
+        return phi.clamp(min=self.phi_min)  # no upper clamp — phi_reg handles it
 
     def _lognormal_params(
         self,
         *,
         mu: torch.Tensor,
-        pi_zero: torch.Tensor,
         phi: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.mu_parameterization == "unconditional_mean":
-            one_minus_pi = (1.0 - pi_zero).clamp_min(self.eps)
-            mu_ref = mu / one_minus_pi
-        else:
-            mu_ref = mu
-
+        mu_ref = mu
         mu_ref = mu_ref.clamp(min=self.mu_min, max=self.mu_max)
 
         if self.mu_parameterization == "median":
@@ -162,10 +137,7 @@ class ZeroInflatedLogNormalNB2Loss(nn.Module):
             )
 
         log_sigma = torch.sqrt(log_sigma2.clamp_min(self.eps))
-        log_sigma = log_sigma.clamp(
-            min=self.log_sigma_min,
-            max=self.log_sigma_max,
-        )
+        log_sigma = log_sigma.clamp(min=self.log_sigma_min)
 
         if self.mu_parameterization == "median":
             log_loc = torch.log(mu_ref.clamp_min(self.eps))
@@ -180,38 +152,29 @@ class ZeroInflatedLogNormalNB2Loss(nn.Module):
         median: torch.Tensor,
         phi: torch.Tensor,
     ) -> torch.Tensor:
-        """Convert NB2 mean-variance dispersion to log-normal sigma^2.
+        """Convert median-anchored NB2-style dispersion to sigma^2.
 
-        For median m and r = exp(sigma^2 / 2), the positive mean is m * r.
-        Equating log-normal variance to mean + phi * mean^2 yields:
+        For median m and x = exp(sigma^2), equating log-normal variance to
+        the median-anchored target m + phi * m^2 yields:
 
-            r^3 - (1 + phi) * r - 1 / m = 0
+            m^2 * x * (x - 1) = m + phi * m^2
+
+        Therefore:
+
+            x^2 - x - (1 / m + phi) = 0
         """
-        a = 1.0 + phi.clamp_min(self.eps)
-        b = 1.0 / median.clamp_min(self.eps)
-
-        lower = torch.sqrt(a).clamp_min(1.0 + self.eps)
-        small_b_approx = lower + b / (2.0 * a.clamp_min(self.eps))
-        large_b_approx = b.clamp_min(self.eps).pow(1.0 / 3.0)
-        r = torch.maximum(small_b_approx, large_b_approx).clamp_min(lower)
-
-        for _ in range(8):
-            f = r.pow(3) - a * r - b
-            fp = (3.0 * r.pow(2) - a).clamp_min(self.eps)
-            r = (r - f / fp).clamp_min(lower)
-
-        return 2.0 * torch.log(r.clamp_min(1.0 + self.eps))
+        a = (1.0 / median.clamp_min(self.eps)) + phi.clamp_min(self.eps)
+        x = 0.5 * (1.0 + torch.sqrt(1.0 + 4.0 * a))
+        return torch.log(x.clamp_min(1.0 + self.eps))
 
     def positive_mean_from_params(
         self,
         *,
         mu: torch.Tensor,
-        pi_zero: torch.Tensor,
         phi: torch.Tensor,
     ) -> torch.Tensor:
         log_loc, log_sigma = self._lognormal_params(
             mu=mu,
-            pi_zero=pi_zero,
             phi=phi,
         )
         mean = torch.exp(log_loc + 0.5 * log_sigma.pow(2))
@@ -220,7 +183,6 @@ class ZeroInflatedLogNormalNB2Loss(nn.Module):
     def forward(
         self,
         mu_phys: torch.Tensor,
-        zero_param: torch.Tensor,
         phi: torch.Tensor,
         y_true: torch.Tensor,
         mask: torch.Tensor,
@@ -234,38 +196,30 @@ class ZeroInflatedLogNormalNB2Loss(nn.Module):
                 max=self.mu_max,
             )
 
-            pi_zero = self.zero_prob_from_param(
-                zero_param.to(torch.float64)
-            )
-
             phi_t = self._prepare_phi(
                 phi.to(torch.float64)
             )
 
-            pi_zero = torch.broadcast_to(pi_zero, y.shape)
             phi_t = torch.broadcast_to(phi_t, y.shape)
 
             log_loc, log_sigma = self._lognormal_params(
                 mu=mu,
-                pi_zero=pi_zero,
                 phi=phi_t,
             )
-
-            one_minus_pi = (1.0 - pi_zero).clamp_min(self.eps)
 
             # Positive log-normal branch.
             log_y = torch.log(y.clamp_min(self.eps))
             z = (log_y - log_loc) / log_sigma
 
             positive_nll = (
-                -torch.log(one_minus_pi)
-                + log_y
+                log_y
                 + torch.log(log_sigma.clamp_min(self.eps))
                 + 0.5 * math.log(2.0 * math.pi)
                 + 0.5 * z.pow(2)
             )
 
-            # Zero / censored-zero branch.
+            # Left-censored branch. Values y <= c contribute the probability
+            # mass below c under the same log-normal, with no zero mixture.
             if self.censor_threshold > 0.0:
                 c = torch.tensor(
                     self.censor_threshold,
@@ -273,220 +227,20 @@ class ZeroInflatedLogNormalNB2Loss(nn.Module):
                     dtype=torch.float64,
                 ).clamp_min(self.eps)
 
-                if self.detach_mu_for_zero_branch:
-                    # Dataset zeros train the dropout/zero branch, not the
-                    # biological queueing support or visibility mean. Detach pi
-                    # only inside the log-normal CDF parameters; the mixture
-                    # probability below still learns from zeros.
-                    log_loc_zero, log_sigma_zero = self._lognormal_params(
-                        mu=mu.detach(),
-                        pi_zero=pi_zero.detach(),
-                        phi=phi_t.detach(),
-                    )
-                else:
-                    log_loc_zero = log_loc
-                    log_sigma_zero = log_sigma
-
-                z_c = (torch.log(c) - log_loc_zero) / log_sigma_zero
+                z_c = (torch.log(c) - log_loc) / log_sigma
                 log_cdf = self._log_normal_cdf_standard(z_c)
-                if self.detach_mu_for_zero_branch:
-                    log_cdf = log_cdf.detach()
-
-                log_zero_mass = torch.logaddexp(
-                    torch.log(pi_zero.clamp_min(self.eps)),
-                    torch.log(one_minus_pi) + log_cdf,
-                )
-
-                zero_nll = -log_zero_mass
-                is_zero = y <= self.censor_threshold
+                censored_nll = -log_cdf
+                is_censored = y <= self.censor_threshold
 
             else:
-                zero_nll = -torch.log(pi_zero.clamp_min(self.eps))
-                is_zero = y <= 0.0
+                # With no left-censoring threshold, exact zeros have no
+                # continuous log-normal mass. Keep this branch explicit so a
+                # c <= 0 configuration fails loudly through a large loss.
+                censored_nll = torch.full_like(positive_nll, 1.0e8)
+                is_censored = y <= 0.0
 
-            nll = torch.where(is_zero, zero_nll, positive_nll)
+            nll = torch.where(is_censored, censored_nll, positive_nll)
 
-            nll = torch.nan_to_num(
-                nll,
-                nan=0.0,
-                posinf=1.0e8,
-                neginf=1.0e8,
-            )
-
-            mask_f = mask.bool().to(torch.float64)
-            valid_len = mask_f.sum(dim=1).clamp_min(1.0)
-
-            loss_per_sample = (nll * mask_f).sum(dim=1) / valid_len
-            loss_per_sample = loss_per_sample.to(torch.float32)
-
-        if return_per_sample:
-            return loss_per_sample
-
-        return loss_per_sample.mean()
-
-
-class ZeroInflatedNegativeBinomialLoss(nn.Module):
-    """
-    Zero-inflated NB2 NLL.
-
-    Positive component:
-
-        Y | not_dropout ~ NB2(mean=mu_pos, var=mu_pos + phi * mu_pos^2)
-
-    Zero-inflated mixture:
-
-        P(Y=0) = pi_zero + (1 - pi_zero) * NB2(Y=0)
-        P(Y>0) = (1 - pi_zero) * NB2(Y)
-
-    target_transform controls how non-integer targets are handled:
-
-        real : gamma-function continuation of NB to non-negative real values.
-        floor : floor target before NB.
-        round : round target before NB.
-    """
-
-    def __init__(
-        self,
-        eps: float = 1.0e-8,
-        mu_min: float = 1.0e-8,
-        mu_max: float = 1.0e8,
-        phi_min: float = 1.0e-4,
-        phi_max: float = 10.0,
-        zero_input_is_logits: bool = True,
-        phi_input_is_log: bool = False,
-        detach_mu_for_zero_branch: bool = True,
-        mu_input_is_positive_mean: bool = True,
-        target_transform: str = "real",
-        zero_threshold: float = 0.0,
-    ):
-        super().__init__()
-
-        self.eps = float(eps)
-        self.mu_min = float(mu_min)
-        self.mu_max = float(mu_max)
-        self.phi_min = float(phi_min)
-        self.phi_max = float(phi_max)
-        self.zero_input_is_logits = bool(zero_input_is_logits)
-        self.phi_input_is_log = bool(phi_input_is_log)
-        self.detach_mu_for_zero_branch = bool(detach_mu_for_zero_branch)
-        self.mu_input_is_positive_mean = bool(mu_input_is_positive_mean)
-        self.target_transform = str(target_transform).lower()
-        self.zero_threshold = float(zero_threshold)
-
-        allowed = {"real", "floor", "round"}
-        if self.target_transform not in allowed:
-            raise ValueError(
-                f"target_transform must be one of {sorted(allowed)}, "
-                f"got {self.target_transform!r}."
-            )
-
-    def zero_prob_from_param(self, zero_param: torch.Tensor) -> torch.Tensor:
-        if self.zero_input_is_logits:
-            pi = torch.sigmoid(zero_param)
-        else:
-            pi = zero_param
-
-        return pi.clamp(min=self.eps, max=1.0 - self.eps)
-
-    def _prepare_phi(self, phi: torch.Tensor) -> torch.Tensor:
-        if self.phi_input_is_log:
-            phi = torch.exp(phi)
-
-        return phi.clamp(min=self.phi_min, max=self.phi_max)
-
-    def _prepare_target(self, y: torch.Tensor) -> torch.Tensor:
-        y = y.clamp_min(0.0)
-
-        if self.target_transform == "floor":
-            return torch.floor(y)
-
-        if self.target_transform == "round":
-            return torch.round(y)
-
-        return y
-
-    def _positive_mean(
-        self,
-        *,
-        mu: torch.Tensor,
-        pi_zero: torch.Tensor,
-    ) -> torch.Tensor:
-        if self.mu_input_is_positive_mean:
-            mu_pos = mu
-        else:
-            mu_pos = mu / (1.0 - pi_zero).clamp_min(self.eps)
-
-        return mu_pos.clamp(min=self.mu_min, max=self.mu_max)
-
-    def _nb_log_prob(
-        self,
-        *,
-        y: torch.Tensor,
-        mu: torch.Tensor,
-        phi: torch.Tensor,
-    ) -> torch.Tensor:
-        mu = mu.clamp(min=self.mu_min, max=self.mu_max)
-        phi = phi.clamp(min=self.phi_min, max=self.phi_max)
-
-        size = (1.0 / phi).clamp_min(self.eps)
-        log_total = torch.log(size + mu)
-
-        return (
-            torch.lgamma(y + size)
-            - torch.lgamma(size)
-            - torch.lgamma(y + 1.0)
-            + size * (torch.log(size.clamp_min(self.eps)) - log_total)
-            + y * (torch.log(mu.clamp_min(self.eps)) - log_total)
-        )
-
-    def forward(
-        self,
-        mu_phys: torch.Tensor,
-        zero_param: torch.Tensor,
-        phi: torch.Tensor,
-        y_true: torch.Tensor,
-        mask: torch.Tensor,
-        return_per_sample: bool = False,
-    ) -> torch.Tensor:
-        with torch.amp.autocast(device_type=mu_phys.device.type, enabled=False):
-            y = self._prepare_target(y_true.to(torch.float64))
-
-            mu = mu_phys.to(torch.float64).clamp(
-                min=self.mu_min,
-                max=self.mu_max,
-            )
-            pi_zero = self.zero_prob_from_param(zero_param.to(torch.float64))
-            phi_t = self._prepare_phi(phi.to(torch.float64))
-
-            pi_zero = torch.broadcast_to(pi_zero, y.shape)
-            phi_t = torch.broadcast_to(phi_t, y.shape)
-
-            mu_pos = self._positive_mean(mu=mu, pi_zero=pi_zero)
-            one_minus_pi = (1.0 - pi_zero).clamp_min(self.eps)
-
-            log_nb_y = self._nb_log_prob(y=y, mu=mu_pos, phi=phi_t)
-            positive_nll = -(torch.log(one_minus_pi) + log_nb_y)
-
-            if self.detach_mu_for_zero_branch:
-                mu_zero = mu_pos.detach()
-                phi_zero = phi_t.detach()
-            else:
-                mu_zero = mu_pos
-                phi_zero = phi_t
-
-            y_zero = torch.zeros_like(y)
-            log_nb_zero = self._nb_log_prob(y=y_zero, mu=mu_zero, phi=phi_zero)
-            if self.detach_mu_for_zero_branch:
-                log_nb_zero = log_nb_zero.detach()
-
-            log_zero_mass = torch.logaddexp(
-                torch.log(pi_zero.clamp_min(self.eps)),
-                torch.log(one_minus_pi) + log_nb_zero,
-            )
-            zero_nll = -log_zero_mass
-
-            is_zero = y <= self.zero_threshold
-            nll = torch.where(is_zero, zero_nll, positive_nll)
             nll = torch.nan_to_num(
                 nll,
                 nan=0.0,
@@ -527,13 +281,10 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         "queue_alpha",
         "queue_propagation_enabled",
         "queue_alpha_trainable",
-        "p_bio_mean",
         "p_visible_mean",
         "beta_mean",
         "mu_mass",
         "lambda_mass",
-        "mu_unconditional_mass",
-        "dropout_prob_mean",
         "visibility_log_abs_mean",
         "visibility_log_q_weighted_mean",
         "visibility_log_center_abs",
@@ -552,40 +303,19 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
     OPTIONAL_SCALAR_METRICS = (
         "nll",
         "pcc_loss",
-        "mu_unconditional_pcc_loss",
+        "mu_pcc_loss",
         "mu_mse",
-        "mu_unconditional_mse",
         "mu_log1p_mse",
-        "mu_unconditional_log1p_mse",
-        "ziln_mean_pcc",
-        "ziln_unconditional_mean_pcc",
-        "ziln_mean_log1p_mse",
-        "ziln_unconditional_mean_log1p_mse",
         "target_zero_frac",
-        "zero_prob_on_zero",
-        "zero_prob_on_positive",
-        "zero_prob_gap",
         "j_centering_loss",
+        "phi_reg_loss",
+        "transcript_scale_centering_loss",
     )
 
     PROFILE_PLOT_GROUPS = (
-        ("biology/support", ("rho_bio", "q_bio", "p_visible")),
-        ("dropout", ("zero_prob",)),
-        ("visibility", ("obs_beta", "log_visibility_bias")),
-        (
-            "mean/scale",
-            ("mu_bio", "lambda_pre_dropout", "mu_positive", "mu_unconditional"),
-        ),
-        (
-            "likelihood",
-            (
-                "phi",
-                "likelihood_sd",
-                "likelihood_shape",
-                "likelihood_positive_mean",
-                "likelihood_unconditional_mean",
-            ),
-        ),
+        ("beta", ("obs_beta",)),
+        ("phi", ("phi",)),
+        ("rho", ("rho_bio",)),
     )
 
     def __init__(
@@ -612,42 +342,33 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
     def _build_loss(self) -> nn.Module:
         loss_cfg = self.config.loss
 
+        valid_likelihoods = {"left_censored_lognormal", "lcln", "lognormal"}
+        if str(loss_cfg.profile_likelihood) not in valid_likelihoods:
+            raise ValueError(
+                "Only left-censored log-normal likelihoods are supported. "
+                f"Use one of {sorted(valid_likelihoods)}. "
+                f"Got {loss_cfg.profile_likelihood!r}."
+            )
+
         common_kwargs = {
             "eps": loss_cfg.eps,
             "mu_min": loss_cfg.mu_min,
             "mu_max": loss_cfg.mu_max,
             "phi_min": loss_cfg.phi_min,
             "phi_max": loss_cfg.phi_max,
-            "zero_input_is_logits": loss_cfg.zero_input_is_logits,
             "phi_input_is_log": loss_cfg.phi_input_is_log,
-            "detach_mu_for_zero_branch": loss_cfg.detach_mu_for_zero_branch,
-            # mu_input_is_positive_mean is not read from config: for ZILN the active
-            # parameterization is set by ziln_mu_parameterization (explicit overrides
-            # the bool default); for ZINB the code default (True) is correct since
-            # mu = scale_dt * support * beta is always the pre-dropout positive mean.
-            "mu_input_is_positive_mean": True,
         }
 
-        loss_builders = {
-            "ziln": lambda: ZeroInflatedLogNormalNB2Loss(
-                **common_kwargs,
-                mu_parameterization=getattr(
-                    loss_cfg,
-                    "ziln_mu_parameterization",
-                    None,
-                ),
-                log_sigma_min=loss_cfg.log_sigma_min,
-                log_sigma_max=loss_cfg.log_sigma_max,
-                censor_threshold=loss_cfg.censor_threshold,
+        return LeftCensoredLogNormalNB2Loss(
+            **common_kwargs,
+            mu_parameterization=getattr(
+                loss_cfg,
+                "lognormal_mu_parameterization",
+                None,
             ),
-            "zinb": lambda: ZeroInflatedNegativeBinomialLoss(
-                **common_kwargs,
-                target_transform=loss_cfg.zinb_target_transform,
-                zero_threshold=loss_cfg.zinb_zero_threshold,
-            ),
-        }
-
-        return loss_builders[loss_cfg.profile_likelihood]()
+            log_sigma_min=loss_cfg.log_sigma_min,
+            censor_threshold=loss_cfg.censor_threshold,
+        )
 
     # ============================================================
     # Forward / batch handling
@@ -689,63 +410,12 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         return self._forward_batch(batch)
 
     # ============================================================
-    # Zero inflation
-    # ============================================================
-
-    def _zero_param_from_out(self, out: dict[str, Any]) -> torch.Tensor:
-        """
-        Priority:
-            1. loss.zero_fixed_prob, if provided.
-            2. extras["zero_logits"]
-        """
-        target = out["target"]
-        mask = out["mask"].bool()
-        extras = out["extras"]
-
-        dtype = target.dtype
-        device = target.device
-
-        fixed_prob = self.config.loss.zero_fixed_prob
-
-        if fixed_prob is not None:
-            p = float(fixed_prob)
-            p = min(max(p, 1.0e-6), 1.0 - 1.0e-6)
-
-            prob = torch.full_like(
-                target,
-                fill_value=p,
-                dtype=dtype,
-                device=device,
-            )
-
-            prob = torch.where(
-                mask,
-                prob,
-                torch.full_like(prob, 1.0e-6),
-            )
-
-            if self.config.loss.zero_input_is_logits:
-                return torch.logit(prob.clamp(1.0e-6, 1.0 - 1.0e-6))
-
-            return prob
-
-        zero_logits = extras["zero_logits"].to(device=device, dtype=dtype)
-
-        if self.config.loss.zero_input_is_logits:
-            return zero_logits
-
-        return torch.sigmoid(zero_logits)
-
-    # ============================================================
     # Loss / metrics
     # ============================================================
 
     def _profile_nll_per_sample(self, out: dict[str, Any]) -> torch.Tensor:
-        zero_param = self._zero_param_from_out(out)
-
         return self.loss_fn(
             mu_phys=out["mu"].float(),
-            zero_param=zero_param.float(),
             phi=out["phi"].float(),
             y_true=out["target"].float(),
             mask=out["mask"].bool(),
@@ -815,50 +485,22 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         name = self.dataset_id_to_name.get(int(dataset_id), str(int(dataset_id)))
         return name.replace("/", "_").replace(" ", "_")
 
-    def _zero_probability_from_out(self, out: dict[str, Any]) -> torch.Tensor:
-        zero_param = self._zero_param_from_out(out)
-
-        if self.config.loss.zero_input_is_logits:
-            return torch.sigmoid(zero_param)
-
-        return zero_param
-
     def _likelihood_curves_for_plot(
         self,
         out: dict[str, Any],
-        zero_prob: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         mu = out["mu"].detach().float()
         phi = out["phi"].detach().float().clamp_min(self.loss_fn.eps)
 
-        if self.config.loss.profile_likelihood == "ziln":
-            with torch.no_grad():
-                log_loc, log_sigma = self.loss_fn._lognormal_params(
-                    mu=mu,
-                    pi_zero=zero_prob.detach().float(),
-                    phi=phi,
-                )
-                log_sigma2 = log_sigma.pow(2)
-                positive_mean = torch.exp(log_loc + 0.5 * log_sigma2)
-                variance = (
-                    torch.expm1(log_sigma2)
-                    * torch.exp(2.0 * log_loc + log_sigma2)
-                )
-                unconditional_mean = (
-                    (1.0 - zero_prob.detach().float())
-                    * positive_mean
-                )
-            return {
-                "likelihood_sd": variance.clamp_min(self.loss_fn.eps).sqrt(),
-                "likelihood_shape": log_sigma.float(),
-                "likelihood_positive_mean": positive_mean.float(),
-                "likelihood_unconditional_mean": unconditional_mean.float(),
-            }
+        with torch.no_grad():
+            log_loc, log_sigma = self.loss_fn._lognormal_params(
+                mu=mu,
+                phi=phi,
+            )
+            positive_mean = torch.exp(log_loc + 0.5 * log_sigma.pow(2))
 
-        variance = mu + phi * mu.pow(2)
         return {
-            "likelihood_sd": variance.clamp_min(self.loss_fn.eps).sqrt(),
-            "likelihood_shape": (1.0 / phi).clamp_max(1.0e6),
+            "likelihood_positive_mean": positive_mean.float(),
         }
 
     def _mean_for_dataset(
@@ -934,7 +576,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
         extras = out["extras"]
         mask = out["mask"].bool()
-        zero_probability = self._zero_probability_from_out(out)
 
         for dataset_id_tensor in unique_dataset_ids:
             dataset_id = int(dataset_id_tensor.item())
@@ -946,44 +587,17 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             scalar_metrics = {
                 "loss": metrics["loss_per_sample"][sample_mask].mean(),
                 "mu_pcc": metrics["mu_pcc_per_sample"][sample_mask].mean(),
-                "mu_unconditional_pcc": metrics[
-                    "mu_unconditional_pcc_per_sample"
-                ][sample_mask].mean(),
-                "mu_unconditional_pcc_loss": metrics[
-                    "mu_unconditional_pcc_loss_per_sample"
-                ][sample_mask].mean(),
+                "mu_pcc_loss": metrics["mu_pcc_loss_per_sample"][
+                    sample_mask
+                ].mean(),
                 "support_pcc": metrics["support_pcc_per_sample"][sample_mask].mean(),
                 "mu_mse": metrics["mu_mse_per_sample"][sample_mask].mean(),
-                "mu_unconditional_mse": metrics[
-                    "mu_unconditional_mse_per_sample"
-                ][sample_mask].mean(),
                 "mu_log1p_mse": metrics["mu_log1p_mse_per_sample"][
                     sample_mask
                 ].mean(),
-                "mu_unconditional_log1p_mse": metrics[
-                    "mu_unconditional_log1p_mse_per_sample"
-                ][sample_mask].mean(),
-                "target_zero_frac": metrics[
-                    "target_zero_frac_per_sample"
-                ][sample_mask].mean(),
-                "zero_prob_on_zero": metrics[
-                    "zero_prob_on_zero_per_sample"
-                ][sample_mask].mean(),
-                "zero_prob_on_positive": metrics[
-                    "zero_prob_on_positive_per_sample"
-                ][sample_mask].mean(),
-                "zero_prob_gap": metrics[
-                    "zero_prob_gap_per_sample"
-                ][sample_mask].mean(),
                 "n_samples": torch.as_tensor(
                     float(n_samples),
                     device=self.device,
-                ),
-                "zero_prob_mean": self._mean_for_dataset(
-                    zero_probability,
-                    sample_mask=sample_mask,
-                    position_mask=mask,
-                    batch_size=batch_size,
                 ),
                 "phi_mean": self._mean_for_dataset(
                     out["phi"],
@@ -993,7 +607,8 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 ),
             }
 
-            # Optional per-sample metrics exist only on the full ZILN + reg path.
+            # Optional per-sample metrics exist only when those objective terms
+            # are active.
             for name in self.OPTIONAL_SCALAR_METRICS:
                 key = f"{name}_per_sample"
                 if key in metrics:
@@ -1036,55 +651,63 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
         return ((pred - target).pow(2) * mask_f).sum(dim=1) / valid_len
 
-    def _zero_threshold_for_metrics(self) -> float:
-        if self.config.loss.profile_likelihood == "ziln":
-            return float(self.config.loss.censor_threshold)
-
-        return float(self.config.loss.zinb_zero_threshold)
-
     def _zero_diagnostics_per_sample(
         self,
-        *,
         out: dict[str, Any],
-        zero_probability: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         target = out["target"].float()
         mask = out["mask"].bool()
         mask_f = mask.to(dtype=target.dtype)
 
-        zero_threshold = self._zero_threshold_for_metrics()
-        zero_mask = (target <= zero_threshold) & mask
-        positive_mask = (target > zero_threshold) & mask
-
+        zero_count = (
+            (target <= float(self.config.loss.censor_threshold)) & mask
+        ).to(dtype=target.dtype).sum(dim=1)
         valid_len = mask_f.sum(dim=1).clamp_min(1.0)
-        zero_count = zero_mask.to(dtype=target.dtype).sum(dim=1)
-        positive_count = positive_mask.to(dtype=target.dtype).sum(dim=1)
 
-        zero_prob = zero_probability.float()
-        zero_prob_on_zero = (
-            zero_prob * zero_mask.to(dtype=zero_prob.dtype)
-        ).sum(dim=1) / zero_count.clamp_min(1.0)
-        zero_prob_on_positive = (
-            zero_prob * positive_mask.to(dtype=zero_prob.dtype)
-        ).sum(dim=1) / positive_count.clamp_min(1.0)
+        return {"target_zero_frac_per_sample": zero_count / valid_len}
 
-        zero_prob_on_zero = torch.where(
-            zero_count > 0.0,
-            zero_prob_on_zero,
-            torch.zeros_like(zero_prob_on_zero),
+    def _support_target_scale(
+        self,
+        *,
+        target: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        strategy = str(
+            getattr(self.config.loss, "support_target_normalization", "max")
+        ).lower()
+        min_scale = float(
+            getattr(self.config.loss, "support_target_min_scale", 1.0)
         )
-        zero_prob_on_positive = torch.where(
-            positive_count > 0.0,
-            zero_prob_on_positive,
-            torch.zeros_like(zero_prob_on_positive),
-        )
+        min_scale = max(min_scale, float(self.config.loss.eps))
 
-        return {
-            "target_zero_frac_per_sample": zero_count / valid_len,
-            "zero_prob_on_zero_per_sample": zero_prob_on_zero,
-            "zero_prob_on_positive_per_sample": zero_prob_on_positive,
-            "zero_prob_gap_per_sample": zero_prob_on_zero - zero_prob_on_positive,
-        }
+        target_f = target.float().clamp_min(0.0)
+        mask_b = mask.bool()
+
+        if strategy in {"max", "maximum"}:
+            mask_f = mask_b.to(dtype=target_f.dtype)
+            return (target_f * mask_f).max(dim=1, keepdim=True).values.clamp_min(
+                min_scale
+            )
+
+        if strategy in {"nonzero_quantile", "quantile_nonzero"}:
+            q = float(getattr(self.config.loss, "support_target_quantile", 0.99))
+            q = min(max(q, 0.0), 1.0)
+            scales = []
+            for target_i, mask_i in zip(target_f, mask_b, strict=True):
+                valid = mask_i & torch.isfinite(target_i) & (target_i > 0.0)
+                values = target_i[valid]
+                if values.numel() == 0:
+                    scale_i = target_i.new_tensor(min_scale)
+                else:
+                    scale_i = torch.quantile(values, q).clamp_min(min_scale)
+                scales.append(scale_i)
+            return torch.stack(scales).reshape(-1, 1)
+
+        raise ValueError(
+            "loss.support_target_normalization must be one of "
+            "{'max', 'nonzero_quantile'}, got "
+            f"{strategy!r}."
+        )
 
     def _compute_loss_and_metrics(
         self,
@@ -1115,10 +738,17 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         mask = out["mask"].bool()
         mask_f = mask.to(dtype=support.dtype)
 
-        # Normalize target per-transcript: y_norm_i = y_i / max_j(y_j), in [0, 1].
-        # clamp_min(1.0) keeps zero-profile transcripts from producing NaN.
-        target_max = (target * mask_f).max(dim=1, keepdim=True).values.clamp_min(1.0)
-        target_norm = (target / target_max * mask_f).clamp(0.0, 1.0)
+        # Robust per-transcript normalization for the support-shape PCC target.
+        # nonzero_quantile avoids letting one noisy extreme footprint set the
+        # scale for the whole profile; values above the scale are winsorized to 1.
+        target_scale = self._support_target_scale(target=target, mask=mask)
+        target_norm = (target.float() / target_scale * mask_f).clamp(0.0, 1.0)
+
+        with torch.no_grad():
+            likelihood_positive_mean = self.loss_fn.positive_mean_from_params(
+                mu=out["mu"].float(),
+                phi=out["phi"].float(),
+            ).float()
 
         support_pcc_per_sample = self._pearson_per_sample(
             pred=support,
@@ -1126,161 +756,79 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             mask=mask,
         )
         mu_pcc_per_sample = self._pearson_per_sample(
-            pred=out["mu"].float(),
-            target=target.float(),
-            mask=mask,
-        )
-        mu_unconditional_pcc_per_sample = self._pearson_per_sample(
-            pred=out["extras"]["mu_unconditional"].float(),
+            pred=likelihood_positive_mean,
             target=target.float(),
             mask=mask,
         )
         mu_mse_per_sample = self._mse_per_sample(
-            pred=out["mu"],
-            target=target,
-            mask=mask,
-        )
-        mu_unconditional_mse_per_sample = self._mse_per_sample(
-            pred=out["extras"]["mu_unconditional"],
+            pred=likelihood_positive_mean,
             target=target,
             mask=mask,
         )
         mu_log1p_mse_per_sample = self._mse_per_sample(
-            pred=out["mu"],
-            target=target,
-            mask=mask,
-            log1p=True,
-        )
-        mu_unconditional_log1p_mse_per_sample = self._mse_per_sample(
-            pred=out["extras"]["mu_unconditional"],
+            pred=likelihood_positive_mean,
             target=target,
             mask=mask,
             log1p=True,
         )
 
-        zero_probability = self._zero_probability_from_out(out)
-        zero_metrics = self._zero_diagnostics_per_sample(
-            out=out,
-            zero_probability=zero_probability,
-        )
-        ziln_mean_metrics = {}
-        if self.config.loss.profile_likelihood == "ziln":
-            with torch.no_grad():
-                ziln_positive_mean = self.loss_fn.positive_mean_from_params(
-                    mu=out["mu"].detach().float(),
-                    pi_zero=zero_probability.detach().float(),
-                    phi=out["phi"].detach().float(),
-                ).float()
-                ziln_unconditional_mean = (
-                    (1.0 - zero_probability.detach().float())
-                    * ziln_positive_mean
-                )
-
-            ziln_mean_pcc_per_sample = self._pearson_per_sample(
-                pred=ziln_positive_mean,
-                target=target.float(),
-                mask=mask,
-            )
-            ziln_unconditional_mean_pcc_per_sample = self._pearson_per_sample(
-                pred=ziln_unconditional_mean,
-                target=target.float(),
-                mask=mask,
-            )
-            ziln_mean_log1p_mse_per_sample = self._mse_per_sample(
-                pred=ziln_positive_mean,
-                target=target,
-                mask=mask,
-                log1p=True,
-            )
-            ziln_unconditional_mean_log1p_mse_per_sample = self._mse_per_sample(
-                pred=ziln_unconditional_mean,
-                target=target,
-                mask=mask,
-                log1p=True,
-            )
-            ziln_mean_metrics = {
-                "ziln_mean_pcc": self._aggregate_per_sample(
-                    ziln_mean_pcc_per_sample, dataset_ids, _ds_split,
-                ),
-                "ziln_mean_pcc_per_sample": ziln_mean_pcc_per_sample,
-                "ziln_unconditional_mean_pcc": self._aggregate_per_sample(
-                    ziln_unconditional_mean_pcc_per_sample, dataset_ids, _ds_split,
-                ),
-                "ziln_unconditional_mean_pcc_per_sample": (
-                    ziln_unconditional_mean_pcc_per_sample
-                ),
-                "ziln_mean_log1p_mse": self._aggregate_per_sample(
-                    ziln_mean_log1p_mse_per_sample, dataset_ids, _ds_split,
-                ),
-                "ziln_mean_log1p_mse_per_sample": ziln_mean_log1p_mse_per_sample,
-                "ziln_unconditional_mean_log1p_mse": self._aggregate_per_sample(
-                    ziln_unconditional_mean_log1p_mse_per_sample, dataset_ids, _ds_split,
-                ),
-                "ziln_unconditional_mean_log1p_mse_per_sample": (
-                    ziln_unconditional_mean_log1p_mse_per_sample
-                ),
-            }
+        zero_metrics = self._zero_diagnostics_per_sample(out)
 
         # Loss = 1 - PCC so that minimising loss maximises correlation.
         pcc_loss_per_sample = 1.0 - support_pcc_per_sample
-        mu_unconditional_pcc_loss_per_sample = 1.0 - mu_unconditional_pcc_per_sample
-        pcc_loss = self._aggregate_per_sample(pcc_loss_per_sample, dataset_ids)
-        mu_unconditional_pcc_loss = self._aggregate_per_sample(
-            mu_unconditional_pcc_loss_per_sample,
+        mu_pcc_loss_per_sample = 1.0 - mu_pcc_per_sample
+        pcc_loss = self._aggregate_per_sample(
+            pcc_loss_per_sample,
             dataset_ids,
+            _ds_split,
         )
-        support_pcc = self._aggregate_per_sample(support_pcc_per_sample, dataset_ids)
-        mu_pcc = self._aggregate_per_sample(mu_pcc_per_sample, dataset_ids)
-        mu_unconditional_pcc = self._aggregate_per_sample(
-            mu_unconditional_pcc_per_sample,
+        mu_pcc_loss = self._aggregate_per_sample(
+            mu_pcc_loss_per_sample,
             dataset_ids,
+            _ds_split,
         )
-        mu_mse = self._aggregate_per_sample(mu_mse_per_sample, dataset_ids)
-        mu_unconditional_mse = self._aggregate_per_sample(
-            mu_unconditional_mse_per_sample,
+        support_pcc = self._aggregate_per_sample(
+            support_pcc_per_sample,
             dataset_ids,
+            _ds_split,
+        )
+        mu_pcc = self._aggregate_per_sample(
+            mu_pcc_per_sample,
+            dataset_ids,
+            _ds_split,
+        )
+        mu_mse = self._aggregate_per_sample(
+            mu_mse_per_sample,
+            dataset_ids,
+            _ds_split,
         )
         mu_log1p_mse = self._aggregate_per_sample(
             mu_log1p_mse_per_sample,
             dataset_ids,
-        )
-        mu_unconditional_log1p_mse = self._aggregate_per_sample(
-            mu_unconditional_log1p_mse_per_sample,
-            dataset_ids,
+            _ds_split,
         )
 
         metrics = {
             "pcc_loss": pcc_loss,
             "pcc_loss_per_sample": pcc_loss_per_sample,
-            "mu_unconditional_pcc_loss": mu_unconditional_pcc_loss,
-            "mu_unconditional_pcc_loss_per_sample": (
-                mu_unconditional_pcc_loss_per_sample
-            ),
+            "mu_pcc_loss": mu_pcc_loss,
+            "mu_pcc_loss_per_sample": mu_pcc_loss_per_sample,
             "support_pcc": support_pcc,
             "support_pcc_per_sample": support_pcc_per_sample,
             "mu_pcc": mu_pcc,
             "mu_pcc_per_sample": mu_pcc_per_sample,
-            "mu_unconditional_pcc": mu_unconditional_pcc,
-            "mu_unconditional_pcc_per_sample": mu_unconditional_pcc_per_sample,
             "mu_mse": mu_mse,
             "mu_mse_per_sample": mu_mse_per_sample,
-            "mu_unconditional_mse": mu_unconditional_mse,
-            "mu_unconditional_mse_per_sample": mu_unconditional_mse_per_sample,
             "mu_log1p_mse": mu_log1p_mse,
             "mu_log1p_mse_per_sample": mu_log1p_mse_per_sample,
-            "mu_unconditional_log1p_mse": mu_unconditional_log1p_mse,
-            "mu_unconditional_log1p_mse_per_sample": (
-                mu_unconditional_log1p_mse_per_sample
-            ),
         }
         for name, value in zero_metrics.items():
             metrics[name] = value
             metrics[name.removesuffix("_per_sample")] = self._aggregate_per_sample(
                 value,
                 dataset_ids,
+                _ds_split,
             )
-        metrics.update(ziln_mean_metrics)
-
         # Batch-mean log(J) centering — breaks the J/scale_dt identifiability degeneracy.
         # J is a per-transcript biological scale (ribosome flux amplitude). Without this
         # constraint, the optimizer slides along the flat J×scale_dt manifold, pushing J→0
@@ -1295,29 +843,51 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             j_centering_loss = j_centering_weight * log_J_mean.pow(2)
             metrics["j_centering_loss"] = j_centering_loss
 
+        phi_reg_weight = float(getattr(self.config.loss, "phi_reg_weight", 0.0))
+        phi_reg_loss = torch.zeros((), device=support.device, dtype=support.dtype)
+        if phi_reg_weight > 0.0:
+            log_phi = out["extras"]["log_phi"].float()  # [B, 1]
+            log_phi_target = math.log(float(getattr(self.config.loss, "phi_reg_target", 10.0)))
+            phi_reg_loss = phi_reg_weight * (log_phi - log_phi_target).pow(2).mean()
+            metrics["phi_reg_loss"] = phi_reg_loss
+
+        ts_centering_weight = float(getattr(self.config.loss, "transcript_scale_centering_weight", 0.0))
+        transcript_scale_centering_loss = torch.zeros((), device=support.device, dtype=support.dtype)
+        if ts_centering_weight > 0.0:
+            transcript_log_scale = out["extras"]["transcript_log_scale"].float().squeeze(-1)  # [B]
+            unique_ds_ids = torch.unique(dataset_ids)
+            per_ds = [
+                transcript_log_scale[dataset_ids == ds_id].mean().pow(2)
+                for ds_id in unique_ds_ids
+                if (dataset_ids == ds_id).sum() > 1
+            ]
+            if per_ds:
+                transcript_scale_centering_loss = ts_centering_weight * torch.stack(per_ds).mean()
+            metrics["transcript_scale_centering_loss"] = transcript_scale_centering_loss
+
         if mode == "pcc_only":
-            metrics["loss"] = pcc_loss + mu_unconditional_pcc_loss + j_centering_loss
+            metrics["loss"] = pcc_loss + mu_pcc_loss + j_centering_loss + phi_reg_loss + transcript_scale_centering_loss
             metrics["loss_per_sample"] = (
-                pcc_loss_per_sample + mu_unconditional_pcc_loss_per_sample
+                pcc_loss_per_sample + mu_pcc_loss_per_sample
             )
             return metrics
 
         nll_per_sample = self._profile_nll_per_sample(out)
-        nll = self._aggregate_per_sample(nll_per_sample, dataset_ids)
+        nll = self._aggregate_per_sample(nll_per_sample, dataset_ids, _ds_split)
 
         metrics["nll"] = nll
         metrics["nll_per_sample"] = nll_per_sample
 
         if mode == "likelihood_only":
-            metrics["loss"] = nll + j_centering_loss
+            metrics["loss"] = nll + j_centering_loss + phi_reg_loss + transcript_scale_centering_loss
             metrics["loss_per_sample"] = nll_per_sample
             return metrics
 
         if mode == "pcc_likelihood":
-            metrics["loss"] = pcc_loss + mu_unconditional_pcc_loss + nll + j_centering_loss
+            metrics["loss"] = pcc_loss + mu_pcc_loss + nll + j_centering_loss + phi_reg_loss + transcript_scale_centering_loss
             metrics["loss_per_sample"] = (
                 pcc_loss_per_sample
-                + mu_unconditional_pcc_loss_per_sample
+                + mu_pcc_loss_per_sample
                 + nll_per_sample
             )
             return metrics
@@ -1359,16 +929,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         )
 
         self.log(
-            f"{stage}_mu_unconditional_pcc",
-            metrics["mu_unconditional_pcc"],
-            on_step=False,
-            on_epoch=True,
-            prog_bar=False,
-            batch_size=batch_size,
-            sync_dist=sync_dist,
-        )
-
-        self.log(
             f"{stage}_support_pcc",
             metrics["support_pcc"],
             on_step=False,
@@ -1405,17 +965,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 sync_dist=sync_dist,
             )
 
-        zero_probability = self._zero_probability_from_out(out)
-        self.log(
-            f"{stage}_zero_prob_mean",
-            zero_probability.float()[out["mask"].bool()].mean(),
-            on_step=False,
-            on_epoch=True,
-            prog_bar=False,
-            batch_size=batch_size,
-            sync_dist=sync_dist,
-        )
-
         self.log(
             f"{stage}_phi_mean",
             out["phi"].float()[out["mask"].bool()].mean(),
@@ -1425,11 +974,16 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             batch_size=batch_size,
             sync_dist=sync_dist,
         )
-        self._log_per_dataset_metrics(
-            stage=stage,
-            out=out,
-            metrics=metrics,
+
+        log_train_per_dataset = bool(
+            getattr(self.config.metrics, "log_train_per_dataset_metrics", False)
         )
+        if stage != "train" or log_train_per_dataset:
+            self._log_per_dataset_metrics(
+                stage=stage,
+                out=out,
+                metrics=metrics,
+            )
 
     # ============================================================
     # Profile plots
@@ -1525,10 +1079,9 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         length = int(mask_i.sum().item())
 
         extras = dict(out["extras"])
-        zero_prob = self._zero_probability_from_out(out)
-        extras["zero_prob"] = zero_prob
         extras["phi"] = out["phi"]
-        extras.update(self._likelihood_curves_for_plot(out, zero_prob))
+        likelihood_curves = self._likelihood_curves_for_plot(out)
+        extras.update(likelihood_curves)
 
         x_axis = torch.arange(length).numpy()
         dataset_id = int(out["dataset_ids"][sample_idx].detach().cpu().item())
@@ -1549,26 +1102,13 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             mask_i=mask_i,
         )
         prediction = self._sequence_for_plot(
-            out["mu"],
+            likelihood_curves["likelihood_positive_mean"],
             sample_idx=sample_idx,
             mask_i=mask_i,
         )
 
         axes[0].plot(x_axis, target, label="target", linewidth=1.2)
-        axes[0].plot(x_axis, prediction, label="prediction", linewidth=1.2)
-        if "mu_unconditional" in extras:
-            mu_unconditional = self._sequence_for_plot(
-                extras["mu_unconditional"],
-                sample_idx=sample_idx,
-                mask_i=mask_i,
-            )
-            axes[0].plot(
-                x_axis,
-                mu_unconditional,
-                label="mu_unconditional",
-                linewidth=1.0,
-                linestyle="--",
-            )
+        axes[0].plot(x_axis, prediction, label="mu prediction", linewidth=1.2)
 
         axes[0].set_title(
             " | ".join(
@@ -1599,8 +1139,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 axis.plot(x_axis, curve, label=key, linewidth=1.0)
 
             axis.set_ylabel(ylabel)
-            if ylabel == "dropout":
-                axis.set_ylim(-0.05, 1.05)
             axis.grid(True, alpha=0.3)
             axis.legend(loc="upper right")
 
@@ -1639,7 +1177,11 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
     @staticmethod
     def _is_biological_parameter_name(name: str) -> bool:
-        return name.startswith("biological_model.") or name == "queue_raw_alpha"
+        return (
+            name.startswith("biological_model.")
+            or name.startswith("queue_alpha_head.")
+            or name == "queue_raw_alpha"
+        )
 
     def _bio_parameters(self) -> list[torch.nn.Parameter]:
         return [
@@ -1842,6 +1384,57 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
         return metrics["loss"]
 
+    @staticmethod
+    def _detach_prediction_value(value: Any) -> Any:
+        if torch.is_tensor(value):
+            return value.detach().cpu()
+
+        return value
+
+    def predict_step(self, batch, batch_idx, dataloader_idx: int = 0):
+        out = self._forward_batch(batch)
+        extras = out["extras"]
+
+        with torch.no_grad():
+            likelihood_positive_mean = self.loss_fn.positive_mean_from_params(
+                mu=out["mu"].detach().float(),
+                phi=out["phi"].detach().float(),
+            ).float()
+
+        predictions: dict[str, Any] = {
+            # Identifiers
+            "ids": out["ids"],
+            "dataset_id": out["dataset_ids"],
+            "lengths": out["lengths"],
+            "mask": out["mask"],
+            "codon_ids": out["codon_ids"],
+            "css": out["css"],
+            # Target
+            "target": out["target"],
+            # Prediction: log-normal mean.
+            "likelihood_positive_mean": likelihood_positive_mean,
+            # Raw model output (median parameterization)
+            "mu": out["mu"],
+            # Biological branch
+            "rho_bio": extras["rho_bio"],
+            "q_bio": extras["q_bio"],
+            "h_bio": extras["h_bio"],
+            "J": extras["J"],
+            "p_visible": extras["p_visible"],
+            # Observation branch
+            "lambda_pre_dropout": extras["lambda_pre_dropout"],
+            "obs_beta": extras["obs_beta"],
+            "log_visibility_bias": extras["log_visibility_bias"],
+            "scale_dt": extras["scale_dt"],
+            # Model params
+            "phi": out["phi"],
+        }
+
+        return {
+            key: self._detach_prediction_value(value)
+            for key, value in predictions.items()
+        }
+
     def on_validation_epoch_end(self) -> None:
         if not self.use_cagrad:
             return
@@ -1861,8 +1454,8 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         base_lr = self.config.optim.lr
         bio_lr = self.config.optim.lr_biological
         rest_lr = self.config.optim.lr_rest
-        weight_decay = self.config.optim.weight_decay
-
+        weight_decay_bio = self.config.optim.weight_decay_bio
+        weight_decay_rest = self.config.optim.weight_decay_rest
         bio_params = []
         rest_params = []
 
@@ -1882,7 +1475,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 {
                     "params": bio_params,
                     "lr": bio_lr,
-                    "weight_decay": weight_decay,
+                    "weight_decay": weight_decay_bio,
                     "name": "biological",
                 }
             )
@@ -1892,7 +1485,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 {
                     "params": rest_params,
                     "lr": rest_lr,
-                    "weight_decay": weight_decay,
+                    "weight_decay": weight_decay_rest,
                     "name": "rest",
                 }
             )
