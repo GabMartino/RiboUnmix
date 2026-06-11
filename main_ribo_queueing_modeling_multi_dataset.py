@@ -83,6 +83,23 @@ def cfg_get(cfg: Any, path: str, default: Any = None) -> Any:
     return cur
 
 
+def cfg_bool(cfg: Any, path: str, default: bool = False) -> bool:
+    """Read a config value as bool without treating the string "false" as True."""
+    value = cfg_get(cfg, path, default)
+
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off", "none", "null", ""}:
+            return False
+
+    return bool(value)
+
+
 def open_file(path: str | Path) -> dict[str, Any]:
     path = Path(path)
 
@@ -168,11 +185,11 @@ def make_dataset_signature(datasets: list[str]) -> str:
 def make_run_tag(cfg: DictConfig) -> str:
     parts = []
 
-    if bool(cfg_get(cfg, "optim.use_cagrad", False)):
+    if cfg_bool(cfg, "optim.use_cagrad", False):
         parts.append("CAGrad")
 
     sampling = str(cfg_get(cfg, "data.train_sampling_strategy", "default"))
-    dataset_balanced_loss = bool(cfg_get(cfg, "loss.dataset_balanced_loss", False))
+    dataset_balanced_loss = cfg_bool(cfg, "loss.dataset_balanced_loss", False)
     pcc_target = str(cfg_get(cfg, "loss.pcc_target", "rho"))
     alpha_learnable = bool(
         cfg_get(
@@ -195,8 +212,22 @@ def make_run_tag(cfg: DictConfig) -> str:
 
 
 def sync_queue_propagation_with_pcc_target(cfg: DictConfig) -> None:
-    pcc_target = cfg.loss.pcc_target
-    use_queue = pcc_target == "q"
+    """
+    pcc_target options (2x2: intensity/occupancy x queue off/on):
+        rho          - intensity, queue OFF
+        q            - intensity, queue ON
+        occupancy    - bounded occupancy, queue OFF
+        q_occupancy  - bounded occupancy, queue ON
+    """
+    pcc_target = str(cfg.loss.pcc_target)
+    queued_targets = {"q", "q_occupancy"}
+    valid_targets = {"rho", "q", "occupancy", "q_occupancy"}
+    if pcc_target not in valid_targets:
+        raise ValueError(
+            f"loss.pcc_target must be one of {sorted(valid_targets)}, "
+            f"got {pcc_target!r}."
+        )
+    use_queue = pcc_target in queued_targets
 
     OmegaConf.set_struct(cfg, False)
     cfg.model.queue_propagation_params.use_queue_propagation = use_queue
@@ -608,6 +639,23 @@ def save_split_manifest(
     print(f"Saved split manifest: {out_file}")
 
 
+def filter_ids_available_in_experiment(
+    *,
+    ids: Sequence[str],
+    metadata: dict[str, dict[str, Any]],
+    experiment_datasets: Sequence[str],
+) -> list[str]:
+    experiment_dataset_set = set(map(str, experiment_datasets))
+    filtered = []
+
+    for tid in map(str, ids):
+        dataset_names = set(map(str, metadata.get(tid, {}).get("datasets", [])))
+        if dataset_names & experiment_dataset_set:
+            filtered.append(tid)
+
+    return filtered
+
+
 # ============================================================
 # Checkpoints
 # ============================================================
@@ -665,15 +713,16 @@ def choose_checkpoint(
 
 def predictions_to_parquet(
     *,
-    predictions: list[dict[str, Any]],
+    predictions: Any,
     out_file: Path,
-) -> None:
+) -> int:
     rows = []
 
     sequence_keys = {
         # Core target/prediction
         "y",
         "target",
+        "likelihood_positive_mean",
         "mu",
         "mu_obs",
         "mu_positive",
@@ -712,6 +761,9 @@ def predictions_to_parquet(
         "profile_prob",
         "p_visible",
         "lambda_pre_dropout",
+        "obs_beta",
+        "log_visibility_bias",
+        "log_sigma",
 
         # Multiplicative observation bias
         "obs_bias_raw",
@@ -814,7 +866,7 @@ def predictions_to_parquet(
 
         return np.asarray(sliced).astype(np.float32, copy=False).tolist()
 
-    for batch in predictions:
+    for batch in flatten_prediction_batches(predictions):
         batch_size = len(batch["ids"])
 
         for i in range(batch_size):
@@ -871,6 +923,100 @@ def predictions_to_parquet(
     print(f"Saving {len(df_predictions)} prediction rows to {out_file}...")
     out_file.parent.mkdir(parents=True, exist_ok=True)
     df_predictions.to_parquet(out_file, engine="pyarrow", index=False)
+    return len(df_predictions)
+
+
+def flatten_prediction_batches(predictions: Any) -> list[dict[str, Any]]:
+    """Flatten Lightning prediction outputs from single-process or DDP strategies."""
+    flat: list[dict[str, Any]] = []
+
+    def visit(obj: Any) -> None:
+        if obj is None:
+            return
+
+        if isinstance(obj, dict):
+            flat.append(obj)
+            return
+
+        if isinstance(obj, (list, tuple)):
+            for item in obj:
+                visit(item)
+            return
+
+        raise TypeError(
+            "Unexpected prediction output type "
+            f"{type(obj).__name__}; expected dict/list/tuple/None."
+        )
+
+    visit(predictions)
+    return flat
+
+
+def trainer_barrier(trainer: pl.Trainer, name: str) -> None:
+    barrier = getattr(getattr(trainer, "strategy", None), "barrier", None)
+    if callable(barrier):
+        barrier(name)
+
+
+def save_predictions_for_trainer(
+    *,
+    predictions: Any,
+    out_file: Path,
+    trainer: pl.Trainer,
+) -> int:
+    """Save predictions safely for both single-process and DDP prediction."""
+    world_size = int(getattr(trainer, "world_size", 1) or 1)
+    rank = int(getattr(trainer, "global_rank", 0) or 0)
+    is_global_zero = bool(getattr(trainer, "is_global_zero", True))
+
+    if world_size <= 1:
+        return predictions_to_parquet(predictions=predictions, out_file=out_file)
+
+    tmp_dir = out_file.parent / f".{out_file.stem}_ddp_parts"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    rank_file = tmp_dir / f"rank_{rank:05d}.parquet"
+
+    local_rows = predictions_to_parquet(predictions=predictions, out_file=rank_file)
+    trainer_barrier(trainer, f"prediction-write-{out_file.stem}")
+
+    total_rows = 0
+    if is_global_zero:
+        part_files = sorted(tmp_dir.glob("rank_*.parquet"))
+        frames = [
+            pd.read_parquet(part_file)
+            for part_file in part_files
+            if part_file.exists()
+        ]
+
+        if frames:
+            df_predictions = pd.concat(frames, ignore_index=True)
+        else:
+            df_predictions = pd.DataFrame()
+
+        if {"transcript_id", "dataset_id"}.issubset(df_predictions.columns):
+            before = len(df_predictions)
+            df_predictions = df_predictions.drop_duplicates(
+                subset=["transcript_id", "dataset_id"],
+                keep="first",
+            )
+            dropped = before - len(df_predictions)
+            if dropped > 0:
+                print(f"Dropped {dropped} duplicate prediction rows while merging DDP shards.")
+
+        total_rows = len(df_predictions)
+        print(f"Saving {total_rows} merged prediction rows to {out_file}...")
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        df_predictions.to_parquet(out_file, engine="pyarrow", index=False)
+
+        for part_file in part_files:
+            part_file.unlink(missing_ok=True)
+        try:
+            tmp_dir.rmdir()
+        except OSError:
+            pass
+
+    trainer_barrier(trainer, f"prediction-merge-{out_file.stem}")
+    return total_rows if is_global_zero else local_rows
 
 
 # ============================================================
@@ -899,13 +1045,13 @@ def make_datamodule(
         codon_to_aa_encoding_path=cfg.paths.encodings.codon_to_aa,
         aa_encoding_path=cfg.paths.encodings.aa,
         datasets_encoding_path=cfg.paths.encodings.datasets,
-        balanced_train_sampling=bool(cfg_get(cfg, "data.balanced_train_sampling", False)),
+        balanced_train_sampling=cfg_bool(cfg, "data.balanced_train_sampling", False),
         dataset_balance_gamma=float(cfg_get(cfg, "data.dataset_balance_gamma", 0.0)),
         train_samples_per_epoch=cfg_get(cfg, "data.train_samples_per_epoch", None),
-        dataset_aware_batching=bool(cfg_get(cfg, "data.dataset_aware_batching", False)),
+        dataset_aware_batching=cfg_bool(cfg, "data.dataset_aware_batching", False),
         datasets_per_batch=int(cfg_get(cfg, "data.datasets_per_batch", 2)),
         train_sampling_strategy=cfg_get(cfg, "data.train_sampling_strategy", "random_dataset_per_transcript"),
-        pin_memory=bool(cfg_get(cfg, "data.pin_memory", True)),
+        pin_memory=cfg_bool(cfg, "data.pin_memory", True),
         prefetch_factor=cfg_get(cfg, "data.prefetch_factor", 4),
     )
 
@@ -958,7 +1104,13 @@ def main(cfg: DictConfig) -> None:
         for dataset in split_universe_datasets
     ]
 
-    split_size = float(cfg.experiment.split_size)
+    split_size = float(
+        cfg_get(
+            cfg,
+            "experiment.split_size",
+            cfg_get(cfg, "split.train_frac", 0.90),
+        )
+    )
 
     print("\n=== Dataset configuration ===")
     print(f"Experiment datasets:     {experiment_datasets}")
@@ -1063,14 +1215,27 @@ def main(cfg: DictConfig) -> None:
         seed=seed,
     )
 
-    css_datamodule = make_datamodule(
-        cfg=cfg,
-        datasets_paths=experiment_dataset_paths,
-        train_fold=train_fold,
-        val_fold=css_benchmark_fold,
-        split_size=split_size,
-        seed=seed,
+    css_benchmark_fold_for_experiment = filter_ids_available_in_experiment(
+        ids=css_benchmark_fold,
+        metadata=split_metadata,
+        experiment_datasets=experiment_datasets,
     )
+
+    css_datamodule = None
+    if len(css_benchmark_fold_for_experiment) > 0:
+        css_datamodule = make_datamodule(
+            cfg=cfg,
+            datasets_paths=experiment_dataset_paths,
+            train_fold=train_fold,
+            val_fold=css_benchmark_fold_for_experiment,
+            split_size=split_size,
+            seed=seed,
+        )
+    else:
+        print(
+            "\nNo CSS benchmark transcripts are available for the selected "
+            f"experiment datasets {experiment_datasets}. CSS prediction will be skipped.\n"
+        )
 
     tb_logger = TensorBoardLogger(save_dir=str(paths_logs), name="")
     exp_name = Path(tb_logger.log_dir or tb_logger.save_dir).name
@@ -1125,15 +1290,26 @@ def main(cfg: DictConfig) -> None:
     }
 
     # CAGrad uses manual optimization and clips inside the LightningModule.
-    if not bool(cfg_get(cfg, "optim.use_cagrad", False)):
+    if not cfg_bool(cfg, "optim.use_cagrad", False):
         trainer_kwargs["gradient_clip_val"] = cfg_get(cfg, "trainer.gradient_clip_val", 0.0)
         trainer_kwargs["gradient_clip_algorithm"] = cfg_get(cfg, "trainer.gradient_clip_algorithm", "norm")
 
+    use_distributed_sampler = cfg_bool(cfg, "trainer.use_distributed_sampler", False)
+    trainer_kwargs["use_distributed_sampler"] = use_distributed_sampler
+
+    if use_distributed_sampler:
+        print(
+            "\n[trainer] WARNING: trainer.use_distributed_sampler=True while the "
+            "multi-dataset datamodule returns custom batch samplers. Lightning may "
+            "try to rebuild those samplers for DDP and fail. Prefer "
+            "trainer.use_distributed_sampler=false for this training script.\n"
+        )
+
     trainer = pl.Trainer(**trainer_kwargs)
 
-    do_train = bool(cfg.experiment.train)
-    do_predict = bool(cfg.experiment.predict)
-    from_checkpoint = bool(cfg.experiment.from_checkpoint)
+    do_train = cfg_bool(cfg, "experiment.train", True)
+    do_predict = cfg_bool(cfg, "experiment.predict", False)
+    from_checkpoint = cfg_bool(cfg, "experiment.from_checkpoint", False)
 
     selected_ckpt = None
 
@@ -1194,37 +1370,40 @@ def main(cfg: DictConfig) -> None:
             ckpt_path=None,
         )
 
-        if main_predictions is not None and len(main_predictions) > 0:
-            out_file = paths_results / f"predictions_main_val_{dataset_str}.parquet"
+        out_file = paths_results / f"predictions_main_val_{dataset_str}.parquet"
+        main_prediction_rows = save_predictions_for_trainer(
+            predictions=main_predictions,
+            out_file=out_file,
+            trainer=trainer,
+        )
 
-            predictions_to_parquet(
-                predictions=main_predictions,
-                out_file=out_file,
-            )
-
+        if trainer.is_global_zero and main_prediction_rows > 0:
             print(f"Main validation prediction complete: {out_file}")
-        else:
+        elif trainer.is_global_zero:
             print("No main validation predictions were returned.")
 
         # Predict CSS-enriched biological benchmark.
-        print("Predicting on CSS biological benchmark set...")
-        css_predictions = trainer.predict(
-            model=lit_model,
-            datamodule=css_datamodule,
-            ckpt_path=None,
-        )
-
-        if css_predictions is not None and len(css_predictions) > 0:
-            out_file = paths_results / f"predictions_css_benchmark_{dataset_str}.parquet"
-
-            predictions_to_parquet(
-                predictions=css_predictions,
-                out_file=out_file,
+        if css_datamodule is not None:
+            print("Predicting on CSS biological benchmark set...")
+            css_predictions = trainer.predict(
+                model=lit_model,
+                datamodule=css_datamodule,
+                ckpt_path=None,
             )
 
-            print(f"CSS benchmark prediction complete: {out_file}")
-        else:
-            print("No CSS benchmark predictions were returned.")
+            out_file = paths_results / f"predictions_css_benchmark_{dataset_str}.parquet"
+            css_prediction_rows = save_predictions_for_trainer(
+                predictions=css_predictions,
+                out_file=out_file,
+                trainer=trainer,
+            )
+
+            if trainer.is_global_zero and css_prediction_rows > 0:
+                print(f"CSS benchmark prediction complete: {out_file}")
+            elif trainer.is_global_zero:
+                print("No CSS benchmark predictions were returned.")
+        elif trainer.is_global_zero:
+            print("Skipping CSS benchmark prediction because the CSS benchmark split is empty.")
 
 
 if __name__ == "__main__":

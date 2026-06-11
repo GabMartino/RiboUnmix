@@ -41,7 +41,12 @@ def upstream_queue_propagation(
     if alpha_t.ndim > 0:
         alpha_t = alpha_t.reshape(rho.shape[0])
 
-    rho = rho.clamp(0.0, 1.0) * mask_f
+    rho = torch.nan_to_num(
+        rho,
+        nan=0.0,
+        posinf=1.0,
+        neginf=0.0,
+    ).clamp(0.0, 1.0) * mask_f
 
     q = torch.zeros_like(rho)
     carry = torch.zeros(rho.shape[0], device=device, dtype=dtype)
@@ -197,6 +202,52 @@ class RiboQueuingModel(nn.Module):
             alpha = self.queue_alpha_fixed.to(device=device, dtype=dtype)
         return alpha.clamp(self.queue_alpha_min, self.queue_alpha_max)
 
+    def _target_scale_dt(
+        self,
+        *,
+        target: torch.Tensor,
+        mask: torch.Tensor,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        target = target.to(device=device, dtype=dtype)
+        mask_b = mask.bool() & torch.isfinite(target)
+        mask_f = mask_b.to(dtype=dtype)
+        target = torch.where(
+            mask_b,
+            target.clamp_min(0.0),
+            torch.zeros_like(target),
+        )
+        valid_len = mask_f.sum(dim=1, keepdim=True).clamp_min(1.0)
+        return (target * mask_f).sum(dim=1, keepdim=True).div(valid_len).clamp_min(self.eps)
+
+    def _intensity_to_utilization(
+        self,
+        intensity: torch.Tensor,
+        mask_f: torch.Tensor,
+    ) -> torch.Tensor:
+        intensity = torch.nan_to_num(
+            intensity,
+            nan=0.0,
+            posinf=self.mu_max,
+            neginf=0.0,
+        ).clamp_min(0.0)
+        return (-torch.expm1(-intensity)).clamp(0.0, 1.0) * mask_f
+
+    def _utilization_to_intensity(
+        self,
+        utilization: torch.Tensor,
+        mask_f: torch.Tensor,
+    ) -> torch.Tensor:
+        # Keep the inverse finite in float32 while preserving a large queue range.
+        utilization = torch.nan_to_num(
+            utilization,
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        ).clamp(0.0, 1.0 - 1.0e-6)
+        return (-torch.log1p(-utilization)).clamp_min(0.0) * mask_f
+
     # ============================================================
     # Forward
     # ============================================================
@@ -207,6 +258,7 @@ class RiboQueuingModel(nn.Module):
         codon_ids: torch.Tensor,
         id_datasets: torch.Tensor,
         mask: torch.Tensor,
+        target: torch.Tensor | None = None,
     ):
         # --------------------------------------------------------
         # 1. Biological branch
@@ -218,14 +270,27 @@ class RiboQueuingModel(nn.Module):
         mask_b = mask.bool()
         mask_f = mask_b.to(dtype=dtype)
 
-        rho = rho.clamp(0.0, 1.0) * mask_f
+        rho = torch.nan_to_num(
+            rho,
+            nan=0.0,
+            posinf=self.mu_max,
+            neginf=0.0,
+        ).clamp_min(0.0) * mask_f
         h_bio = h_bio.clamp_min(0.0) * mask_f
         alpha = self._queue_alpha(h_n=h_n, device=device, dtype=dtype)
+        rho_utilization = self._intensity_to_utilization(rho, mask_f)
 
         if self.use_queue_propagation:
-            q = upstream_queue_propagation(rho=rho, mask=mask_b, alpha=alpha, q_max=self.queue_q_max)
+            q_utilization = upstream_queue_propagation(
+                rho=rho_utilization,
+                mask=mask_b,
+                alpha=alpha,
+                q_max=self.queue_q_max,
+            )
+            q = self._utilization_to_intensity(q_utilization, mask_f)
         else:
-            q = rho.clamp(0.0, self.queue_q_max) * mask_f
+            q = rho * mask_f
+            q_utilization = rho_utilization
 
         # --------------------------------------------------------
         # 2. Observation heads
@@ -253,9 +318,29 @@ class RiboQueuingModel(nn.Module):
         # --------------------------------------------------------
         # 4. Dataset-transcript scale
         # --------------------------------------------------------
-        scale_dt = bias["scale_dt"].to(dtype=dtype)
-        if scale_dt.ndim == 1:
-            scale_dt = scale_dt.reshape(-1, 1)
+        learned_scale_dt = bias["scale_dt"].to(dtype=dtype)
+        if learned_scale_dt.ndim == 1:
+            learned_scale_dt = learned_scale_dt.reshape(-1, 1)
+
+        if target is None:
+            scale_dt = learned_scale_dt
+            log_scale_dt = bias["log_scale_dt"].to(dtype=dtype)
+            dataset_scale = bias["dataset_scale"].to(dtype=dtype)
+            transcript_scale = bias["transcript_scale"].to(dtype=dtype)
+            transcript_log_scale = bias["transcript_log_scale"].to(dtype=dtype)
+            scale_dt_is_target = torch.zeros((rho.shape[0],), device=device, dtype=dtype)
+        else:
+            scale_dt = self._target_scale_dt(
+                target=target,
+                mask=mask_b,
+                dtype=dtype,
+                device=device,
+            )
+            log_scale_dt = torch.log(scale_dt.clamp_min(self.eps))
+            dataset_scale = torch.ones_like(scale_dt)
+            transcript_scale = scale_dt
+            transcript_log_scale = log_scale_dt
+            scale_dt_is_target = torch.ones((rho.shape[0],), device=device, dtype=dtype)
 
         mu_bio = (scale_dt * q).clamp(self.eps, self.mu_max) * mask_f
         lambda_pre_dropout = (scale_dt * q * beta).clamp(self.eps, self.mu_max) * mask_f
@@ -268,10 +353,10 @@ class RiboQueuingModel(nn.Module):
         mu = torch.where(mask_b, mu, torch.ones_like(mu))
 
         # --------------------------------------------------------
-        # 6. Dispersion
+        # 6. Log-sigma (log-normal dispersion, predicted directly)
         # --------------------------------------------------------
-        phi = bias["phi"].to(dtype=dtype)
-        phi = torch.where(mask_b, phi, torch.ones_like(phi))
+        log_sigma = bias["log_sigma"].to(dtype=dtype)
+        log_sigma = torch.where(mask_b, log_sigma, torch.zeros_like(log_sigma))
 
         # --------------------------------------------------------
         # 7. Diagnostics
@@ -281,6 +366,9 @@ class RiboQueuingModel(nn.Module):
         rho_mean = (rho * mask_f).sum(dim=1) / valid_len
         q_mean = (q * mask_f).sum(dim=1) / valid_len
         q_max_val = q.masked_fill(~mask_b, 0.0).max(dim=1).values
+        rho_utilization_mean = (rho_utilization * mask_f).sum(dim=1) / valid_len
+        q_utilization_mean = (q_utilization * mask_f).sum(dim=1) / valid_len
+        q_utilization_max = q_utilization.masked_fill(~mask_b, 0.0).max(dim=1).values
         q_zero_frac = ((q <= 0.0) & mask_b).float().sum(dim=1) / valid_len
         p_visible_mean = (p_visible * mask_f).sum(dim=1) / valid_len
         beta_mean = (beta * mask_f).sum(dim=1) / valid_len
@@ -313,6 +401,8 @@ class RiboQueuingModel(nn.Module):
             "rho_bio": rho,
             "q_bio": q,
             "h_bio": h_bio,
+            "rho_utilization": rho_utilization,
+            "q_utilization": q_utilization,
             "J": J,
             "queue_alpha": queue_alpha,
             "queue_propagation_enabled": queue_propagation_enabled,
@@ -328,19 +418,25 @@ class RiboQueuingModel(nn.Module):
 
             # Scale
             "scale_dt": scale_dt.reshape(-1),
-            "log_scale_dt": bias["log_scale_dt"],
-            "dataset_scale": bias["dataset_scale"],
-            "transcript_scale": bias["transcript_scale"],
-            "transcript_log_scale": bias["transcript_log_scale"],  # [B, 1]
+            "log_scale_dt": log_scale_dt,
+            "dataset_scale": dataset_scale,
+            "transcript_scale": transcript_scale,
+            "transcript_log_scale": transcript_log_scale,  # [B, 1]
+            "learned_scale_dt": learned_scale_dt.reshape(-1),
+            "learned_log_scale_dt": bias["log_scale_dt"],
+            "scale_dt_is_target": scale_dt_is_target,
 
-            # Dispersion (also returned as second value of forward)
-            "phi": phi,
-            "log_phi": bias["log_phi"],  # [B, 1]
+            # Log-sigma (also returned as second value of forward)
+            "log_sigma": log_sigma,
+            "log_sigma_t": bias["log_sigma_t"],  # [B, 1]
 
             # Scalar diagnostics (all in DATASET_DIAGNOSTIC_KEYS)
             "rho_mean": rho_mean,
             "q_mean": q_mean,
             "q_max": q_max_val,
+            "rho_utilization_mean": rho_utilization_mean,
+            "q_utilization_mean": q_utilization_mean,
+            "q_utilization_max": q_utilization_max,
             "q_zero_frac": q_zero_frac,
             "p_visible_mean": p_visible_mean,
             "beta_mean": beta_mean,
@@ -354,4 +450,4 @@ class RiboQueuingModel(nn.Module):
             "mu_zero_frac": mu_zero_frac,
         }
 
-        return mu, phi, extras
+        return mu, log_sigma, extras

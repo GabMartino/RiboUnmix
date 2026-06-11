@@ -274,6 +274,7 @@ class DatasetAwareBatchSampler:
 
     def __init__(
         self,
+        sampler=None,   # accepted for Lightning DDP compat; not used internally
         *,
         dataset_ids,
         lengths,
@@ -284,6 +285,8 @@ class DatasetAwareBatchSampler:
         seed: int = 42,
         drop_last: bool = False,
         sort_by_length: bool = True,
+        num_replicas: int = 1,
+        rank: int = 0,
     ):
         self.dataset_ids = np.asarray(dataset_ids, dtype=np.int64)
         self.lengths = np.asarray(lengths, dtype=np.int64)
@@ -295,6 +298,8 @@ class DatasetAwareBatchSampler:
         self.seed = int(seed)
         self.drop_last = bool(drop_last)
         self.sort_by_length = bool(sort_by_length)
+        self.num_replicas = max(int(num_replicas), 1)
+        self.rank = int(rank) % self.num_replicas
 
         if self.batch_size <= 0:
             raise ValueError("batch_size must be positive.")
@@ -335,6 +340,7 @@ class DatasetAwareBatchSampler:
         base_k = self.batch_size // d_per_batch
         remainder = self.batch_size % d_per_batch
 
+        batch_idx = 0
         for _ in range(self.num_batches):
             chosen_datasets = rng.choice(
                 self.unique_dataset_ids,
@@ -359,10 +365,12 @@ class DatasetAwareBatchSampler:
                 )
 
             if len(batch) == self.batch_size or not self.drop_last:
-                yield batch
+                batch_idx += 1
+                if (batch_idx - 1) % self.num_replicas == self.rank:
+                    yield batch
 
     def __len__(self):
-        return self.num_batches
+        return (self.num_batches + self.num_replicas - 1 - self.rank) // self.num_replicas
 
 
 class SortedLengthBatchSampler(BatchSampler):
@@ -385,6 +393,8 @@ class SortedLengthBatchSampler(BatchSampler):
         seed: int = 42,
         shuffle: bool = True,
         descending: bool = True,
+        num_replicas: int = 1,
+        rank: int = 0,
     ):
         self.sampler = sampler
         self.batch_size = int(batch_size)
@@ -392,6 +402,8 @@ class SortedLengthBatchSampler(BatchSampler):
         self.seed = int(seed)
         self.shuffle = bool(shuffle)
         self.descending = bool(descending)
+        self.num_replicas = max(int(num_replicas), 1)
+        self.rank = int(rank) % self.num_replicas
 
         if lengths is None:
             raise ValueError("SortedLengthBatchSampler requires lengths.")
@@ -428,17 +440,16 @@ class SortedLengthBatchSampler(BatchSampler):
             rng = np.random.default_rng(self.seed + self._iter_count)
             self._iter_count += 1
             batch_order = rng.permutation(len(batches))
-            for j in batch_order:
-                yield batches[int(j)]
-        else:
-            for batch in batches:
+            batches = [batches[int(j)] for j in batch_order]
+
+        for i, batch in enumerate(batches):
+            if i % self.num_replicas == self.rank:
                 yield batch
 
     def __len__(self):
         n = len(self.sampler)
-        if self.drop_last:
-            return n // self.batch_size
-        return (n + self.batch_size - 1) // self.batch_size
+        total = n // self.batch_size if self.drop_last else (n + self.batch_size - 1) // self.batch_size
+        return (total + self.num_replicas - 1 - self.rank) // self.num_replicas
 
 
 # ============================================================
@@ -902,6 +913,12 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         torch.manual_seed(worker_seed)
         np.random.seed(worker_seed)
 
+    def _dist_info(self) -> tuple[int, int]:
+        """Return (num_replicas, rank) for the current distributed context."""
+        if self.trainer is not None and self.trainer.world_size > 1:
+            return self.trainer.world_size, self.trainer.global_rank
+        return 1, 0
+
     def _dataloader_kwargs(self):
         kwargs = {
             "num_workers": self.num_workers,
@@ -922,6 +939,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         strategy = self._resolve_train_sampling_strategy()
         epoch = self.trainer.current_epoch if self.trainer is not None else 0
         seed = self.seed + int(epoch)
+        num_replicas, rank = self._dist_info()
 
         if strategy == "legacy_random_dataset":
             base_sampler = SequentialSampler(self.train_dataset_obj)
@@ -934,6 +952,8 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
                 lengths=self.train_lengths,
                 seed=seed,
                 descending=True,
+                num_replicas=num_replicas,
+                rank=rank,
             )
 
         elif strategy == "random_dataset_per_transcript":
@@ -957,6 +977,8 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
                 lengths=self.train_lengths,
                 seed=seed,
                 descending=True,
+                num_replicas=num_replicas,
+                rank=rank,
             )
 
         elif strategy == "transcript_balanced_pairs":
@@ -985,6 +1007,8 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
                 lengths=self.train_lengths,
                 seed=seed,
                 descending=True,
+                num_replicas=num_replicas,
+                rank=rank,
             )
 
         elif strategy == "flat_pairs":
@@ -1007,6 +1031,8 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
                 lengths=self.train_lengths,
                 seed=seed,
                 descending=True,
+                num_replicas=num_replicas,
+                rank=rank,
             )
 
         elif strategy == "dataset_balanced_pairs":
@@ -1040,6 +1066,8 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
                 lengths=self.train_lengths,
                 seed=seed,
                 descending=True,
+                num_replicas=num_replicas,
+                rank=rank,
             )
 
         elif strategy == "dataset_aware_balanced_pairs":
@@ -1063,6 +1091,8 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
                 seed=seed,
                 drop_last=False,
                 sort_by_length=True,
+                num_replicas=num_replicas,
+                rank=rank,
             )
 
         else:
@@ -1104,6 +1134,8 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         if self.val_dataset_obj is None:
             raise RuntimeError("setup() must be called before predict_dataloader().")
 
+        num_replicas, rank = self._dist_info()
+
         batch_sampler = SortedLengthBatchSampler(
             sampler=SequentialSampler(self.val_dataset_obj),
             batch_size=self.batch_size,
@@ -1112,6 +1144,8 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             lengths=self.val_lengths,
             seed=self.seed,
             descending=True,
+            num_replicas=num_replicas,
+            rank=rank,
         )
 
         return DataLoader(

@@ -10,7 +10,6 @@ experiment:
   predict: true
   dataset: ["kutay_2021", "grimson_2019"]
   seed: 42
-  split_size: 0.9
 
 split:
   master_dataset_universe: ["grimson_2019", "kutay_2021"]
@@ -47,11 +46,6 @@ data:
   prefetch_factor: 2
 
 model:
-  # true = mu uses dataset/protocol heads:
-  #   mu = scale_dt * support * beta
-  # where support is rho or causal q depending on loss.pcc_target.
-  use_dataset_bias: true
-
   biological_params:
     input_size: 97
     hidden_size: 256
@@ -62,14 +56,12 @@ model:
     J_max: 8.0
     init_J: 0.5
     init_local_hazard_factor: 1.0
-    hazard_max: 8.0
-    rho_max: 1.0
 
   queue_propagation_params:
     # Overridden at startup from loss.pcc_target:
     #   rho -> false, raw occupancy prediction
     #   q   -> true, causal queue propagation prediction
-    use_queue_propagation: false
+    use_queue_propagation: true
     # Init near "no coupling" but with a live gradient. Do NOT use 0.0: at the
     # alpha_min boundary sigmoid'(raw) ~ 0, so alpha would be frozen there.
     queue_propagation_alpha: 0.5
@@ -106,22 +98,24 @@ model:
     context_cnn_gated: false
     context_cnn_residual_scale: 1.0
 
-    # Legacy key name; this is now a continuous visibility log-bias head.
+    # Continuous visibility log-bias head: beta = exp(centered_log_bias).
     dataset_multiplicative_allocation_bias_submodule_params:
       hidden_size: 128
       dropout: 0.1
-      log_bias_max: 2.0
+      log_bias_max: 5.0
 
-    dataset_dispersion_submodule_params:
+    dataset_log_sigma_submodule_params:
       dataset_embedding_size: 16
       hidden_size: 128
       dropout: 0.1
-      phi_min: 0.001
-      phi_max: 10.0
-      init_phi: 5.0
+      # Initial log_sigma head bias. 0.0 -> sigma = 1.
+      init_log_sigma: 0.2
+      # null -> learn per-position log_sigma.
+      # Positive value -> bypass the sigma head and use this constant sigma.
+      fixed_sigma: null
 
     dataset_transcript_scale_factor_params:
-      dataset_scale_embedding_size: 16
+      dataset_scale_embedding_size: 32
       hidden_size: 128
       dropout: 0.1
 
@@ -134,10 +128,15 @@ loss:
   # Likelihood is applied to the full left-censored log-normal profile.
   mode: pcc_likelihood
 
-  # Quantity correlated against the observed profile and used to set queue mode:
-  #   rho = raw local occupancy, no causal propagation
-  #   q   = occupancy after causal queue propagation
-  pcc_target: rho
+  # Quantity correlated against the observed profile. Also auto-controls
+  # use_queue_propagation via sync_queue_propagation_with_pcc_target.
+  #   rho          : raw traffic intensity (unbounded), queue OFF
+  #   q            : traffic intensity after queue propagation, queue ON
+  #   occupancy    : 1 - exp(-rho), bounded in [0, 1), queue OFF
+  #   q_occupancy  : 1 - exp(-q),   bounded in [0, 1), queue ON
+  # 2x2 A/B matrix: rho vs occupancy isolates the bounded-mapping effect;
+  # rho vs q (or occupancy vs q_occupancy) isolates queue propagation.
+  pcc_target: q
   # Normalization for support-PCC targets. nonzero_quantile computes the scale
   # only over valid nonzero target positions, then clips normalized targets to 1.
   # This is more robust than max normalization when one codon has a noisy spike.
@@ -145,38 +144,48 @@ loss:
   support_target_quantile: 0.99
   support_target_min_scale: 1.0
 
-  profile_likelihood: left_censored_lognormal
-  # positive_mean makes mu the log-normal mean; median decouples the
-  # log-normal location from dispersion so phi changes do not shift the center.
+  # left_censored_lognormal, poisson, or negative_binomial.
+  # poisson uses mu directly as the rate and ignores log_sigma.
+  # negative_binomial uses the log_sigma head output as log_alpha:
+  #   alpha = exp(log_alpha), r = 1 / alpha.
+  profile_likelihood: negative_binomial
+  # positive_mean makes mu the log-normal mean; median makes mu the log-normal
+  # median (log_loc = log(mu)). With sigma predicted directly (no NB2 back-solve)
+  # both decouple location from dispersion equally; median is the simplest.
   lognormal_mu_parameterization: median
   eps: 1.0e-8
 
   mu_min: 1.0e-8
   mu_max: 1.0e8
+  nb_log_alpha_min: -1.0
+  nb_log_alpha_max: 10.0
+  # Negative-binomial valid-position reduction inside each sequence:
+  #   mean = old behavior, average NLL over sequence length before aggregation
+  #   sum  = sum NLL over sequence length, then aggregate across batch/datasets
+  nb_sequence_reduction: mean
 
-  phi_min: 0.001
-  phi_max: 10.0
-
-  log_sigma_min: 0.05
+  # log_sigma is predicted directly by the model head. The loss exponentiates
+  # it to sigma, then clamps sigma to [sigma_min, sigma_max] for numerical
+  # stability; the soft L2 penalty below controls log_sigma drift.
+  sigma_min: 0.05
+  sigma_max: 3.0
 
   censor_threshold: 0.5
 
-  phi_input_is_log: false
-  dataset_balanced_loss: true
+  dataset_balanced_loss: false
   # Soft penalty on the batch-mean of log(J) drifting away from 0.
   # Prevents the J/scale_dt degeneracy (J→0, scale_dt→∞) while preserving
   # per-transcript J variation (the biological signal).
   j_centering_weight: 0.05
   # Pins batch-mean of transcript_log_scale near 0, preventing the scale_dt/rho
   # gauge from oscillating in multi-dataset training.
-  transcript_scale_centering_weight: 0.2
-  # Symmetric L2 penalty in log space keeping phi near phi_reg_target.
-  # Replaces the hard phi_max clamp (which caused gradient deadzone → crash).
-  phi_reg_weight: 0.1
-  phi_reg_target: 10.0
+  transcript_scale_centering_weight: 0.0
+  # Symmetric L2 penalty pulling predicted log_sigma toward log_sigma_reg_target.
+  # Target 0.0 → sigma = 1 (moderate spread).
+  log_sigma_reg_weight: 0.0
+  log_sigma_reg_target: 0.2
 
 optim:
-  lr: 5.0e-4
   lr_biological: 5.0e-4
   lr_rest: 1.0e-3
   weight_decay_bio: 1.0e-1
@@ -197,6 +206,7 @@ trainer:
   devices: [0]
   accelerator: gpu
   precision: 32-true
+  use_distributed_sampler: false
 
   accumulate_grad_batches: 1
   max_epochs: 200

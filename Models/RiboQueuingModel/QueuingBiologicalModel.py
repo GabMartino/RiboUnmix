@@ -18,14 +18,26 @@ def inv_softplus(x: float) -> float:
 
 class QueuingBiologicalModel(nn.Module):
     """
-    Local biological hazard model with bounded occupancy support.
+    Local biological traffic-intensity model.
 
-        h_i   >= 0
-        rho_i = 1 - exp(-h_i)
+        h_i      >= 0                    (softplus output)
+        rho_i    = J * h_i               (per-codon traffic intensity, unbounded)
+
+    Semantics: rho_i here is *traffic intensity* in queueing-theory terms
+    (analogous to lambda / mu_service in M/M/1), not stationary occupancy
+    probability. It is intentionally unbounded above so the downstream
+    prediction mu = scale_dt * rho * beta can express the full dynamic range
+    of observed ribo-seq footprint counts (zero through ~thousands).
+
+    The bounded probabilistic occupancy is recovered downstream in
+    RiboQueuingModel as `rho_utilization = 1 - exp(-rho)`, which is the
+    Poisson "at least one footprint" probability and lives in [0, 1). That
+    is the quantity used for queue propagation (where bounded inputs are
+    required for stability); rho itself stays unbounded for the prediction
+    head. See _intensity_to_utilization in RiboQueuingModel.
 
     There is intentionally no transcript-level sum_i w_i = 1 allocation
-    constraint. Each codon gets a local hazard before optional downstream
-    queue propagation in the outer model.
+    constraint.
     """
 
     def __init__(self, config_params: dict):
@@ -39,8 +51,6 @@ class QueuingBiologicalModel(nn.Module):
         self.J_min = float(config_params.get("J_min", 1.0e-6))
         self.J_max = float(config_params.get("J_max", 10.0))
         self.init_J = float(config_params.get("init_J", max(self.J_min, 0.5)))
-        self.hazard_max = float(config_params.get("hazard_max", 8.0))
-        self.rho_max = float(config_params.get("rho_max", 1.0))
         self.init_local_hazard_factor = float(
             config_params.get("init_local_hazard_factor", 1.0)
         )
@@ -51,9 +61,6 @@ class QueuingBiologicalModel(nn.Module):
         self.init_local_hazard_weight_std = float(
             config_params.get("init_local_hazard_weight_std", 1.0e-2)
         )
-
-        if not (0.0 < self.rho_max <= 1.0):
-            raise ValueError(f"rho_max must be in (0, 1], got {self.rho_max}.")
 
         self.rnn = nn.GRU(
             input_size=self.input_size,
@@ -132,18 +139,17 @@ class QueuingBiologicalModel(nn.Module):
         J = J.clamp(min=self.J_min, max=self.J_max)
 
         # ------------------------------------------------------------
-        # 3. Local bounded hazard. No sum_i w_i = 1 constraint.
+        # 3. Local unbounded traffic/intensity. No sum_i w_i = 1 constraint.
         # ------------------------------------------------------------
         h_bio = J.to(dtype=out.dtype).reshape(B, 1) * local_factor
         h_bio = torch.nan_to_num(
             h_bio,
             nan=0.0,
-            posinf=self.hazard_max,
+            posinf=1.0e8,
             neginf=0.0,
         )
-        h_bio = h_bio.clamp(min=0.0, max=self.hazard_max) * mask_f
+        h_bio = h_bio.clamp_min(0.0) * mask_f
 
-        rho_bio = self.rho_max * (-torch.expm1(-h_bio))
-        rho_bio = rho_bio * mask_f
+        rho_bio = h_bio
 
         return rho_bio, J, h_bio, h_n

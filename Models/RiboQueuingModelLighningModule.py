@@ -18,46 +18,33 @@ from matplotlib import pyplot as plt
 # Loss
 # ============================================================
 
-class LeftCensoredLogNormalNB2Loss(nn.Module):
+class LeftCensoredLogNormalLoss(nn.Module):
     """
-    Left-censored log-normal NLL with NB2-style variance.
+    Left-censored log-normal NLL with sigma predicted directly.
+
+    log_sigma is consumed as model output. There is no NB2 back-solve and
+    no coupling of sigma to mu: a free-sigma head retires the
+    `mu -> 0  =>  sigma -> infinity` pathology of the NB2-derived loss.
 
     Model for threshold c > 0:
 
-        P(Y <= c) = LogNormalCDF(c; log_loc, log_sigma)
+        P(Y <= c) = LogNormalCDF(c; log_loc, sigma)
 
-        Y | Y > c uses the LogNormal(log_loc, log_sigma) density.
-
-    There is no zero-inflated mixture and no fixed/manual pi parameter.
+        Y | Y > c uses the LogNormal(log_loc, sigma) density.
 
     Mu convention:
 
         positive_mean:
-
             mu = E[Y | Y > 0]
+            log_loc = log(mu) - 0.5 * sigma^2
 
         median:
-
             mu = median[Y | Y > 0] = exp(log_loc)
-
-    Positive-component variance target:
-
-        positive_mean:
-            Var[Y | Y > 0] = E[Y | Y > 0] + phi * E[Y | Y > 0]^2
-
-        median:
-            Var[Y | Y > 0] = median[Y | Y > 0] + phi * median[Y | Y > 0]^2
-
-    Conversion:
-
-        For mean parameterizations:
-            log_sigma^2 = log(1 + Var / E[Y | Y > 0]^2)
-            log_loc = log(E[Y | Y > 0]) - 0.5 * log_sigma^2
-
-        For median parameterization:
-            x = (1 + sqrt(1 + 4 * (1 / median + phi))) / 2
-            log_sigma^2 = log(x)
             log_loc = log(mu)
+
+    Sigma is clamped at the loss boundary to [sigma_min, sigma_max]
+    for numerical stability; an external L2 regulariser on log_sigma is
+    the recommended way to control its scale.
     """
 
     def __init__(
@@ -65,11 +52,9 @@ class LeftCensoredLogNormalNB2Loss(nn.Module):
         eps: float = 1.0e-8,
         mu_min: float = 1.0e-8,
         mu_max: float = 1.0e8,
-        phi_min: float = 1.0e-4,
-        phi_max: float = 10.0,
-        log_sigma_min: float = 0.05,
+        sigma_min: float = 0.05,
+        sigma_max: float = 3.0,
         censor_threshold: float = 0.0,
-        phi_input_is_log: bool = False,
         mu_parameterization: str | None = None,
     ):
         super().__init__()
@@ -78,22 +63,24 @@ class LeftCensoredLogNormalNB2Loss(nn.Module):
         self.mu_min = float(mu_min)
         self.mu_max = float(mu_max)
 
-        self.phi_min = float(phi_min)
-        self.phi_max = float(phi_max)
-
-        self.log_sigma_min = float(log_sigma_min)
+        self.sigma_min = float(sigma_min)
+        self.sigma_max = float(sigma_max)
+        if self.sigma_max <= self.sigma_min:
+            raise ValueError(
+                "sigma_max must be > sigma_min, "
+                f"got {self.sigma_max} <= {self.sigma_min}."
+            )
+        if self.sigma_min <= 0.0:
+            raise ValueError(f"sigma_min must be > 0, got {self.sigma_min}.")
 
         self.censor_threshold = float(censor_threshold)
-        self.phi_input_is_log = bool(phi_input_is_log)
+
         if mu_parameterization is None:
-            mu_parameterization = "positive_mean"
+            mu_parameterization = "median"
         if str(mu_parameterization) == "unconditional_mean":
             mu_parameterization = "positive_mean"
         self.mu_parameterization = str(mu_parameterization)
-        valid_parameterizations = {
-            "positive_mean",
-            "median",
-        }
+        valid_parameterizations = {"positive_mean", "median"}
         if self.mu_parameterization not in valid_parameterizations:
             raise ValueError(
                 "mu_parameterization must be one of "
@@ -109,111 +96,106 @@ class LeftCensoredLogNormalNB2Loss(nn.Module):
             0.5 * torch.erfc(-z / math.sqrt(2.0))
         ).clamp_min(-1.0e30)
 
-    def _prepare_phi(self, phi: torch.Tensor) -> torch.Tensor:
-        if self.phi_input_is_log:
-            phi = torch.exp(phi)
+    @staticmethod
+    def _broadcast_profile_param(
+        value: torch.Tensor,
+        target_shape: torch.Size | tuple[int, ...],
+    ) -> torch.Tensor:
+        """Broadcast transcript-level or position-level parameters to [B, T]."""
+        if value.ndim == len(target_shape) + 1 and value.shape[-1] == 1:
+            value = value.squeeze(-1)
 
-        return phi.clamp(min=self.phi_min)  # no upper clamp — phi_reg handles it
+        if value.ndim == 1 and len(target_shape) == 2 and value.shape[0] == target_shape[0]:
+            value = value.reshape(-1, 1)
+
+        return torch.broadcast_to(value, target_shape)
 
     def _lognormal_params(
         self,
         *,
         mu: torch.Tensor,
-        phi: torch.Tensor,
+        log_sigma: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        mu_ref = mu
-        mu_ref = mu_ref.clamp(min=self.mu_min, max=self.mu_max)
-
-        if self.mu_parameterization == "median":
-            log_sigma2 = self._median_log_sigma2_from_nb2_dispersion(
-                median=mu_ref,
-                phi=phi,
-            )
-        else:
-            var_pos = mu_ref + phi * mu_ref.pow(2)
-            var_pos = var_pos.clamp_min(self.eps)
-            log_sigma2 = torch.log1p(
-                var_pos / mu_ref.pow(2).clamp_min(self.eps)
-            )
-
-        log_sigma = torch.sqrt(log_sigma2.clamp_min(self.eps))
-        log_sigma = log_sigma.clamp(min=self.log_sigma_min)
-
-        if self.mu_parameterization == "median":
-            log_loc = torch.log(mu_ref.clamp_min(self.eps))
-        else:
-            log_loc = torch.log(mu_ref.clamp_min(self.eps)) - 0.5 * log_sigma.pow(2)
-
-        return log_loc, log_sigma
-
-    def _median_log_sigma2_from_nb2_dispersion(
-        self,
-        *,
-        median: torch.Tensor,
-        phi: torch.Tensor,
-    ) -> torch.Tensor:
-        """Convert median-anchored NB2-style dispersion to sigma^2.
-
-        For median m and x = exp(sigma^2), equating log-normal variance to
-        the median-anchored target m + phi * m^2 yields:
-
-            m^2 * x * (x - 1) = m + phi * m^2
-
-        Therefore:
-
-            x^2 - x - (1 / m + phi) = 0
         """
-        a = (1.0 / median.clamp_min(self.eps)) + phi.clamp_min(self.eps)
-        x = 0.5 * (1.0 + torch.sqrt(1.0 + 4.0 * a))
-        return torch.log(x.clamp_min(1.0 + self.eps))
+        Convert (mu, log_sigma) to (log_loc, sigma).
+
+        log_sigma is the model head's raw output, interpreted as log(sigma).
+        The sigma value is clamped to [sigma_min, sigma_max] for stability.
+        """
+        mu = torch.nan_to_num(
+            mu,
+            nan=self.mu_min,
+            posinf=self.mu_max,
+            neginf=self.mu_min,
+        )
+        log_sigma = torch.nan_to_num(
+            log_sigma,
+            nan=0.0,
+            posinf=math.log(self.sigma_max),
+            neginf=math.log(self.sigma_min),
+        )
+
+        mu_ref = mu.clamp(min=self.mu_min, max=self.mu_max)
+        log_mu = torch.log(mu_ref.clamp_min(self.eps))
+
+        sigma = torch.exp(log_sigma).clamp(min=self.sigma_min, max=self.sigma_max)
+
+        if self.mu_parameterization == "median":
+            log_loc = log_mu
+        else:
+            log_loc = log_mu - 0.5 * sigma.pow(2)
+
+        return log_loc, sigma
 
     def positive_mean_from_params(
         self,
         *,
         mu: torch.Tensor,
-        phi: torch.Tensor,
+        log_sigma: torch.Tensor,
     ) -> torch.Tensor:
-        log_loc, log_sigma = self._lognormal_params(
-            mu=mu,
-            phi=phi,
+        log_loc, sigma = self._lognormal_params(mu=mu, log_sigma=log_sigma)
+        mean = torch.exp(log_loc + 0.5 * sigma.pow(2))
+        mean = torch.nan_to_num(
+            mean,
+            nan=self.mu_min,
+            posinf=self.mu_max,
+            neginf=self.mu_min,
         )
-        mean = torch.exp(log_loc + 0.5 * log_sigma.pow(2))
         return mean.clamp(min=self.mu_min, max=self.mu_max)
 
     def forward(
         self,
         mu_phys: torch.Tensor,
-        phi: torch.Tensor,
+        log_sigma: torch.Tensor,
         y_true: torch.Tensor,
         mask: torch.Tensor,
         return_per_sample: bool = False,
     ) -> torch.Tensor:
         with torch.amp.autocast(device_type=mu_phys.device.type, enabled=False):
-            y = y_true.to(torch.float64).clamp_min(0.0)
+            finite_mask = mask.bool() & torch.isfinite(y_true)
+            y = torch.nan_to_num(
+                y_true.to(torch.float64),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).clamp_min(0.0)
 
-            mu = mu_phys.to(torch.float64).clamp(
-                min=self.mu_min,
-                max=self.mu_max,
+            mu = mu_phys.to(torch.float64).clamp(min=self.mu_min, max=self.mu_max)
+
+            log_sigma_t = self._broadcast_profile_param(
+                log_sigma.to(torch.float64),
+                y.shape,
             )
 
-            phi_t = self._prepare_phi(
-                phi.to(torch.float64)
-            )
-
-            phi_t = torch.broadcast_to(phi_t, y.shape)
-
-            log_loc, log_sigma = self._lognormal_params(
-                mu=mu,
-                phi=phi_t,
-            )
+            log_loc, sigma = self._lognormal_params(mu=mu, log_sigma=log_sigma_t)
 
             # Positive log-normal branch.
             log_y = torch.log(y.clamp_min(self.eps))
-            z = (log_y - log_loc) / log_sigma
+            z = (log_y - log_loc) / sigma
 
             positive_nll = (
                 log_y
-                + torch.log(log_sigma.clamp_min(self.eps))
+                + torch.log(sigma.clamp_min(self.eps))
                 + 0.5 * math.log(2.0 * math.pi)
                 + 0.5 * z.pow(2)
             )
@@ -227,7 +209,7 @@ class LeftCensoredLogNormalNB2Loss(nn.Module):
                     dtype=torch.float64,
                 ).clamp_min(self.eps)
 
-                z_c = (torch.log(c) - log_loc) / log_sigma
+                z_c = (torch.log(c) - log_loc) / sigma
                 log_cdf = self._log_normal_cdf_standard(z_c)
                 censored_nll = -log_cdf
                 is_censored = y <= self.censor_threshold
@@ -248,10 +230,233 @@ class LeftCensoredLogNormalNB2Loss(nn.Module):
                 neginf=1.0e8,
             )
 
-            mask_f = mask.bool().to(torch.float64)
+            mask_f = finite_mask.to(torch.float64)
             valid_len = mask_f.sum(dim=1).clamp_min(1.0)
 
             loss_per_sample = (nll * mask_f).sum(dim=1) / valid_len
+            loss_per_sample = loss_per_sample.to(torch.float32)
+
+        if return_per_sample:
+            return loss_per_sample
+
+        return loss_per_sample.mean()
+
+
+class PoissonProfileLoss(nn.Module):
+    """
+    Poisson profile NLL.
+
+    The target-only lgamma(y + 1) term is dropped, matching the optimized
+    objective used for training:
+
+        NLL = mu - y * log(mu)
+
+    The dropped term does not affect gradients with respect to model
+    parameters, but the logged NLL is not an absolute normalized likelihood.
+    """
+
+    def __init__(
+        self,
+        eps: float = 1.0e-8,
+        mu_min: float = 1.0e-8,
+        mu_max: float = 1.0e8,
+    ):
+        super().__init__()
+
+        self.eps = float(eps)
+        self.mu_min = float(mu_min)
+        self.mu_max = float(mu_max)
+
+    def positive_mean_from_params(
+        self,
+        *,
+        mu: torch.Tensor,
+        log_sigma: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del log_sigma
+        mu = torch.nan_to_num(
+            mu,
+            nan=self.mu_min,
+            posinf=self.mu_max,
+            neginf=self.mu_min,
+        )
+        return mu.clamp(min=self.mu_min, max=self.mu_max)
+
+    def forward(
+        self,
+        mu_phys: torch.Tensor,
+        log_sigma: torch.Tensor,
+        y_true: torch.Tensor,
+        mask: torch.Tensor,
+        return_per_sample: bool = False,
+    ) -> torch.Tensor:
+        del log_sigma
+
+        with torch.amp.autocast(device_type=mu_phys.device.type, enabled=False):
+            finite_mask = mask.bool() & torch.isfinite(y_true)
+            y = torch.nan_to_num(
+                y_true.to(torch.float64),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).clamp_min(0.0)
+
+            mu = self.positive_mean_from_params(
+                mu=mu_phys.to(torch.float64),
+                log_sigma=None,
+            ).to(torch.float64)
+
+            nll = (
+                mu
+                - y * torch.log(mu.clamp_min(self.eps))
+            )
+            nll = torch.nan_to_num(
+                nll,
+                nan=0.0,
+                posinf=1.0e8,
+                neginf=1.0e8,
+            )
+
+            mask_f = finite_mask.to(torch.float64)
+            valid_len = mask_f.sum(dim=1).clamp_min(1.0)
+
+            loss_per_sample = (nll * mask_f).sum(dim=1) / valid_len
+            loss_per_sample = loss_per_sample.to(torch.float32)
+
+        if return_per_sample:
+            return loss_per_sample
+
+        return loss_per_sample.mean()
+
+
+class NegativeBinomialProfileLoss(nn.Module):
+    """
+    Negative Binomial profile NLL optimized for training.
+
+    Parameterization:
+        mu:
+            predicted mean.
+        log_alpha:
+            log dispersion, alpha = exp(log_alpha), r = 1 / alpha.
+        sequence_reduction:
+            "mean" averages valid positions within each sequence before the
+            batch reduction. "sum" sums valid positions within each sequence,
+            then averages only across batch samples.
+
+    The loss drops the target-only lgamma(y + 1) term, matching the optimized
+    training objective supplied by the user. With non-integer averaged targets,
+    the remaining gamma terms are evaluated by the continuous lgamma extension.
+    """
+
+    def __init__(
+        self,
+        eps: float = 1.0e-8,
+        mu_min: float = 1.0e-8,
+        mu_max: float = 1.0e8,
+        log_alpha_min: float = -10.0,
+        log_alpha_max: float = 10.0,
+        sequence_reduction: str = "mean",
+    ):
+        super().__init__()
+
+        self.eps = float(eps)
+        self.mu_min = float(mu_min)
+        self.mu_max = float(mu_max)
+        self.log_alpha_min = float(log_alpha_min)
+        self.log_alpha_max = float(log_alpha_max)
+        if self.log_alpha_max <= self.log_alpha_min:
+            raise ValueError(
+                "log_alpha_max must be > log_alpha_min, "
+                f"got {self.log_alpha_max} <= {self.log_alpha_min}."
+            )
+        if sequence_reduction not in {"mean", "sum"}:
+            raise ValueError(
+                "sequence_reduction must be one of {'mean', 'sum'}, "
+                f"got {sequence_reduction!r}."
+            )
+        self.sequence_reduction = sequence_reduction
+
+    def positive_mean_from_params(
+        self,
+        *,
+        mu: torch.Tensor,
+        log_sigma: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del log_sigma
+        mu = torch.nan_to_num(
+            mu,
+            nan=self.mu_min,
+            posinf=self.mu_max,
+            neginf=self.mu_min,
+        )
+        return mu.clamp(min=self.mu_min, max=self.mu_max)
+
+    def _log_alpha_from_model_output(
+        self,
+        *,
+        log_sigma: torch.Tensor,
+        target_shape: torch.Size | tuple[int, ...],
+    ) -> torch.Tensor:
+        log_alpha = LeftCensoredLogNormalLoss._broadcast_profile_param(
+            log_sigma,
+            target_shape,
+        )
+        log_alpha = torch.nan_to_num(
+            log_alpha,
+            nan=0.0,
+            posinf=self.log_alpha_max,
+            neginf=self.log_alpha_min,
+        )
+        return log_alpha.clamp(min=self.log_alpha_min, max=self.log_alpha_max)
+
+    def forward(
+        self,
+        mu_phys: torch.Tensor,
+        log_sigma: torch.Tensor,
+        y_true: torch.Tensor,
+        mask: torch.Tensor,
+        return_per_sample: bool = False,
+    ) -> torch.Tensor:
+        with torch.amp.autocast(device_type=mu_phys.device.type, enabled=False):
+            finite_mask = mask.bool() & torch.isfinite(y_true)
+            y = torch.nan_to_num(
+                y_true.to(torch.float64),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).clamp_min(0.0)
+
+            mu = self.positive_mean_from_params(
+                mu=mu_phys.to(torch.float64),
+                log_sigma=None,
+            ).to(torch.float64)
+            log_alpha = self._log_alpha_from_model_output(
+                log_sigma=log_sigma.to(torch.float64),
+                target_shape=y.shape,
+            )
+            r = torch.exp(-log_alpha).clamp_min(self.eps)
+
+            nll = (
+                torch.lgamma(r)
+                - torch.lgamma(y + r)
+                - r * torch.log(r.clamp_min(self.eps))
+                - y * torch.log(mu.clamp_min(self.eps))
+                + (r + y) * torch.log((r + mu).clamp_min(self.eps))
+            )
+            nll = torch.nan_to_num(
+                nll,
+                nan=0.0,
+                posinf=1.0e8,
+                neginf=1.0e8,
+            )
+
+            mask_f = finite_mask.to(torch.float64)
+            valid_len = mask_f.sum(dim=1).clamp_min(1.0)
+
+            nll = torch.where(finite_mask, nll, torch.zeros_like(nll))
+            loss_per_sample = (nll * mask_f).sum(dim=1)
+            if self.sequence_reduction == "mean":
+                loss_per_sample = loss_per_sample / valid_len
             loss_per_sample = loss_per_sample.to(torch.float32)
 
         if return_per_sample:
@@ -270,13 +475,17 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
         mu = S_dt * support * beta
 
-    where support is rho_bio or q_bio depending on loss.pcc_target.
+    where support is unbounded rho_bio traffic intensity or queue-propagated
+    q_bio traffic intensity depending on loss.pcc_target.
     """
 
     DATASET_DIAGNOSTIC_KEYS = (
         "rho_mean",
         "q_mean",
         "q_max",
+        "rho_utilization_mean",
+        "q_utilization_mean",
+        "q_utilization_max",
         "q_zero_frac",
         "queue_alpha",
         "queue_propagation_enabled",
@@ -308,14 +517,15 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         "mu_log1p_mse",
         "target_zero_frac",
         "j_centering_loss",
-        "phi_reg_loss",
+        "log_sigma_reg_loss",
         "transcript_scale_centering_loss",
     )
 
     PROFILE_PLOT_GROUPS = (
         ("beta", ("obs_beta",)),
-        ("phi", ("phi",)),
+        ("log_sigma", ("log_sigma",)),
         ("rho", ("rho_bio",)),
+        ("utilization", ("rho_utilization", "q_utilization")),
     )
 
     def __init__(
@@ -342,32 +552,61 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
     def _build_loss(self) -> nn.Module:
         loss_cfg = self.config.loss
 
-        valid_likelihoods = {"left_censored_lognormal", "lcln", "lognormal"}
-        if str(loss_cfg.profile_likelihood) not in valid_likelihoods:
+        def loss_cfg_get(name: str, default: Any = None) -> Any:
+            try:
+                return getattr(loss_cfg, name)
+            except (AttributeError, KeyError):
+                return default
+
+        likelihood = str(loss_cfg.profile_likelihood).lower()
+        lognormal_likelihoods = {"left_censored_lognormal", "lcln", "lognormal"}
+        poisson_likelihoods = {"poisson", "poisson_pseudo"}
+        nb_likelihoods = {"negative_binomial", "nb", "nb_pseudo"}
+        valid_likelihoods = lognormal_likelihoods | poisson_likelihoods | nb_likelihoods
+        if likelihood not in valid_likelihoods:
             raise ValueError(
-                "Only left-censored log-normal likelihoods are supported. "
+                "Unsupported profile likelihood. "
                 f"Use one of {sorted(valid_likelihoods)}. "
                 f"Got {loss_cfg.profile_likelihood!r}."
             )
 
-        common_kwargs = {
-            "eps": loss_cfg.eps,
-            "mu_min": loss_cfg.mu_min,
-            "mu_max": loss_cfg.mu_max,
-            "phi_min": loss_cfg.phi_min,
-            "phi_max": loss_cfg.phi_max,
-            "phi_input_is_log": loss_cfg.phi_input_is_log,
-        }
+        if likelihood in poisson_likelihoods:
+            return PoissonProfileLoss(
+                eps=loss_cfg.eps,
+                mu_min=loss_cfg.mu_min,
+                mu_max=loss_cfg.mu_max,
+            )
 
-        return LeftCensoredLogNormalNB2Loss(
-            **common_kwargs,
+        if likelihood in nb_likelihoods:
+            return NegativeBinomialProfileLoss(
+                eps=loss_cfg.eps,
+                mu_min=loss_cfg.mu_min,
+                mu_max=loss_cfg.mu_max,
+                log_alpha_min=float(loss_cfg_get("nb_log_alpha_min", -10.0)),
+                log_alpha_max=float(loss_cfg_get("nb_log_alpha_max", 10.0)),
+                sequence_reduction=str(loss_cfg_get("nb_sequence_reduction", "mean")),
+            )
+
+        sigma_min = loss_cfg_get("sigma_min", None)
+        if sigma_min is None:
+            sigma_min = loss_cfg_get("log_sigma_min", 0.05)
+
+        sigma_max = loss_cfg_get("sigma_max", None)
+        if sigma_max is None:
+            sigma_max = loss_cfg_get("log_sigma_max", 3.0)
+
+        return LeftCensoredLogNormalLoss(
+            eps=loss_cfg.eps,
+            mu_min=loss_cfg.mu_min,
+            mu_max=loss_cfg.mu_max,
+            sigma_min=sigma_min,
+            sigma_max=sigma_max,
+            censor_threshold=loss_cfg.censor_threshold,
             mu_parameterization=getattr(
                 loss_cfg,
                 "lognormal_mu_parameterization",
                 None,
             ),
-            log_sigma_min=loss_cfg.log_sigma_min,
-            censor_threshold=loss_cfg.censor_threshold,
         )
 
     # ============================================================
@@ -386,11 +625,12 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             css,
         ) = batch
 
-        mu, phi, extras = self.model(
+        mu, log_sigma, extras = self.model(
             x_packed=seq_packed,
             codon_ids=codon_ids,
             id_datasets=dataset_ids,
             mask=mask,
+            target=target,
         )
 
         return {
@@ -402,7 +642,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "codon_ids": codon_ids,
             "css": css,
             "mu": mu,
-            "phi": phi,
+            "log_sigma": log_sigma,
             "extras": extras,
         }
 
@@ -416,7 +656,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
     def _profile_nll_per_sample(self, out: dict[str, Any]) -> torch.Tensor:
         return self.loss_fn(
             mu_phys=out["mu"].float(),
-            phi=out["phi"].float(),
+            log_sigma=out["log_sigma"].float(),
             y_true=out["target"].float(),
             mask=out["mask"].bool(),
             return_per_sample=True,
@@ -453,11 +693,13 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         mask: torch.Tensor,
         eps: float = 1.0e-8,
     ) -> torch.Tensor:
-        mask_b = mask.bool()
+        pred = pred.float()
+        target = target.float()
+        mask_b = mask.bool() & torch.isfinite(pred) & torch.isfinite(target)
         mask_f = mask_b.to(dtype=pred.dtype)
 
-        pred = pred.float() * mask_f
-        target = target.float() * mask_f
+        pred = torch.where(mask_b, pred, torch.zeros_like(pred)) * mask_f
+        target = torch.where(mask_b, target, torch.zeros_like(target)) * mask_f
 
         valid_len = mask_f.sum(dim=1).clamp_min(1.0)
 
@@ -490,17 +732,16 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         out: dict[str, Any],
     ) -> dict[str, torch.Tensor]:
         mu = out["mu"].detach().float()
-        phi = out["phi"].detach().float().clamp_min(self.loss_fn.eps)
+        log_sigma = out["log_sigma"].detach().float()
 
         with torch.no_grad():
-            log_loc, log_sigma = self.loss_fn._lognormal_params(
+            positive_mean = self.loss_fn.positive_mean_from_params(
                 mu=mu,
-                phi=phi,
-            )
-            positive_mean = torch.exp(log_loc + 0.5 * log_sigma.pow(2))
+                log_sigma=log_sigma,
+            ).float()
 
         return {
-            "likelihood_positive_mean": positive_mean.float(),
+            "likelihood_positive_mean": positive_mean,
         }
 
     def _mean_for_dataset(
@@ -571,6 +812,11 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         dataset_ids = out["dataset_ids"].detach().to(device=out["target"].device)
         unique_dataset_ids = torch.unique(dataset_ids)
 
+        # With a single active dataset the per-dataset series duplicates the
+        # aggregate (e.g. val_mu_pcc == val_mu_pcc/<name>). Skip the duplication.
+        if unique_dataset_ids.numel() <= 1:
+            return
+
         batch_size = int(out["target"].shape[0])
         sync_dist = self.config.trainer.sync_dist_logs
 
@@ -599,8 +845,8 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                     float(n_samples),
                     device=self.device,
                 ),
-                "phi_mean": self._mean_for_dataset(
-                    out["phi"],
+                "log_sigma_mean": self._mean_for_dataset(
+                    out["log_sigma"],
                     sample_mask=sample_mask,
                     position_mask=mask,
                     batch_size=batch_size,
@@ -639,11 +885,14 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         mask: torch.Tensor,
         log1p: bool = False,
     ) -> torch.Tensor:
-        mask_f = mask.bool().to(dtype=pred.dtype)
+        pred = pred.float()
+        target = target.float()
+        mask_b = mask.bool() & torch.isfinite(pred) & torch.isfinite(target)
+        mask_f = mask_b.to(dtype=pred.dtype)
         valid_len = mask_f.sum(dim=1).clamp_min(1.0)
 
-        pred = pred.float().clamp_min(0.0)
-        target = target.float().clamp_min(0.0)
+        pred = torch.where(mask_b, pred, torch.zeros_like(pred)).clamp_min(0.0)
+        target = torch.where(mask_b, target, torch.zeros_like(target)).clamp_min(0.0)
 
         if log1p:
             pred = torch.log1p(pred)
@@ -656,7 +905,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         out: dict[str, Any],
     ) -> dict[str, torch.Tensor]:
         target = out["target"].float()
-        mask = out["mask"].bool()
+        mask = out["mask"].bool() & torch.isfinite(target)
         mask_f = mask.to(dtype=target.dtype)
 
         zero_count = (
@@ -665,6 +914,565 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         valid_len = mask_f.sum(dim=1).clamp_min(1.0)
 
         return {"target_zero_frac_per_sample": zero_count / valid_len}
+
+    @staticmethod
+    def _masked_sum(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        mask_b = mask.bool() & torch.isfinite(values)
+        values = torch.where(mask_b, values, torch.zeros_like(values))
+        return values.sum()
+
+    @classmethod
+    def _masked_mean(cls, values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        mask_b = mask.bool() & torch.isfinite(values)
+        denom = mask_b.to(dtype=values.dtype).sum().clamp_min(1.0)
+        return cls._masked_sum(values, mask_b) / denom
+
+    @classmethod
+    def _masked_std(cls, values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        mask_b = mask.bool() & torch.isfinite(values)
+        mean = cls._masked_mean(values, mask_b)
+        centered = torch.where(mask_b, values - mean, torch.zeros_like(values))
+        denom = mask_b.to(dtype=values.dtype).sum().clamp_min(1.0)
+        return torch.sqrt(centered.pow(2).sum() / denom)
+
+    @staticmethod
+    def _masked_fraction(mask: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+        valid_mask = valid_mask.bool()
+        dtype = torch.float32
+        denom = valid_mask.to(dtype=dtype).sum().clamp_min(1.0)
+        return (mask.bool() & valid_mask).to(dtype=dtype).sum() / denom
+
+    # Quantile cut-points (of positive ground truth) that define the positive-side
+    # calibration bins. The low bin is fixed by the censor threshold; the positive
+    # side is partitioned by these quantiles of valid positive y in the batch.
+    _POSITIVE_BIN_QUANTILES = (0.5, 0.75, 0.9, 0.99)
+
+    @classmethod
+    def _add_target_bin_calibration_metrics(
+        cls,
+        *,
+        metrics: dict[str, torch.Tensor],
+        bins: tuple[tuple[str, torch.Tensor], ...],
+        y: torch.Tensor,
+        pred: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> None:
+        """
+        Per-target-bin calibration view:
+          - mean_target_by_target_bin_<label>: average observed y in the bin
+          - mean_pred_by_target_bin_<label>:   average predicted mu in the bin
+          - log1p_mse_by_target_bin_<label>:   MSE on log1p scale (comparable
+                                               across bins of different scale)
+          - target_bin_<label>_frac:           fraction of valid positions in bin
+
+        Calibration read: if mean_pred ~ mean_target per bin the model extracts
+        that magnitude regime correctly. log1p_mse quantifies spread on a scale
+        where the zero bin and the top-1% bin are directly comparable.
+        """
+        # Match dtypes; pred may be float32 while y is float64.
+        pred_d = pred.to(dtype=y.dtype) if pred.dtype != y.dtype else pred
+        log1p_sq_err = (torch.log1p(pred_d.clamp_min(0.0))
+                        - torch.log1p(y.clamp_min(0.0))).pow(2)
+
+        for label, bin_mask_raw in bins:
+            bin_mask = valid_mask & bin_mask_raw & torch.isfinite(y) & torch.isfinite(pred_d)
+            metrics[f"mean_target_by_target_bin_{label}"] = cls._masked_mean(
+                y, bin_mask
+            ).float()
+            metrics[f"mean_pred_by_target_bin_{label}"] = cls._masked_mean(
+                pred_d, bin_mask
+            ).float()
+            metrics[f"log1p_mse_by_target_bin_{label}"] = cls._masked_mean(
+                log1p_sq_err, bin_mask
+            ).float()
+            metrics[f"target_bin_{label}_frac"] = cls._masked_fraction(
+                bin_mask, valid_mask
+            ).to(device=pred_d.device)
+
+    @classmethod
+    def _add_positive_quantile_threshold_metrics(
+        cls,
+        *,
+        metrics: dict[str, torch.Tensor],
+        y: torch.Tensor,
+        valid_mask: torch.Tensor,
+        threshold: float,
+    ) -> None:
+        q_vals = cls._positive_quantile_thresholds(
+            y=y,
+            valid_mask=valid_mask,
+            threshold=threshold,
+        )
+        if q_vals is None:
+            return
+        for q, v in zip(cls._POSITIVE_BIN_QUANTILES, q_vals, strict=True):
+            label = f"q{int(round(q * 100)):02d}"
+            metrics[f"target_pos_{label}_threshold"] = torch.tensor(
+                float(v), device=y.device, dtype=torch.float32
+            )
+
+    @classmethod
+    def _positive_quantile_thresholds(
+        cls,
+        *,
+        y: torch.Tensor,
+        valid_mask: torch.Tensor,
+        threshold: float,
+    ) -> tuple[float, ...] | None:
+        positive_mask = valid_mask & (y > threshold) & torch.isfinite(y)
+        positive_y = y[positive_mask]
+        if positive_y.numel() < max(int(1.0 / (1.0 - cls._POSITIVE_BIN_QUANTILES[-1])), 16):
+            return None
+        qs = torch.tensor(
+            cls._POSITIVE_BIN_QUANTILES,
+            device=positive_y.device,
+            dtype=positive_y.dtype,
+        )
+        return tuple(torch.quantile(positive_y, qs).tolist())
+
+    @classmethod
+    def _positive_quantile_bins(
+        cls,
+        *,
+        values: torch.Tensor,
+        y: torch.Tensor,
+        valid_mask: torch.Tensor,
+        threshold: float,
+    ) -> tuple[tuple[str, torch.Tensor], ...]:
+        """
+        Build target-magnitude bins for calibration diagnostics.
+
+        - One zero/censored bin (`le_c`) at y <= threshold.
+        - Positive-side bins partitioned by quantiles of the in-batch positive y,
+          so the high-value bin is "actually high values" rather than a fixed
+          count cutoff that may be dataset-inappropriate.
+
+        Quantile thresholds are recomputed per batch; with the default sampler
+        (~16 sequences x O(1k) positions) the per-batch p50..p99 are stable
+        enough for epoch aggregation.
+        """
+        q_vals = cls._positive_quantile_thresholds(
+            y=y,
+            valid_mask=valid_mask,
+            threshold=threshold,
+        )
+        if q_vals is None:
+            return (
+                ("le_c", values <= threshold),
+                ("positive", values > threshold),
+            )
+        q50, q75, q90, q99 = q_vals
+
+        return (
+            ("le_c", values <= threshold),
+            ("pos_q0_50", (values > threshold) & (values <= q50)),
+            ("pos_q50_75", (values > q50) & (values <= q75)),
+            ("pos_q75_90", (values > q75) & (values <= q90)),
+            ("pos_q90_99", (values > q90) & (values <= q99)),
+            ("pos_gt_q99", values > q99),
+        )
+
+    def _likelihood_position_diagnostics(
+        self,
+        out: dict[str, Any],
+    ) -> dict[str, torch.Tensor]:
+        if isinstance(self.loss_fn, NegativeBinomialProfileLoss):
+            return self._negative_binomial_position_diagnostics(out)
+
+        if isinstance(self.loss_fn, PoissonProfileLoss):
+            return self._poisson_position_diagnostics(out)
+
+        if not isinstance(self.loss_fn, LeftCensoredLogNormalLoss):
+            return {}
+
+        with torch.no_grad(), torch.amp.autocast(
+            device_type=out["mu"].device.type,
+            enabled=False,
+        ):
+            target_raw = out["target"].float()
+            valid_mask = out["mask"].bool() & torch.isfinite(target_raw)
+
+            y = torch.nan_to_num(
+                target_raw.to(torch.float64),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).clamp_min(0.0)
+
+            mu = torch.nan_to_num(
+                out["mu"].float().to(torch.float64),
+                nan=self.loss_fn.mu_min,
+                posinf=self.loss_fn.mu_max,
+                neginf=self.loss_fn.mu_min,
+            ).clamp(min=self.loss_fn.mu_min, max=self.loss_fn.mu_max)
+            log_sigma = self.loss_fn._broadcast_profile_param(
+                out["log_sigma"].float().to(torch.float64),
+                y.shape,
+            )
+
+            log_loc, sigma = self.loss_fn._lognormal_params(
+                mu=mu,
+                log_sigma=log_sigma,
+            )
+
+            log_y = torch.log(y.clamp_min(self.loss_fn.eps))
+            z = (log_y - log_loc) / sigma.clamp_min(self.loss_fn.eps)
+            positive_nll = (
+                log_y
+                + torch.log(sigma.clamp_min(self.loss_fn.eps))
+                + 0.5 * math.log(2.0 * math.pi)
+                + 0.5 * z.pow(2)
+            )
+
+            if self.loss_fn.censor_threshold > 0.0:
+                c = torch.tensor(
+                    self.loss_fn.censor_threshold,
+                    device=y.device,
+                    dtype=torch.float64,
+                ).clamp_min(self.loss_fn.eps)
+                z_c = (torch.log(c) - log_loc) / sigma.clamp_min(self.loss_fn.eps)
+                log_cdf = self.loss_fn._log_normal_cdf_standard(z_c)
+                censored_nll = -log_cdf
+                censored_prob = torch.exp(log_cdf).clamp(0.0, 1.0)
+                is_censored = y <= self.loss_fn.censor_threshold
+            else:
+                censored_nll = torch.full_like(positive_nll, 1.0e8)
+                censored_prob = torch.zeros_like(positive_nll)
+                is_censored = y <= 0.0
+
+            nll = torch.where(is_censored, censored_nll, positive_nll)
+            nll = torch.nan_to_num(nll, nan=0.0, posinf=1.0e8, neginf=1.0e8)
+            valid_mask = valid_mask & torch.isfinite(nll)
+            censored_mask = valid_mask & is_censored
+            positive_mask = valid_mask & ~is_censored
+
+            valid_count = valid_mask.to(dtype=torch.float64).sum().clamp_min(1.0)
+            log_residual = log_y - log_loc
+            abs_log_residual = log_residual.abs()
+            abs_z = z.abs()
+            positive_mean = torch.exp(log_loc + 0.5 * sigma.pow(2))
+            positive_mean = torch.nan_to_num(
+                positive_mean,
+                nan=self.loss_fn.mu_min,
+                posinf=self.loss_fn.mu_max,
+                neginf=self.loss_fn.mu_min,
+            ).clamp(min=self.loss_fn.mu_min, max=self.loss_fn.mu_max)
+
+            metrics: dict[str, torch.Tensor] = {
+                "nll_censored": self._masked_mean(nll, censored_mask).float(),
+                "nll_positive": self._masked_mean(nll, positive_mask).float(),
+                "nll_censored_contrib": (
+                    self._masked_sum(nll, censored_mask) / valid_count
+                ).float(),
+                "nll_positive_contrib": (
+                    self._masked_sum(nll, positive_mask) / valid_count
+                ).float(),
+                "nll_censored_frac": self._masked_fraction(
+                    censored_mask,
+                    valid_mask,
+                ).to(device=nll.device),
+                "nll_positive_frac": self._masked_fraction(
+                    positive_mask,
+                    valid_mask,
+                ).to(device=nll.device),
+                "censored_prob_mean": self._masked_mean(
+                    censored_prob,
+                    valid_mask,
+                ).float(),
+                "censored_prob_on_censored": self._masked_mean(
+                    censored_prob,
+                    censored_mask,
+                ).float(),
+                "censored_prob_on_positive": self._masked_mean(
+                    censored_prob,
+                    positive_mask,
+                ).float(),
+                "positive_log_residual_mean": self._masked_mean(
+                    log_residual,
+                    positive_mask,
+                ).float(),
+                "positive_log_residual_std": self._masked_std(
+                    log_residual,
+                    positive_mask,
+                ).float(),
+                "positive_abs_log_residual_mean": self._masked_mean(
+                    abs_log_residual,
+                    positive_mask,
+                ).float(),
+                "positive_z_mean": self._masked_mean(z, positive_mask).float(),
+                "positive_z_std": self._masked_std(z, positive_mask).float(),
+                "positive_abs_z_mean": self._masked_mean(abs_z, positive_mask).float(),
+                "sigma_mean": self._masked_mean(sigma, valid_mask).float(),
+                "sigma_censored_mean": self._masked_mean(
+                    sigma,
+                    censored_mask,
+                ).float(),
+                "sigma_positive_mean": self._masked_mean(
+                    sigma,
+                    positive_mask,
+                ).float(),
+                "pred_mean_censored_mean": self._masked_mean(
+                    positive_mean,
+                    censored_mask,
+                ).float(),
+                "pred_mean_positive_mean": self._masked_mean(
+                    positive_mean,
+                    positive_mask,
+                ).float(),
+            }
+
+            c_val = float(self.loss_fn.censor_threshold)
+            bins = self._positive_quantile_bins(
+                values=y,
+                y=y,
+                valid_mask=valid_mask,
+                threshold=c_val,
+            )
+            self._add_target_bin_calibration_metrics(
+                metrics=metrics,
+                bins=bins,
+                y=y,
+                pred=positive_mean,
+                valid_mask=valid_mask,
+            )
+            self._add_positive_quantile_threshold_metrics(
+                metrics=metrics,
+                y=y,
+                valid_mask=valid_mask,
+                threshold=c_val,
+            )
+
+            return metrics
+
+    def _poisson_position_diagnostics(
+        self,
+        out: dict[str, Any],
+    ) -> dict[str, torch.Tensor]:
+        with torch.no_grad(), torch.amp.autocast(
+            device_type=out["mu"].device.type,
+            enabled=False,
+        ):
+            target_raw = out["target"].float()
+            valid_mask = out["mask"].bool() & torch.isfinite(target_raw)
+            y = torch.nan_to_num(
+                target_raw.to(torch.float64),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).clamp_min(0.0)
+            mu = self.loss_fn.positive_mean_from_params(
+                mu=out["mu"].float().to(torch.float64),
+                log_sigma=None,
+            ).to(torch.float64)
+
+            nll = (
+                mu
+                - y * torch.log(mu.clamp_min(self.loss_fn.eps))
+            )
+            nll = torch.nan_to_num(nll, nan=0.0, posinf=1.0e8, neginf=1.0e8)
+            valid_mask = valid_mask & torch.isfinite(nll)
+
+            threshold = float(getattr(self.config.loss, "censor_threshold", 0.0))
+            low_mask = valid_mask & (y <= threshold)
+            positive_mask = valid_mask & (y > threshold)
+            valid_count = valid_mask.to(dtype=torch.float64).sum().clamp_min(1.0)
+
+            residual = y - mu
+            pearson_residual = residual / torch.sqrt(mu.clamp_min(self.loss_fn.eps))
+
+            metrics: dict[str, torch.Tensor] = {
+                "nll_censored": self._masked_mean(nll, low_mask).float(),
+                "nll_positive": self._masked_mean(nll, positive_mask).float(),
+                "nll_censored_contrib": (
+                    self._masked_sum(nll, low_mask) / valid_count
+                ).float(),
+                "nll_positive_contrib": (
+                    self._masked_sum(nll, positive_mask) / valid_count
+                ).float(),
+                "nll_censored_frac": self._masked_fraction(
+                    low_mask,
+                    valid_mask,
+                ).to(device=nll.device),
+                "nll_positive_frac": self._masked_fraction(
+                    positive_mask,
+                    valid_mask,
+                ).to(device=nll.device),
+                "poisson_residual_mean": self._masked_mean(
+                    residual,
+                    valid_mask,
+                ).float(),
+                "poisson_abs_residual_mean": self._masked_mean(
+                    residual.abs(),
+                    valid_mask,
+                ).float(),
+                "poisson_pearson_residual_mean": self._masked_mean(
+                    pearson_residual,
+                    valid_mask,
+                ).float(),
+                "poisson_pearson_residual_std": self._masked_std(
+                    pearson_residual,
+                    valid_mask,
+                ).float(),
+                "poisson_abs_pearson_residual_mean": self._masked_mean(
+                    pearson_residual.abs(),
+                    valid_mask,
+                ).float(),
+                "pred_mean_censored_mean": self._masked_mean(
+                    mu,
+                    low_mask,
+                ).float(),
+                "pred_mean_positive_mean": self._masked_mean(
+                    mu,
+                    positive_mask,
+                ).float(),
+            }
+
+            bins = self._positive_quantile_bins(
+                values=y,
+                y=y,
+                valid_mask=valid_mask,
+                threshold=threshold,
+            )
+            self._add_target_bin_calibration_metrics(
+                metrics=metrics,
+                bins=bins,
+                y=y,
+                pred=mu,
+                valid_mask=valid_mask,
+            )
+            self._add_positive_quantile_threshold_metrics(
+                metrics=metrics,
+                y=y,
+                valid_mask=valid_mask,
+                threshold=threshold,
+            )
+
+            return metrics
+
+    def _negative_binomial_position_diagnostics(
+        self,
+        out: dict[str, Any],
+    ) -> dict[str, torch.Tensor]:
+        with torch.no_grad(), torch.amp.autocast(
+            device_type=out["mu"].device.type,
+            enabled=False,
+        ):
+            target_raw = out["target"].float()
+            valid_mask = out["mask"].bool() & torch.isfinite(target_raw)
+            y = torch.nan_to_num(
+                target_raw.to(torch.float64),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).clamp_min(0.0)
+            mu = self.loss_fn.positive_mean_from_params(
+                mu=out["mu"].float().to(torch.float64),
+                log_sigma=None,
+            ).to(torch.float64)
+            log_alpha = self.loss_fn._log_alpha_from_model_output(
+                log_sigma=out["log_sigma"].float().to(torch.float64),
+                target_shape=y.shape,
+            )
+            alpha = torch.exp(log_alpha)
+            r = torch.exp(-log_alpha).clamp_min(self.loss_fn.eps)
+
+            nll = (
+                torch.lgamma(r)
+                - torch.lgamma(y + r)
+                - r * torch.log(r.clamp_min(self.loss_fn.eps))
+                - y * torch.log(mu.clamp_min(self.loss_fn.eps))
+                + (r + y) * torch.log((r + mu).clamp_min(self.loss_fn.eps))
+            )
+            nll = torch.nan_to_num(nll, nan=0.0, posinf=1.0e8, neginf=1.0e8)
+            valid_mask = valid_mask & torch.isfinite(nll)
+
+            threshold = float(getattr(self.config.loss, "censor_threshold", 0.0))
+            low_mask = valid_mask & (y <= threshold)
+            positive_mask = valid_mask & (y > threshold)
+            valid_count = valid_mask.to(dtype=torch.float64).sum().clamp_min(1.0)
+
+            residual = y - mu
+            variance = mu + alpha * mu.pow(2)
+            pearson_residual = residual / torch.sqrt(variance.clamp_min(self.loss_fn.eps))
+
+            metrics: dict[str, torch.Tensor] = {
+                "nll_censored": self._masked_mean(nll, low_mask).float(),
+                "nll_positive": self._masked_mean(nll, positive_mask).float(),
+                "nll_censored_contrib": (
+                    self._masked_sum(nll, low_mask) / valid_count
+                ).float(),
+                "nll_positive_contrib": (
+                    self._masked_sum(nll, positive_mask) / valid_count
+                ).float(),
+                "nll_censored_frac": self._masked_fraction(
+                    low_mask,
+                    valid_mask,
+                ).to(device=nll.device),
+                "nll_positive_frac": self._masked_fraction(
+                    positive_mask,
+                    valid_mask,
+                ).to(device=nll.device),
+                "nb_alpha_mean": self._masked_mean(alpha, valid_mask).float(),
+                "nb_alpha_censored_mean": self._masked_mean(
+                    alpha,
+                    low_mask,
+                ).float(),
+                "nb_alpha_positive_mean": self._masked_mean(
+                    alpha,
+                    positive_mask,
+                ).float(),
+                "nb_r_mean": self._masked_mean(r, valid_mask).float(),
+                "nb_residual_mean": self._masked_mean(
+                    residual,
+                    valid_mask,
+                ).float(),
+                "nb_abs_residual_mean": self._masked_mean(
+                    residual.abs(),
+                    valid_mask,
+                ).float(),
+                "nb_pearson_residual_mean": self._masked_mean(
+                    pearson_residual,
+                    valid_mask,
+                ).float(),
+                "nb_pearson_residual_std": self._masked_std(
+                    pearson_residual,
+                    valid_mask,
+                ).float(),
+                "nb_abs_pearson_residual_mean": self._masked_mean(
+                    pearson_residual.abs(),
+                    valid_mask,
+                ).float(),
+                "pred_mean_censored_mean": self._masked_mean(
+                    mu,
+                    low_mask,
+                ).float(),
+                "pred_mean_positive_mean": self._masked_mean(
+                    mu,
+                    positive_mask,
+                ).float(),
+            }
+
+            bins = self._positive_quantile_bins(
+                values=y,
+                y=y,
+                valid_mask=valid_mask,
+                threshold=threshold,
+            )
+            self._add_target_bin_calibration_metrics(
+                metrics=metrics,
+                bins=bins,
+                y=y,
+                pred=mu,
+                valid_mask=valid_mask,
+            )
+            self._add_positive_quantile_threshold_metrics(
+                metrics=metrics,
+                y=y,
+                valid_mask=valid_mask,
+                threshold=threshold,
+            )
+
+            return metrics
 
     def _support_target_scale(
         self,
@@ -680,11 +1488,17 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         )
         min_scale = max(min_scale, float(self.config.loss.eps))
 
-        target_f = target.float().clamp_min(0.0)
+        target_raw = target.float()
         mask_b = mask.bool()
+        finite_mask = mask_b & torch.isfinite(target_raw)
+        target_f = torch.where(
+            finite_mask,
+            target_raw.clamp_min(0.0),
+            torch.zeros_like(target_raw),
+        )
 
         if strategy in {"max", "maximum"}:
-            mask_f = mask_b.to(dtype=target_f.dtype)
+            mask_f = finite_mask.to(dtype=target_f.dtype)
             return (target_f * mask_f).max(dim=1, keepdim=True).values.clamp_min(
                 min_scale
             )
@@ -693,8 +1507,8 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             q = float(getattr(self.config.loss, "support_target_quantile", 0.99))
             q = min(max(q, 0.0), 1.0)
             scales = []
-            for target_i, mask_i in zip(target_f, mask_b, strict=True):
-                valid = mask_i & torch.isfinite(target_i) & (target_i > 0.0)
+            for target_i, mask_i in zip(target_f, finite_mask, strict=True):
+                valid = mask_i & (target_i > 0.0)
                 values = target_i[valid]
                 if values.numel() == 0:
                     scale_i = target_i.new_tensor(min_scale)
@@ -725,17 +1539,35 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             )
             _ds_split = (_ds_inv, int(_ds_inv.max().item()) + 1)
 
-        # Quantity correlated against normalized profile shape:
-        #   rho = raw local occupancy (baseline)
-        #   q   = occupancy AFTER causal queue propagation. This is the ONLY path
-        #         by which the queue coupling (and a learnable alpha) reaches the
-        #         loss; with propagation off, q_bio == rho_bio.
-        support = out["extras"][
-            {"q": "q_bio", "rho": "rho_bio"}[self.config.loss.pcc_target]
-        ]
+        # Quantity correlated against normalized profile shape. Two axes:
+        #   intensity (rho_bio / q_bio) — unbounded, full dynamic range
+        #   occupancy (rho_utilization / q_utilization) — bounded in [0, 1),
+        #                                                 Poisson "at least one
+        #                                                 footprint" probability
+        # and queue propagation off / on. q_bio == rho_bio and q_utilization ==
+        # rho_utilization when propagation is off.
+        support_key = {
+            "rho": "rho_bio",                  # intensity, no queue
+            "q": "q_bio",                      # intensity, queue-propagated
+            "occupancy": "rho_utilization",    # bounded occupancy, no queue
+            "q_occupancy": "q_utilization",    # bounded occupancy, queue-propagated
+        }
+        pcc_target = str(self.config.loss.pcc_target)
+        if pcc_target not in support_key:
+            raise ValueError(
+                f"loss.pcc_target must be one of {sorted(support_key)}, "
+                f"got {pcc_target!r}."
+            )
+        support = out["extras"][support_key[pcc_target]]
 
-        target = out["target"]
-        mask = out["mask"].bool()
+        target_raw = out["target"].float()
+        mask = out["mask"].bool() & torch.isfinite(target_raw)
+        target = torch.nan_to_num(
+            target_raw,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
         mask_f = mask.to(dtype=support.dtype)
 
         # Robust per-transcript normalization for the support-shape PCC target.
@@ -747,7 +1579,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         with torch.no_grad():
             likelihood_positive_mean = self.loss_fn.positive_mean_from_params(
                 mu=out["mu"].float(),
-                phi=out["phi"].float(),
+                log_sigma=out["log_sigma"].float(),
             ).float()
 
         support_pcc_per_sample = self._pearson_per_sample(
@@ -843,17 +1675,24 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             j_centering_loss = j_centering_weight * log_J_mean.pow(2)
             metrics["j_centering_loss"] = j_centering_loss
 
-        phi_reg_weight = float(getattr(self.config.loss, "phi_reg_weight", 0.0))
-        phi_reg_loss = torch.zeros((), device=support.device, dtype=support.dtype)
-        if phi_reg_weight > 0.0:
-            log_phi = out["extras"]["log_phi"].float()  # [B, 1]
-            log_phi_target = math.log(float(getattr(self.config.loss, "phi_reg_target", 10.0)))
-            phi_reg_loss = phi_reg_weight * (log_phi - log_phi_target).pow(2).mean()
-            metrics["phi_reg_loss"] = phi_reg_loss
+        log_sigma_reg_weight = float(getattr(self.config.loss, "log_sigma_reg_weight", 0.0))
+        log_sigma_reg_target = float(getattr(self.config.loss, "log_sigma_reg_target", 0.0))
+        log_sigma_reg_loss = torch.zeros((), device=support.device, dtype=support.dtype)
+        if log_sigma_reg_weight > 0.0 and not isinstance(self.loss_fn, PoissonProfileLoss):
+            log_sigma_t = out["extras"]["log_sigma_t"].float()  # [B, 1]
+            log_sigma_reg_loss = log_sigma_reg_weight * (
+                log_sigma_t - log_sigma_reg_target
+            ).pow(2).mean()
+            metrics["log_sigma_reg_loss"] = log_sigma_reg_loss
 
         ts_centering_weight = float(getattr(self.config.loss, "transcript_scale_centering_weight", 0.0))
         transcript_scale_centering_loss = torch.zeros((), device=support.device, dtype=support.dtype)
-        if ts_centering_weight > 0.0:
+        scale_dt_is_target = out["extras"].get("scale_dt_is_target")
+        using_target_scale = (
+            scale_dt_is_target is not None
+            and bool((scale_dt_is_target.float() > 0.5).all().item())
+        )
+        if ts_centering_weight > 0.0 and not using_target_scale:
             transcript_log_scale = out["extras"]["transcript_log_scale"].float().squeeze(-1)  # [B]
             unique_ds_ids = torch.unique(dataset_ids)
             per_ds = [
@@ -866,7 +1705,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             metrics["transcript_scale_centering_loss"] = transcript_scale_centering_loss
 
         if mode == "pcc_only":
-            metrics["loss"] = pcc_loss + mu_pcc_loss + j_centering_loss + phi_reg_loss + transcript_scale_centering_loss
+            metrics["loss"] = pcc_loss + mu_pcc_loss + j_centering_loss + log_sigma_reg_loss + transcript_scale_centering_loss
             metrics["loss_per_sample"] = (
                 pcc_loss_per_sample + mu_pcc_loss_per_sample
             )
@@ -877,14 +1716,15 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
         metrics["nll"] = nll
         metrics["nll_per_sample"] = nll_per_sample
+        metrics.update(self._likelihood_position_diagnostics(out))
 
         if mode == "likelihood_only":
-            metrics["loss"] = nll + j_centering_loss + phi_reg_loss + transcript_scale_centering_loss
+            metrics["loss"] = nll + j_centering_loss + log_sigma_reg_loss + transcript_scale_centering_loss
             metrics["loss_per_sample"] = nll_per_sample
             return metrics
 
         if mode == "pcc_likelihood":
-            metrics["loss"] = pcc_loss + mu_pcc_loss + nll + j_centering_loss + phi_reg_loss + transcript_scale_centering_loss
+            metrics["loss"] = pcc_loss + mu_pcc_loss + nll + j_centering_loss + log_sigma_reg_loss + transcript_scale_centering_loss
             metrics["loss_per_sample"] = (
                 pcc_loss_per_sample
                 + mu_pcc_loss_per_sample
@@ -911,7 +1751,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         self.log(
             f"{stage}_loss",
             metrics["loss"],
-            on_step=(stage == "train"),
+            on_step=False,
             on_epoch=True,
             prog_bar=True,
             batch_size=batch_size,
@@ -939,18 +1779,24 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         )
 
         # Optional scalar metrics produced only by the active objective terms.
-        # In pcc_only mode the likelihood NLL is absent.
-        for name in self.OPTIONAL_SCALAR_METRICS:
-            if name in metrics:
-                self.log(
-                    f"{stage}_{name}",
-                    metrics[name],
-                    on_step=False,
-                    on_epoch=True,
-                    prog_bar=False,
-                    batch_size=batch_size,
-                    sync_dist=sync_dist,
-                )
+        # This also logs detached likelihood diagnostics such as branch NLLs
+        # and target/prediction-bin contributions.
+        already_logged = {"loss", "mu_pcc", "support_pcc"}
+        for name, value in metrics.items():
+            if name in already_logged or name.endswith("_per_sample"):
+                continue
+            if not torch.is_tensor(value) or value.ndim != 0:
+                continue
+
+            self.log(
+                f"{stage}_{name}",
+                value,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size,
+                sync_dist=sync_dist,
+            )
 
         extras = out["extras"]
 
@@ -966,8 +1812,8 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             )
 
         self.log(
-            f"{stage}_phi_mean",
-            out["phi"].float()[out["mask"].bool()].mean(),
+            f"{stage}_log_sigma_mean",
+            out["log_sigma"].float()[out["mask"].bool()].mean(),
             on_step=False,
             on_epoch=True,
             prog_bar=False,
@@ -1079,7 +1925,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         length = int(mask_i.sum().item())
 
         extras = dict(out["extras"])
-        extras["phi"] = out["phi"]
+        extras["log_sigma"] = out["log_sigma"]
         likelihood_curves = self._likelihood_curves_for_plot(out)
         extras.update(likelihood_curves)
 
@@ -1398,7 +2244,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         with torch.no_grad():
             likelihood_positive_mean = self.loss_fn.positive_mean_from_params(
                 mu=out["mu"].detach().float(),
-                phi=out["phi"].detach().float(),
+                log_sigma=out["log_sigma"].detach().float(),
             ).float()
 
         predictions: dict[str, Any] = {
@@ -1419,6 +2265,8 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "rho_bio": extras["rho_bio"],
             "q_bio": extras["q_bio"],
             "h_bio": extras["h_bio"],
+            "rho_utilization": extras["rho_utilization"],
+            "q_utilization": extras["q_utilization"],
             "J": extras["J"],
             "p_visible": extras["p_visible"],
             # Observation branch
@@ -1427,7 +2275,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "log_visibility_bias": extras["log_visibility_bias"],
             "scale_dt": extras["scale_dt"],
             # Model params
-            "phi": out["phi"],
+            "log_sigma": out["log_sigma"],
         }
 
         return {
@@ -1451,7 +2299,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
     # ============================================================
 
     def configure_optimizers(self):
-        base_lr = self.config.optim.lr
         bio_lr = self.config.optim.lr_biological
         rest_lr = self.config.optim.lr_rest
         weight_decay_bio = self.config.optim.weight_decay_bio

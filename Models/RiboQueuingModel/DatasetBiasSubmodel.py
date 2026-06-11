@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from Models.RiboQueuingModel.submodels.DatasetDispersionHead import DatasetDispersionHead
+from Models.RiboQueuingModel.submodels.DatasetLogSigmaHead import DatasetLogSigmaHead
 from Models.RiboQueuingModel.submodels.DatasetMultiplicativeAllocationBiasHead import (
     DatasetMultiplicativeAllocationBiasHead,
 )
@@ -246,11 +246,11 @@ class DatasetBiasSubmodel(nn.Module):
             input_size=head_input_size
         )
 
-        disp_cfg = dict(config_params["dataset_dispersion_submodule_params"])
-        disp_cfg["num_datasets"] = self.num_datasets
-        disp_cfg["codon_input_size"] = self.codon_embeddings_size
+        log_sigma_cfg = dict(config_params["dataset_log_sigma_submodule_params"])
+        log_sigma_cfg["num_datasets"] = self.num_datasets
+        log_sigma_cfg["codon_input_size"] = self.codon_embeddings_size
 
-        self.dispersion_head = DatasetDispersionHead(config_params=disp_cfg)
+        self.log_sigma_head = DatasetLogSigmaHead(config_params=log_sigma_cfg, input_size=head_input_size)
 
         scale_cfg = config_params.get("dataset_transcript_scale_factor_params", None)
 
@@ -309,15 +309,20 @@ class DatasetBiasSubmodel(nn.Module):
             mask=mask_b,
         )
 
-        disp_out = self.dispersion_head(
+        log_sigma_out = self.log_sigma_head(
             dataset_ids=dataset_ids,
-            codon_embeddings=codon_emb.detach(),
+            codon_embeddings=codon_emb,
+            x = x,
             mask=mask_b,
         )
-        phi = disp_out["phi"].expand(B, T)
-        phi = torch.where(mask_b, phi, torch.ones_like(phi))
-        out["phi"] = phi
-        out["log_phi"] = disp_out["log_phi"]  # [B, 1] — for phi reg loss
+        log_sigma = log_sigma_out["log_sigma"]  # [B, T]
+        log_sigma = torch.where(mask_b, log_sigma, torch.zeros_like(log_sigma))
+        out["log_sigma"] = log_sigma
+        log_sigma_t = (log_sigma * mask_f).sum(dim=1, keepdim=True) / mask_f.sum(
+            dim=1,
+            keepdim=True,
+        ).clamp_min(1.0)
+        out["log_sigma_t"] = log_sigma_t  # [B, 1] — masked mean for log_sigma reg loss
 
         scale_out = self.dataset_transcript_scale(
             dataset_ids=dataset_ids,
