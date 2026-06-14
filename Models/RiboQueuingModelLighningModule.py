@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-from pathlib import Path
 from typing import Any
 
 import lightning as pl
@@ -2072,19 +2071,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 figure_name=tag,
                 figure=fig,
                 step=self.global_step,
-            )
-
-        log_dir = getattr(self.logger, "log_dir", None)
-        if log_dir is not None:
-            plot_dir = Path(log_dir) / "profile_plots"
-            plot_dir.mkdir(parents=True, exist_ok=True)
-            fig.savefig(
-                plot_dir
-                / (
-                    f"epoch_{int(self.current_epoch):04d}_"
-                    f"step_{int(self.global_step):08d}_{dataset_name}.png"
-                ),
-                dpi=140,
             )
 
         plt.close(fig)
