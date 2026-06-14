@@ -844,55 +844,6 @@ class NeuralPhysicsRiboLoss(nn.Module):
 
 
 
-def hurdle_lognormal_nll(y, logit_zero, mu, log_sigma, mask=None, eps=1e-6, reduction="mean"):
-    """
-    Robust Hurdle Loss that prevents NaNs during backprop.
-    """
-    # 1. Clamp Sigma to prevent division by zero or explosion
-    log_sigma = torch.clamp(log_sigma, min=-3.0, max=5.0)
-    sigma = torch.exp(log_sigma)
-
-    # 2. Probability of Zero
-    pi = torch.sigmoid(logit_zero)
-    pi = torch.clamp(pi, 1e-6, 1.0 - 1e-6)
-
-    # 3. Safe Targets for LogNormal Branch
-    # When y=0, we swap it with a dummy value (1.0) to prevent log(0) = -inf
-    # The result of this branch will be discarded by torch.where anyway,
-    # but we need the gradient calculation to remain finite.
-    is_zero = (y <= eps)
-    y_safe = torch.where(is_zero, torch.ones_like(y), y)
-
-    # LogNormal Calculation on SAFE data
-    log_y = torch.log(y_safe)
-    log_f = -(
-            log_y
-            + log_sigma
-            + 0.5 * math.log(2 * math.pi)
-            + 0.5 * ((log_y - mu) / sigma) ** 2
-    )
-
-    # 4. Combine Branches
-    # If y=0: Loss is -log(pi)
-    # If y>0: Loss is -log(1-pi) - log_f
-    loss_pixel = torch.where(
-        is_zero,
-        -torch.log(pi),
-        -torch.log(1 - pi) - log_f
-    )
-
-    # 5. Apply Masking
-    if mask is not None:
-        loss_pixel = loss_pixel * mask
-        if reduction == "mean":
-            return loss_pixel.sum() / (mask.sum() + 1e-8)
-
-    if reduction == "mean":
-        return loss_pixel.mean()
-
-    return loss_pixel.sum()
-
-
 class TweedieLoss(nn.Module):
     def __init__(self, p=1.5, eps=1e-8, reduction='mean'):
         """

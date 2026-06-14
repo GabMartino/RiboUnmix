@@ -452,6 +452,262 @@ class SortedLengthBatchSampler(BatchSampler):
         return (total + self.num_replicas - 1 - self.rank) // self.num_replicas
 
 
+class TranscriptGroupedMultiDatasetBatchSampler:
+    """
+    Batch sampler that keeps transcript-dataset pairs for the same transcript
+    together.
+
+    This is intended for multi-dataset biological-gradient methods such as
+    CAGrad, where comparing dataset gradients is cleaner when each dataset sees
+    matched transcript content inside the same batch.
+
+    Each emitted batch contains flat pair indices. For a transcript t measured
+    in datasets D(t), the sampler emits the group:
+
+        [(t, d) for d in D(t)]
+
+    as an atomic unit. Groups are packed into batches without splitting them.
+    If require_multidataset is true, transcripts with fewer than two available
+    dataset observations are skipped.
+    """
+
+    def __init__(
+        self,
+        *,
+        flat_transcript_ids: Sequence[str] | np.ndarray,
+        flat_dataset_ids: Sequence[int] | np.ndarray,
+        lengths,
+        batch_size: int,
+        num_samples: Optional[int] = None,
+        gamma: float = 0.0,
+        seed: int = 42,
+        drop_last: bool = False,
+        sort_by_length: bool = True,
+        require_multidataset: bool = True,
+        num_replicas: int = 1,
+        rank: int = 0,
+    ):
+        self.flat_transcript_ids = _as_numpy_str(flat_transcript_ids)
+        self.flat_dataset_ids = _as_numpy_int(flat_dataset_ids)
+        self.lengths = np.asarray(lengths, dtype=np.int64)
+        self.batch_size = int(batch_size)
+        self.num_samples = int(num_samples) if num_samples is not None else None
+        self.gamma = float(gamma)
+        self.seed = int(seed)
+        self.drop_last = bool(drop_last)
+        self.sort_by_length = bool(sort_by_length)
+        self.require_multidataset = bool(require_multidataset)
+        self.num_replicas = max(int(num_replicas), 1)
+        self.rank = int(rank) % self.num_replicas
+        self._iter_count = 0
+
+        if self.batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+        if len(self.flat_transcript_ids) != len(self.flat_dataset_ids):
+            raise ValueError("flat_transcript_ids and flat_dataset_ids must have same length.")
+        if len(self.flat_transcript_ids) != len(self.lengths):
+            raise ValueError("flat_transcript_ids and lengths must have same length.")
+
+        grouped: dict[str, list[int]] = defaultdict(list)
+        for idx, tid in enumerate(self.flat_transcript_ids):
+            grouped[str(tid)].append(int(idx))
+
+        groups: list[np.ndarray] = []
+        group_lengths: list[int] = []
+        for tid in sorted(grouped):
+            indices = np.asarray(grouped[tid], dtype=np.int64)
+            dataset_count = len(np.unique(self.flat_dataset_ids[indices]))
+            if self.require_multidataset and dataset_count < 2:
+                continue
+            groups.append(indices)
+            group_lengths.append(int(self.lengths[indices[0]]))
+
+        if len(groups) == 0:
+            raise RuntimeError(
+                "No transcript groups available for transcript-grouped sampling. "
+                "If this split has no transcripts measured in multiple datasets, use "
+                "train_sampling_strategy=transcript_grouped_pairs or another sampler."
+            )
+
+        self.groups = groups
+        self.group_lengths = np.asarray(group_lengths, dtype=np.int64)
+        self.group_pair_counts = np.asarray(
+            [min(len(g), self.batch_size) for g in self.groups],
+            dtype=np.int64,
+        )
+
+        dataset_counts: dict[int, int] = defaultdict(int)
+        for ds in self.flat_dataset_ids:
+            dataset_counts[int(ds)] += 1
+        self.dataset_counts = {int(k): int(v) for k, v in dataset_counts.items()}
+
+        # Per-epoch target number of (transcript, dataset) pairs when num_samples
+        # is not given. Used by the group-selection-balancing path below.
+        self._epoch_pairs = int(self.group_pair_counts.sum())
+
+        # Group-SELECTION balancing weights. When gamma > 0, groups are drawn (with
+        # replacement) in proportion to the rarity of the datasets they contain, so
+        # transcripts measured in a rare dataset (e.g. the small one) are upsampled
+        # instead of being flooded by single-dataset groups of the abundant dataset.
+        # Weight of a group = sum over its member pairs of N_d^{-gamma}, reusing the
+        # same N_d^{-gamma} scheme as _sample_group_indices and
+        # _dataset_pair_weights_from_ids. gamma <= 0 -> None -> uniform selection
+        # (unchanged legacy behavior).
+        self.group_select_weights: Optional[np.ndarray] = None
+        if self.gamma > 0.0:
+            raw = np.asarray(
+                [
+                    sum(
+                        float(self.dataset_counts[int(self.flat_dataset_ids[idx])]) ** (-self.gamma)
+                        for idx in group
+                    )
+                    for group in self.groups
+                ],
+                dtype=np.float64,
+            )
+            raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
+            total = raw.sum()
+            if total > 0:
+                self.group_select_weights = raw / total
+
+    def _sample_group_indices(
+        self,
+        group: np.ndarray,
+        rng: np.random.Generator,
+    ) -> np.ndarray:
+        if group.size <= self.batch_size:
+            return group.copy()
+
+        if self.gamma <= 0.0:
+            probs = None
+        else:
+            raw = np.asarray(
+                [
+                    float(self.dataset_counts[int(self.flat_dataset_ids[idx])]) ** (-self.gamma)
+                    for idx in group
+                ],
+                dtype=np.float64,
+            )
+            raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
+            probs = raw / raw.sum() if raw.sum() > 0 else None
+
+        sampled = rng.choice(group, size=self.batch_size, replace=False, p=probs)
+        return np.asarray(sampled, dtype=np.int64)
+
+    def _select_groups(
+        self,
+        rng: np.random.Generator,
+    ) -> list[tuple[int, np.ndarray]]:
+        if self.group_select_weights is not None:
+            # Dataset-rarity-weighted selection with replacement. Fill until the
+            # target pair count is reached; groups containing rare datasets are
+            # upsampled so per-epoch per-dataset representation is balanced.
+            target_pairs = (
+                int(self.num_samples)
+                if self.num_samples is not None
+                else self._epoch_pairs
+            )
+            order: list[int] = []
+            n_pairs = 0
+            num_groups = len(self.groups)
+            # Sample in chunks to avoid one rng call per group.
+            chunk = max(num_groups, 1)
+            while n_pairs < target_pairs:
+                draws = rng.choice(
+                    num_groups, size=chunk, replace=True, p=self.group_select_weights
+                )
+                for group_idx in draws:
+                    order.append(int(group_idx))
+                    n_pairs += int(self.group_pair_counts[int(group_idx)])
+                    if n_pairs >= target_pairs:
+                        break
+            group_order = np.asarray(order, dtype=np.int64)
+        elif self.num_samples is None:
+            group_order = rng.permutation(len(self.groups))
+        else:
+            order = []
+            n_pairs = 0
+            while n_pairs < self.num_samples:
+                group_idx = int(rng.integers(0, len(self.groups)))
+                order.append(group_idx)
+                n_pairs += int(self.group_pair_counts[group_idx])
+            group_order = np.asarray(order, dtype=np.int64)
+
+        selected = []
+        for group_idx in group_order:
+            indices = self._sample_group_indices(self.groups[int(group_idx)], rng)
+            length = int(self.group_lengths[int(group_idx)])
+            selected.append((length, indices))
+
+        if self.sort_by_length:
+            selected.sort(key=lambda item: item[0], reverse=True)
+
+        return selected
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self._iter_count)
+        self._iter_count += 1
+
+        selected_groups = self._select_groups(rng)
+
+        batches: list[list[int]] = []
+        batch: list[int] = []
+
+        for _, group in selected_groups:
+            group_list = group.tolist()
+
+            if batch and len(batch) + len(group_list) > self.batch_size:
+                batches.append(batch)
+                batch = []
+
+            batch.extend(group_list)
+
+        if batch and (len(batch) == self.batch_size or not self.drop_last):
+            batches.append(batch)
+
+        if len(batches) > 1:
+            batch_order = rng.permutation(len(batches))
+            batches = [batches[int(i)] for i in batch_order]
+
+        for i, batch in enumerate(batches):
+            if i % self.num_replicas == self.rank:
+                yield batch
+
+    def __len__(self):
+        if self.group_select_weights is not None:
+            # Weighted-with-replacement selection draws ~target_pairs pairs/epoch.
+            target_pairs = (
+                int(self.num_samples)
+                if self.num_samples is not None
+                else self._epoch_pairs
+            )
+            n_batches = target_pairs // self.batch_size if self.drop_last else (
+                target_pairs + self.batch_size - 1
+            ) // self.batch_size
+        elif self.num_samples is None:
+            order = np.arange(len(self.groups), dtype=np.int64)
+            if self.sort_by_length:
+                order = order[np.argsort(self.group_lengths[order], kind="stable")[::-1]]
+
+            n_batches = 0
+            batch_len = 0
+            for group_idx in order:
+                group_len = int(self.group_pair_counts[int(group_idx)])
+                if batch_len and batch_len + group_len > self.batch_size:
+                    n_batches += 1
+                    batch_len = 0
+                batch_len += group_len
+
+            if batch_len and (batch_len == self.batch_size or not self.drop_last):
+                n_batches += 1
+        else:
+            n_batches = self.num_samples // self.batch_size if self.drop_last else (
+                self.num_samples + self.batch_size - 1
+            ) // self.batch_size
+
+        return (n_batches + self.num_replicas - 1 - self.rank) // self.num_replicas
+
+
 # ============================================================
 # DataModule
 # ============================================================
@@ -495,6 +751,15 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
 
         dataset_aware_balanced_pairs
             Explicitly balanced multi-dataset batches. Strong equalization.
+
+        transcript_grouped_pairs
+            Groups all available dataset observations for each sampled transcript
+            into the same batch. Single-dataset transcripts are included.
+
+        transcript_grouped_multidataset_pairs
+            Same as transcript_grouped_pairs, but only uses transcripts measured
+            in at least two datasets. This gives matched multi-dataset ground
+            truth per transcript inside each batch, which is useful for CAGrad.
 
         legacy_random_dataset
             Old behavior: dataset_choice_mode='random' inside __getitem__.
@@ -1095,11 +1360,32 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
                 rank=rank,
             )
 
+        elif strategy in {"transcript_grouped_pairs", "transcript_grouped_multidataset_pairs"}:
+            if self.train_flat_transcript_ids is None or self.train_flat_dataset_ids is None:
+                raise RuntimeError(f"{strategy} requires deterministic flat metadata.")
+
+            batch_sampler = TranscriptGroupedMultiDatasetBatchSampler(
+                flat_transcript_ids=self.train_flat_transcript_ids,
+                flat_dataset_ids=self.train_flat_dataset_ids,
+                lengths=self.train_lengths,
+                batch_size=self.batch_size,
+                num_samples=self.train_samples_per_epoch,
+                gamma=self.dataset_balance_gamma,
+                seed=seed,
+                drop_last=False,
+                sort_by_length=True,
+                require_multidataset=(strategy == "transcript_grouped_multidataset_pairs"),
+                num_replicas=num_replicas,
+                rank=rank,
+            )
+
         else:
             raise ValueError(
                 f"Unknown train_sampling_strategy={strategy!r}. Supported: "
                 "random_dataset_per_transcript, transcript_balanced_pairs, flat_pairs, "
-                "dataset_balanced_pairs, dataset_aware_balanced_pairs, legacy_random_dataset."
+                "dataset_balanced_pairs, dataset_aware_balanced_pairs, "
+                "transcript_grouped_pairs, transcript_grouped_multidataset_pairs, "
+                "legacy_random_dataset."
             )
 
         return DataLoader(

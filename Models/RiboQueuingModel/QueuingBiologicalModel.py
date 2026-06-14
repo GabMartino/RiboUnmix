@@ -20,7 +20,8 @@ class QueuingBiologicalModel(nn.Module):
     """
     Local biological traffic-intensity model.
 
-        h_i      >= 0                    (softplus output)
+        h_i      >= 0                    (softplus output, mean-normalized per transcript)
+        mean_i h_i = 1                  (over valid codons)
         rho_i    = J * h_i               (per-codon traffic intensity, unbounded)
 
     Semantics: rho_i here is *traffic intensity* in queueing-theory terms
@@ -36,8 +37,9 @@ class QueuingBiologicalModel(nn.Module):
     required for stability); rho itself stays unbounded for the prediction
     head. See _intensity_to_utilization in RiboQueuingModel.
 
-    There is intentionally no transcript-level sum_i w_i = 1 allocation
-    constraint.
+    The local factor is mean-normalized, not sum-normalized: J is therefore the
+    transcript-level average intensity, while h_i carries only within-transcript
+    shape without introducing length-dependent shrinkage.
     """
 
     def __init__(self, config_params: dict):
@@ -125,9 +127,13 @@ class QueuingBiologicalModel(nn.Module):
             )
 
         # ------------------------------------------------------------
-        # 1. Local non-normalized hazard factor
+        # 1. Local mean-normalized hazard factor
         # ------------------------------------------------------------
         local_factor = self.ff_local_hazard(out).squeeze(-1)
+        local_factor = local_factor * mask_f
+        valid_len = mask_f.sum(dim=1, keepdim=True).clamp_min(1.0)
+        local_mean = (local_factor * mask_f).sum(dim=1, keepdim=True) / valid_len
+        local_factor = local_factor / local_mean.clamp_min(1.0e-6)
         local_factor = local_factor * mask_f
 
         # ------------------------------------------------------------
@@ -139,7 +145,7 @@ class QueuingBiologicalModel(nn.Module):
         J = J.clamp(min=self.J_min, max=self.J_max)
 
         # ------------------------------------------------------------
-        # 3. Local unbounded traffic/intensity. No sum_i w_i = 1 constraint.
+        # 3. Local unbounded traffic/intensity. J controls average scale.
         # ------------------------------------------------------------
         h_bio = J.to(dtype=out.dtype).reshape(B, 1) * local_factor
         h_bio = torch.nan_to_num(
@@ -148,8 +154,9 @@ class QueuingBiologicalModel(nn.Module):
             posinf=1.0e8,
             neginf=0.0,
         )
+        ##TODO: modify
+        #h_bio = torch.expm1()
         h_bio = h_bio.clamp_min(0.0) * mask_f
-
         rho_bio = h_bio
 
         return rho_bio, J, h_bio, h_n

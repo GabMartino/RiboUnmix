@@ -1287,6 +1287,7 @@ def main(cfg: DictConfig) -> None:
         "log_every_n_steps": int(cfg.trainer.log_every_n_steps),
         "accumulate_grad_batches": int(cfg_get(cfg, "trainer.accumulate_grad_batches", 1)),
         "callbacks": [checkpoint_callback, early_stopping, lr_monitor],
+        "strategy":'ddp_find_unused_parameters_true'
     }
 
     # CAGrad uses manual optimization and clips inside the LightningModule.

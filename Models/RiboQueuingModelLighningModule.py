@@ -18,229 +18,18 @@ from matplotlib import pyplot as plt
 # Loss
 # ============================================================
 
-class LeftCensoredLogNormalLoss(nn.Module):
-    """
-    Left-censored log-normal NLL with sigma predicted directly.
+def _broadcast_profile_param(
+    value: torch.Tensor,
+    target_shape: torch.Size | tuple[int, ...],
+) -> torch.Tensor:
+    """Broadcast transcript-level or position-level parameters to [B, T]."""
+    if value.ndim == len(target_shape) + 1 and value.shape[-1] == 1:
+        value = value.squeeze(-1)
 
-    log_sigma is consumed as model output. There is no NB2 back-solve and
-    no coupling of sigma to mu: a free-sigma head retires the
-    `mu -> 0  =>  sigma -> infinity` pathology of the NB2-derived loss.
+    if value.ndim == 1 and len(target_shape) == 2 and value.shape[0] == target_shape[0]:
+        value = value.reshape(-1, 1)
 
-    Model for threshold c > 0:
-
-        P(Y <= c) = LogNormalCDF(c; log_loc, sigma)
-
-        Y | Y > c uses the LogNormal(log_loc, sigma) density.
-
-    Mu convention:
-
-        positive_mean:
-            mu = E[Y | Y > 0]
-            log_loc = log(mu) - 0.5 * sigma^2
-
-        median:
-            mu = median[Y | Y > 0] = exp(log_loc)
-            log_loc = log(mu)
-
-    Sigma is clamped at the loss boundary to [sigma_min, sigma_max]
-    for numerical stability; an external L2 regulariser on log_sigma is
-    the recommended way to control its scale.
-    """
-
-    def __init__(
-        self,
-        eps: float = 1.0e-8,
-        mu_min: float = 1.0e-8,
-        mu_max: float = 1.0e8,
-        sigma_min: float = 0.05,
-        sigma_max: float = 3.0,
-        censor_threshold: float = 0.0,
-        mu_parameterization: str | None = None,
-    ):
-        super().__init__()
-
-        self.eps = float(eps)
-        self.mu_min = float(mu_min)
-        self.mu_max = float(mu_max)
-
-        self.sigma_min = float(sigma_min)
-        self.sigma_max = float(sigma_max)
-        if self.sigma_max <= self.sigma_min:
-            raise ValueError(
-                "sigma_max must be > sigma_min, "
-                f"got {self.sigma_max} <= {self.sigma_min}."
-            )
-        if self.sigma_min <= 0.0:
-            raise ValueError(f"sigma_min must be > 0, got {self.sigma_min}.")
-
-        self.censor_threshold = float(censor_threshold)
-
-        if mu_parameterization is None:
-            mu_parameterization = "median"
-        if str(mu_parameterization) == "unconditional_mean":
-            mu_parameterization = "positive_mean"
-        self.mu_parameterization = str(mu_parameterization)
-        valid_parameterizations = {"positive_mean", "median"}
-        if self.mu_parameterization not in valid_parameterizations:
-            raise ValueError(
-                "mu_parameterization must be one of "
-                f"{sorted(valid_parameterizations)}, got {self.mu_parameterization!r}."
-            )
-
-    @staticmethod
-    def _log_normal_cdf_standard(z: torch.Tensor) -> torch.Tensor:
-        if hasattr(torch.special, "log_ndtr"):
-            return torch.special.log_ndtr(z)
-
-        return torch.log(
-            0.5 * torch.erfc(-z / math.sqrt(2.0))
-        ).clamp_min(-1.0e30)
-
-    @staticmethod
-    def _broadcast_profile_param(
-        value: torch.Tensor,
-        target_shape: torch.Size | tuple[int, ...],
-    ) -> torch.Tensor:
-        """Broadcast transcript-level or position-level parameters to [B, T]."""
-        if value.ndim == len(target_shape) + 1 and value.shape[-1] == 1:
-            value = value.squeeze(-1)
-
-        if value.ndim == 1 and len(target_shape) == 2 and value.shape[0] == target_shape[0]:
-            value = value.reshape(-1, 1)
-
-        return torch.broadcast_to(value, target_shape)
-
-    def _lognormal_params(
-        self,
-        *,
-        mu: torch.Tensor,
-        log_sigma: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Convert (mu, log_sigma) to (log_loc, sigma).
-
-        log_sigma is the model head's raw output, interpreted as log(sigma).
-        The sigma value is clamped to [sigma_min, sigma_max] for stability.
-        """
-        mu = torch.nan_to_num(
-            mu,
-            nan=self.mu_min,
-            posinf=self.mu_max,
-            neginf=self.mu_min,
-        )
-        log_sigma = torch.nan_to_num(
-            log_sigma,
-            nan=0.0,
-            posinf=math.log(self.sigma_max),
-            neginf=math.log(self.sigma_min),
-        )
-
-        mu_ref = mu.clamp(min=self.mu_min, max=self.mu_max)
-        log_mu = torch.log(mu_ref.clamp_min(self.eps))
-
-        sigma = torch.exp(log_sigma).clamp(min=self.sigma_min, max=self.sigma_max)
-
-        if self.mu_parameterization == "median":
-            log_loc = log_mu
-        else:
-            log_loc = log_mu - 0.5 * sigma.pow(2)
-
-        return log_loc, sigma
-
-    def positive_mean_from_params(
-        self,
-        *,
-        mu: torch.Tensor,
-        log_sigma: torch.Tensor,
-    ) -> torch.Tensor:
-        log_loc, sigma = self._lognormal_params(mu=mu, log_sigma=log_sigma)
-        mean = torch.exp(log_loc + 0.5 * sigma.pow(2))
-        mean = torch.nan_to_num(
-            mean,
-            nan=self.mu_min,
-            posinf=self.mu_max,
-            neginf=self.mu_min,
-        )
-        return mean.clamp(min=self.mu_min, max=self.mu_max)
-
-    def forward(
-        self,
-        mu_phys: torch.Tensor,
-        log_sigma: torch.Tensor,
-        y_true: torch.Tensor,
-        mask: torch.Tensor,
-        return_per_sample: bool = False,
-    ) -> torch.Tensor:
-        with torch.amp.autocast(device_type=mu_phys.device.type, enabled=False):
-            finite_mask = mask.bool() & torch.isfinite(y_true)
-            y = torch.nan_to_num(
-                y_true.to(torch.float64),
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
-            ).clamp_min(0.0)
-
-            mu = mu_phys.to(torch.float64).clamp(min=self.mu_min, max=self.mu_max)
-
-            log_sigma_t = self._broadcast_profile_param(
-                log_sigma.to(torch.float64),
-                y.shape,
-            )
-
-            log_loc, sigma = self._lognormal_params(mu=mu, log_sigma=log_sigma_t)
-
-            # Positive log-normal branch.
-            log_y = torch.log(y.clamp_min(self.eps))
-            z = (log_y - log_loc) / sigma
-
-            positive_nll = (
-                log_y
-                + torch.log(sigma.clamp_min(self.eps))
-                + 0.5 * math.log(2.0 * math.pi)
-                + 0.5 * z.pow(2)
-            )
-
-            # Left-censored branch. Values y <= c contribute the probability
-            # mass below c under the same log-normal, with no zero mixture.
-            if self.censor_threshold > 0.0:
-                c = torch.tensor(
-                    self.censor_threshold,
-                    device=y.device,
-                    dtype=torch.float64,
-                ).clamp_min(self.eps)
-
-                z_c = (torch.log(c) - log_loc) / sigma
-                log_cdf = self._log_normal_cdf_standard(z_c)
-                censored_nll = -log_cdf
-                is_censored = y <= self.censor_threshold
-
-            else:
-                # With no left-censoring threshold, exact zeros have no
-                # continuous log-normal mass. Keep this branch explicit so a
-                # c <= 0 configuration fails loudly through a large loss.
-                censored_nll = torch.full_like(positive_nll, 1.0e8)
-                is_censored = y <= 0.0
-
-            nll = torch.where(is_censored, censored_nll, positive_nll)
-
-            nll = torch.nan_to_num(
-                nll,
-                nan=0.0,
-                posinf=1.0e8,
-                neginf=1.0e8,
-            )
-
-            mask_f = finite_mask.to(torch.float64)
-            valid_len = mask_f.sum(dim=1).clamp_min(1.0)
-
-            loss_per_sample = (nll * mask_f).sum(dim=1) / valid_len
-            loss_per_sample = loss_per_sample.to(torch.float32)
-
-        if return_per_sample:
-            return loss_per_sample
-
-        return loss_per_sample.mean()
-
+    return torch.broadcast_to(value, target_shape)
 
 class PoissonProfileLoss(nn.Module):
     """
@@ -397,7 +186,7 @@ class NegativeBinomialProfileLoss(nn.Module):
         log_sigma: torch.Tensor,
         target_shape: torch.Size | tuple[int, ...],
     ) -> torch.Tensor:
-        log_alpha = LeftCensoredLogNormalLoss._broadcast_profile_param(
+        log_alpha = _broadcast_profile_param(
             log_sigma,
             target_shape,
         )
@@ -436,9 +225,17 @@ class NegativeBinomialProfileLoss(nn.Module):
             )
             r = torch.exp(-log_alpha).clamp_min(self.eps)
 
+            # Full NB negative log-likelihood, including the lgamma(y+1)
+            # normalization (the continuous generalization of log(y!)). This
+            # term is constant w.r.t. the model parameters, so it does NOT
+            # change gradients, but it makes the reported/combined NLL a proper
+            # log-density. Without it the NLL magnitude is dominated by count
+            # scale (large-count datasets look strongly negative regardless of
+            # fit quality), which makes cross-dataset NLLs incomparable.
             nll = (
                 torch.lgamma(r)
                 - torch.lgamma(y + r)
+                + torch.lgamma(y + 1.0)
                 - r * torch.log(r.clamp_min(self.eps))
                 - y * torch.log(mu.clamp_min(self.eps))
                 + (r + y) * torch.log((r + mu).clamp_min(self.eps))
@@ -549,6 +346,119 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         self.automatic_optimization = not self.use_cagrad
         self._val_profile_plot_logged_this_epoch = False
 
+        # Per-dataset loss-scale normalization (ablation, see
+        # "memory documents/dataset_loss_scale_normalization.md").
+        # When enabled, the NLL term of dataset d is divided by a detached
+        # EMA of its own NLL magnitude before datasets are combined, so each
+        # dataset contributes a comparable gradient to the shared biological
+        # parameters regardless of its absolute count scale.
+        loss_cfg = self.config.loss
+        # Power-space mu PCC for the OPTIMIZED loss term only (the reported
+        # mu_pcc metric stays in raw space): raises values to an exponent > 1 so
+        # peaks dominate the optimized correlation (peak / CSS recovery). See
+        # loss.mu_pcc_power_space in the config.
+        self.mu_pcc_power_space = bool(getattr(loss_cfg, "mu_pcc_power_space", False))
+        self.mu_pcc_power_exponent = float(
+            getattr(loss_cfg, "mu_pcc_power_exponent", 2.0)
+        )
+        self.dataset_loss_scale_norm_enabled = bool(
+            getattr(loss_cfg, "dataset_loss_scale_normalization", False)
+        )
+        self.dataset_loss_scale_ema_decay = float(
+            getattr(loss_cfg, "dataset_loss_scale_ema_decay", 0.99)
+        )
+        self.dataset_loss_scale_eps = float(
+            getattr(loss_cfg, "dataset_loss_scale_eps", 1.0e-6)
+        )
+        num_datasets = (
+            max(self.dataset_id_to_name) + 1 if self.dataset_id_to_name else 1
+        )
+        # Running per-dataset NLL magnitude (EMA). Persisted in checkpoints so
+        # the normalization survives resume; updated during training only.
+        self.register_buffer(
+            "dataset_loss_scale",
+            torch.ones(num_datasets, dtype=torch.float32),
+            persistent=True,
+        )
+        self.register_buffer(
+            "dataset_loss_scale_initialized",
+            torch.zeros(num_datasets, dtype=torch.bool),
+            persistent=True,
+        )
+
+        # Per-dataset plateau loss-weight schedule (soft per-task early stopping).
+        # When a dataset's val_nll stops improving for `patience` validations,
+        # its training loss weight is multiplied by `decay` (floored at
+        # `min_weight`). The small/sparse dataset that overfits early thus stops
+        # driving updates and its val curve flattens, while datasets still
+        # improving keep weight 1.0. Updated in on_validation_epoch_end from the
+        # logged val_nll/<name>. See
+        # "memory documents/dataset_loss_scale_normalization.md".
+        self.dataset_loss_weight_schedule_enabled = bool(
+            getattr(loss_cfg, "dataset_loss_weight_schedule", False)
+        )
+        self.dataset_loss_weight_patience = int(
+            getattr(loss_cfg, "dataset_loss_weight_patience", 3)
+        )
+        self.dataset_loss_weight_decay = float(
+            getattr(loss_cfg, "dataset_loss_weight_decay", 0.5)
+        )
+        self.dataset_loss_weight_min = float(
+            getattr(loss_cfg, "dataset_loss_weight_min", 0.1)
+        )
+        self.dataset_loss_weight_min_delta = float(
+            getattr(loss_cfg, "dataset_loss_weight_min_delta", 0.0)
+        )
+        # w_d (applied to the loss), best val_nll seen, and the no-improvement
+        # counter — per global dataset id, persisted so a resume keeps the
+        # schedule state.
+        self.register_buffer(
+            "dataset_loss_weight",
+            torch.ones(num_datasets, dtype=torch.float32),
+            persistent=True,
+        )
+        self.register_buffer(
+            "dataset_loss_weight_best_nll",
+            torch.full((num_datasets,), float("inf"), dtype=torch.float32),
+            persistent=True,
+        )
+        self.register_buffer(
+            "dataset_loss_weight_bad_epochs",
+            torch.zeros(num_datasets, dtype=torch.int64),
+            persistent=True,
+        )
+
+        # Running per-dataset sample count (training only), used to scale the
+        # optional hierarchical-shrinkage penalty so the smallest dataset shrinks
+        # the most (the "partial pooling" inductive bias). See _dataset_pooling_loss.
+        self.register_buffer(
+            "dataset_seen_count",
+            torch.zeros(num_datasets, dtype=torch.float64),
+            persistent=True,
+        )
+
+        # Per-dataset EMA self-shrinkage of log_sigma (option 2a). Anchors each
+        # dataset's dispersion to its OWN running history (not the cross-dataset
+        # mean), so a head cannot drift to extremes late in training (overfit)
+        # while legitimately different levels (e.g. kutay's sharp sigma) are kept.
+        # See _dataset_log_sigma_self_target and the pooling guide.
+        self.dataset_log_sigma_self_reg_weight = float(
+            getattr(loss_cfg, "dataset_log_sigma_self_reg_weight", 0.0)
+        )
+        self.dataset_log_sigma_self_reg_ema_decay = float(
+            getattr(loss_cfg, "dataset_log_sigma_self_reg_ema_decay", 0.99)
+        )
+        self.register_buffer(
+            "dataset_log_sigma_ema",
+            torch.zeros(num_datasets, dtype=torch.float32),
+            persistent=True,
+        )
+        self.register_buffer(
+            "dataset_log_sigma_ema_initialized",
+            torch.zeros(num_datasets, dtype=torch.bool),
+            persistent=True,
+        )
+
     def _build_loss(self) -> nn.Module:
         loss_cfg = self.config.loss
 
@@ -559,10 +469,9 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 return default
 
         likelihood = str(loss_cfg.profile_likelihood).lower()
-        lognormal_likelihoods = {"left_censored_lognormal", "lcln", "lognormal"}
         poisson_likelihoods = {"poisson", "poisson_pseudo"}
         nb_likelihoods = {"negative_binomial", "nb", "nb_pseudo"}
-        valid_likelihoods = lognormal_likelihoods | poisson_likelihoods | nb_likelihoods
+        valid_likelihoods = poisson_likelihoods | nb_likelihoods
         if likelihood not in valid_likelihoods:
             raise ValueError(
                 "Unsupported profile likelihood. "
@@ -577,36 +486,13 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 mu_max=loss_cfg.mu_max,
             )
 
-        if likelihood in nb_likelihoods:
-            return NegativeBinomialProfileLoss(
-                eps=loss_cfg.eps,
-                mu_min=loss_cfg.mu_min,
-                mu_max=loss_cfg.mu_max,
-                log_alpha_min=float(loss_cfg_get("nb_log_alpha_min", -10.0)),
-                log_alpha_max=float(loss_cfg_get("nb_log_alpha_max", 10.0)),
-                sequence_reduction=str(loss_cfg_get("nb_sequence_reduction", "mean")),
-            )
-
-        sigma_min = loss_cfg_get("sigma_min", None)
-        if sigma_min is None:
-            sigma_min = loss_cfg_get("log_sigma_min", 0.05)
-
-        sigma_max = loss_cfg_get("sigma_max", None)
-        if sigma_max is None:
-            sigma_max = loss_cfg_get("log_sigma_max", 3.0)
-
-        return LeftCensoredLogNormalLoss(
+        return NegativeBinomialProfileLoss(
             eps=loss_cfg.eps,
             mu_min=loss_cfg.mu_min,
             mu_max=loss_cfg.mu_max,
-            sigma_min=sigma_min,
-            sigma_max=sigma_max,
-            censor_threshold=loss_cfg.censor_threshold,
-            mu_parameterization=getattr(
-                loss_cfg,
-                "lognormal_mu_parameterization",
-                None,
-            ),
+            log_alpha_min=float(loss_cfg_get("nb_log_alpha_min", -10.0)),
+            log_alpha_max=float(loss_cfg_get("nb_log_alpha_max", 10.0)),
+            sequence_reduction=str(loss_cfg_get("nb_sequence_reduction", "mean")),
         )
 
     # ============================================================
@@ -667,8 +553,34 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         values: torch.Tensor,
         dataset_ids: torch.Tensor,
         _ds_split: "tuple[torch.Tensor, int] | None" = None,
+        apply_scale_norm: bool = False,
+        apply_task_weight: bool = False,
     ) -> torch.Tensor:
-        if not self.config.loss.dataset_balanced_loss:
+        """
+        Combine a per-sample quantity into a single scalar.
+
+        Three orthogonal axes (all ablatable via config):
+          - dataset_balanced_loss: average per-dataset means with EQUAL weight
+            per dataset (removes the sample-COUNT imbalance) instead of pooling
+            all samples (which weights by count).
+          - apply_scale_norm + dataset_loss_scale_normalization: divide each
+            dataset's mean by a detached EMA of its own MAGNITUDE before
+            combining (removes the gradient-MAGNITUDE imbalance). Only passed
+            True for the NLL term; PCC/MSE are already comparable across
+            datasets.
+          - apply_task_weight + dataset_loss_weight_schedule: multiply each
+            dataset's mean by its plateau loss weight w_d (soft per-task early
+            stopping). Passed True only for the loss-component terms (mu_pcc_loss
+            and the NLL), never for logged metrics. NOT renormalized: datasets
+            still at w_d=1 keep their full gradient; a decayed dataset simply
+            fades out. See "memory documents/dataset_loss_scale_normalization.md".
+        """
+        scale_norm = apply_scale_norm and self.dataset_loss_scale_norm_enabled
+        task_weight = apply_task_weight and self.dataset_loss_weight_schedule_enabled
+        balanced = bool(self.config.loss.dataset_balanced_loss)
+
+        # Fast path: nothing to group by.
+        if not balanced and not scale_norm and not task_weight:
             return values.mean()
 
         if _ds_split is None:
@@ -684,7 +596,266 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             0, inverse, values
         )
         counts = torch.bincount(inverse, minlength=K).to(dtype=values.dtype)
-        return (sums / counts.clamp_min(1.0)).mean()
+        per_ds_mean = sums / counts.clamp_min(1.0)
+
+        # sorted unique global ids correspond 1:1 to group order in `inverse`
+        global_ids = (
+            torch.unique(dataset_ids.to(device=values.device))
+            if (scale_norm or task_weight)
+            else None
+        )
+
+        if scale_norm:
+            scale = self._dataset_loss_scale_for(global_ids, per_ds_mean)
+            per_ds_mean = per_ds_mean / scale
+
+        if task_weight:
+            w = self.dataset_loss_weight[global_ids.long()].to(per_ds_mean.dtype)
+            per_ds_mean = per_ds_mean * w
+
+        if balanced:
+            # equal weight per dataset
+            return per_ds_mean.mean()
+        # count-weighted recombination (preserves the un-balanced semantics
+        # while still applying the per-dataset scale normalization)
+        return (per_ds_mean * counts).sum() / counts.sum().clamp_min(1.0)
+
+    def _dataset_loss_scale_for(
+        self,
+        global_ids: torch.Tensor,
+        per_ds_mean: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Return a detached, positive per-dataset scale used to normalize the
+        loss magnitude. During training, update the EMA buffer in place:
+            first time a dataset is seen -> initialize to its current magnitude
+            afterwards                   -> EMA of |per-dataset mean|.
+        During val/test the buffer is frozen, so the same (training-derived)
+        normalization is applied — keeping val metrics comparable to train.
+        """
+        ids = global_ids.long()
+        magnitude = per_ds_mean.detach().abs().to(self.dataset_loss_scale.dtype)
+
+        if self.training:
+            decay = self.dataset_loss_scale_ema_decay
+            current = self.dataset_loss_scale[ids]
+            seen = self.dataset_loss_scale_initialized[ids]
+            updated = torch.where(
+                seen,
+                decay * current + (1.0 - decay) * magnitude,
+                magnitude,
+            )
+            self.dataset_loss_scale[ids] = updated
+            self.dataset_loss_scale_initialized[ids] = torch.ones_like(seen)
+
+        scale = self.dataset_loss_scale[ids].clamp_min(self.dataset_loss_scale_eps)
+        return scale.to(per_ds_mean.dtype)
+
+    def _dataset_pool_size_weights(
+        self,
+        global_ids: torch.Tensor,
+        dataset_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Detached per-dataset shrinkage weights `s_d = (mean_count / N_d)^exponent`,
+        so smaller datasets are shrunk harder toward the shared baseline (the
+        hierarchical `theta_d ~ N(theta_global, tau^2)` prior gets stronger as
+        N_d shrinks). `exponent = 0` recovers a uniform ridge (no size scaling).
+        N_d is estimated online from the training stream so no datamodule
+        plumbing is needed.
+        """
+        if self.training:
+            counts = torch.bincount(
+                dataset_ids.long(), minlength=self.dataset_seen_count.numel()
+            ).to(self.dataset_seen_count.dtype)
+            self.dataset_seen_count += counts
+
+        exponent = float(getattr(self.config.loss, "dataset_pool_size_exponent", 1.0))
+        c = self.dataset_seen_count[global_ids.long()].clamp_min(1.0)
+        if exponent == 0.0:
+            return torch.ones_like(c, dtype=torch.float32)
+        w = (c.mean() / c).pow(exponent)
+        return w.detach().to(torch.float32)
+
+    def _dataset_pooling_loss(
+        self,
+        out: dict[str, Any],
+        dataset_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Optional hierarchical-shrinkage (partial-pooling) penalty on the
+        per-dataset heads — a pure loss add-on; touches no head class.
+
+        - Visibility: pulls each dataset's `log_visibility_bias` toward 0
+          (beta -> 1, the shared "no idiosyncratic visibility bias" baseline).
+        - Dispersion (cross-dataset): pulls each dataset's mean `log_sigma`
+          toward the detached cross-dataset mean (datasets share a dispersion
+          level; the small one borrows it). UNSAFE when a dataset's dispersion is
+          legitimately different — see the pooling guide.
+        - Dispersion (self, option 2a): pulls each dataset's mean `log_sigma`
+          toward its OWN running EMA, so the head cannot drift to extremes late
+          in training (overfit) while each dataset keeps its own level. No
+          cross-dataset coupling, so it is safe even when levels differ.
+
+        Each dataset's term is weighted by `_dataset_pool_size_weights`, then a
+        size-weighted mean is taken so the strength stays interpretable and the
+        smallest dataset is shrunk the most. Off (returns 0) when all weights
+        are 0. See "memory documents/hierarchical_pooling_hyperparameters.md".
+        """
+        target = out["target"]
+        zero = torch.zeros((), device=target.device, dtype=torch.float32)
+
+        vw = float(getattr(self.config.loss, "dataset_pool_visibility_weight", 0.0))
+        sw = float(getattr(self.config.loss, "dataset_pool_log_sigma_weight", 0.0))
+        self_w = self.dataset_log_sigma_self_reg_weight
+        if vw <= 0.0 and sw <= 0.0 and self_w <= 0.0:
+            return zero
+
+        mask_f = out["mask"].bool().to(torch.float32)
+        valid_len = mask_f.sum(dim=1).clamp_min(1.0)  # [B]
+
+        global_ids, inverse = torch.unique(
+            dataset_ids.to(device=target.device), return_inverse=True
+        )
+        K = int(global_ids.numel())
+        size_w = self._dataset_pool_size_weights(global_ids, dataset_ids)
+        size_w_sum = size_w.sum().clamp_min(1.0e-8)
+
+        def _per_dataset_mean(per_sample: torch.Tensor) -> torch.Tensor:
+            sums = torch.zeros(K, device=per_sample.device, dtype=per_sample.dtype)
+            sums = sums.scatter_add_(0, inverse, per_sample)
+            counts = torch.bincount(inverse, minlength=K).to(per_sample.dtype)
+            return sums / counts.clamp_min(1.0)
+
+        loss = zero
+        if vw > 0.0:
+            log_bias = out["extras"]["log_visibility_bias"].to(torch.float32)
+            # mean bias^2 over valid positions per transcript -> per dataset
+            per_sample = (log_bias.pow(2) * mask_f).sum(dim=1) / valid_len
+            per_ds = _per_dataset_mean(per_sample)
+            loss = loss + vw * (size_w * per_ds).sum() / size_w_sum
+
+        if sw > 0.0 or self_w > 0.0:
+            log_sigma = out["extras"]["log_sigma"].to(torch.float32)
+            per_sample_ls = (log_sigma * mask_f).sum(dim=1) / valid_len
+            per_ds_ls = _per_dataset_mean(per_sample_ls)
+
+            if sw > 0.0:
+                global_ls = per_ds_ls.mean().detach()  # pooled target (stop-grad)
+                loss = loss + sw * (size_w * (per_ds_ls - global_ls).pow(2)).sum() / size_w_sum
+
+            if self_w > 0.0:
+                # Anchor to each dataset's OWN EMA history (detached) — resists
+                # late overfit drift without coupling datasets together.
+                self_target = self._dataset_log_sigma_self_target(global_ids, per_ds_ls)
+                loss = loss + self_w * (size_w * (per_ds_ls - self_target).pow(2)).sum() / size_w_sum
+
+        return loss
+
+    def _dataset_log_sigma_self_target(
+        self,
+        global_ids: torch.Tensor,
+        per_ds_ls: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Return the detached per-dataset EMA of mean log_sigma used as the
+        self-shrinkage target, and (training only) advance the EMA toward the
+        current value. First time a dataset is seen the target equals its current
+        value (no penalty), so the anchor never injects a transient. The penalty
+        `(per_ds_ls - target)^2` therefore measures drift away from the dataset's
+        own recent history; a slower `ema_decay` gives a longer-memory leash.
+        """
+        ids = global_ids.long()
+        value = per_ds_ls.detach().to(self.dataset_log_sigma_ema.dtype)
+        seen = self.dataset_log_sigma_ema_initialized[ids]
+        old = self.dataset_log_sigma_ema[ids]
+        # pre-update target: old EMA where seen, else current value
+        target = torch.where(seen, old, value)
+
+        if self.training:
+            decay = self.dataset_log_sigma_self_reg_ema_decay
+            updated = torch.where(seen, decay * old + (1.0 - decay) * value, value)
+            self.dataset_log_sigma_ema[ids] = updated
+            self.dataset_log_sigma_ema_initialized[ids] = torch.ones_like(seen)
+
+        return target.to(per_ds_ls.dtype)
+
+    def _beta_cross_dataset_center_loss(
+        self,
+        out: dict[str, Any],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Cross-dataset visibility-bias neutrality (identifiability gauge).
+
+        For a transcript t measured in datasets D(t), the centered log
+        visibility bias is required to average to zero across datasets at every
+        position:
+
+            mean_{d in D(t)} log beta_{d,t,i} = 0   for all i.
+
+        Any per-position shape that is COMMON to all datasets is thereby forced
+        out of the bias branch and into the shared biological factor rho (the
+        only factor that can still fit it), keeping biology out of beta.
+        Dataset-SPECIFIC deviations are unconstrained (they can arrange a zero
+        cross-dataset mean). Only transcripts present in >= 2 datasets within the
+        batch contribute, so a transcript-grouped sampler
+        (train_sampling_strategy=transcript_grouped_multidataset_pairs) is
+        required for the same transcript's dataset copies to co-occur in a batch.
+
+        Returns (loss, mean_abs_diag), both 0-dim tensors. Uses the centered
+        log_visibility_bias (the quantity that actually forms beta in mu), so it
+        is in the same gauge as the prediction.
+        """
+        log_vis = out["extras"]["log_visibility_bias"].float()  # [B, T] centered, masked
+        mask_f = out["mask"].bool().to(dtype=log_vis.dtype)      # [B, T]
+        device = log_vis.device
+        zero = torch.zeros((), device=device, dtype=log_vis.dtype)
+
+        ids = out.get("ids")
+        B, T = log_vis.shape
+        if ids is None or len(ids) != B or B == 0:
+            return zero, zero
+
+        # Transcript identity is a list of string ids; map to integer group idx.
+        id_to_group: dict[str, int] = {}
+        inv: list[int] = []
+        for x in ids:
+            key = str(x)
+            g = id_to_group.get(key)
+            if g is None:
+                g = len(id_to_group)
+                id_to_group[key] = g
+            inv.append(g)
+        G = len(id_to_group)
+        group_idx = torch.as_tensor(inv, device=device, dtype=torch.long)  # [B]
+
+        # Per (transcript group, position): sum and count of valid log beta.
+        sum_gt = torch.zeros((G, T), device=device, dtype=log_vis.dtype)
+        cnt_gt = torch.zeros((G, T), device=device, dtype=log_vis.dtype)
+        sum_gt.index_add_(0, group_idx, log_vis * mask_f)
+        cnt_gt.index_add_(0, group_idx, mask_f)
+        mean_gt = sum_gt / cnt_gt.clamp_min(1.0)                 # [G, T] cross-dataset mean
+        valid_gt = (cnt_gt > 0).to(log_vis.dtype)
+
+        # rows-per-group == distinct datasets per group (flat pairs are unique
+        # (transcript, dataset)); single-dataset transcripts give no meaningful
+        # cross-dataset mean and must be excluded.
+        rows_per_group = torch.zeros((G,), device=device, dtype=log_vis.dtype)
+        rows_per_group.index_add_(
+            0, group_idx, torch.ones((B,), device=device, dtype=log_vis.dtype)
+        )
+        qualifying = (rows_per_group >= 2.0).to(log_vis.dtype)   # [G]
+        denom = qualifying.sum()
+        if float(denom) == 0.0:
+            return zero, zero
+
+        pos_per_group = valid_gt.sum(dim=1).clamp_min(1.0)       # [G]
+        per_group_sq = (mean_gt.pow(2) * valid_gt).sum(dim=1) / pos_per_group   # [G]
+        per_group_abs = (mean_gt.abs() * valid_gt).sum(dim=1) / pos_per_group   # [G]
+
+        loss = (per_group_sq * qualifying).sum() / denom
+        diag = (per_group_abs * qualifying).sum() / denom
+        return loss, diag
 
     def _pearson_per_sample(
         self,
@@ -692,6 +863,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         target: torch.Tensor,
         mask: torch.Tensor,
         eps: float = 1.0e-8,
+        power: float = 1.0,
     ) -> torch.Tensor:
         pred = pred.float()
         target = target.float()
@@ -700,6 +872,15 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
         pred = torch.where(mask_b, pred, torch.zeros_like(pred)) * mask_f
         target = torch.where(mask_b, target, torch.zeros_like(target)) * mask_f
+
+        # Optional power transform on the non-negative profiles before
+        # correlating (the reported mu_pcc passes power=1.0 and stays raw).
+        # power > 1 gives peak emphasis -- high positions dominate the fit
+        # (CSS / stalling-site recovery). 0^p = 0 keeps masked positions at zero.
+        if power != 1.0:
+            p = max(float(power), eps)
+            pred = pred.clamp_min(0.0).pow(p) * mask_f
+            target = target.clamp_min(0.0).pow(p) * mask_f
 
         valid_len = mask_f.sum(dim=1).clamp_min(1.0)
 
@@ -1082,167 +1263,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         if isinstance(self.loss_fn, PoissonProfileLoss):
             return self._poisson_position_diagnostics(out)
 
-        if not isinstance(self.loss_fn, LeftCensoredLogNormalLoss):
-            return {}
-
-        with torch.no_grad(), torch.amp.autocast(
-            device_type=out["mu"].device.type,
-            enabled=False,
-        ):
-            target_raw = out["target"].float()
-            valid_mask = out["mask"].bool() & torch.isfinite(target_raw)
-
-            y = torch.nan_to_num(
-                target_raw.to(torch.float64),
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
-            ).clamp_min(0.0)
-
-            mu = torch.nan_to_num(
-                out["mu"].float().to(torch.float64),
-                nan=self.loss_fn.mu_min,
-                posinf=self.loss_fn.mu_max,
-                neginf=self.loss_fn.mu_min,
-            ).clamp(min=self.loss_fn.mu_min, max=self.loss_fn.mu_max)
-            log_sigma = self.loss_fn._broadcast_profile_param(
-                out["log_sigma"].float().to(torch.float64),
-                y.shape,
-            )
-
-            log_loc, sigma = self.loss_fn._lognormal_params(
-                mu=mu,
-                log_sigma=log_sigma,
-            )
-
-            log_y = torch.log(y.clamp_min(self.loss_fn.eps))
-            z = (log_y - log_loc) / sigma.clamp_min(self.loss_fn.eps)
-            positive_nll = (
-                log_y
-                + torch.log(sigma.clamp_min(self.loss_fn.eps))
-                + 0.5 * math.log(2.0 * math.pi)
-                + 0.5 * z.pow(2)
-            )
-
-            if self.loss_fn.censor_threshold > 0.0:
-                c = torch.tensor(
-                    self.loss_fn.censor_threshold,
-                    device=y.device,
-                    dtype=torch.float64,
-                ).clamp_min(self.loss_fn.eps)
-                z_c = (torch.log(c) - log_loc) / sigma.clamp_min(self.loss_fn.eps)
-                log_cdf = self.loss_fn._log_normal_cdf_standard(z_c)
-                censored_nll = -log_cdf
-                censored_prob = torch.exp(log_cdf).clamp(0.0, 1.0)
-                is_censored = y <= self.loss_fn.censor_threshold
-            else:
-                censored_nll = torch.full_like(positive_nll, 1.0e8)
-                censored_prob = torch.zeros_like(positive_nll)
-                is_censored = y <= 0.0
-
-            nll = torch.where(is_censored, censored_nll, positive_nll)
-            nll = torch.nan_to_num(nll, nan=0.0, posinf=1.0e8, neginf=1.0e8)
-            valid_mask = valid_mask & torch.isfinite(nll)
-            censored_mask = valid_mask & is_censored
-            positive_mask = valid_mask & ~is_censored
-
-            valid_count = valid_mask.to(dtype=torch.float64).sum().clamp_min(1.0)
-            log_residual = log_y - log_loc
-            abs_log_residual = log_residual.abs()
-            abs_z = z.abs()
-            positive_mean = torch.exp(log_loc + 0.5 * sigma.pow(2))
-            positive_mean = torch.nan_to_num(
-                positive_mean,
-                nan=self.loss_fn.mu_min,
-                posinf=self.loss_fn.mu_max,
-                neginf=self.loss_fn.mu_min,
-            ).clamp(min=self.loss_fn.mu_min, max=self.loss_fn.mu_max)
-
-            metrics: dict[str, torch.Tensor] = {
-                "nll_censored": self._masked_mean(nll, censored_mask).float(),
-                "nll_positive": self._masked_mean(nll, positive_mask).float(),
-                "nll_censored_contrib": (
-                    self._masked_sum(nll, censored_mask) / valid_count
-                ).float(),
-                "nll_positive_contrib": (
-                    self._masked_sum(nll, positive_mask) / valid_count
-                ).float(),
-                "nll_censored_frac": self._masked_fraction(
-                    censored_mask,
-                    valid_mask,
-                ).to(device=nll.device),
-                "nll_positive_frac": self._masked_fraction(
-                    positive_mask,
-                    valid_mask,
-                ).to(device=nll.device),
-                "censored_prob_mean": self._masked_mean(
-                    censored_prob,
-                    valid_mask,
-                ).float(),
-                "censored_prob_on_censored": self._masked_mean(
-                    censored_prob,
-                    censored_mask,
-                ).float(),
-                "censored_prob_on_positive": self._masked_mean(
-                    censored_prob,
-                    positive_mask,
-                ).float(),
-                "positive_log_residual_mean": self._masked_mean(
-                    log_residual,
-                    positive_mask,
-                ).float(),
-                "positive_log_residual_std": self._masked_std(
-                    log_residual,
-                    positive_mask,
-                ).float(),
-                "positive_abs_log_residual_mean": self._masked_mean(
-                    abs_log_residual,
-                    positive_mask,
-                ).float(),
-                "positive_z_mean": self._masked_mean(z, positive_mask).float(),
-                "positive_z_std": self._masked_std(z, positive_mask).float(),
-                "positive_abs_z_mean": self._masked_mean(abs_z, positive_mask).float(),
-                "sigma_mean": self._masked_mean(sigma, valid_mask).float(),
-                "sigma_censored_mean": self._masked_mean(
-                    sigma,
-                    censored_mask,
-                ).float(),
-                "sigma_positive_mean": self._masked_mean(
-                    sigma,
-                    positive_mask,
-                ).float(),
-                "pred_mean_censored_mean": self._masked_mean(
-                    positive_mean,
-                    censored_mask,
-                ).float(),
-                "pred_mean_positive_mean": self._masked_mean(
-                    positive_mean,
-                    positive_mask,
-                ).float(),
-            }
-
-            c_val = float(self.loss_fn.censor_threshold)
-            bins = self._positive_quantile_bins(
-                values=y,
-                y=y,
-                valid_mask=valid_mask,
-                threshold=c_val,
-            )
-            self._add_target_bin_calibration_metrics(
-                metrics=metrics,
-                bins=bins,
-                y=y,
-                pred=positive_mean,
-                valid_mask=valid_mask,
-            )
-            self._add_positive_quantile_threshold_metrics(
-                metrics=metrics,
-                y=y,
-                valid_mask=valid_mask,
-                threshold=c_val,
-            )
-
-            return metrics
+        return {}
 
     def _poisson_position_diagnostics(
         self,
@@ -1592,6 +1613,18 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             target=target.float(),
             mask=mask,
         )
+        # Quantity that actually drives the loss. Identical to mu_pcc_per_sample
+        # unless power-space (peak emphasis) is configured. The raw mu_pcc above
+        # remains the reported metric / val monitor.
+        if self.mu_pcc_power_space and self.mu_pcc_power_exponent != 1.0:
+            mu_pcc_for_loss_per_sample = self._pearson_per_sample(
+                pred=likelihood_positive_mean,
+                target=target.float(),
+                mask=mask,
+                power=self.mu_pcc_power_exponent,
+            )
+        else:
+            mu_pcc_for_loss_per_sample = mu_pcc_per_sample
         mu_mse_per_sample = self._mse_per_sample(
             pred=likelihood_positive_mean,
             target=target,
@@ -1608,7 +1641,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
         # Loss = 1 - PCC so that minimising loss maximises correlation.
         pcc_loss_per_sample = 1.0 - support_pcc_per_sample
-        mu_pcc_loss_per_sample = 1.0 - mu_pcc_per_sample
+        mu_pcc_loss_per_sample = 1.0 - mu_pcc_for_loss_per_sample
         pcc_loss = self._aggregate_per_sample(
             pcc_loss_per_sample,
             dataset_ids,
@@ -1618,6 +1651,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             mu_pcc_loss_per_sample,
             dataset_ids,
             _ds_split,
+            apply_task_weight=True,
         )
         support_pcc = self._aggregate_per_sample(
             support_pcc_per_sample,
@@ -1676,13 +1710,14 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             metrics["j_centering_loss"] = j_centering_loss
 
         log_sigma_reg_weight = float(getattr(self.config.loss, "log_sigma_reg_weight", 0.0))
-        log_sigma_reg_target = float(getattr(self.config.loss, "log_sigma_reg_target", 0.0))
         log_sigma_reg_loss = torch.zeros((), device=support.device, dtype=support.dtype)
         if log_sigma_reg_weight > 0.0 and not isinstance(self.loss_fn, PoissonProfileLoss):
             log_sigma_t = out["extras"]["log_sigma_t"].float()  # [B, 1]
-            log_sigma_reg_loss = log_sigma_reg_weight * (
-                log_sigma_t - log_sigma_reg_target
-            ).pow(2).mean()
+            # Magnitude (L2-toward-zero) shrinkage: keep the dispersion low
+            # without anchoring it to a specific target value. log_sigma is the
+            # NB log_alpha, so this discourages large overdispersion (the main
+            # NLL overfitting channel) while leaving its sign/shape free.
+            log_sigma_reg_loss = log_sigma_reg_weight * log_sigma_t.pow(2).mean()
             metrics["log_sigma_reg_loss"] = log_sigma_reg_loss
 
         ts_centering_weight = float(getattr(self.config.loss, "transcript_scale_centering_weight", 0.0))
@@ -1704,30 +1739,67 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 transcript_scale_centering_loss = ts_centering_weight * torch.stack(per_ds).mean()
             metrics["transcript_scale_centering_loss"] = transcript_scale_centering_loss
 
+        # Optional hierarchical-shrinkage (partial pooling) of the per-dataset
+        # heads. Zero unless dataset_pool_*_weight > 0. Shrinks small datasets
+        # harder toward the shared baseline so they cannot overfit their own
+        # visibility/dispersion heads.
+        dataset_pool_loss = self._dataset_pooling_loss(out, dataset_ids).to(support.dtype)
+        if dataset_pool_loss.requires_grad or float(dataset_pool_loss) != 0.0:
+            metrics["dataset_pool_loss"] = dataset_pool_loss
+
+        # Cross-dataset beta-neutrality (identifiability gauge): forces per-position
+        # profile shape that is COMMON across datasets out of the bias branch and
+        # into the shared biological factor rho. Requires a transcript-grouped
+        # sampler. Zero (no behavior change) unless the weight is > 0.
+        beta_xdc_weight = float(
+            getattr(self.config.loss, "beta_cross_dataset_center_weight", 0.0)
+        )
+        beta_xdc_loss = torch.zeros((), device=support.device, dtype=support.dtype)
+        if beta_xdc_weight > 0.0:
+            raw_xdc, xdc_diag = self._beta_cross_dataset_center_loss(out)
+            beta_xdc_loss = (beta_xdc_weight * raw_xdc).to(support.dtype)
+            metrics["beta_cross_dataset_center"] = beta_xdc_loss
+            metrics["beta_cross_dataset_logabs"] = xdc_diag.to(support.dtype)
+
         if mode == "pcc_only":
-            metrics["loss"] = pcc_loss + mu_pcc_loss + j_centering_loss + log_sigma_reg_loss + transcript_scale_centering_loss
+            metrics["loss"] = mu_pcc_loss + j_centering_loss + log_sigma_reg_loss + transcript_scale_centering_loss + dataset_pool_loss + beta_xdc_loss
             metrics["loss_per_sample"] = (
-                pcc_loss_per_sample + mu_pcc_loss_per_sample
+                mu_pcc_loss_per_sample
             )
             return metrics
 
         nll_per_sample = self._profile_nll_per_sample(out)
+        # Raw, interpretable aggregate NLL — logged as <stage>_nll and directly
+        # comparable to the per-dataset <stage>_nll/<name> series (it is their
+        # equal- or count-weighted mean depending on dataset_balanced_loss).
+        # Does NOT touch the per-dataset EMA buffers.
         nll = self._aggregate_per_sample(nll_per_sample, dataset_ids, _ds_split)
+        # Scale-normalized aggregate actually summed into the optimized loss.
+        # Identical to `nll` when dataset_loss_scale_normalization is false;
+        # otherwise each dataset is divided by its detached EMA magnitude (this
+        # call is what updates the EMA buffers). Kept separate from `nll` so the
+        # logged diagnostic stays interpretable.
+        nll_for_loss = self._aggregate_per_sample(
+            nll_per_sample, dataset_ids, _ds_split,
+            apply_scale_norm=True, apply_task_weight=True
+        )
 
         metrics["nll"] = nll
         metrics["nll_per_sample"] = nll_per_sample
+        if self.dataset_loss_scale_norm_enabled:
+            # What the optimizer actually sees (in normalized units, ~O(1)).
+            metrics["nll_scaled"] = nll_for_loss
         metrics.update(self._likelihood_position_diagnostics(out))
 
         if mode == "likelihood_only":
-            metrics["loss"] = nll + j_centering_loss + log_sigma_reg_loss + transcript_scale_centering_loss
+            metrics["loss"] = nll_for_loss + j_centering_loss + log_sigma_reg_loss + transcript_scale_centering_loss + dataset_pool_loss + beta_xdc_loss
             metrics["loss_per_sample"] = nll_per_sample
             return metrics
 
         if mode == "pcc_likelihood":
-            metrics["loss"] = pcc_loss + mu_pcc_loss + nll + j_centering_loss + log_sigma_reg_loss + transcript_scale_centering_loss
+            metrics["loss"] = mu_pcc_loss + nll_for_loss + j_centering_loss + log_sigma_reg_loss + transcript_scale_centering_loss + dataset_pool_loss + beta_xdc_loss
             metrics["loss_per_sample"] = (
-                pcc_loss_per_sample
-                + mu_pcc_loss_per_sample
+                mu_pcc_loss_per_sample
                 + nll_per_sample
             )
             return metrics
@@ -2284,6 +2356,13 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         }
 
     def on_validation_epoch_end(self) -> None:
+        # Log a scale-free, cross-dataset-comparable objective: the UNWEIGHTED
+        # mean of the per-dataset val_mu_pcc. The pooled val_loss is dominated
+        # by the high-count / large-magnitude-NLL datasets, so we monitor this
+        # instead (see config optim.scheduler.monitor: val_mean_mu_pcc).
+        self._log_mean_mu_pcc()
+        self._update_dataset_loss_weight_schedule()
+
         if not self.use_cagrad:
             return
 
@@ -2293,6 +2372,92 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
         if metric is not None:
             scheduler.step(metric)
+
+    def _log_mean_mu_pcc(self) -> None:
+        """
+        Aggregates the per-dataset ``val_mu_pcc/<name>`` series (already
+        epoch-reduced into ``trainer.callback_metrics``) into a single
+        ``val_mean_mu_pcc`` with equal weight per dataset. This is the metric
+        the scheduler / checkpoint / early-stopping monitor.
+
+        With a single active dataset the per-dataset series is not emitted
+        (see ``_log_per_dataset_metrics``); fall back to the aggregate
+        ``val_mu_pcc`` so the monitored metric is always present.
+        """
+        callback_metrics = self.trainer.callback_metrics
+        prefix = "val_mu_pcc/"
+        per_dataset = [
+            value
+            for name, value in callback_metrics.items()
+            if name.startswith(prefix) and value is not None
+        ]
+
+        if per_dataset:
+            mean_mu_pcc = torch.stack(
+                [v.detach().to(self.device).float() for v in per_dataset]
+            ).mean()
+        else:
+            fallback = callback_metrics.get("val_mu_pcc")
+            if fallback is None:
+                return
+            mean_mu_pcc = fallback.detach().to(self.device).float()
+
+        self.log(
+            "val_mean_mu_pcc",
+            mean_mu_pcc,
+            prog_bar=True,
+            sync_dist=self.config.trainer.sync_dist_logs,
+        )
+
+    def _update_dataset_loss_weight_schedule(self) -> None:
+        """
+        Soft per-task early stopping. After each validation, compare every
+        dataset's ``val_nll/<name>`` against its best-so-far. A dataset that has
+        not improved by ``min_delta`` for ``patience`` consecutive validations
+        has its training loss weight ``w_d`` multiplied by ``decay`` (floored at
+        ``min_weight``) and its counter reset, so the decay happens once per
+        ``patience`` window. The resulting ``w_d`` is applied in
+        ``_aggregate_per_sample`` (apply_task_weight=True) and logged as
+        ``dataset_loss_weight/<name>``.
+
+        Skipped during the sanity-check validation (no real training has
+        happened yet) so a transient first value cannot latch the schedule.
+        """
+        if not self.dataset_loss_weight_schedule_enabled:
+            return
+        if getattr(self.trainer, "sanity_checking", False):
+            return
+
+        callback_metrics = self.trainer.callback_metrics
+        name_to_id = {name: ds_id for ds_id, name in self.dataset_id_to_name.items()}
+        sync_dist = self.config.trainer.sync_dist_logs
+
+        for name, ds_id in name_to_id.items():
+            metric = callback_metrics.get(f"val_nll/{name}")
+            if metric is None:
+                continue
+            cur = float(metric.detach().float().item())
+
+            best = float(self.dataset_loss_weight_best_nll[ds_id].item())
+            if cur < best - self.dataset_loss_weight_min_delta:
+                self.dataset_loss_weight_best_nll[ds_id] = cur
+                self.dataset_loss_weight_bad_epochs[ds_id] = 0
+            else:
+                self.dataset_loss_weight_bad_epochs[ds_id] += 1
+                if int(self.dataset_loss_weight_bad_epochs[ds_id].item()) >= self.dataset_loss_weight_patience:
+                    decayed = max(
+                        float(self.dataset_loss_weight[ds_id].item()) * self.dataset_loss_weight_decay,
+                        self.dataset_loss_weight_min,
+                    )
+                    self.dataset_loss_weight[ds_id] = decayed
+                    self.dataset_loss_weight_bad_epochs[ds_id] = 0
+
+            self.log(
+                f"dataset_loss_weight/{name}",
+                float(self.dataset_loss_weight[ds_id].item()),
+                prog_bar=False,
+                sync_dist=sync_dist,
+            )
 
     # ============================================================
     # Optimizer

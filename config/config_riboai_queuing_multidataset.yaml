@@ -8,11 +8,11 @@ experiment:
   from_checkpoint: false
   train: true
   predict: true
-  dataset: ["kutay_2021", "grimson_2019"]
+  dataset: ["kutay_2021", "sako_2020"]
   seed: 42
 
 split:
-  master_dataset_universe: ["grimson_2019", "kutay_2021"]
+  master_dataset_universe: ["sako_2020", "kutay_2021"]
   train_frac: 0.90
   main_val_frac: 0.10
   css_benchmark_frac: 0.00
@@ -36,11 +36,26 @@ data:
   batch_size: 32
   num_workers: 2
 
-  train_sampling_strategy: dataset_aware_balanced_pairs
-  dataset_balance_gamma: 1.0
+  # transcript_grouped_pairs co-batches the SAME transcript's dataset copies into
+  # one batch while keeping the FULL datasets (single-dataset transcripts are
+  # included). loss.beta_cross_dataset_center_weight uses the co-batched intersection
+  # transcripts and skips singleton groups via its rows>=2 filter, so the full data
+  # still trains normally. (transcript_grouped_multidataset_pairs would instead DROP
+  # every transcript not measured in >=2 datasets — only use it to train on the
+  # intersection.)
+  train_sampling_strategy: transcript_grouped_pairs
+  # With the grouped samplers, dataset_balance_gamma now also balances GROUP
+  # SELECTION: groups are drawn with replacement weighted by sum_d N_d^{-gamma}
+  # over their member datasets, so transcripts measured in a rare dataset (e.g.
+  # sako) are upsampled instead of being flooded by single-dataset groups of the
+  # abundant dataset (kutay). 0.0 -> uniform selection (legacy); higher -> closer
+  # to 1:1 per-dataset representation (~1.7:1 at 1.0, ~1.1:1 at 2.0 for 725/119).
+  dataset_balance_gamma: 2.0
   train_samples_per_epoch: null
 
-  datasets_per_batch: 2
+  # Unused by transcript_grouped_pairs (it packs transcript groups into batches of
+  # batch_size); only used by dataset_aware_balanced_pairs.
+  datasets_per_batch: 16
 
   pin_memory: false
   prefetch_factor: 2
@@ -61,13 +76,13 @@ model:
     # Overridden at startup from loss.pcc_target:
     #   rho -> false, raw occupancy prediction
     #   q   -> true, causal queue propagation prediction
-    use_queue_propagation: true
+    use_queue_propagation: false
     # Init near "no coupling" but with a live gradient. Do NOT use 0.0: at the
     # alpha_min boundary sigmoid'(raw) ~ 0, so alpha would be frozen there.
     queue_propagation_alpha: 0.5
     # Effective only when loss.pcc_target is q.
     queue_propagation_learnable: true
-    queue_propagation_per_transcript: true
+    queue_propagation_per_transcript: false
     queue_propagation_alpha_min: 0.0
     queue_propagation_alpha_max: 0.95
     queue_propagation_q_max: 10.0
@@ -94,7 +109,7 @@ model:
     num_filters: 32
     kernel_size: 15
     context_cnn_dilations: [1, 2, 4, 8, 16, 32, 64]
-    context_cnn_dropout: 0.1
+    context_cnn_dropout: 0.5
     context_cnn_gated: false
     context_cnn_residual_scale: 1.0
 
@@ -124,8 +139,9 @@ model:
 
 loss:
   # pcc_only, likelihood_only, or pcc_likelihood.
-  # PCC is applied to rho/q support and the log-normal mean profile.
-  # Likelihood is applied to the full left-censored log-normal profile.
+  # The optimized PCC term is applied to the predicted mean profile.
+  # rho/q support PCC is logged as a metric but is not part of the loss.
+  # Likelihood is applied to the full profile.
   mode: pcc_likelihood
 
   # Quantity correlated against the observed profile. Also auto-controls
@@ -136,7 +152,7 @@ loss:
   #   q_occupancy  : 1 - exp(-q),   bounded in [0, 1), queue ON
   # 2x2 A/B matrix: rho vs occupancy isolates the bounded-mapping effect;
   # rho vs q (or occupancy vs q_occupancy) isolates queue propagation.
-  pcc_target: q
+  pcc_target: rho
   # Normalization for support-PCC targets. nonzero_quantile computes the scale
   # only over valid nonzero target positions, then clips normalized targets to 1.
   # This is more robust than max normalization when one codon has a noisy spike.
@@ -144,15 +160,22 @@ loss:
   support_target_quantile: 0.99
   support_target_min_scale: 1.0
 
-  # left_censored_lognormal, poisson, or negative_binomial.
+  # --- Power-space mu PCC loss (peak emphasis) ---
+  # The optimized mu_pcc_loss = 1 - PCC(positive_mean, target). When enabled,
+  # both prediction and target are raised to an exponent > 1 before correlating,
+  # so high (peak / stalling-site) positions dominate the fit. Use this when the
+  # objective is recovering peaks (e.g. CSS recall) rather than matching the
+  # low-occupancy bulk. exponent = 1.0 is a no-op (raw Pearson). The REPORTED
+  # mu_pcc metric (and val_mean_mu_pcc monitor) stays raw for continuity.
+  #   exponent > 1 : stronger peak emphasis (2.0 = squared)
+  mu_pcc_power_space: true
+  mu_pcc_power_exponent: 2.0
+
+  # poisson or negative_binomial.
   # poisson uses mu directly as the rate and ignores log_sigma.
   # negative_binomial uses the log_sigma head output as log_alpha:
   #   alpha = exp(log_alpha), r = 1 / alpha.
   profile_likelihood: negative_binomial
-  # positive_mean makes mu the log-normal mean; median makes mu the log-normal
-  # median (log_loc = log(mu)). With sigma predicted directly (no NB2 back-solve)
-  # both decouple location from dispersion equally; median is the simplest.
-  lognormal_mu_parameterization: median
   eps: 1.0e-8
 
   mu_min: 1.0e-8
@@ -164,42 +187,97 @@ loss:
   #   sum  = sum NLL over sequence length, then aggregate across batch/datasets
   nb_sequence_reduction: mean
 
-  # log_sigma is predicted directly by the model head. The loss exponentiates
-  # it to sigma, then clamps sigma to [sigma_min, sigma_max] for numerical
-  # stability; the soft L2 penalty below controls log_sigma drift.
-  sigma_min: 0.05
-  sigma_max: 3.0
-
+  # Diagnostic-only low-count bin threshold: positions with target <= this are
+  # reported in the y<=c calibration bin. Does NOT affect the NB/Poisson loss.
   censor_threshold: 0.5
 
-  dataset_balanced_loss: false
+  dataset_balanced_loss: true
+
+  # --- Per-dataset loss-scale normalization (ablation) ---
+  # Divides the NLL term of each dataset by a detached EMA of its own NLL
+  # magnitude before datasets are combined, so each dataset contributes a
+  # comparable gradient to the SHARED biological parameters regardless of its
+  # absolute count scale (the magnitude-imbalance fix). Orthogonal to
+  # dataset_balanced_loss, which only removes the sample-COUNT imbalance.
+  # See "memory documents/dataset_loss_scale_normalization.md".
+  dataset_loss_scale_normalization: false
+  dataset_loss_scale_ema_decay: 0.9      # EMA smoothing of the per-dataset scale
+  dataset_loss_scale_eps: 1.0e-6          # floor on the scale divisor
+
+  # --- Per-dataset plateau loss-weight schedule (soft per-task early stop) ---
+  # When a dataset's val_nll stops improving for `patience` validations, its
+  # training loss weight w_d is multiplied by `decay` (floored at `min`). The
+  # small/sparse dataset that overfits early thus stops driving updates and its
+  # val curve flattens, while datasets still improving keep w_d = 1.0. Updated
+  # in on_validation_epoch_end from val_nll/<name>; logged as
+  # dataset_loss_weight/<name>. Applied to the mu_pcc_loss and NLL loss terms.
+  dataset_loss_weight_schedule: false
+  dataset_loss_weight_patience: 3         # validations with no improvement before a decay
+  dataset_loss_weight_decay: 0.5          # multiplicative weight decay per trigger
+  dataset_loss_weight_min: 0.1            # floor on w_d (0 = fully drop the dataset)
+  dataset_loss_weight_min_delta: 0.0      # min val_nll improvement to reset the counter
+
+  # --- Hierarchical shrinkage / partial pooling of the per-dataset heads ---
+  # Optional pure loss add-on (no head-class changes). Pulls each dataset's
+  # per-dataset signals toward the shared baseline, weighted so the SMALLEST
+  # dataset shrinks the most (theta_d ~ N(theta_global, tau^2), prior strength
+  # ~ 1/N_d). Lets a small/sparse dataset borrow from the big ones instead of
+  # overfitting its own heads. Both weights 0 -> disabled (no behavior change).
+  # See "memory documents/dataset_loss_scale_normalization.md".
+  dataset_pool_visibility_weight: 0.0    # shrink log_visibility_bias -> 0 (beta -> 1)
+  dataset_pool_log_sigma_weight: 0.0      # pool mean log_sigma -> cross-dataset mean (UNSAFE if dispersions legitimately differ)
+  dataset_pool_size_exponent: 1.0         # 0 = uniform ridge; 1 = shrink ∝ 1/N_d
+  # log_sigma EMA self-shrinkage (option 2a). Anchors each dataset's mean
+  # log_sigma to its OWN running EMA so the dispersion head can't drift to
+  # extremes late in training (overfit), WITHOUT coupling datasets (safe even
+  # when kutay's sigma is legitimately very different). Size-weighted by
+  # dataset_pool_size_exponent. Weight 0 -> disabled.
+  dataset_log_sigma_self_reg_weight: 0.0  # >0 enables; try 0.01–0.1
+  dataset_log_sigma_self_reg_ema_decay: 0.99  # higher = longer-memory leash (catches slower drift)
   # Soft penalty on the batch-mean of log(J) drifting away from 0.
   # Prevents the J/scale_dt degeneracy (J→0, scale_dt→∞) while preserving
   # per-transcript J variation (the biological signal).
-  j_centering_weight: 0.05
+  j_centering_weight: 0.00
   # Pins batch-mean of transcript_log_scale near 0, preventing the scale_dt/rho
   # gauge from oscillating in multi-dataset training.
   transcript_scale_centering_weight: 0.0
-  # Symmetric L2 penalty pulling predicted log_sigma toward log_sigma_reg_target.
-  # Target 0.0 → sigma = 1 (moderate spread).
+  # L2-toward-zero shrinkage on the per-transcript log_sigma (NB log_alpha):
+  # keeps the dispersion low without anchoring it to a target value. Keep the
+  # weight small -- a mild anti-overfitting nudge, not a hard prior.
   log_sigma_reg_weight: 0.0
-  log_sigma_reg_target: 0.2
+
+  # --- Cross-dataset beta-neutrality (identifiability gauge) ---
+  # For a transcript measured in >=2 datasets, penalizes the squared cross-dataset
+  # mean of the centered log visibility bias at every position:
+  #   mean_d log beta_{d,t,i} = 0.
+  # Per-position shape COMMON to all datasets is biology and is forced out of the
+  # bias branch (beta) into the shared biological factor rho; dataset-SPECIFIC
+  # deviation still passes through beta. This is the direct enforcement of
+  # "no biology in the dataset bias branch". Requires
+  # data.train_sampling_strategy=transcript_grouped_multidataset_pairs so a
+  # transcript's dataset copies co-occur in a batch. 0 -> disabled (no behavior
+  # change); try 0.1-1.0. Logged as beta_cross_dataset_center (+ _logabs diag).
+  beta_cross_dataset_center_weight: 0.2
 
 optim:
   lr_biological: 5.0e-4
   lr_rest: 1.0e-3
   weight_decay_bio: 1.0e-1
-  weight_decay_rest: 1.0e-8
+  weight_decay_rest: 1.0e-4
   use_cagrad: false
   cagrad_alpha: 0.5
-  cagrad_iterations: 25
+  cagrad_iterations: 5
   cagrad_rescale_to_mean_norm: true
 
   scheduler:
-    monitor: val_loss
-    mode: min
+    # Scale-free, cross-dataset-comparable objective: unweighted mean of the
+    # per-dataset val_mu_pcc. Avoids the pooled val_loss being dominated by the
+    # high-count / large-magnitude-NLL datasets (grimson, kutay) and ignoring
+    # the small/sparse one (sako). Logged in on_validation_epoch_end.
+    monitor: val_mean_mu_pcc
+    mode: max
     factor: 0.9
-    patience: 1
+    patience: 0
     min_lr: 1.0e-6
 
 trainer:
@@ -216,7 +294,7 @@ trainer:
   gradient_clip_algorithm: norm
 
 callbacks:
-  early_stopping_patience: 10
+  early_stopping_patience: 25
 
 metrics:
   log_train_per_dataset_metrics: false
