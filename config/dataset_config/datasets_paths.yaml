@@ -17,7 +17,7 @@ dataset_path:
   weber_2024: "Datasets/data/filtered_datasets_ribo_only_with_css/weber_2024.parquet"
   wu_2019: "Datasets/data/filtered_datasets_ribo_only_with_css/wu_2019.parquet"
   wu_2020: "Datasets/data/filtered_datasets_ribo_only_with_css/wu_2020.parquet"
-  gillen_2019: "Datasets/data/filtered_datasets_ribo_only_with_css/gillen_2019.parquet"
+  gillen_2019: "Datasets/data/filtered_dadatasets_paths.yamltasets_ribo_only_with_css/gillen_2019.parquet"
   grimson_2019: "Datasets/data/filtered_datasets_ribo_only_with_css/grimson_2019.parquet"
   iwasaki_2014: "Datasets/data/filtered_datasets_ribo_only_with_css/iwasaki_2014.parquet"
   iwasaki_2018: "Datasets/data/filtered_datasets_ribo_only_with_css/iwasaki_2018.parquet"

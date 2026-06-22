@@ -8,6 +8,7 @@ from typing import List, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 
 def conserved_stalling_sites_aware_split(
@@ -148,7 +149,16 @@ def build_transcript_metadata(
       - CSS count from the sequence/CSS parquet
       - dataset availability from dataset-specific ribo parquets
     """
-    seq_df = pd.read_parquet(sequences_path)
+    # Only the CSS column (keyed by transcript_id) is needed here; skip the large
+    # unused sequence/structure columns so split setup stays fast.
+    _seq_available = set(pq.read_schema(sequences_path).names)
+    _seq_css_col = (
+        "conserved_stalling_sites"
+        if "conserved_stalling_sites" in _seq_available
+        else "css"
+    )
+    _seq_columns = [c for c in ("transcript_id", _seq_css_col) if c in _seq_available]
+    seq_df = pd.read_parquet(sequences_path, columns=_seq_columns or None)
 
     if "transcript_id" in seq_df.columns:
         seq_df = seq_df.set_index("transcript_id")
@@ -170,7 +180,8 @@ def build_transcript_metadata(
 
     for path in datasets_paths:
         dataset_name = _dataset_name_from_path(path)
-        df = pd.read_parquet(path)
+        # Only the `id` column is needed to record dataset availability.
+        df = pd.read_parquet(path, columns=["id"])
 
         if "id" not in df.columns:
             raise KeyError(f"'id' column missing in {path}")

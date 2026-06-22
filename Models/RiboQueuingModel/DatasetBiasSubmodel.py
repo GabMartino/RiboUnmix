@@ -10,7 +10,17 @@ from Models.RiboQueuingModel.submodels.DatasetLogSigmaHead import DatasetLogSigm
 from Models.RiboQueuingModel.submodels.DatasetMultiplicativeAllocationBiasHead import (
     DatasetMultiplicativeAllocationBiasHead,
 )
-from Models.RiboQueuingModel.submodels.DatasetTranscriptScaleFactorHead import DatasetTranscriptScaleFactorHead
+
+
+class ChannelLayerNorm(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(int(channels))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 3:
+            raise ValueError(f"Expected x [B, C, T], got {tuple(x.shape)}.")
+        return self.norm(x.transpose(1, 2)).transpose(1, 2)
 
 
 class ResidualDilatedConvBlock(nn.Module):
@@ -46,7 +56,7 @@ class ResidualDilatedConvBlock(nn.Module):
 
         padding = self.dilation * (self.kernel_size - 1) // 2
 
-        self.norm = nn.GroupNorm(num_groups=1, num_channels=self.channels)
+        self.norm = ChannelLayerNorm(self.channels)
 
         conv_out_channels = 2 * self.channels if self.gated else self.channels
 
@@ -106,7 +116,7 @@ class ResidualDilatedConvBlock(nn.Module):
 
 class DilatedContextCNN(nn.Module):
     """
-    Masked residual dilated TCN for local codon-context features.
+    Masked residual dilated TCN for dataset-conditioned local context features.
     """
 
     def __init__(
@@ -150,7 +160,7 @@ class DilatedContextCNN(nn.Module):
             ]
         )
 
-        self.output_norm = nn.GroupNorm(num_groups=1, num_channels=self.out_channels)
+        self.output_norm = ChannelLayerNorm(self.out_channels)
 
     @property
     def receptive_field(self) -> int:
@@ -196,7 +206,6 @@ class DatasetBiasSubmodel(nn.Module):
     def __init__(
         self,
         config_params: dict,
-        biological_context_size: int,
     ):
         super().__init__()
 
@@ -224,7 +233,7 @@ class DatasetBiasSubmodel(nn.Module):
         self.use_local_context_cnn = bool(config_params.get("use_local_context_cnn", True))
 
         self.local_context_cnn = DilatedContextCNN(
-            in_channels=self.codon_embeddings_size,
+            in_channels=self.codon_embeddings_size + self.dataset_embeddings_size,
             out_channels=self.num_filters,
             kernel_size=self.kernel_size,
             dilations=config_params.get("context_cnn_dilations", (1, 2, 4, 8, 16)),
@@ -252,24 +261,12 @@ class DatasetBiasSubmodel(nn.Module):
 
         self.log_sigma_head = DatasetLogSigmaHead(config_params=log_sigma_cfg, input_size=head_input_size)
 
-        scale_cfg = config_params.get("dataset_transcript_scale_factor_params", None)
-
-        scale_cfg = dict(scale_cfg)
-        scale_cfg["num_datasets"] = self.num_datasets
-        scale_cfg["biological_context_size"] = int(biological_context_size)
-
-        self.dataset_transcript_scale = DatasetTranscriptScaleFactorHead(
-            config_params=scale_cfg,
-        )
-
-
     def forward(
         self,
         dataset_ids: torch.Tensor,
         mask: torch.Tensor,
         codon_ids: torch.Tensor,
         position_features: torch.Tensor,
-        biological_context: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         B, T = codon_ids.shape
 
@@ -291,8 +288,9 @@ class DatasetBiasSubmodel(nn.Module):
 
         features = [dataset_emb]
         if self.use_local_context_cnn:
+            cnn_input = torch.cat((dataset_emb, codon_emb), dim=-1)
             local_context = self.local_context_cnn(
-                codon_emb.transpose(1, 2),
+                cnn_input.transpose(1, 2),
                 mask=mask_b,
             ).transpose(1, 2)
             features.append(local_context)
@@ -322,12 +320,6 @@ class DatasetBiasSubmodel(nn.Module):
             dim=1,
             keepdim=True,
         ).clamp_min(1.0)
-        out["log_sigma_t"] = log_sigma_t  # [B, 1] — masked mean for log_sigma reg loss
-
-        scale_out = self.dataset_transcript_scale(
-            dataset_ids=dataset_ids,
-            biological_context=biological_context,
-        )
-        out.update(scale_out)
+        out["log_sigma_t"] = log_sigma_t  # [B, 1] — masked mean log_sigma
 
         return out

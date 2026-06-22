@@ -11,6 +11,7 @@ import hydra
 import lightning as pl
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import torch
 import yaml
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
@@ -112,6 +113,61 @@ def open_file(path: str | Path) -> dict[str, Any]:
     return {} if data is None else data
 
 
+def resolve_dataset_config_path(name_or_path: str | Path) -> Path:
+    path = Path(str(name_or_path))
+
+    if path.suffix in {".yaml", ".yml"} or len(path.parts) > 1:
+        return path
+
+    return Path(__file__).resolve().parent / "config" / "dataset_config" / f"{path}.yaml"
+
+
+def dataset_path_mapping_from_source(
+    cfg: DictConfig,
+    source: Any,
+) -> tuple[dict[str, str], str]:
+    """
+    Resolve a dataset_path mapping.
+
+    source:
+        None / "active" / "dataset_config"
+            Use the active Hydra dataset_config.
+        "datasets_paths"
+            Load config/dataset_config/datasets_paths.yaml.
+        path/to/file.yaml
+            Load an explicit YAML config with a dataset_path mapping.
+    """
+    if source is None:
+        return dict(cfg.dataset_config.dataset_path), "active dataset_config"
+
+    source_str = str(source).strip()
+    if source_str.lower() in {"", "active", "dataset_config", "same"}:
+        return dict(cfg.dataset_config.dataset_path), "active dataset_config"
+
+    source_path = resolve_dataset_config_path(source_str)
+    source_cfg = open_file(source_path)
+
+    if "dataset_path" not in source_cfg:
+        raise KeyError(f"dataset_path missing in split source config: {source_path}")
+
+    return dict(source_cfg["dataset_path"]), str(source_path)
+
+
+def dataset_paths_for(
+    *,
+    mapping: dict[str, str],
+    datasets: Sequence[str],
+    source_label: str,
+) -> list[str]:
+    missing = [dataset for dataset in datasets if dataset not in mapping]
+    if missing:
+        raise KeyError(
+            f"Dataset(s) {missing} missing from dataset path source {source_label}."
+        )
+
+    return [str(mapping[dataset]) for dataset in datasets]
+
+
 def normalize_dataset_list(raw: Any) -> list[str]:
     if raw is None:
         return []
@@ -182,66 +238,37 @@ def make_dataset_signature(datasets: list[str]) -> str:
     return f"{len(datasets)}_datasets_mix_{short_hash}"
 
 
-def make_run_tag(cfg: DictConfig) -> str:
-    parts = []
-
-    if cfg_bool(cfg, "optim.use_cagrad", False):
-        parts.append("CAGrad")
-
-    sampling = str(cfg_get(cfg, "data.train_sampling_strategy", "default"))
-    dataset_balanced_loss = cfg_bool(cfg, "loss.dataset_balanced_loss", False)
-    pcc_target = str(cfg_get(cfg, "loss.pcc_target", "rho"))
-    alpha_learnable = bool(
-        cfg_get(
-            cfg,
-            "model.queue_propagation_params.queue_propagation_learnable",
-            False,
-        )
+def format_run_tag_value(value: Any) -> str:
+    return (
+        str(value)
+        .replace("/", "-")
+        .replace(".", "p")
+        .replace("-", "m")
+        .replace(" ", "")
     )
 
+
+def make_run_tag(cfg: DictConfig) -> str:
+    parts = ["queueNB"]
+
+    if cfg_bool(cfg, "cagrad.enabled", cfg_bool(cfg, "optim.use_cagrad", False)):
+        cagrad_c = format_run_tag_value(cfg_get(cfg, "cagrad.c", 0.5))
+        parts.append(f"CAGradc{cagrad_c}")
+
+    sampling = str(cfg_get(cfg, "data.train_sampling_strategy", "default"))
     if sampling not in {"", "default", "None", "none"}:
         parts.append(sampling)
 
-    parts.append(f"{pcc_target}PCC")
-    if pcc_target == "q":
-        parts.append("alphaLearn" if alpha_learnable else "alphaFixed")
+    mass_weight = cfg_get(cfg, "loss.mass_loss_weight", 0.1)
+    parts.append(f"mass{mass_weight}")
 
-    parts.append("DBLoss" if dataset_balanced_loss else "SampleMeanLoss")
+    if cfg_bool(cfg, "loss.dataset_balanced_loss", False):
+        parts.append("DBLoss")
+
+    if cfg_bool(cfg, "model.dataset_J_params.enabled", False):
+        parts.append("Jd")
 
     return "_".join(parts)
-
-
-def sync_queue_propagation_with_pcc_target(cfg: DictConfig) -> None:
-    """
-    pcc_target options (2x2: intensity/occupancy x queue off/on):
-        rho          - intensity, queue OFF
-        q            - intensity, queue ON
-        occupancy    - bounded occupancy, queue OFF
-        q_occupancy  - bounded occupancy, queue ON
-    """
-    pcc_target = str(cfg.loss.pcc_target)
-    queued_targets = {"q", "q_occupancy"}
-    valid_targets = {"rho", "q", "occupancy", "q_occupancy"}
-    if pcc_target not in valid_targets:
-        raise ValueError(
-            f"loss.pcc_target must be one of {sorted(valid_targets)}, "
-            f"got {pcc_target!r}."
-        )
-    use_queue = pcc_target in queued_targets
-
-    OmegaConf.set_struct(cfg, False)
-    cfg.model.queue_propagation_params.use_queue_propagation = use_queue
-    OmegaConf.set_struct(cfg, True)
-
-    alpha_learnable = bool(cfg.model.queue_propagation_params.queue_propagation_learnable)
-    alpha_state = "trainable" if use_queue and alpha_learnable else "fixed/disabled"
-
-    print(
-        "Queue prediction mode: "
-        f"pcc_target={pcc_target}, "
-        f"use_queue_propagation={use_queue}, "
-        f"alpha_t={alpha_state}."
-    )
 
 
 def dataset_name_from_path(path: str | Path) -> str:
@@ -250,6 +277,34 @@ def dataset_name_from_path(path: str | Path) -> str:
 
 def sanitize_metric_name_for_filename(metric_name: str) -> str:
     return str(metric_name).replace("/", "__")
+
+
+def shared_logger_version_from_environment() -> str | None:
+    """
+    Return a deterministic logger version shared by all externally launched DDP
+    ranks. With Slurm + srun every rank executes this script independently before
+    Lightning has a Trainer/rank-zero guard, so TensorBoardLogger's auto version
+    discovery can race and create one version_* directory per rank.
+    """
+    slurm_job_id = os.environ.get("SLURM_JOB_ID")
+    if slurm_job_id:
+        array_task_id = os.environ.get("SLURM_ARRAY_TASK_ID")
+        if array_task_id and array_task_id not in {"", "NO_VAL", "4294967294"}:
+            return f"slurm_{slurm_job_id}_{array_task_id}"
+        return f"slurm_{slurm_job_id}"
+
+    return None
+
+
+def env_global_rank() -> int:
+    for key in ("RANK", "SLURM_PROCID"):
+        value = os.environ.get(key)
+        if value is not None:
+            try:
+                return int(value)
+            except ValueError:
+                pass
+    return 0
 
 
 # ============================================================
@@ -373,7 +428,16 @@ def build_transcript_metadata(
     Important:
         The supplied datasets_paths define the split universe.
     """
-    seq_df = pd.read_parquet(sequences_path)
+    # Only the CSS column (keyed by transcript_id) is read from the sequence
+    # parquet here; the large unused sequence/structure columns are skipped.
+    _seq_available = set(pq.read_schema(sequences_path).names)
+    _seq_css_col = (
+        "conserved_stalling_sites"
+        if "conserved_stalling_sites" in _seq_available
+        else "css"
+    )
+    _seq_columns = [c for c in ("transcript_id", _seq_css_col) if c in _seq_available]
+    seq_df = pd.read_parquet(sequences_path, columns=_seq_columns or None)
 
     if "transcript_id" in seq_df.columns:
         seq_df = seq_df.set_index("transcript_id")
@@ -391,7 +455,8 @@ def build_transcript_metadata(
 
     for path in datasets_paths:
         dataset_name = dataset_name_from_path(path)
-        df = pd.read_parquet(path)
+        # Only the `id` column is needed to record dataset availability.
+        df = pd.read_parquet(path, columns=["id"])
 
         if "id" not in df.columns:
             raise KeyError(f"'id' column missing in dataset parquet: {path}")
@@ -586,6 +651,10 @@ def save_split_manifest(
     out_file: Path,
     experiment_datasets: list[str],
     split_universe_datasets: list[str],
+    split_dataset_source: str | None = None,
+    split_dataset_paths: Sequence[str] | None = None,
+    training_dataset_paths: Sequence[str] | None = None,
+    extra_train_ids: Sequence[str] | None = None,
     train_ids: Sequence[str],
     main_val_ids: Sequence[str],
     css_benchmark_ids: Sequence[str],
@@ -613,6 +682,10 @@ def save_split_manifest(
         "seed": int(seed),
         "experiment_datasets": list(experiment_datasets),
         "split_universe_datasets": list(split_universe_datasets),
+        "split_dataset_source": split_dataset_source,
+        "split_dataset_paths": list(map(str, split_dataset_paths or [])),
+        "training_dataset_paths": list(map(str, training_dataset_paths or [])),
+        "extra_train_ids_from_training_datasets": list(map(str, extra_train_ids or [])),
         "fractions": {
             "train_frac": float(train_frac),
             "main_val_frac": float(main_val_frac),
@@ -654,6 +727,21 @@ def filter_ids_available_in_experiment(
             filtered.append(tid)
 
     return filtered
+
+
+def dataset_names_by_transcript(
+    *,
+    ids: Sequence[str],
+    metadata: dict[str, dict[str, Any]],
+) -> dict[str, list[str]]:
+    allowed: dict[str, list[str]] = {}
+
+    for tid in map(str, ids):
+        if tid not in metadata:
+            continue
+        allowed[tid] = list(map(str, metadata[tid].get("datasets", [])))
+
+    return allowed
 
 
 # ============================================================
@@ -1029,6 +1117,8 @@ def make_datamodule(
     datasets_paths: list[str],
     train_fold: list[str],
     val_fold: list[str],
+    train_allowed_dataset_names_by_transcript: dict[str, list[str]] | None = None,
+    val_allowed_dataset_names_by_transcript: dict[str, list[str]] | None = None,
     split_size: float,
     seed: int,
 ) -> RiboAIQueuingDatamoduleMultiDataset:
@@ -1051,6 +1141,8 @@ def make_datamodule(
         dataset_aware_batching=cfg_bool(cfg, "data.dataset_aware_batching", False),
         datasets_per_batch=int(cfg_get(cfg, "data.datasets_per_batch", 2)),
         train_sampling_strategy=cfg_get(cfg, "data.train_sampling_strategy", "random_dataset_per_transcript"),
+        train_allowed_dataset_names_by_transcript=train_allowed_dataset_names_by_transcript,
+        val_allowed_dataset_names_by_transcript=val_allowed_dataset_names_by_transcript,
         pin_memory=cfg_bool(cfg, "data.pin_memory", True),
         prefetch_factor=cfg_get(cfg, "data.prefetch_factor", 4),
     )
@@ -1094,15 +1186,22 @@ def main(cfg: DictConfig) -> None:
     experiment_datasets = get_datasets(cfg)
     split_universe_datasets = get_split_universe_datasets(cfg, experiment_datasets)
 
-    experiment_dataset_paths = [
-        cfg.dataset_config.dataset_path[dataset]
-        for dataset in experiment_datasets
-    ]
+    experiment_dataset_paths = dataset_paths_for(
+        mapping=dict(cfg.dataset_config.dataset_path),
+        datasets=experiment_datasets,
+        source_label="active dataset_config",
+    )
 
-    split_universe_dataset_paths = [
-        cfg.dataset_config.dataset_path[dataset]
-        for dataset in split_universe_datasets
-    ]
+    split_source = cfg_get(cfg, "split.source_dataset_config", None)
+    split_dataset_mapping, split_dataset_source_label = dataset_path_mapping_from_source(
+        cfg,
+        split_source,
+    )
+    split_universe_dataset_paths = dataset_paths_for(
+        mapping=split_dataset_mapping,
+        datasets=split_universe_datasets,
+        source_label=split_dataset_source_label,
+    )
 
     split_size = float(
         cfg_get(
@@ -1115,6 +1214,8 @@ def main(cfg: DictConfig) -> None:
     print("\n=== Dataset configuration ===")
     print(f"Experiment datasets:     {experiment_datasets}")
     print(f"Split universe datasets: {split_universe_datasets}")
+    print(f"Training dataset config: active dataset_config")
+    print(f"Split dataset source:    {split_dataset_source_label}")
 
     # ------------------------------------------------------------
     # Split strategy
@@ -1162,9 +1263,51 @@ def main(cfg: DictConfig) -> None:
         random_seed=seed,
     )
 
+    extra_train_ids: list[str] = []
+    if cfg_bool(cfg, "split.include_experiment_only_train_ids", False):
+        experiment_metadata = build_transcript_metadata(
+            sequences_path=cfg.paths.sequences_path,
+            datasets_paths=experiment_dataset_paths,
+        )
+        split_id_set = set(map(str, split_metadata.keys()))
+        extra_train_ids = sorted(set(experiment_metadata.keys()) - split_id_set)
+
+        if extra_train_ids:
+            print(
+                "\n[split] Adding training-only transcript IDs available in the "
+                "active experiment datasets but absent from the split source: "
+                f"{len(extra_train_ids)}"
+            )
+            train_fold = sorted(set(map(str, train_fold)).union(extra_train_ids))
+            for tid in extra_train_ids:
+                split_metadata[tid] = {
+                    **experiment_metadata[tid],
+                    "split_role": "extra_train_from_training_datasets",
+                }
+        else:
+            print("\n[split] No extra training-only IDs found outside the split source.")
+
+    main_val_fold_for_experiment = filter_ids_available_in_experiment(
+        ids=main_val_fold,
+        metadata=split_metadata,
+        experiment_datasets=experiment_datasets,
+    )
+    removed_main_val_ids = len(main_val_fold) - len(main_val_fold_for_experiment)
+    if removed_main_val_ids > 0:
+        print(
+            "\n[split] Filtering main validation IDs to transcripts available "
+            "in the active experiment datasets: "
+            f"{len(main_val_fold_for_experiment)} kept, {removed_main_val_ids} removed."
+        )
+    if len(main_val_fold_for_experiment) == 0:
+        raise RuntimeError(
+            "Main validation split is empty after filtering to active experiment "
+            f"datasets {experiment_datasets}. Check split.master_dataset_universe "
+            "or experiment.dataset."
+        )
+
     dataset_str = make_dataset_signature(experiment_datasets)
     split_universe_str = make_dataset_signature(split_universe_datasets)
-    sync_queue_propagation_with_pcc_target(cfg)
     run_tag = make_run_tag(cfg)
 
     print(f"\nTracking dataset signature: {dataset_str}")
@@ -1180,6 +1323,10 @@ def main(cfg: DictConfig) -> None:
         out_file=paths_results / f"split_manifest_experiment_{dataset_str}_universe_{split_universe_str}.json",
         experiment_datasets=experiment_datasets,
         split_universe_datasets=split_universe_datasets,
+        split_dataset_source=split_dataset_source_label,
+        split_dataset_paths=split_universe_dataset_paths,
+        training_dataset_paths=experiment_dataset_paths,
+        extra_train_ids=extra_train_ids,
         train_ids=train_fold,
         main_val_ids=main_val_fold,
         css_benchmark_ids=css_benchmark_fold,
@@ -1191,11 +1338,21 @@ def main(cfg: DictConfig) -> None:
     )
 
     dataset_encoding = open_file(cfg.paths.encodings.datasets)
+    missing_dataset_encodings = [
+        dataset for dataset in experiment_datasets if dataset not in dataset_encoding
+    ]
+    if missing_dataset_encodings:
+        raise KeyError(
+            "Experiment dataset(s) missing from dataset encoding: "
+            f"{missing_dataset_encodings}"
+        )
+    active_dataset_ids = [int(dataset_encoding[dataset]) for dataset in experiment_datasets]
 
     torch_model = RiboQueuingModel(
         model_configs=cfg.model,
         eps=float(cfg.model.get("eps", 1e-8)),
         mu_max=float(cfg.model.get("mu_max", 1e8)),
+        active_dataset_ids=active_dataset_ids,
     )
 
     lit_model = RiboQueuingModelLightningModule(
@@ -1204,13 +1361,36 @@ def main(cfg: DictConfig) -> None:
         dataset_encoding=dataset_encoding,
     )
 
-    # Actual datamodules use the experiment datasets, but receive the master split IDs.
-    # They should filter transcript IDs according to dataset availability internally.
+    restrict_train_pairs_to_split_source = cfg_bool(
+        cfg, "split.restrict_train_pairs_to_split_source", False
+    )
+    restrict_val_pairs_to_split_source = cfg_bool(
+        cfg, "split.restrict_val_pairs_to_split_source", False
+    )
+    train_allowed_datasets = (
+        dataset_names_by_transcript(ids=train_fold, metadata=split_metadata)
+        if restrict_train_pairs_to_split_source
+        else None
+    )
+    val_allowed_datasets = (
+        dataset_names_by_transcript(
+            ids=main_val_fold_for_experiment,
+            metadata=split_metadata,
+        )
+        if restrict_val_pairs_to_split_source
+        else None
+    )
+
+    # Actual datamodules use the experiment datasets, but receive the split IDs.
+    # When configured, validation flat pairs are restricted to the filtered split
+    # source availability even though training/prediction can load raw profiles.
     datamodule = make_datamodule(
         cfg=cfg,
         datasets_paths=experiment_dataset_paths,
         train_fold=train_fold,
-        val_fold=main_val_fold,
+        val_fold=main_val_fold_for_experiment,
+        train_allowed_dataset_names_by_transcript=train_allowed_datasets,
+        val_allowed_dataset_names_by_transcript=val_allowed_datasets,
         split_size=split_size,
         seed=seed,
     )
@@ -1223,11 +1403,21 @@ def main(cfg: DictConfig) -> None:
 
     css_datamodule = None
     if len(css_benchmark_fold_for_experiment) > 0:
+        css_allowed_datasets = (
+            dataset_names_by_transcript(
+                ids=css_benchmark_fold_for_experiment,
+                metadata=split_metadata,
+            )
+            if restrict_val_pairs_to_split_source
+            else None
+        )
         css_datamodule = make_datamodule(
             cfg=cfg,
             datasets_paths=experiment_dataset_paths,
             train_fold=train_fold,
             val_fold=css_benchmark_fold_for_experiment,
+            train_allowed_dataset_names_by_transcript=train_allowed_datasets,
+            val_allowed_dataset_names_by_transcript=css_allowed_datasets,
             split_size=split_size,
             seed=seed,
         )
@@ -1237,14 +1427,20 @@ def main(cfg: DictConfig) -> None:
             f"experiment datasets {experiment_datasets}. CSS prediction will be skipped.\n"
         )
 
-    tb_logger = TensorBoardLogger(save_dir=str(paths_logs), name="")
+    logger_version = shared_logger_version_from_environment()
+    tb_logger = TensorBoardLogger(
+        save_dir=str(paths_logs),
+        name="",
+        version=logger_version,
+    )
     exp_name = Path(tb_logger.log_dir or tb_logger.save_dir).name
 
     # Save full resolved config next to the TensorBoard events file so each
     # version_N directory is self-contained and traceable without Hydra outputs.
     tb_log_dir = Path(tb_logger.log_dir)
     tb_log_dir.mkdir(parents=True, exist_ok=True)
-    OmegaConf.save(cfg, tb_log_dir / "config.yaml")
+    if env_global_rank() == 0:
+        OmegaConf.save(cfg, tb_log_dir / "config.yaml")
 
     ckpt_dir = paths_checkpoints / exp_name
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -1278,33 +1474,38 @@ def main(cfg: DictConfig) -> None:
 
     lr_monitor = LearningRateMonitor(logging_interval="epoch")
 
+    devices_cfg = cfg.trainer.devices
+    if isinstance(devices_cfg, (list, tuple, ListConfig)):
+        n_devices = len(devices_cfg)
+    else:
+        try:
+            n_devices = int(devices_cfg)
+        except (TypeError, ValueError):
+            n_devices = 1
+
     trainer_kwargs = {
         "accelerator": cfg.trainer.accelerator,
-        "devices": cfg.trainer.devices,
+        "devices": devices_cfg,
         "precision": cfg.trainer.precision,
         "max_epochs": int(cfg.trainer.max_epochs),
         "logger": tb_logger,
         "log_every_n_steps": int(cfg.trainer.log_every_n_steps),
         "accumulate_grad_batches": int(cfg_get(cfg, "trainer.accumulate_grad_batches", 1)),
         "callbacks": [checkpoint_callback, early_stopping, lr_monitor],
-        "strategy":'ddp_find_unused_parameters_true'
+        "use_distributed_sampler": cfg_bool(
+            cfg,
+            "trainer.use_distributed_sampler",
+            False,
+        ),
     }
+    if n_devices > 1:
+        trainer_kwargs["strategy"] = "ddp_find_unused_parameters_true"
 
-    # CAGrad uses manual optimization and clips inside the LightningModule.
-    if not cfg_bool(cfg, "optim.use_cagrad", False):
+    # CAGrad has its own biological-gradient override; keep Trainer clipping for
+    # non-CAGrad runs only.
+    if not cfg_bool(cfg, "cagrad.enabled", cfg_bool(cfg, "optim.use_cagrad", False)):
         trainer_kwargs["gradient_clip_val"] = cfg_get(cfg, "trainer.gradient_clip_val", 0.0)
         trainer_kwargs["gradient_clip_algorithm"] = cfg_get(cfg, "trainer.gradient_clip_algorithm", "norm")
-
-    use_distributed_sampler = cfg_bool(cfg, "trainer.use_distributed_sampler", False)
-    trainer_kwargs["use_distributed_sampler"] = use_distributed_sampler
-
-    if use_distributed_sampler:
-        print(
-            "\n[trainer] WARNING: trainer.use_distributed_sampler=True while the "
-            "multi-dataset datamodule returns custom batch samplers. Lightning may "
-            "try to rebuild those samplers for DDP and fail. Prefer "
-            "trainer.use_distributed_sampler=false for this training script.\n"
-        )
 
     trainer = pl.Trainer(**trainer_kwargs)
 

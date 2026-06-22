@@ -18,28 +18,24 @@ def inv_softplus(x: float) -> float:
 
 class QueuingBiologicalModel(nn.Module):
     """
-    Local biological traffic-intensity model.
+    Shared, dataset-blind biological queue-load model (sequence only).
 
-        h_i      >= 0                    (softplus output, mean-normalized per transcript)
-        mean_i h_i = 1                  (over valid codons)
-        rho_i    = J * h_i               (per-codon traffic intensity, unbounded)
+    Pipeline (mean-normalized local factor + transcript flux -> queue load):
 
-    Semantics: rho_i here is *traffic intensity* in queueing-theory terms
-    (analogous to lambda / mu_service in M/M/1), not stationary occupancy
-    probability. It is intentionally unbounded above so the downstream
-    prediction mu = scale_dt * rho * beta can express the full dynamic range
-    of observed ribo-seq footprint counts (zero through ~thousands).
+        w_raw_i    = softplus(local_head(out)_i)          >= 0
+        w_norm_i   = w_raw_i / mean_valid(w_raw)           (mean_valid(w_norm)=1)
+        J          = clamp(softplus(J_head(h_n)), J_min, J_max)   > 0
+        lambda_i   = clamp(J * w_norm_i, lambda_bio_min, lambda_bio_max)
+        rho_i      = 1 - exp(-lambda_i)            (utilization in [0, 1))
+        L_bio_i    = expm1(lambda_i) = rho_i / (1 - rho_i)   (avg jobs in queue)
 
-    The bounded probabilistic occupancy is recovered downstream in
-    RiboQueuingModel as `rho_utilization = 1 - exp(-rho)`, which is the
-    Poisson "at least one footprint" probability and lives in [0, 1). That
-    is the quantity used for queue propagation (where bounded inputs are
-    required for stability); rho itself stays unbounded for the prediction
-    head. See _intensity_to_utilization in RiboQueuingModel.
+    `L_bio` is the queueing-theory average number of jobs in the queue and is
+    the biological load multiplied downstream by the target-derived scale and
+    the dataset visibility correction:
 
-    The local factor is mean-normalized, not sum-normalized: J is therefore the
-    transcript-level average intensity, while h_i carries only within-transcript
-    shape without introducing length-dependent shrinkage.
+        mu = S[d,t] * L_bio[t,i] * beta[d,t,i].
+
+    `forward` returns a dict with: w_raw, w_norm, J, lambda_bio, rho, L_bio, h_n.
     """
 
     def __init__(self, config_params: dict):
@@ -50,16 +46,29 @@ class QueuingBiologicalModel(nn.Module):
         self.num_layers = int(config_params["num_layers"])
         self.dropout = float(config_params.get("dropout", 0.0))
 
-        self.J_min = float(config_params.get("J_min", 1.0e-6))
-        self.J_max = float(config_params.get("J_max", 10.0))
-        self.init_J = float(config_params.get("init_J", max(self.J_min, 0.5)))
+        self.J_min = float(config_params.get("J_min", 1.0e-4))
+        self.J_max = float(config_params.get("J_max", 5.0))
+        self.init_J = float(config_params.get("init_J", 0.5))
+        self.lambda_bio_min = float(config_params.get("lambda_bio_min", 1.0e-3))
+        self.lambda_bio_max = float(config_params.get("lambda_bio_max", 3.0))
+        self.eps = float(config_params.get("eps", 1.0e-8))
+
+        if self.lambda_bio_min < 0.0:
+            raise ValueError(
+                f"lambda_bio_min must be >= 0, got {self.lambda_bio_min}."
+            )
+        if self.lambda_bio_max <= self.lambda_bio_min:
+            raise ValueError(
+                "lambda_bio_max must be greater than lambda_bio_min, got "
+                f"{self.lambda_bio_max} <= {self.lambda_bio_min}."
+            )
+
         self.init_local_hazard_factor = float(
             config_params.get("init_local_hazard_factor", 1.0)
         )
-        # Std of the random init for the final local-hazard weights. Must be > 0
-        # so the per-position hazard is NOT flat at init: a perfectly constant
-        # rho makes a Pearson-correlation loss gradient identically zero (the
-        # PCC validity gate detaches it), which would freeze training on arrival.
+        # Std of the random init for the final local-factor weights. Must be > 0
+        # so the per-position factor is NOT flat at init (a flat profile gives a
+        # degenerate / zero shape signal on arrival).
         self.init_local_hazard_weight_std = float(
             config_params.get("init_local_hazard_weight_std", 1.0e-2)
         )
@@ -84,7 +93,7 @@ class QueuingBiologicalModel(nn.Module):
             nn.Softplus(),
         )
 
-        self.ff_J_conditioned = nn.Sequential(
+        self.ff_J = nn.Sequential(
             nn.Linear(h_dim, h_dim),
             nn.GELU(),
             nn.Dropout(p=self.dropout),
@@ -95,7 +104,7 @@ class QueuingBiologicalModel(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        final_j = self.ff_J_conditioned[-2]
+        final_j = self.ff_J[-2]
         if isinstance(final_j, nn.Linear):
             nn.init.zeros_(final_j.weight)
             init_j = min(max(self.init_J, self.J_min), self.J_max)
@@ -103,9 +112,9 @@ class QueuingBiologicalModel(nn.Module):
 
         final_h = self.ff_local_hazard[-2]
         if isinstance(final_h, nn.Linear):
-            # Small random (not zero) weights so the local hazard varies across
-            # positions at init; the bias still centers the mean factor at
-            # init_local_hazard_factor. See init_local_hazard_weight_std above.
+            # Small random (not zero) weights so the local factor varies across
+            # positions at init; the bias centers the mean factor at
+            # init_local_hazard_factor.
             std = max(float(self.init_local_hazard_weight_std), 0.0)
             if std > 0.0:
                 nn.init.normal_(final_h.weight, mean=0.0, std=std)
@@ -114,49 +123,48 @@ class QueuingBiologicalModel(nn.Module):
             init_factor = max(float(self.init_local_hazard_factor), 1.0e-6)
             nn.init.constant_(final_h.bias, inv_softplus(init_factor))
 
-    def forward(self, x_packed, mask) -> tuple:
+    def forward(self, x_packed, mask) -> dict[str, torch.Tensor]:
         out_packed, h_n = self.rnn(x_packed)
-        out, _ = pad_packed_sequence(out_packed, batch_first=True)
+        out, _ = pad_packed_sequence(
+            out_packed,
+            batch_first=True,
+            total_length=mask.shape[1],
+        )
         B, T, _ = out.shape
         mask_b = mask.bool()
-        mask_f = mask.to(dtype=out.dtype)
+        mask_f = mask_b.to(dtype=out.dtype)
 
         if mask_b.shape != (B, T):
             raise ValueError(
                 f"mask shape {tuple(mask_b.shape)} does not match RNN output {(B, T)}."
             )
 
-        # ------------------------------------------------------------
-        # 1. Local mean-normalized hazard factor
-        # ------------------------------------------------------------
-        local_factor = self.ff_local_hazard(out).squeeze(-1)
-        local_factor = local_factor * mask_f
+        # 1. Local mean-normalized biological factor: mean_valid(w_norm) = 1.
+        w_raw = self.ff_local_hazard(out).squeeze(-1)
+        w_raw = w_raw * mask_f
         valid_len = mask_f.sum(dim=1, keepdim=True).clamp_min(1.0)
-        local_mean = (local_factor * mask_f).sum(dim=1, keepdim=True) / valid_len
-        local_factor = local_factor / local_mean.clamp_min(1.0e-6)
-        local_factor = local_factor * mask_f
+        w_mean = (w_raw * mask_f).sum(dim=1, keepdim=True) / valid_len
+        w_norm = w_raw / w_mean.clamp_min(self.eps)
+        w_norm = w_norm * mask_f
 
-        # ------------------------------------------------------------
-        # 2. Transcript-level hazard scale
-        # ------------------------------------------------------------
+        # 2. Transcript-level flux / intensity J > 0.
         h_n_flat = h_n.permute(1, 0, 2).reshape(B, -1)
+        J = self.ff_J(h_n_flat).clamp(min=self.J_min, max=self.J_max)  # [B, 1]
 
-        J = self.ff_J_conditioned(h_n_flat)
-        J = J.clamp(min=self.J_min, max=self.J_max)
+        # 3. Queue load. lambda = J * w_norm (clamped); L_bio = expm1(lambda).
+        lambda_bio = (J * w_norm).clamp(
+            min=self.lambda_bio_min,
+            max=self.lambda_bio_max,
+        ) * mask_f
+        rho = (-torch.expm1(-lambda_bio)).clamp(0.0, 1.0 - 1.0e-6) * mask_f
+        L_bio = torch.expm1(lambda_bio).clamp_min(self.eps) * mask_f
 
-        # ------------------------------------------------------------
-        # 3. Local unbounded traffic/intensity. J controls average scale.
-        # ------------------------------------------------------------
-        h_bio = J.to(dtype=out.dtype).reshape(B, 1) * local_factor
-        h_bio = torch.nan_to_num(
-            h_bio,
-            nan=0.0,
-            posinf=1.0e8,
-            neginf=0.0,
-        )
-        ##TODO: modify
-        #h_bio = torch.expm1()
-        h_bio = h_bio.clamp_min(0.0) * mask_f
-        rho_bio = h_bio
-
-        return rho_bio, J, h_bio, h_n
+        return {
+            "w_raw": w_raw,
+            "w_norm": w_norm,
+            "J": J,
+            "lambda_bio": lambda_bio,
+            "rho": rho,
+            "L_bio": L_bio,
+            "h_n": h_n,
+        }

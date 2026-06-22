@@ -7,6 +7,7 @@ from typing import Optional, Iterator, Sequence
 import lightning as pl
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import torch
 import yaml
 from torch.utils.data import (
@@ -340,7 +341,7 @@ class DatasetAwareBatchSampler:
         base_k = self.batch_size // d_per_batch
         remainder = self.batch_size % d_per_batch
 
-        batch_idx = 0
+        batches = []
         for _ in range(self.num_batches):
             chosen_datasets = rng.choice(
                 self.unique_dataset_ids,
@@ -365,12 +366,38 @@ class DatasetAwareBatchSampler:
                 )
 
             if len(batch) == self.batch_size or not self.drop_last:
-                batch_idx += 1
-                if (batch_idx - 1) % self.num_replicas == self.rank:
-                    yield batch
+                batches.append(batch)
+
+        yield from _shard_batches_padded(batches, self.num_replicas, self.rank)
 
     def __len__(self):
-        return (self.num_batches + self.num_replicas - 1 - self.rank) // self.num_replicas
+        # Replacement sampling fills every batch, so the global count is
+        # num_batches; ceil with no `- rank` -> equal per-rank count after padding.
+        return (self.num_batches + self.num_replicas - 1) // self.num_replicas
+
+
+def _shard_batches_padded(batches, num_replicas: int, rank: int):
+    """Return this rank's shard of an already-built global batch list.
+
+    Every rank builds the SAME `batches` list (identical sampler seed), so the
+    global ordering is consistent and batch `i` deterministically belongs to
+    rank `i % W`. Under DDP each rank MUST yield the same number of batches:
+    unequal counts desynchronize the per-step gradient all-reduce and the
+    epoch-end collectives (e.g. EarlyStopping's boolean reduce), which deadlocks
+    NCCL until the watchdog timeout. We therefore pad the global list up to a
+    multiple of `W` by wrapping around before striding, so each rank yields
+    exactly ceil(n / W) batches. Padding (rather than dropping the remainder)
+    keeps every sample in the epoch; the <= W-1 duplicated batches are re-drawn
+    on the next epoch (training) or de-duplicated at prediction merge.
+    """
+    W = max(int(num_replicas), 1)
+    n = len(batches)
+    if W == 1 or n == 0:
+        return list(batches)
+    rem = n % W
+    if rem != 0:
+        batches = list(batches) + [batches[j % n] for j in range(W - rem)]
+    return batches[rank::W]
 
 
 class SortedLengthBatchSampler(BatchSampler):
@@ -442,14 +469,13 @@ class SortedLengthBatchSampler(BatchSampler):
             batch_order = rng.permutation(len(batches))
             batches = [batches[int(j)] for j in batch_order]
 
-        for i, batch in enumerate(batches):
-            if i % self.num_replicas == self.rank:
-                yield batch
+        yield from _shard_batches_padded(batches, self.num_replicas, self.rank)
 
     def __len__(self):
         n = len(self.sampler)
         total = n // self.batch_size if self.drop_last else (n + self.batch_size - 1) // self.batch_size
-        return (total + self.num_replicas - 1 - self.rank) // self.num_replicas
+        # ceil, with no `- rank`: padded sharding gives every rank an equal count.
+        return (total + self.num_replicas - 1) // self.num_replicas
 
 
 class TranscriptGroupedMultiDatasetBatchSampler:
@@ -457,9 +483,9 @@ class TranscriptGroupedMultiDatasetBatchSampler:
     Batch sampler that keeps transcript-dataset pairs for the same transcript
     together.
 
-    This is intended for multi-dataset biological-gradient methods such as
-    CAGrad, where comparing dataset gradients is cleaner when each dataset sees
-    matched transcript content inside the same batch.
+    This is intended for disentanglement losses that need matched transcript
+    content across datasets, especially cross-dataset beta neutrality:
+    mean_d log_beta[d,t,i] ~= 0.
 
     Each emitted batch contains flat pair indices. For a transcript t measured
     in datasets D(t), the sampler emits the group:
@@ -669,9 +695,7 @@ class TranscriptGroupedMultiDatasetBatchSampler:
             batch_order = rng.permutation(len(batches))
             batches = [batches[int(i)] for i in batch_order]
 
-        for i, batch in enumerate(batches):
-            if i % self.num_replicas == self.rank:
-                yield batch
+        yield from _shard_batches_padded(batches, self.num_replicas, self.rank)
 
     def __len__(self):
         if self.group_select_weights is not None:
@@ -705,7 +729,8 @@ class TranscriptGroupedMultiDatasetBatchSampler:
                 self.num_samples + self.batch_size - 1
             ) // self.batch_size
 
-        return (n_batches + self.num_replicas - 1 - self.rank) // self.num_replicas
+        # ceil, with no `- rank`: padded sharding gives every rank an equal count.
+        return (n_batches + self.num_replicas - 1) // self.num_replicas
 
 
 # ============================================================
@@ -794,11 +819,18 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         dataset_aware_batching: bool = False,
         datasets_per_batch: int = 4,
         train_sampling_strategy: Optional[str] = None,
+        train_allowed_dataset_names_by_transcript: Optional[dict[str, Sequence[str]]] = None,
+        val_allowed_dataset_names_by_transcript: Optional[dict[str, Sequence[str]]] = None,
         pin_memory: bool = True,
         prefetch_factor: Optional[int] = 4,
     ):
         super().__init__()
-        self.save_hyperparameters()
+        self.save_hyperparameters(
+            ignore=[
+                "train_allowed_dataset_names_by_transcript",
+                "val_allowed_dataset_names_by_transcript",
+            ]
+        )
 
         self.sequences_path = sequences_path
         self.datasets_paths = list(datasets_paths)
@@ -815,6 +847,8 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         self.dataset_aware_batching = bool(dataset_aware_batching)
         self.datasets_per_batch = int(datasets_per_batch)
         self.train_sampling_strategy = train_sampling_strategy
+        self.train_allowed_dataset_names_by_transcript = train_allowed_dataset_names_by_transcript
+        self.val_allowed_dataset_names_by_transcript = val_allowed_dataset_names_by_transcript
 
         self.pin_memory = bool(pin_memory)
         self.prefetch_factor = prefetch_factor
@@ -972,7 +1006,20 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
 
         print(f"Unioning master sequences with {len(self.datasets_paths)} datasets...")
 
-        seq_df = pd.read_parquet(self.sequences_path)
+        # The model only consumes the per-codon `ref` one-hots and the CSS column
+        # (keyed by transcript_id). The sequence parquet also stores large unused
+        # columns (e.g. `openen` alone is ~80% of the 161MB file), so we read only
+        # what we need — a far smaller and much faster deserialization.
+        seq_available = set(pq.read_schema(self.sequences_path).names)
+        seq_css_col = (
+            "conserved_stalling_sites"
+            if "conserved_stalling_sites" in seq_available
+            else "css"
+        )
+        seq_columns = [
+            c for c in ("transcript_id", "ref", seq_css_col) if c in seq_available
+        ]
+        seq_df = pd.read_parquet(self.sequences_path, columns=seq_columns or None)
         if "transcript_id" in seq_df.columns:
             seq_df = seq_df.set_index("transcript_id")
         seq_df.index = seq_df.index.astype(str)
@@ -980,6 +1027,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         print("Length of the main sequence:", len(seq_df.index))
 
         loaded_datasets = {}
+        weighted_dataset_names = []
         union_index = pd.Index([], dtype=seq_df.index.dtype)
 
         for path in tqdm(self.datasets_paths, desc="Loading ribo datasets"):
@@ -994,8 +1042,21 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             df.index = df.index.astype(str)
 
             dataset_name = os.path.basename(path).split(".")[0]
-            loaded_datasets[dataset_name] = df[["ribo"]]
+            columns = ["ribo"]
+            if "weight" in df.columns:
+                columns.append("weight")
+                weighted_dataset_names.append(dataset_name)
+
+            loaded_datasets[dataset_name] = df[columns]
             union_index = union_index.union(df.index, sort=False)
+
+        if weighted_dataset_names:
+            print(
+                "Using transcript weights from "
+                f"{len(weighted_dataset_names)}/{len(loaded_datasets)} loaded datasets."
+            )
+        else:
+            print("No transcript weight column found; using unit sample weights.")
 
         valid_index = seq_df.index.intersection(union_index, sort=False)
         if len(valid_index) == 0:
@@ -1024,15 +1085,27 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             "ref": ref_arrays,
             "css": css,
             "ribo_profiles": defaultdict(dict),
+            "sample_weights": defaultdict(dict),
             "lengths": lengths,
             "datasets_names": list(loaded_datasets.keys()),
         }
 
         valid_ids = set(valid_index.astype(str))
         for dataset_name, df in loaded_datasets.items():
-            for t_id, ribo_profile in zip(df.index.astype(str), df["ribo"].values):
-                if t_id in valid_ids:
-                    shared_data["ribo_profiles"][t_id][dataset_name] = ribo_profile
+            if "weight" in df.columns:
+                iterator = zip(
+                    df.index.astype(str),
+                    df["ribo"].values,
+                    df["weight"].values,
+                )
+                for t_id, ribo_profile, sample_weight in iterator:
+                    if t_id in valid_ids:
+                        shared_data["ribo_profiles"][t_id][dataset_name] = ribo_profile
+                        shared_data["sample_weights"][t_id][dataset_name] = sample_weight
+            else:
+                for t_id, ribo_profile in zip(df.index.astype(str), df["ribo"].values):
+                    if t_id in valid_ids:
+                        shared_data["ribo_profiles"][t_id][dataset_name] = ribo_profile
 
         if self.split is None:
             raise NotImplementedError(
@@ -1078,6 +1151,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             datasets_encoding=self.datasets_enc,
             transcripts_ids=train_ids,
             dataset_choice_mode=train_choice_mode,
+            allowed_dataset_names_by_transcript=self.train_allowed_dataset_names_by_transcript,
             seed=self.seed,
         )
 
@@ -1119,6 +1193,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             datasets_encoding=self.datasets_enc,
             transcripts_ids=val_ids,
             dataset_choice_mode="deterministic",
+            allowed_dataset_names_by_transcript=self.val_allowed_dataset_names_by_transcript,
             seed=self.seed,
         )
 
@@ -1163,6 +1238,17 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         print("transcripts by number of available datasets:")
         for k, n in zip(unique_k, k_counts):
             print(f"  k={int(k):2d}: transcripts={int(n)}")
+
+        sample_weights = getattr(dataset_obj, "flat_sample_weights", None)
+        if sample_weights is not None:
+            sample_weights = np.asarray(sample_weights, dtype=np.float32)
+            print(
+                "sample weights: "
+                f"mean={sample_weights.mean():.4f}, "
+                f"min={sample_weights.min():.4f}, "
+                f"max={sample_weights.max():.4f}, "
+                f"nonzero={(sample_weights > 0.0).mean():.3f}"
+            )
 
     # ------------------------------------------------------------
     # Workers / DataLoaders

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from typing import Mapping, Sequence
 
 import numpy as np
 import torch
@@ -41,6 +42,7 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             codon_ids[T],
             ribo_profile[T],
             css,
+            sample_weight,
         )
 
     Collate returns:
@@ -53,6 +55,7 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             mask_pad,              # [B, T_max]
             codon_ids_pad,         # [B, T_max]
             css_sorted,            # list
+            sample_weights_sorted, # [B]
         )
 
     Speed-oriented details:
@@ -75,6 +78,7 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         lengths: np.ndarray | None = None,
         seed: int = 42,
         dataset_choice_mode: str = "random",  # "random" or "deterministic"
+        allowed_dataset_names_by_transcript: Mapping[str, Sequence[str]] | None = None,
         precompute_features: bool = True,
         precompute_ribo: bool = True,
     ):
@@ -105,6 +109,14 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         self.seed = int(seed)
         self.precompute_features = bool(precompute_features)
         self.precompute_ribo = bool(precompute_ribo)
+        self.allowed_dataset_names_by_transcript = (
+            {
+                str(tid): set(map(str, dataset_names))
+                for tid, dataset_names in allowed_dataset_names_by_transcript.items()
+            }
+            if allowed_dataset_names_by_transcript is not None
+            else None
+        )
 
         if self.dataset_choice_mode not in {"random", "deterministic"}:
             raise ValueError(f"Unknown dataset_choice_mode={self.dataset_choice_mode}")
@@ -140,6 +152,7 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
 
         # Ribo cache keyed by (transcript_id, dataset_name).
         self._ribo_cache: dict[tuple[str, str], np.ndarray] = {}
+        self._sample_weight_cache: dict[tuple[str, str], float] = {}
 
         # ------------------------------------------------------------
         # Precompute available datasets per local transcript.
@@ -150,9 +163,18 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         for tid in self.transcripts_ids:
             available_map = self.data_records["ribo_profiles"][tid]
             available_names = list(available_map.keys())
+            if self.allowed_dataset_names_by_transcript is not None:
+                allowed = self.allowed_dataset_names_by_transcript.get(str(tid))
+                if allowed is not None:
+                    available_names = [
+                        name for name in available_names if str(name) in allowed
+                    ]
 
             if len(available_names) == 0:
-                raise RuntimeError(f"Transcript {tid} has no available ribo profiles.")
+                raise RuntimeError(
+                    f"Transcript {tid} has no available ribo profiles after "
+                    "applying allowed dataset filtering."
+                )
 
             missing_dataset_names = [
                 name for name in available_names if name not in self.datasets_encoding
@@ -181,6 +203,7 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         self.flat_dataset_names: list[str] = []
         self.flat_dataset_ids: list[int] = []
         self.flat_lengths: list[int] = []
+        self.flat_sample_weights: list[float] = []
 
         for local_idx, tid in enumerate(self.transcripts_ids):
             tid = str(tid)
@@ -197,6 +220,9 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
                 self.flat_dataset_names.append(dataset_name)
                 self.flat_dataset_ids.append(int(self.datasets_encoding[dataset_name]))
                 self.flat_lengths.append(transcript_length)
+                self.flat_sample_weights.append(
+                    self._get_sample_weight(tid, dataset_name)
+                )
 
         self.flat_transcript_ids = np.asarray(self.flat_transcript_ids, dtype=str)
         self.flat_local_indices = np.asarray(self.flat_local_indices, dtype=np.int64)
@@ -204,6 +230,10 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         self.flat_dataset_names = np.asarray(self.flat_dataset_names, dtype=object)
         self.flat_dataset_ids = np.asarray(self.flat_dataset_ids, dtype=np.int64)
         self.flat_lengths = np.asarray(self.flat_lengths, dtype=np.int32)
+        self.flat_sample_weights = np.asarray(
+            self.flat_sample_weights,
+            dtype=np.float32,
+        )
 
         self.total_length = int(len(self.flat_local_indices))
 
@@ -217,6 +247,7 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             == len(self.flat_dataset_names)
             == len(self.flat_dataset_ids)
             == len(self.flat_lengths)
+            == len(self.flat_sample_weights)
         ):
             raise RuntimeError("Flat-pair metadata arrays have inconsistent lengths.")
 
@@ -268,6 +299,7 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         encoded, codon_ids = self._get_encoded_and_codon_ids(global_idx)
         ribo = self._get_ribo_profile(transcript_id, dataset_name)
         css = self.data_records["css"][global_idx]
+        sample_weight = self._get_sample_weight(transcript_id, dataset_name)
 
         if len(ribo) != encoded.shape[0]:
             raise ValueError(
@@ -283,7 +315,15 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
 
         real_idx_dataset = int(self.datasets_encoding[dataset_name])
 
-        return real_idx_dataset, transcript_id, encoded, codon_ids, ribo, css
+        return (
+            real_idx_dataset,
+            transcript_id,
+            encoded,
+            codon_ids,
+            ribo,
+            css,
+            sample_weight,
+        )
 
     # ============================================================
     # Balancing / metadata helpers
@@ -542,6 +582,27 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
 
         return ribo
 
+    def _get_sample_weight(self, transcript_id: str, dataset_name: str) -> float:
+        key = (str(transcript_id), str(dataset_name))
+        cached = self._sample_weight_cache.get(key)
+        if cached is not None:
+            return cached
+
+        value = 1.0
+        sample_weights = self.data_records.get("sample_weights")
+        if sample_weights is not None:
+            transcript_weights = sample_weights.get(str(transcript_id))
+            if transcript_weights is not None:
+                value = transcript_weights.get(str(dataset_name), 1.0)
+
+        value = float(value)
+        if not np.isfinite(value):
+            value = 1.0
+
+        value = float(np.clip(value, 0.0, 1.0))
+        self._sample_weight_cache[key] = value
+        return value
+
     def _extract_features_and_codon_ids(
         self,
         nucleotide_sequence_per_codon,
@@ -648,7 +709,15 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
     # ============================================================
 
     def collate_fn(self, batch):
-        idx_datasets, ids, sequences, codon_ids, profiles, css_s = zip(*batch)
+        (
+            idx_datasets,
+            ids,
+            sequences,
+            codon_ids,
+            profiles,
+            css_s,
+            sample_weights,
+        ) = zip(*batch)
 
         lengths = torch.as_tensor(
             [s.shape[0] for s in sequences],
@@ -683,6 +752,10 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         ]
 
         css_sorted = [css_s[i] for i in order_list]
+        sample_weights_sorted = torch.as_tensor(
+            [sample_weights[i] for i in order_list],
+            dtype=torch.float32,
+        )
 
         seq_pad = pad_sequence(
             seq_sorted,
@@ -744,4 +817,5 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             mask_pad,
             codon_ids_pad,
             css_sorted,
+            sample_weights_sorted,
         )
