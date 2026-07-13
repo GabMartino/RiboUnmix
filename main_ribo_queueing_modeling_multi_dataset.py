@@ -248,25 +248,140 @@ def format_run_tag_value(value: Any) -> str:
     )
 
 
-def make_run_tag(cfg: DictConfig) -> str:
-    parts = ["queueNB"]
+def make_cagrad_run_tag(cfg: DictConfig) -> str:
+    cagrad_enabled = cfg_bool(
+        cfg,
+        "cagrad.enabled",
+        cfg_bool(cfg, "optim.use_cagrad", False),
+    )
+    if not cagrad_enabled:
+        return "CAGradOff"
 
-    if cfg_bool(cfg, "cagrad.enabled", cfg_bool(cfg, "optim.use_cagrad", False)):
-        cagrad_c = format_run_tag_value(cfg_get(cfg, "cagrad.c", 0.5))
-        parts.append(f"CAGradc{cagrad_c}")
+    cagrad_c = format_run_tag_value(cfg_get(cfg, "cagrad.c", 0.5))
+    return f"CAGradOn_c{cagrad_c}"
 
-    sampling = str(cfg_get(cfg, "data.train_sampling_strategy", "default"))
-    if sampling not in {"", "default", "None", "none"}:
-        parts.append(sampling)
 
-    mass_weight = cfg_get(cfg, "loss.mass_loss_weight", 0.1)
-    parts.append(f"mass{mass_weight}")
-
+def make_dataset_balance_run_tag(cfg: DictConfig) -> str:
     if cfg_bool(cfg, "loss.dataset_balanced_loss", False):
-        parts.append("DBLoss")
+        return "DBLossOn"
+    return "DBLossOff"
 
-    if cfg_bool(cfg, "model.dataset_J_params.enabled", False):
-        parts.append("Jd")
+
+def make_replica_objective_run_tag(cfg: DictConfig) -> str:
+    objective = str(cfg_get(cfg, "loss.replica_objective", "replica")).lower()
+
+    if objective == "consensus":
+        return "ConsensusOnly"
+
+    if objective == "consensus_plus_replica":
+        replica_nll_weight = format_run_tag_value(
+            cfg_get(cfg, "loss.replica_nll_weight", 0.0)
+        )
+        replica_pcc_weight = format_run_tag_value(
+            cfg_get(cfg, "loss.replica_pcc_loss_weight", 0.0)
+        )
+        return f"ConsensusReplicas_nll{replica_nll_weight}_pcc{replica_pcc_weight}"
+
+    if objective == "replica":
+        return "ReplicasOnly"
+
+    return f"ReplicaObj{format_run_tag_value(objective)}"
+
+
+def make_sampling_run_tag(cfg: DictConfig) -> str | None:
+    sampling = str(cfg_get(cfg, "data.train_sampling_strategy", "default")).strip()
+    if sampling in {"", "default", "None", "none"}:
+        return None
+    return f"Sampling_{format_run_tag_value(sampling)}"
+
+
+def make_pcc_run_tag(cfg: DictConfig) -> str:
+    if not cfg_bool(cfg, "loss.pcc_loss_enabled", False):
+        return "PCCOff"
+
+    mode = str(cfg_get(cfg, "loss.pcc_loss_mode", "raw")).lower()
+    total_weight = format_run_tag_value(cfg_get(cfg, "loss.pcc_loss_weight", 1.0))
+
+    if mode == "raw":
+        return f"PCCraw_w{total_weight}"
+
+    if mode == "log1p":
+        return f"PCClog1p_w{total_weight}"
+
+    if mode.startswith("hybrid_raw_nb_vst"):
+        suffix = ""
+        if "weighted" in mode:
+            suffix += "Weighted"
+        if "mean_ratio_gated" in mode:
+            suffix += "Gated"
+
+        raw_weight = format_run_tag_value(
+            cfg_get(cfg, "loss.pcc_raw_component_weight", 0.0)
+        )
+        nb_vst_weight = format_run_tag_value(
+            cfg_get(cfg, "loss.pcc_nb_vst_component_weight", 0.0)
+        )
+        return (
+            f"PCCrawVarAdj{suffix}_w{total_weight}"
+            f"_raw{raw_weight}_var{nb_vst_weight}"
+        )
+
+    if mode.startswith("nb_vst"):
+        suffix = ""
+        if "weighted" in mode:
+            suffix += "Weighted"
+        if "mean_ratio_gated" in mode:
+            suffix += "Gated"
+        return f"PCCvarAdj{suffix}_w{total_weight}"
+
+    return f"PCC{format_run_tag_value(mode)}_w{total_weight}"
+
+
+def make_gamma_transform_run_tag(cfg: DictConfig) -> str | None:
+    transform = str(cfg_get(cfg, "model.gamma_transform", "exponential")).lower()
+    if transform in {"exponential", "exp"}:
+        return None
+    if transform in {"entmax15", "entmax15_gated_exponential"}:
+        temperature = format_run_tag_value(
+            cfg_get(cfg, "model.gamma_entmax_temperature", 10.0)
+        )
+        return f"GammaEntmax15T{temperature}"
+    return f"Gamma{format_run_tag_value(transform)}"
+
+
+def make_gamma_support_run_tag(cfg: DictConfig) -> str | None:
+    if not bool(cfg_get(cfg, "model.gamma_split_support_head", False)):
+        return None
+    bce_weight = format_run_tag_value(
+        cfg_get(cfg, "loss.support_calibration_weight", 0.0)
+    )
+    gate_additive = bool(cfg_get(cfg, "model.gamma_gate_additive_bias", False))
+    parts = [f"SplitSupportBCEw{bce_weight}"]
+    if gate_additive:
+        parts.append("GateAdd")
+    return "".join(parts)
+
+
+def make_run_tag(cfg: DictConfig) -> str:
+    parts = [
+        "queueNB",
+        make_cagrad_run_tag(cfg),
+        make_dataset_balance_run_tag(cfg),
+        make_replica_objective_run_tag(cfg),
+        make_pcc_run_tag(cfg),
+    ]
+
+    sampling_tag = make_sampling_run_tag(cfg)
+    if sampling_tag is not None:
+        parts.append(sampling_tag)
+
+    gamma_transform_tag = make_gamma_transform_run_tag(cfg)
+    if gamma_transform_tag is not None:
+        parts.append(gamma_transform_tag)
+
+    gamma_support_tag = make_gamma_support_run_tag(cfg)
+    if gamma_support_tag is not None:
+        parts.append(gamma_support_tag)
 
     return "_".join(parts)
 
@@ -759,6 +874,108 @@ def load_weights_only(
     It intentionally does not restore optimizer/scheduler state.
     """
     ckpt_path = Path(ckpt_path)
+
+    # Gamma's sparse/exponential transform is parameter-free and therefore is
+    # not represented by tensor weights. Recover it from the run-local config
+    # so old exponential checkpoints are not silently evaluated with new
+    # entmax semantics (and vice versa).
+    model = getattr(lit_model, "model", None)
+    if model is not None and hasattr(model, "set_gamma_transform"):
+        saved_config_path = None
+        try:
+            checkpoint_root = Path(lit_model.config.paths.checkpoints).resolve()
+            relative_parent = ckpt_path.resolve().parent.relative_to(checkpoint_root)
+            saved_config_path = (
+                Path(lit_model.config.paths.logs).resolve()
+                / relative_parent
+                / "config.yaml"
+            )
+        except (AttributeError, ValueError):
+            saved_config_path = None
+
+        if saved_config_path is not None and saved_config_path.exists():
+            saved_cfg = OmegaConf.load(saved_config_path)
+            saved_transform = str(
+                cfg_get(saved_cfg, "model.gamma_transform", "exponential")
+            )
+            saved_temperature = float(
+                cfg_get(saved_cfg, "model.gamma_entmax_temperature", 10.0)
+            )
+            # Fields absent from historical configs intentionally restore the
+            # legacy coupled-score/additive-ungated semantics.
+            saved_split_support = bool(
+                cfg_get(saved_cfg, "model.gamma_split_support_head", False)
+            )
+            saved_gate_additive = bool(
+                cfg_get(saved_cfg, "model.gamma_gate_additive_bias", False)
+            )
+            model.set_gamma_transform(
+                saved_transform,
+                entmax_temperature=saved_temperature,
+                split_support_head=saved_split_support,
+                gate_additive_bias=saved_gate_additive,
+            )
+            OmegaConf.update(
+                lit_model.config,
+                "model.gamma_transform",
+                model.gamma_transform,
+                merge=False,
+            )
+            OmegaConf.update(
+                lit_model.config,
+                "model.gamma_entmax_temperature",
+                model.gamma_entmax_temperature,
+                merge=False,
+            )
+            OmegaConf.update(
+                lit_model.config,
+                "model.gamma_split_support_head",
+                model.gamma_split_support_head,
+                merge=False,
+            )
+            OmegaConf.update(
+                lit_model.config,
+                "model.gamma_gate_additive_bias",
+                model.gamma_gate_additive_bias,
+                merge=False,
+            )
+            print(
+                "Restored gamma transform from checkpoint run config: "
+                f"{model.gamma_transform}; split_support="
+                f"{model.gamma_split_support_head}; gate_additive="
+                f"{model.gamma_gate_additive_bias}"
+            )
+            removed_separate_trunk = bool(
+                cfg_get(saved_cfg, "model.gamma_separate_support_trunk", False)
+            )
+            removed_lbio_response = bool(
+                cfg_get(saved_cfg, "model.gamma_lbio_response_enabled", False)
+            ) and (
+                float(
+                    cfg_get(
+                        saved_cfg,
+                        "model.gamma_lbio_amplitude_response_max_abs",
+                        0.0,
+                    )
+                )
+                > 0.0
+                or float(
+                    cfg_get(
+                        saved_cfg,
+                        "model.gamma_lbio_support_response_max_abs",
+                        0.0,
+                    )
+                )
+                > 0.0
+            )
+            if removed_separate_trunk or removed_lbio_response:
+                print(
+                    "Warning: this checkpoint used an experimental gamma "
+                    "structure removed from the cleaned model. Its extra "
+                    "weights will be ignored; use the historical code to "
+                    "reproduce that checkpoint exactly."
+                )
+
     ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
 
     state_dict = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
@@ -807,84 +1024,34 @@ def predictions_to_parquet(
     rows = []
 
     sequence_keys = {
-        # Core target/prediction
-        "y",
         "target",
         "likelihood_positive_mean",
         "mu",
-        "mu_obs",
-        "mu_positive",
-        "mu_unconditional",
-        "mu_unconditional_raw",
-        "mu_total",
-        "mu_base",
-
-        # Mean profiles
-        "mu_L_only",
-        "mu_L_bio",
-        "mu_L_obs",
-        "mu_bio_only",
-        "mu_bio_smooth",
-
-        # Biological branch
-        "w_logits",
-        "w_bio",
-        "w_prob",
-        "h_bio",
         "rho_bio",
-        "q_bio",
         "L_bio",
-        "L_queue",
-        "bio_q_base",
-
-        # Observed branch
-        "w_obs",
-        "h_obs",
-        "rho_obs",
-        "L_obs",
-        "L_queue_obs",
-        "bio_q",
-        "q",
-        "q_for_profile",
-        "profile_prob",
-        "p_visible",
-        "lambda_pre_dropout",
-        "obs_beta",
-        "log_visibility_bias",
+        "gamma",
+        "gamma_amplitude",
+        "gamma_sparse_gate",
+        "gamma_support_logits",
+        "gamma_support_logits_raw",
+        "log_gamma",
+        "gamma_raw",
+        "log_gamma_raw",
+        "gamma_cross_dataset_log_center",
+        "gamma_centering_reliability",
+        "gamma_centering_eligible",
+        "gamma_centering_applied",
+        "gamma_num_distinct_datasets",
+        "gamma_total_reliability",
+        "additive_bias",
         "log_sigma",
-
-        # Multiplicative observation bias
-        "obs_bias_raw",
-        "obs_bias_effective",
-        "obs_bias_amp",
-        "obs_bias_amp_logits",
-        "obs_bias_keep_prob",
-        "obs_bias_keep_gate",
-        "obs_bias_keep_hard",
-        "obs_bias_gate_logits",
-
-        # Backward-compatible old names
-        "L_effective",
-        "bio_q_smooth",
-        "h_bio_smooth",
-        "rho",
-        "rho_diag",
-        "exp_b",
-        "b",
-        "b_shape",
-        "log_b",
-        "lambda_frac",
-        "lambda_bg",
-        "additive_noise",
-        "additive_support_eff",
-        "additive_frac_eff",
-        "keep_gate",
-
-        # Batch arrays
         "mask",
         "codon_ids",
-        "profile_kappa",
-        "kappa_input",
+    }
+    bool_sequence_keys = {
+        "mask",
+        "gamma_centering_eligible",
+        "gamma_centering_applied",
     }
 
     def to_numpy(x):
@@ -946,7 +1113,7 @@ def predictions_to_parquet(
         else:
             sliced = arr[i, :valid_len]
 
-        if key == "mask":
+        if key in bool_sequence_keys:
             return np.asarray(sliced).astype(np.bool_, copy=False).tolist()
 
         if key == "codon_ids":
@@ -1145,6 +1312,10 @@ def make_datamodule(
         val_allowed_dataset_names_by_transcript=val_allowed_dataset_names_by_transcript,
         pin_memory=cfg_bool(cfg, "data.pin_memory", True),
         prefetch_factor=cfg_get(cfg, "data.prefetch_factor", 4),
+        use_ribo_replicas=cfg_bool(cfg, "data.use_ribo_replicas", False),
+        ribo_replicas_column=str(
+            cfg_get(cfg, "data.ribo_replicas_column", "ribo_cds_replicas")
+        ),
     )
 
 
@@ -1318,24 +1489,27 @@ def main(cfg: DictConfig) -> None:
     paths_results = Path(cfg.paths.results) / dataset_str / run_tag
     paths_checkpoints = Path(cfg.paths.checkpoints) / dataset_str / run_tag
 
-    # Save split provenance. This is essential for checking fairness across runs.
-    save_split_manifest(
-        out_file=paths_results / f"split_manifest_experiment_{dataset_str}_universe_{split_universe_str}.json",
-        experiment_datasets=experiment_datasets,
-        split_universe_datasets=split_universe_datasets,
-        split_dataset_source=split_dataset_source_label,
-        split_dataset_paths=split_universe_dataset_paths,
-        training_dataset_paths=experiment_dataset_paths,
-        extra_train_ids=extra_train_ids,
-        train_ids=train_fold,
-        main_val_ids=main_val_fold,
-        css_benchmark_ids=css_benchmark_fold,
-        metadata=split_metadata,
-        seed=seed,
-        train_frac=train_frac,
-        main_val_frac=main_val_frac,
-        css_benchmark_frac=css_benchmark_frac,
-    )
+    # Save split provenance once. Under Slurm+srun, every rank executes this
+    # script before the Lightning Trainer exists, so use the environment rank
+    # guard rather than trainer.is_global_zero.
+    if env_global_rank() == 0:
+        save_split_manifest(
+            out_file=paths_results / f"split_manifest_experiment_{dataset_str}_universe_{split_universe_str}.json",
+            experiment_datasets=experiment_datasets,
+            split_universe_datasets=split_universe_datasets,
+            split_dataset_source=split_dataset_source_label,
+            split_dataset_paths=split_universe_dataset_paths,
+            training_dataset_paths=experiment_dataset_paths,
+            extra_train_ids=extra_train_ids,
+            train_ids=train_fold,
+            main_val_ids=main_val_fold,
+            css_benchmark_ids=css_benchmark_fold,
+            metadata=split_metadata,
+            seed=seed,
+            train_frac=train_frac,
+            main_val_frac=main_val_frac,
+            css_benchmark_frac=css_benchmark_frac,
+        )
 
     dataset_encoding = open_file(cfg.paths.encodings.datasets)
     missing_dataset_encodings = [
@@ -1466,6 +1640,19 @@ def main(cfg: DictConfig) -> None:
         mode=metric_mode,
     )
 
+    # Keep a second, independently selected checkpoint for the metric the
+    # current ablation is explicitly trying to improve. The likelihood-best
+    # checkpoint remains available for calibration/NLL comparisons.
+    pcc_checkpoint_callback = ModelCheckpoint(
+        dirpath=str(ckpt_dir),
+        filename="pcc-{epoch}-{val_mu_pcc:.4f}",
+        save_top_k=1,
+        save_last=False,
+        save_weights_only=True,
+        monitor="val_mu_pcc",
+        mode="max",
+    )
+
     early_stopping = EarlyStopping(
         monitor=monitor,
         patience=int(cfg.callbacks.early_stopping_patience),
@@ -1491,7 +1678,12 @@ def main(cfg: DictConfig) -> None:
         "logger": tb_logger,
         "log_every_n_steps": int(cfg.trainer.log_every_n_steps),
         "accumulate_grad_batches": int(cfg_get(cfg, "trainer.accumulate_grad_batches", 1)),
-        "callbacks": [checkpoint_callback, early_stopping, lr_monitor],
+        "callbacks": [
+            checkpoint_callback,
+            pcc_checkpoint_callback,
+            early_stopping,
+            lr_monitor,
+        ],
         "use_distributed_sampler": cfg_bool(
             cfg,
             "trainer.use_distributed_sampler",
@@ -1548,7 +1740,11 @@ def main(cfg: DictConfig) -> None:
     if do_predict:
         paths_results.mkdir(parents=True, exist_ok=True)
 
-        ckpt_to_use = checkpoint_callback.best_model_path or selected_ckpt
+        ckpt_to_use = (
+            pcc_checkpoint_callback.best_model_path
+            or checkpoint_callback.best_model_path
+            or selected_ckpt
+        )
 
         if ckpt_to_use is None:
             ckpt_to_use = choose_checkpoint(

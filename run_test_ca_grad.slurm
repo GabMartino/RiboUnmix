@@ -18,6 +18,6 @@ srun python main_ribo_queueing_modeling_multi_dataset.py \
     trainer.devices=[0,1] \
     data.batch_size=128 \
     data.num_workers=8 \
-    optim.use_cagrad=true \
+    cagrad.enabled=true \
     experiment.dataset="['kutay_2021', 'grimson_2019', 'sako_2020']" \
-    split.master_dataset_universe="['kutay_2021', 'grimson_2019', 'sako_2020']" \
+    split.master_dataset_universe="['kutay_2021', 'grimson_2019', 'sako_2020']"

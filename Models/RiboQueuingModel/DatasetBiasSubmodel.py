@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Sequence
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,187 +16,74 @@ class ChannelLayerNorm(nn.Module):
         self.norm = nn.LayerNorm(int(channels))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.ndim != 3:
-            raise ValueError(f"Expected x [B, C, T], got {tuple(x.shape)}.")
         return self.norm(x.transpose(1, 2)).transpose(1, 2)
 
 
-class ResidualDilatedConvBlock(nn.Module):
+class BiGRUContextEncoder(nn.Module):
     """
-    Pre-norm residual dilated convolution block.
+    Bidirectional GRU context encoder for the dataset-bias branch.
 
-    Args:
-        x:
-            Tensor with shape [B, C, T].
-        mask:
-            Optional valid-position mask with shape [B, T].
-    """
+    It maps [B, C_in, T] -> [B, C_out, T]. This is a *separate* encoder from
+    the biological BiGRU on purpose: gamma must stay an independent function
+    of (sequence, dataset_id), so an XAI attribution on gamma resolves to the
+    sequence directly and never flows through biology-derived features. That
+    keeps `L_bio <- GRU_bio(seq)` and `gamma <- GRU_bias(seq, dataset)` cleanly
+    separable at interpretation time.
 
-    def __init__(
-        self,
-        channels: int,
-        kernel_size: int,
-        dilation: int,
-        dropout: float = 0.0,
-        gated: bool = True,
-        residual_scale: float = 1.0,
-    ):
-        super().__init__()
-
-        if kernel_size % 2 == 0:
-            raise ValueError("kernel_size must be odd for same-length padding.")
-
-        self.channels = int(channels)
-        self.kernel_size = int(kernel_size)
-        self.dilation = int(dilation)
-        self.gated = bool(gated)
-        self.residual_scale = float(residual_scale)
-
-        padding = self.dilation * (self.kernel_size - 1) // 2
-
-        self.norm = ChannelLayerNorm(self.channels)
-
-        conv_out_channels = 2 * self.channels if self.gated else self.channels
-
-        self.conv = nn.Conv1d(
-            in_channels=self.channels,
-            out_channels=conv_out_channels,
-            kernel_size=self.kernel_size,
-            padding=padding,
-            dilation=self.dilation,
-            padding_mode="replicate",
-            bias=True,
-        )
-
-        self.dropout = nn.Dropout(p=float(dropout))
-
-        self.pointwise = nn.Conv1d(
-            in_channels=self.channels,
-            out_channels=self.channels,
-            kernel_size=1,
-            bias=True,
-        )
-
-        # Identity-like residual initialization.
-        nn.init.zeros_(self.pointwise.weight)
-        nn.init.zeros_(self.pointwise.bias)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        residual = x
-
-        if mask is not None:
-            mask_f = mask.bool().to(dtype=x.dtype).unsqueeze(1)
-            x = x * mask_f
-
-        z = self.norm(x)
-        z = self.conv(z)
-
-        if self.gated:
-            value, gate = z.chunk(2, dim=1)
-            z = value * torch.sigmoid(gate)
-        else:
-            z = F.gelu(z)
-
-        z = self.dropout(z)
-        z = self.pointwise(z)
-
-        out = residual + self.residual_scale * z
-
-        if mask is not None:
-            out = out * mask.bool().to(dtype=out.dtype).unsqueeze(1)
-
-        return out
-
-
-class DilatedContextCNN(nn.Module):
-    """
-    Masked residual dilated TCN for dataset-conditioned local context features.
+    Padding is handled with packed sequences: a bidirectional GRU run on padded
+    input would let the backward pass integrate padding into the valid region.
     """
 
     def __init__(
         self,
         in_channels: int,
-        out_channels: int,
-        kernel_size: int = 15,
-        dilations: Sequence[int] = (1, 2, 4, 8, 16),
+        hidden_size: int,
+        num_layers: int = 1,
         dropout: float = 0.0,
-        gated: bool = True,
-        residual_scale: float = 1.0,
     ):
         super().__init__()
-
-        if kernel_size % 2 == 0:
-            raise ValueError("kernel_size must be odd for same-length padding.")
-
         self.in_channels = int(in_channels)
-        self.out_channels = int(out_channels)
-        self.kernel_size = int(kernel_size)
-        self.dilations = tuple(int(d) for d in dilations)
+        self.hidden_size = int(hidden_size)
+        self.num_layers = int(num_layers)
+        self.out_channels = 2 * self.hidden_size  # bidirectional
 
-        self.input_proj = nn.Conv1d(
-            in_channels=self.in_channels,
-            out_channels=self.out_channels,
-            kernel_size=1,
-            bias=True,
+        self.rnn = nn.GRU(
+            input_size=self.in_channels,
+            hidden_size=self.hidden_size,
+            num_layers=self.num_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=float(dropout) if self.num_layers > 1 else 0.0,
         )
-
-        self.blocks = nn.ModuleList(
-            [
-                ResidualDilatedConvBlock(
-                    channels=self.out_channels,
-                    kernel_size=self.kernel_size,
-                    dilation=d,
-                    dropout=dropout,
-                    gated=gated,
-                    residual_scale=residual_scale,
-                )
-                for d in self.dilations
-            ]
-        )
-
         self.output_norm = ChannelLayerNorm(self.out_channels)
-
-    @property
-    def receptive_field(self) -> int:
-        return 1 + (self.kernel_size - 1) * sum(self.dilations)
 
     def forward(
         self,
         x: torch.Tensor,
         mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if x.ndim != 3:
-            raise ValueError(f"Expected x [B, C, T], got {tuple(x.shape)}.")
+        # x: [B, C_in, T] -> GRU wants [B, T, C_in]
+        seq = x.transpose(1, 2)
+        B, T, _ = seq.shape
 
         if mask is not None:
-            if mask.ndim != 2:
-                raise ValueError(f"Expected mask [B, T], got {tuple(mask.shape)}.")
-            if x.shape[0] != mask.shape[0] or x.shape[-1] != mask.shape[1]:
-                raise ValueError(
-                    f"x/mask mismatch: x={tuple(x.shape)}, mask={tuple(mask.shape)}."
-                )
+            mask_b = mask.bool()
+            lengths = mask_b.sum(dim=1).clamp_min(1).to("cpu")
+            packed = nn.utils.rnn.pack_padded_sequence(
+                seq, lengths, batch_first=True, enforce_sorted=False
+            )
+            out_packed, _ = self.rnn(packed)
+            out, _ = nn.utils.rnn.pad_packed_sequence(
+                out_packed, batch_first=True, total_length=T
+            )
+        else:
+            out, _ = self.rnn(seq)
 
-            x = x * mask.bool().to(dtype=x.dtype).unsqueeze(1)
-
-        x = self.input_proj(x)
-
+        out = out.transpose(1, 2)  # [B, C_out, T]
+        out = self.output_norm(out)
         if mask is not None:
-            x = x * mask.bool().to(dtype=x.dtype).unsqueeze(1)
-
-        for block in self.blocks:
-            x = block(x, mask=mask)
-
-        x = self.output_norm(x)
-
-        if mask is not None:
-            x = x * mask.bool().to(dtype=x.dtype).unsqueeze(1)
-
-        return x
-
+            out = out * mask.bool().to(dtype=out.dtype).unsqueeze(1)
+        return out
 
 
 class DatasetBiasSubmodel(nn.Module):
@@ -214,8 +99,6 @@ class DatasetBiasSubmodel(nn.Module):
 
         self.codon_embeddings_size = int(config_params["codon_embeddings_size"])
         self.dataset_embeddings_size = int(config_params["dataset_embeddings_size"])
-        self.num_filters = int(config_params["num_filters"])
-        self.kernel_size = int(config_params["kernel_size"])
         self.num_datasets = int(config_params["num_datasets"])
         self.num_codons = int(config_params["num_codons"])
 
@@ -230,35 +113,46 @@ class DatasetBiasSubmodel(nn.Module):
             self.codon_embeddings_size,
         )
 
-        self.use_local_context_cnn = bool(config_params.get("use_local_context_cnn", True))
-
-        self.local_context_cnn = DilatedContextCNN(
-            in_channels=self.codon_embeddings_size + self.dataset_embeddings_size,
-            out_channels=self.num_filters,
-            kernel_size=self.kernel_size,
-            dilations=config_params.get("context_cnn_dilations", (1, 2, 4, 8, 16)),
-            dropout=float(config_params.get("context_cnn_dropout", 0.0)),
-            gated=bool(config_params.get("context_cnn_gated", True)),
-            residual_scale=float(config_params.get("context_cnn_residual_scale", 1.0)),
+        # This branch deliberately owns a GRU separate from the biological GRU,
+        # preserving gamma as a function of only (sequence, dataset_id).
+        encoder_in = self.codon_embeddings_size + self.dataset_embeddings_size
+        self.local_context_gru = BiGRUContextEncoder(
+            in_channels=encoder_in,
+            hidden_size=int(config_params.get("context_gru_hidden_size", 128)),
+            num_layers=int(config_params.get("context_gru_num_layers", 2)),
+            dropout=float(config_params.get("context_gru_dropout", 0.0)),
         )
+        self.context_dim = self.local_context_gru.out_channels
 
         head_input_size = (
             self.dataset_embeddings_size
-            + (self.num_filters if self.use_local_context_cnn else self.codon_embeddings_size)
+            + self.context_dim
             + self.position_dim
         )
+        self.additive_bias_input_mode = str(
+            config_params.get("additive_bias_input_mode", "full")
+        ).lower()
+        allowed_additive_input_modes = {
+            "full",
+            "dataset_only",
+            "dataset_and_position",
+        }
+        if self.additive_bias_input_mode == "dataset_only":
+            additive_input_size = self.dataset_embeddings_size
+        elif self.additive_bias_input_mode == "dataset_and_position":
+            additive_input_size = self.dataset_embeddings_size + self.position_dim
+        else:
+            additive_input_size = None
 
 
         self.observation_bias_head = DatasetMultiplicativeAllocationBiasHead(
             config_params=config_params.get(
             "dataset_multiplicative_allocation_bias_submodule_params"),
-            input_size=head_input_size
+            input_size=head_input_size,
+            additive_input_size=additive_input_size,
         )
 
         log_sigma_cfg = dict(config_params["dataset_log_sigma_submodule_params"])
-        log_sigma_cfg["num_datasets"] = self.num_datasets
-        log_sigma_cfg["codon_input_size"] = self.codon_embeddings_size
-
         self.log_sigma_head = DatasetLogSigmaHead(config_params=log_sigma_cfg, input_size=head_input_size)
 
     def forward(
@@ -286,31 +180,33 @@ class DatasetBiasSubmodel(nn.Module):
         codon_emb = self.codon_embedding(codon_ids).to(dtype=dtype)
         codon_emb = codon_emb * mask_f.unsqueeze(-1)
 
-        features = [dataset_emb]
-        if self.use_local_context_cnn:
-            cnn_input = torch.cat((dataset_emb, codon_emb), dim=-1)
-            local_context = self.local_context_cnn(
-                cnn_input.transpose(1, 2),
-                mask=mask_b,
-            ).transpose(1, 2)
-            features.append(local_context)
-        else:
-            features.append(codon_emb)
-        features.append(position_features)
+        encoder_input = torch.cat((dataset_emb, codon_emb), dim=-1).transpose(1, 2)
+        local_context = self.local_context_gru(
+            encoder_input,
+            mask=mask_b,
+        ).transpose(1, 2)
+        features = [dataset_emb, local_context, position_features]
 
 
         x = torch.cat(features, dim=-1)
         x = x * mask_f.unsqueeze(-1)
+        if self.additive_bias_input_mode == "dataset_only":
+            additive_x = dataset_emb
+        elif self.additive_bias_input_mode == "dataset_and_position":
+            additive_x = torch.cat((dataset_emb, position_features), dim=-1)
+        else:
+            additive_x = None
+        if additive_x is not None:
+            additive_x = additive_x * mask_f.unsqueeze(-1)
 
         out = self.observation_bias_head(
             x=x,
             mask=mask_b,
+            additive_x=additive_x,
         )
 
         log_sigma_out = self.log_sigma_head(
-            dataset_ids=dataset_ids,
-            codon_embeddings=codon_emb,
-            x = x,
+            x=x,
             mask=mask_b,
         )
         log_sigma = log_sigma_out["log_sigma"]  # [B, T]

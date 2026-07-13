@@ -5,3 +5,9 @@
 /outputs/
 /logs/
 /.idea
+/.pytest_cache/
+__pycache__/
+*.py[cod]
+job_*.out
+job_*.err
+run_log_GPU*.txt

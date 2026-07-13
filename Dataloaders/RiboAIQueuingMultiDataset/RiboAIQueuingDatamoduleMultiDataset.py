@@ -478,14 +478,13 @@ class SortedLengthBatchSampler(BatchSampler):
         return (total + self.num_replicas - 1) // self.num_replicas
 
 
-class TranscriptGroupedMultiDatasetBatchSampler:
+class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
     """
     Batch sampler that keeps transcript-dataset pairs for the same transcript
     together.
 
-    This is intended for disentanglement losses that need matched transcript
-    content across datasets, especially cross-dataset beta neutrality:
-    mean_d log_beta[d,t,i] ~= 0.
+    This is intended for losses that need matched transcript content across
+    datasets, including cross-dataset gamma centering for shared transcripts.
 
     Each emitted batch contains flat pair indices. For a transcript t measured
     in datasets D(t), the sampler emits the group:
@@ -499,6 +498,7 @@ class TranscriptGroupedMultiDatasetBatchSampler:
 
     def __init__(
         self,
+        sampler: Optional[Sampler] = None,
         *,
         flat_transcript_ids: Sequence[str] | np.ndarray,
         flat_dataset_ids: Sequence[int] | np.ndarray,
@@ -510,12 +510,21 @@ class TranscriptGroupedMultiDatasetBatchSampler:
         drop_last: bool = False,
         sort_by_length: bool = True,
         require_multidataset: bool = True,
+        shuffle_batches: bool = True,
         num_replicas: int = 1,
         rank: int = 0,
     ):
         self.flat_transcript_ids = _as_numpy_str(flat_transcript_ids)
         self.flat_dataset_ids = _as_numpy_int(flat_dataset_ids)
         self.lengths = np.asarray(lengths, dtype=np.int64)
+        if sampler is None:
+            sampler = SequentialSampler(range(len(self.flat_transcript_ids)))
+        # Lightning reconstructs BatchSampler subclasses during prediction to
+        # wrap them for index tracking. Exposing and initializing ``sampler``
+        # makes that reconstruction compatible. Group selection and distributed
+        # sharding remain owned by this sampler (Trainer disables automatic
+        # distributed-sampler injection in the project config).
+        super().__init__(sampler=sampler, batch_size=batch_size, drop_last=drop_last)
         self.batch_size = int(batch_size)
         self.num_samples = int(num_samples) if num_samples is not None else None
         self.gamma = float(gamma)
@@ -523,6 +532,7 @@ class TranscriptGroupedMultiDatasetBatchSampler:
         self.drop_last = bool(drop_last)
         self.sort_by_length = bool(sort_by_length)
         self.require_multidataset = bool(require_multidataset)
+        self.shuffle_batches = bool(shuffle_batches)
         self.num_replicas = max(int(num_replicas), 1)
         self.rank = int(rank) % self.num_replicas
         self._iter_count = 0
@@ -691,7 +701,7 @@ class TranscriptGroupedMultiDatasetBatchSampler:
         if batch and (len(batch) == self.batch_size or not self.drop_last):
             batches.append(batch)
 
-        if len(batches) > 1:
+        if self.shuffle_batches and len(batches) > 1:
             batch_order = rng.permutation(len(batches))
             batches = [batches[int(i)] for i in batch_order]
 
@@ -823,6 +833,8 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         val_allowed_dataset_names_by_transcript: Optional[dict[str, Sequence[str]]] = None,
         pin_memory: bool = True,
         prefetch_factor: Optional[int] = 4,
+        use_ribo_replicas: bool = False,
+        ribo_replicas_column: str = "ribo_cds_replicas",
     ):
         super().__init__()
         self.save_hyperparameters(
@@ -853,6 +865,9 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         self.pin_memory = bool(pin_memory)
         self.prefetch_factor = prefetch_factor
 
+        self.use_ribo_replicas = bool(use_ribo_replicas)
+        self.ribo_replicas_column = str(ribo_replicas_column)
+
         self.nt_enc = open_file(nt_encoding_path)
         self.c2aa_enc = open_file(codon_to_aa_encoding_path)
         self.c_enc = open_file(codon_encoding_path)
@@ -868,6 +883,8 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         self.train_flat_dataset_ids = None
         self.train_flat_transcript_ids = None
         self.train_pair_weights = None
+        self.val_flat_dataset_ids = None
+        self.val_flat_transcript_ids = None
 
         self._has_loaded_data = False
 
@@ -1047,6 +1064,17 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
                 columns.append("weight")
                 weighted_dataset_names.append(dataset_name)
 
+            if self.use_ribo_replicas:
+                if self.ribo_replicas_column not in df.columns:
+                    raise KeyError(
+                        f"data.use_ribo_replicas=true but column "
+                        f"{self.ribo_replicas_column!r} is missing in {path}. Point "
+                        "dataset_config at the replica parquets "
+                        "(config/dataset_config/replica_datasets_paths.yaml or "
+                        "Datasets/data/weighted_datasets_ribo_replicas)."
+                    )
+                columns.append(self.ribo_replicas_column)
+
             loaded_datasets[dataset_name] = df[columns]
             union_index = union_index.union(df.index, sort=False)
 
@@ -1085,27 +1113,47 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             "ref": ref_arrays,
             "css": css,
             "ribo_profiles": defaultdict(dict),
+            "ribo_replicas": defaultdict(dict),
             "sample_weights": defaultdict(dict),
             "lengths": lengths,
             "datasets_names": list(loaded_datasets.keys()),
         }
 
+        def _stack_replicas(cell) -> np.ndarray:
+            """Stack a per-transcript replica cell into a [n_replicas, L] array."""
+            reps = [np.asarray(rep, dtype=np.float32) for rep in cell]
+            if len(reps) == 0:
+                raise ValueError("Encountered a transcript with zero replicas.")
+            rep_lengths = {rep.shape[0] for rep in reps}
+            if len(rep_lengths) != 1:
+                raise ValueError(
+                    f"Replica length mismatch within a transcript: {sorted(rep_lengths)}."
+                )
+            return np.ascontiguousarray(np.stack(reps, axis=0))
+
         valid_ids = set(valid_index.astype(str))
         for dataset_name, df in loaded_datasets.items():
-            if "weight" in df.columns:
-                iterator = zip(
-                    df.index.astype(str),
-                    df["ribo"].values,
-                    df["weight"].values,
-                )
-                for t_id, ribo_profile, sample_weight in iterator:
-                    if t_id in valid_ids:
-                        shared_data["ribo_profiles"][t_id][dataset_name] = ribo_profile
-                        shared_data["sample_weights"][t_id][dataset_name] = sample_weight
-            else:
-                for t_id, ribo_profile in zip(df.index.astype(str), df["ribo"].values):
-                    if t_id in valid_ids:
-                        shared_data["ribo_profiles"][t_id][dataset_name] = ribo_profile
+            has_weight = "weight" in df.columns
+            ids = df.index.astype(str)
+            ribo_values = df["ribo"].values
+            weight_values = df["weight"].values if has_weight else None
+            replica_values = (
+                df[self.ribo_replicas_column].values if self.use_ribo_replicas else None
+            )
+            for i, t_id in enumerate(ids):
+                if t_id not in valid_ids:
+                    continue
+                if self.use_ribo_replicas:
+                    reps = _stack_replicas(replica_values[i])  # [R, L], CDS-aligned
+                    shared_data["ribo_replicas"][t_id][dataset_name] = reps
+                    # Representative target = replica mean (aligned to the start
+                    # codon). The single `ribo` field is +1-shifted and is
+                    # intentionally NOT used as the target in replica mode.
+                    shared_data["ribo_profiles"][t_id][dataset_name] = reps.mean(axis=0)
+                else:
+                    shared_data["ribo_profiles"][t_id][dataset_name] = ribo_values[i]
+                if has_weight:
+                    shared_data["sample_weights"][t_id][dataset_name] = weight_values[i]
 
         if self.split is None:
             raise NotImplementedError(
@@ -1153,6 +1201,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             dataset_choice_mode=train_choice_mode,
             allowed_dataset_names_by_transcript=self.train_allowed_dataset_names_by_transcript,
             seed=self.seed,
+            use_ribo_replicas=self.use_ribo_replicas,
         )
 
         if train_choice_mode == "deterministic":
@@ -1195,12 +1244,15 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             dataset_choice_mode="deterministic",
             allowed_dataset_names_by_transcript=self.val_allowed_dataset_names_by_transcript,
             seed=self.seed,
+            use_ribo_replicas=self.use_ribo_replicas,
         )
 
         self.val_lengths = self._get_flat_lengths(self.val_dataset_obj)
 
         val_flat_dataset_ids = self._get_flat_dataset_ids(self.val_dataset_obj)
         val_flat_transcript_ids = self._get_flat_transcript_ids(self.val_dataset_obj)
+        self.val_flat_dataset_ids = val_flat_dataset_ids
+        self.val_flat_transcript_ids = val_flat_transcript_ids
         self._print_flat_pair_summary(
             dataset_obj=self.val_dataset_obj,
             flat_transcript_ids=val_flat_transcript_ids,
@@ -1485,14 +1537,24 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         if self.val_dataset_obj is None:
             raise RuntimeError("setup() must be called before val_dataloader().")
 
-        batch_sampler = SortedLengthBatchSampler(
-            sampler=SequentialSampler(self.val_dataset_obj),
-            batch_size=self.batch_size,
-            drop_last=False,
-            shuffle=False,
+        if self.val_flat_transcript_ids is None or self.val_flat_dataset_ids is None:
+            raise RuntimeError("Validation dataloader requires deterministic flat metadata.")
+
+        num_replicas, rank = self._dist_info()
+        batch_sampler = TranscriptGroupedMultiDatasetBatchSampler(
+            flat_transcript_ids=self.val_flat_transcript_ids,
+            flat_dataset_ids=self.val_flat_dataset_ids,
             lengths=self.val_lengths,
+            batch_size=self.batch_size,
+            num_samples=None,
+            gamma=0.0,
             seed=self.seed,
-            descending=True,
+            drop_last=False,
+            sort_by_length=True,
+            require_multidataset=False,
+            shuffle_batches=False,
+            num_replicas=num_replicas,
+            rank=rank,
         )
 
         return DataLoader(
@@ -1506,16 +1568,23 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         if self.val_dataset_obj is None:
             raise RuntimeError("setup() must be called before predict_dataloader().")
 
+        if self.val_flat_transcript_ids is None or self.val_flat_dataset_ids is None:
+            raise RuntimeError("Prediction dataloader requires deterministic flat metadata.")
+
         num_replicas, rank = self._dist_info()
 
-        batch_sampler = SortedLengthBatchSampler(
-            sampler=SequentialSampler(self.val_dataset_obj),
-            batch_size=self.batch_size,
-            drop_last=False,
-            shuffle=False,
+        batch_sampler = TranscriptGroupedMultiDatasetBatchSampler(
+            flat_transcript_ids=self.val_flat_transcript_ids,
+            flat_dataset_ids=self.val_flat_dataset_ids,
             lengths=self.val_lengths,
+            batch_size=self.batch_size,
+            num_samples=None,
+            gamma=0.0,
+            drop_last=False,
             seed=self.seed,
-            descending=True,
+            sort_by_length=True,
+            require_multidataset=False,
+            shuffle_batches=False,
             num_replicas=num_replicas,
             rank=rank,
         )

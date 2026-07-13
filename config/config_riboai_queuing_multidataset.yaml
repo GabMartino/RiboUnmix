@@ -3,18 +3,18 @@ name: ribo_queueing_multi_datasets
 defaults:
   # Use weighted_datasets_paths here to train with the optional parquet `weight`
   # column generated in Datasets/data/weighted_datasets_ribo_only_with_css.
-  - dataset_config: weighted_datasets_paths
+  - dataset_config: weighted_datasets_paths_replicas
   - _self_
 
 experiment:
   from_checkpoint: false
   train: true
   predict: true
-  dataset: ["kutay_2021", "sako_2020"]
+  dataset: ["kutay_2021", "grimson_2019"]
   seed: 42
 
 split:
-  master_dataset_universe: ["kutay_2021", "sako_2020", "kito_2023"]
+  master_dataset_universe: ["kutay_2021", "grimson_2019"]
   # Active training paths come from defaults.dataset_config. With
   # weighted_datasets_paths active, use the same weighted dataset config to
   # decide which transcript/dataset observations are eligible for validation and
@@ -45,60 +45,108 @@ paths:
 
 data:
   batch_size: 32
-  num_workers: 4
+  num_workers: 2
 
   # transcript_grouped_pairs keeps the FULL datasets (single-dataset transcripts
   # included) while packing transcript groups into batches of batch_size.
-  train_sampling_strategy: transcript_grouped_pairs
+  train_sampling_strategy: transcript_grouped_pairs # random_dataset_per_transcript
   dataset_balance_gamma: 0.0
   train_samples_per_epoch: null
 
   # Unused by transcript_grouped_pairs; only used by dataset_aware_balanced_pairs.
-  datasets_per_batch: 2
+  datasets_per_batch: 16
 
   pin_memory: true
   prefetch_factor: 2
 
+  # --- Per-replica training ---
+  # When true, train on the individual biological replicas (ribo_replicas_column,
+  # shape [n_replicas, L] of raw per-codon counts) instead of the single averaged
+  # `ribo` profile. The batch carries every replica; the loss is the average over
+  # replicas of the per-sample loss (NB NLL + PCC), with the oracle scale S
+  # computed PER replica: mu_r = S_r * (gamma * L_bio + additive_bias).
+  # Requires dataset_config to
+  # point at parquet files that contain the replica column (replica_datasets_paths
+  # / weighted_datasets_ribo_replicas). The replicas are used as-is: they are
+  # already CDS/start-codon aligned (codon 0 = ATG), whereas the averaged `ribo`
+  # field is shifted +1 codon and is NOT used in this mode.
+  use_ribo_replicas: true
+  ribo_replicas_column: ribo_cds_replicas
+
 model:
   # --- Minimal queue-load model ---
-  #   mu[d,t,i] = S[d,t] * L_bio[t,i] * beta[d,t,i]
   # S[d,t]     = mean over valid positions of the target (mean gauge, not learned)
-  # L_bio[d,t,i] = expm1(J_dt * w_norm) = rho / (1 - rho)
-  # J_dt       = J_t(sequence) * J_d(dataset), with J_d centered below.
-  # beta       = exp(log_visibility_bias - beta_center_strength * center).
-  #              beta_center_strength=1 hard-centers under detached L_bio
-  #              weights, 0 leaves beta free but bounded.
-  scale_gauge_mode: mean
-  beta_center_strength: 1.0
+  # L_bio       = normalized biological load, so mean_valid(L_bio)=1.
+  # rho         = L_bio / (1 + L_bio). High rho marks locally saturated peaks.
+  # lambda      = log(1 + L_bio), so L_bio = rho / (1 - rho).
+  # Mean model: mu = S * (gamma * L_bio + additive_bias).
+  # Gamma starts neutral at 1. Its centered score is bounded by
+  # gamma_centering.log_gamma_min/max, and mean(score^2) regularization pulls
+  # dataset adaptation back toward the shared L_bio baseline.
+  init_gamma: 1.0
+  # Learned sparse dataset adaptation:
+  #   gamma = exp(centered_amplitude_score)
+  #           * T * entmax15(support_logits / temperature)
+  # Neutral scores give gamma=1; entmax can give exact zeros, while the
+  # independent exponential amplitude retains arbitrarily high peak capacity.
+  gamma_transform: entmax15_gated_exponential
+  gamma_entmax_temperature: 5.0
+  # Separate support and amplitude scores: entmax support decides exact zeros,
+  # while the centered exponential amplitude controls dataset-specific peaks.
+  gamma_split_support_head: true
+  # An entmax support zero suppresses additive background as well as gamma*L_bio.
+  gamma_gate_additive_bias: true
+  # Mass conservation: renormalize the shape (gamma*L_bio + additive) to mean 1
+  # over valid positions before applying S, so mean_valid(mu) = S exactly and
+  # sum(mu) = sum(target). Makes zero-suppression mass-neutral (mass leaves the
+  # zeros and lands on the peaks). gamma/L_bio stay per-position interpretable.
+  mass_conservation: true
+  # Reliability-weighted geometric anchoring of dataset-specific gamma.
+  # This removes a multiplicative reference ambiguity only when enough reliable
+  # same-transcript cross-dataset observations are present. It does not identify
+  # the unrestricted additive branch.
+  gamma_centering:
+    enabled: true
+    scope: batch_grouped
+    strength: 1.0
+    eps: 1.0e-8
+
+    reference_mode: reliable_geometric_center
+    reference_dataset_ids: []
+    reference_hard_anchor: false
+
+    reliability_mode: combined
+    reliability_detach: true
+
+    min_reliability: 0.05
+    min_total_reliability: 0.5
+    min_distinct_datasets: 2
+
+    transcript_depth_kappa: 100.0
+    local_coverage_window: 5
+    local_coverage_kappa: 1.0
+    replicate_agreement_tau: 0.5
+
+    duplicate_dataset_reliability_reduction: mean
+    combined_reliability_reduction: geometric_mean
+
+    log_gamma_min: -8.0
+    log_gamma_max: 8.0
+
+    reference_anchor_weight: 0.0
+    reference_anchor_warmup_epochs: 0
+
+    log_diagnostics: false
+
 
   biological_params:
     input_size: 97
     hidden_size: 256
     num_layers: 2
     dropout: 0.0
-
-    J_min: 1.0e-4
-    J_max: 5.0
-    init_J: 0.5
-    lambda_bio_min: 1.0e-3
-    lambda_bio_max: 3.0
+    # Direct-load queue: L_bio is already mean-one.
     init_local_hazard_factor: 1.0
     init_local_hazard_weight_std: 1.0e-2
-
-  # Dataset-level flux multiplier:
-  #   J_dt = J_t * exp(log_J_d).
-  # log_J_d is symmetrically centered over the active experiment datasets below.
-  # Keep beta hard-centered when this is enabled; otherwise beta can absorb the
-  # same mass degree of freedom as J_d.
-  dataset_J_params:
-    enabled: true
-    init_log_J_dataset: 0.0
-    # Symmetric, non-anchored gauge: center log_J_d over experiment.dataset ids
-    # so active datasets have geometric-mean J_d = 1. This removes the global
-    # J_t/J_d scale mode without choosing a reference dataset.
-    center_strength: 1.0
-    center_mode: active_configured
-    log_J_dataset_max: 0.7
 
   dataset_bias_params:
     position_features:
@@ -109,25 +157,33 @@ model:
     position_edge_tau: 100.0
     position_scale: 5000.0
 
-    num_datasets: 33
+    num_datasets: 30
     dataset_embeddings_size: 32
 
     num_codons: 64
     codon_embeddings_size: 16
 
-    use_local_context_cnn: true
-    num_filters: 16
-    kernel_size: 7
-    context_cnn_dilations: [1, 2, 4, 8, 16]
-    context_cnn_dropout: 0.1
-    context_cnn_gated: false
-    context_cnn_residual_scale: 1.0
+    # Dedicated dataset-bias BiGRU. It is deliberately separate from the
+    # biological BiGRU, so gamma remains a pure function of (sequence,
+    # dataset_id) and L_bio and gamma stay separately interpretable.
+    context_gru_hidden_size: 128
+    context_gru_num_layers: 2
+    context_gru_dropout: 0.1
+    # Restricting the additive head can improve separation of L_bio, gamma, and
+    # additive background in sensitivity experiments. Default keeps the original
+    # full context capacity.
+    additive_bias_input_mode: full
 
-    # Continuous visibility log-bias head: beta = exp(centered_log_bias).
+    # Dataset correction head for gamma residuals and additive background.
     dataset_multiplicative_allocation_bias_submodule_params:
       hidden_size: 128
       dropout: 0.1
-      log_bias_max: 2.5
+      # relu can produce exact zero additive backgrounds. softplus is smooth but
+      # cannot produce exact zeros at finite logits.
+      additive_bias_activation: relu
+      # Keep this positive for softplus. With relu, setting it to 0.0 gives
+      # exact-zero init but can leave the ReLU head inactive.
+      init_additive_bias: 1.0e-8
 
     dataset_log_sigma_submodule_params:
       dataset_embedding_size: 16
@@ -140,11 +196,9 @@ model:
       fixed_sigma: null
 
 loss:
-  # NB likelihood + soft mass regularization + configurable mu/y PCC loss:
-  #   loss = NB_NLL + mass_loss_weight * mass_loss
-  #        + effective_pcc_weight * pcc_loss
-  # mass_loss = (log(mean_valid(mu)) - log(S))^2  (log-ratio of the means).
-  mode: nb_plus_mass_plus_pcc
+  # NB likelihood + configurable mu/y PCC loss:
+  #   loss = NB_NLL + effective_pcc_weight * pcc_loss
+  mode: nb_plus_pcc
   profile_likelihood: negative_binomial
 
   eps: 1.0e-8
@@ -152,7 +206,13 @@ loss:
   mu_max: 100000000.0
 
   nb_log_alpha_min: -5.0
-  nb_log_alpha_max: 3.0
+  # Dispersion cap. alpha = exp(log_alpha), Var = mu + alpha*mu^2. Lower max ->
+  # NB approaches Poisson -> a nonzero mu at a true zero becomes expensive, so
+  # the model is forced to push mu down at zeros (instead of hiding the misfit
+  # as overdispersion). Was 3.0 (alpha<=~20, very overdispersed); 1.0 caps
+  # alpha<=~2.7. Lower it further to push zeros harder, at some cost to peak
+  # tail calibration.
+  nb_log_alpha_max: 1.0
   # Negative-binomial valid-position reduction inside each sequence:
   #   mean = average NLL over sequence length before aggregation
   #   sum  = sum NLL over sequence length, then aggregate across batch/datasets
@@ -163,42 +223,72 @@ loss:
   nb_length_temper_min_weight: 0.5
   nb_length_temper_max_weight: 2.0
 
-  mass_loss_weight: 0.1
-  mass_loss_type: log_mean_ratio
-
   pcc_loss_enabled: true
   pcc_loss_mode: hybrid_raw_nb_vst
   pcc_loss_weight: 1.0
-  pcc_raw_component_weight: 0.2
-  pcc_nb_vst_component_weight: 0.8
-  pcc_loss_warmup_epochs: 5
+  pcc_raw_component_weight: 0.5
+  pcc_nb_vst_component_weight: 0.5
+  pcc_loss_warmup_epochs: 0
   min_pcc_target_var: 1.0e-6
-  pcc_mass_gate_tau: 0.25
-  pcc_mass_gate_floor: 0.0
+  pcc_mean_ratio_gate_tau: 0.25
+  pcc_mean_ratio_gate_floor: 0.0
   pcc_reliability_min: 0.05
   pcc_reliability_max: 1.0
   pcc_alpha_min: 1.0e-5
   pcc_alpha_max: 20.0
   pcc_detach_alpha: true
   pcc_detach_reliability: true
-  pcc_detach_mass_gate: true
+  pcc_detach_mean_ratio_gate: true
+
+  # Replica handling:
+  #   replica                 -> optimize raw-replica NLL/PCC.
+  #   consensus               -> optimize only the representative mean target.
+  #   consensus_plus_replica  -> optimize the mean target and add small
+  #                              raw-replica auxiliary terms for noise calibration.
+  replica_objective: consensus_plus_replica
+  replica_nll_weight: 0.2
+  replica_pcc_loss_weight: 0.0
+
+  # Proper zero-vs-nonzero calibration score computed from the NB probability
+  # P(Y=0). Use the consensus profile by default: a consensus zero is supported
+  # across replicas, whereas individual-replica zeros are often sampling zeros
+  # and should not force the expected mean toward zero.
+  # Disabled in the default experiment because, at target zeros, this repeats
+  # the NB NLL's zero-event term and calibrates P(Y=0), not an exact gamma zero.
+  zero_calibration_weight: 0.0
+  zero_calibration_warmup_epochs: 0
+  zero_calibration_detach_alpha: true
+  zero_calibration_threshold: 0.0
+  zero_calibration_source: consensus
+
+  # Balanced support supervision on the sequence-centered logits passed to
+  # entmax. It also supplies a recovery gradient when an active position has
+  # already been excluded by the sparse transform.
+  support_calibration_weight: 0.02
+  support_calibration_warmup_epochs: 0
+  support_calibration_threshold: 0.0
 
   # Equal weight per dataset when combining per-sample losses.
-  dataset_balanced_loss: true
+  dataset_balanced_loss: false
 
-  # Optional regularizers around the NB + mass + PCC objective.
-  log_sigma_reg_weight: 0.0
-  # Penalizes log(J_d)^2, so relative J_d deviations stay small.
-  # The active_configured gauge above already removes the global J_d mode.
-  J_dataset_reg_weight: 0.01
-  # Penalize beta amplitude and local roughness in log-space. beta is still
-  # hard mass-centered by model.beta_center_strength; these terms prevent the
-  # dataset visibility branch from explaining profiles through sharp spikes.
-  beta_l2_weight: 1.0e-4
-  beta_tv_weight: 3.0e-4
+  # Optional regularizers around the NB + PCC objective.
+  # gamma is pulled to 1 through mean(log_gamma^2); additive_bias is pulled to 0
+  # through a nonnegative L1 penalty.
+  gamma_reg_weight: 1e-4
+  gamma_reg_warmup_epochs: 0
+  additive_bias_l1_weight: 1e-3
+  additive_reference_anchor_weight: 0.0
+  additive_reference_anchor_warmup_epochs: 0
+
+  # Predicted-value floor for PCC only (honest zero handling, no extra
+  # parameter): when computing Pearson correlation, predictions below this
+  # count are treated as 0 ("undetected"), matching the target zeros without
+  # ever looking at the target. 0.0 disables. The likelihood is unchanged; the
+  # model must still push mu down at zeros to benefit.
+  pcc_prediction_floor: 0.0
 
 gradient_conflict_diagnostics:
-  enabled: true
+  enabled: false
   every_n_train_steps: 200
   max_batches_per_epoch: 5
   parameter_groups:
@@ -206,7 +296,6 @@ gradient_conflict_diagnostics:
     - rest
     - all
   include_pcc_in_dataset_loss: true
-  include_mass_in_dataset_loss: true
   include_nll_in_dataset_loss: true
   component_modes:
     - full
@@ -216,7 +305,7 @@ gradient_conflict_diagnostics:
 
 
 cagrad:
-  enabled: true
+  enabled: false
   apply_to: biological
   # CAGrad conflict-aversion coefficient, not a model scale parameter.
   c: 0.5
@@ -243,10 +332,9 @@ residual_diagnostics:
   log_by_mu_quantile: true
   log_by_target_quantile: true
   log_by_L_bio_quantile: true
-  log_by_beta_quantile: true
 
-  export_csv: true
-  export_sample_csv: true
+  export_csv: false
+  export_sample_csv: false
   export_dir: residual_diagnostics
 
   posterior_predictive_enabled: false
@@ -266,13 +354,13 @@ optim:
   lr_biological: 5.0e-4
   lr_rest: 1.0e-3
   weight_decay_bio: 1.0e-2
-  weight_decay_rest: 1.0e-3
+  weight_decay_rest: 1.0e-2
 
   scheduler:
-    monitor: val_pcc_value
-    mode: max
-    factor: 0.9
-    patience: 1
+    monitor: val_loss
+    mode: min
+    factor: 0.99
+    patience: 5
     min_lr: 1.0e-6
 
 trainer:
@@ -285,13 +373,13 @@ trainer:
   max_epochs: 200
   log_every_n_steps: 1
   sync_dist_logs: false
-  gradient_clip_val: 0.5
+  gradient_clip_val: 1.0
   gradient_clip_algorithm: norm
 
 callbacks:
-  early_stopping_patience: 25
+  early_stopping_patience: 10
 
 metrics:
-  log_train_per_dataset_metrics: true
+  log_train_per_dataset_metrics: false
   log_example_plot: true
-  example_plot_max_datasets: 4
+  example_plot_max_datasets: 2
