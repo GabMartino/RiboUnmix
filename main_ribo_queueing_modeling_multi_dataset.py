@@ -1289,6 +1289,11 @@ def make_datamodule(
     split_size: float,
     seed: int,
 ) -> RiboAIQueuingDatamoduleMultiDataset:
+    feature_cfg = cfg_get(cfg, "model.additional_sequence_features", {})
+    if OmegaConf.is_config(feature_cfg):
+        feature_cfg = OmegaConf.to_container(feature_cfg, resolve=True)
+    else:
+        feature_cfg = dict(feature_cfg or {})
     return RiboAIQueuingDatamoduleMultiDataset(
         sequences_path=cfg.paths.sequences_path,
         datasets_paths=datasets_paths,
@@ -1316,6 +1321,7 @@ def make_datamodule(
         ribo_replicas_column=str(
             cfg_get(cfg, "data.ribo_replicas_column", "ribo_cds_replicas")
         ),
+        additional_sequence_features=feature_cfg,
     )
 
 
@@ -1520,13 +1526,10 @@ def main(cfg: DictConfig) -> None:
             "Experiment dataset(s) missing from dataset encoding: "
             f"{missing_dataset_encodings}"
         )
-    active_dataset_ids = [int(dataset_encoding[dataset]) for dataset in experiment_datasets]
-
     torch_model = RiboQueuingModel(
         model_configs=cfg.model,
         eps=float(cfg.model.get("eps", 1e-8)),
         mu_max=float(cfg.model.get("mu_max", 1e8)),
-        active_dataset_ids=active_dataset_ids,
     )
 
     lit_model = RiboQueuingModelLightningModule(

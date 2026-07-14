@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=riboai_all_datasets
+#SBATCH --job-name=riboai_all_final
 #SBATCH --partition=boost_usr_prod
 #SBATCH --account=euhpc_d35_089
 #SBATCH --nodes=1
@@ -8,89 +8,48 @@
 #SBATCH --gres=gpu:2
 #SBATCH --mem=128G
 #SBATCH --time=1-00:00:00
-# 2 x 2 x 2 x 2 ablation grid. The %4 throttle limits concurrent tasks.
-#SBATCH --array=0-15%4
-#SBATCH --output=job_%A_%a_riboai_all_datasets.out
-#SBATCH --error=job_%A_%a_riboai_all_datasets.err
+#SBATCH --output=job_%j_riboai_all_final.out
+#SBATCH --error=job_%j_riboai_all_final.err
 
 set -euo pipefail
 
 module load python/3.11
-source ../venvs/queuing_ribo_venv/bin/activate
 
-# ---------------------------------------------------------------------------
-# Ablation grid: one Slurm array task per configuration.
-#
-# Dimensions:
-#   1. CAGrad: off/on
-#   2. Dataset-balanced loss: off/on
-#   3. Replica objective: consensus only / consensus + replica auxiliary loss
-#   4. PCC loss: raw PCC / raw PCC + NB variance-adjusted PCC
-#
-# The Python entry point adds these choices to the run tag, so logs, results and
-# checkpoints are separated under the common output root.
-# ---------------------------------------------------------------------------
-CAGRAD_OPTIONS=(false true)
-DATASET_BALANCED_OPTIONS=(false true)
-REPLICA_OBJECTIVE_OPTIONS=(consensus consensus_plus_replica)
-PCC_MODE_OPTIONS=(raw hybrid_raw_nb_vst)
-PCC_LABELS=(raw raw_plus_varadj)
-PCC_RAW_WEIGHTS=(1.0 0.2)
-PCC_NB_VST_WEIGHTS=(0.0 0.8)
+# Submit from the repository root, or provide PROJECT_DIR/VENV_PATH explicitly:
+#   sbatch --export=ALL,PROJECT_DIR=/path/to/QueueingRiboAI run_all_datasets.slurm
+PROJECT_DIR="${PROJECT_DIR:-${SLURM_SUBMIT_DIR:-$(pwd)}}"
+VENV_PATH="${VENV_PATH:-${PROJECT_DIR}/../venvs/queuing_ribo_venv}"
 
-TOTAL_ABLATIONS=$(( \
-    ${#CAGRAD_OPTIONS[@]} \
-    * ${#DATASET_BALANCED_OPTIONS[@]} \
-    * ${#REPLICA_OBJECTIVE_OPTIONS[@]} \
-    * ${#PCC_MODE_OPTIONS[@]} \
-))
-
-ABLATION_ID="${SLURM_ARRAY_TASK_ID:-${ABLATION_ID:-0}}"
-if ! [[ "${ABLATION_ID}" =~ ^[0-9]+$ ]]; then
-    echo "ABLATION_ID must be an integer, got: ${ABLATION_ID}" >&2
+if [[ ! -f "${PROJECT_DIR}/main_ribo_queueing_modeling_multi_dataset.py" ]]; then
+    echo "PROJECT_DIR is not the QueueingRiboAI repository: ${PROJECT_DIR}" >&2
     exit 2
 fi
-if (( ABLATION_ID < 0 || ABLATION_ID >= TOTAL_ABLATIONS )); then
-    echo "ABLATION_ID ${ABLATION_ID} outside valid range 0-$((TOTAL_ABLATIONS - 1))." >&2
+if [[ ! -f "${VENV_PATH}/bin/activate" ]]; then
+    echo "Python virtual environment not found: ${VENV_PATH}" >&2
     exit 2
 fi
 
-idx="${ABLATION_ID}"
-pcc_idx=$((idx % ${#PCC_MODE_OPTIONS[@]}))
-idx=$((idx / ${#PCC_MODE_OPTIONS[@]}))
+cd "${PROJECT_DIR}"
+source "${VENV_PATH}/bin/activate"
 
-replica_idx=$((idx % ${#REPLICA_OBJECTIVE_OPTIONS[@]}))
-idx=$((idx / ${#REPLICA_OBJECTIVE_OPTIONS[@]}))
+# Model and loss settings are inherited unchanged from
+# config/config_riboai_queuing_multidataset.yaml. These environment variables
+# control only execution resources and reproducibility.
+SEED="${SEED:-42}"
+BATCH_SIZE="${BATCH_SIZE:-32}"
+NUM_WORKERS="${NUM_WORKERS:-8}"
 
-dataset_balanced_idx=$((idx % ${#DATASET_BALANCED_OPTIONS[@]}))
-idx=$((idx / ${#DATASET_BALANCED_OPTIONS[@]}))
-
-cagrad_idx=$((idx % ${#CAGRAD_OPTIONS[@]}))
-
-CAGRAD_ENABLED="${CAGRAD_OPTIONS[${cagrad_idx}]}"
-DATASET_BALANCED_LOSS="${DATASET_BALANCED_OPTIONS[${dataset_balanced_idx}]}"
-REPLICA_OBJECTIVE="${REPLICA_OBJECTIVE_OPTIONS[${replica_idx}]}"
-PCC_MODE="${PCC_MODE_OPTIONS[${pcc_idx}]}"
-PCC_LABEL="${PCC_LABELS[${pcc_idx}]}"
-PCC_RAW_WEIGHT="${PCC_RAW_WEIGHTS[${pcc_idx}]}"
-PCC_NB_VST_WEIGHT="${PCC_NB_VST_WEIGHTS[${pcc_idx}]}"
-
-# ---------------------------------------------------------------------------
-# Storage: NEVER write to $HOME (small byte + inode quota -> Errno 122).
-# Persistent outputs you want to keep  -> $WORK  (project area, not purged).
-# Transient/regenerable files (tmp, caches, hydra run dir) -> $SCRATCH (purged).
-# ---------------------------------------------------------------------------
+# Persistent outputs go to $WORK; transient caches and Hydra files go to
+# $SCRATCH. Avoid writing large files to the small home quota.
 SCRATCH_DIR="${SCRATCH:-${CINECA_SCRATCH:-/leonardo_scratch/large/userexternal/${USER}}}"
 WORK_DIR="${WORK:-/leonardo_work/${SLURM_JOB_ACCOUNT:-euhpc_d35_089}/${USER}}"
 
-RUN_GROUP="riboai_all_datasets_${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-local}}"
-RUN_TAG="${RUN_GROUP}_abl${ABLATION_ID}"
-OUT_DIR="${WORK_DIR}/riboai_runs/${RUN_GROUP}"
+RUN_TAG="riboai_all_final_seed${SEED}_${SLURM_JOB_ID:-local}"
+OUT_DIR="${WORK_DIR}/riboai_runs/${RUN_TAG}"
 CKPT_DIR="${OUT_DIR}/checkpoints"
 LOG_DIR="${OUT_DIR}/logs"
 RESULTS_DIR="${OUT_DIR}/results"
 
-# Caches, scratch tmp and Hydra's per-run output dir -> scratch (off $HOME).
 export TMPDIR="${SCRATCH_DIR}/tmp/${RUN_TAG}"
 export XDG_CACHE_HOME="${SCRATCH_DIR}/.cache"
 export MPLCONFIGDIR="${SCRATCH_DIR}/.cache/matplotlib"
@@ -99,45 +58,40 @@ export HF_HOME="${SCRATCH_DIR}/.cache/huggingface"
 export TRITON_CACHE_DIR="${SCRATCH_DIR}/.cache/triton"
 HYDRA_RUN_DIR="${SCRATCH_DIR}/hydra/${RUN_TAG}"
 
-mkdir -p "${CKPT_DIR}" "${LOG_DIR}" "${RESULTS_DIR}" "${TMPDIR}" "${MPLCONFIGDIR}" \
-         "${TORCH_HOME}" "${HF_HOME}" "${TRITON_CACHE_DIR}" "${HYDRA_RUN_DIR}"
+mkdir -p "${CKPT_DIR}" "${LOG_DIR}" "${RESULTS_DIR}" "${TMPDIR}" \
+    "${MPLCONFIGDIR}" "${TORCH_HOME}" "${HF_HOME}" \
+    "${TRITON_CACHE_DIR}" "${HYDRA_RUN_DIR}"
 
-# Remove the scratch tmp dir on exit so it does not linger between jobs.
 trap 'rm -rf "${TMPDIR}"' EXIT
 
-# ---------------------------------------------------------------------------
-# Threads: 2 tasks x 8 cpus = 16 cores. Keep BLAS/OpenMP
-# from oversubscribing on top of the DataLoader workers.
-# ---------------------------------------------------------------------------
-export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
+# Lightning detects the two externally launched Slurm tasks as its two DDP
+# ranks. The entry point uses SLURM_PROCID to keep rank-zero writes and logger
+# versions coordinated.
 export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-8}"
-
-# Silence the benign NCCL heartbeat/TCPStore "Broken pipe" warning at teardown.
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 export TORCH_NCCL_ENABLE_MONITORING=0
 
+echo "Starting all-dataset final-model run"
+echo "Project  -> ${PROJECT_DIR}"
 echo "Outputs  -> ${OUT_DIR}"
-echo "Scratch  -> ${SCRATCH_DIR} (tmp/caches/hydra)"
-echo "Ablation -> ${ABLATION_ID}/$((TOTAL_ABLATIONS - 1))"
-echo "             cagrad.enabled=${CAGRAD_ENABLED}"
-echo "             loss.dataset_balanced_loss=${DATASET_BALANCED_LOSS}"
-echo "             loss.replica_objective=${REPLICA_OBJECTIVE}"
-echo "             pcc=${PCC_LABEL} (${PCC_MODE})"
-echo "             pcc_raw_weight=${PCC_RAW_WEIGHT}"
-echo "             pcc_nb_vst_weight=${PCC_NB_VST_WEIGHT}"
+echo "Scratch  -> ${SCRATCH_DIR}"
+echo "Seed     -> ${SEED}"
+echo "Batch    -> ${BATCH_SIZE} per DDP rank"
+echo "Workers  -> ${NUM_WORKERS} per DDP rank"
+echo "GPUs     -> ${CUDA_VISIBLE_DEVICES:-managed by Slurm}"
 
-srun python main_ribo_queueing_modeling_multi_dataset.py \
+srun --ntasks=2 python main_ribo_queueing_modeling_multi_dataset.py \
     experiment.dataset=all \
     split.master_dataset_universe=all \
-    cagrad.enabled="${CAGRAD_ENABLED}" \
-    loss.dataset_balanced_loss="${DATASET_BALANCED_LOSS}" \
-    loss.replica_objective="${REPLICA_OBJECTIVE}" \
-    loss.pcc_loss_enabled=true \
-    loss.pcc_loss_mode="${PCC_MODE}" \
-    loss.pcc_raw_component_weight="${PCC_RAW_WEIGHT}" \
-    loss.pcc_nb_vst_component_weight="${PCC_NB_VST_WEIGHT}" \
+    experiment.seed="${SEED}" \
+    experiment.from_checkpoint=false \
+    experiment.train=true \
+    experiment.predict=true \
     'trainer.devices=[0,1]' \
-    data.batch_size=128 \
-    data.num_workers=8 \
+    trainer.use_distributed_sampler=false \
+    trainer.sync_dist_logs=true \
+    data.batch_size="${BATCH_SIZE}" \
+    data.num_workers="${NUM_WORKERS}" \
     paths.checkpoints="${CKPT_DIR}" \
     paths.logs="${LOG_DIR}" \
     paths.results="${RESULTS_DIR}" \

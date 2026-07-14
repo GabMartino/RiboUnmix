@@ -835,6 +835,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         prefetch_factor: Optional[int] = 4,
         use_ribo_replicas: bool = False,
         ribo_replicas_column: str = "ribo_cds_replicas",
+        additional_sequence_features: Optional[dict] = None,
     ):
         super().__init__()
         self.save_hyperparameters(
@@ -867,6 +868,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
 
         self.use_ribo_replicas = bool(use_ribo_replicas)
         self.ribo_replicas_column = str(ribo_replicas_column)
+        self.additional_sequence_features = dict(additional_sequence_features or {})
 
         self.nt_enc = open_file(nt_encoding_path)
         self.c2aa_enc = open_file(codon_to_aa_encoding_path)
@@ -1023,19 +1025,31 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
 
         print(f"Unioning master sequences with {len(self.datasets_paths)} datasets...")
 
-        # The model only consumes the per-codon `ref` one-hots and the CSS column
-        # (keyed by transcript_id). The sequence parquet also stores large unused
-        # columns (e.g. `openen` alone is ~80% of the 161MB file), so we read only
-        # what we need — a far smaller and much faster deserialization.
+        # Read the base sequence/CSS columns plus only the optional per-codon
+        # features that are routed to at least one model branch.
         seq_available = set(pq.read_schema(self.sequences_path).names)
         seq_css_col = (
             "conserved_stalling_sites"
             if "conserved_stalling_sites" in seq_available
             else "css"
         )
+        active_sequence_feature_names = [
+            str(name)
+            for name, raw_spec in self.additional_sequence_features.items()
+            if str(dict(raw_spec or {}).get("route", "none")).lower() != "none"
+        ]
+        missing_sequence_features = sorted(
+            set(active_sequence_feature_names) - seq_available
+        )
+        if missing_sequence_features:
+            raise KeyError(
+                "Configured additional sequence feature columns are missing from "
+                f"{self.sequences_path}: {missing_sequence_features}."
+            )
         seq_columns = [
             c for c in ("transcript_id", "ref", seq_css_col) if c in seq_available
         ]
+        seq_columns.extend(active_sequence_feature_names)
         seq_df = pd.read_parquet(self.sequences_path, columns=seq_columns or None)
         if "transcript_id" in seq_df.columns:
             seq_df = seq_df.set_index("transcript_id")
@@ -1117,6 +1131,10 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             "sample_weights": defaultdict(dict),
             "lengths": lengths,
             "datasets_names": list(loaded_datasets.keys()),
+            "sequence_features": {
+                name: seq_df_union[name].values
+                for name in active_sequence_feature_names
+            },
         }
 
         def _stack_replicas(cell) -> np.ndarray:
@@ -1202,6 +1220,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             allowed_dataset_names_by_transcript=self.train_allowed_dataset_names_by_transcript,
             seed=self.seed,
             use_ribo_replicas=self.use_ribo_replicas,
+            additional_sequence_features=self.additional_sequence_features,
         )
 
         if train_choice_mode == "deterministic":
@@ -1245,6 +1264,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             allowed_dataset_names_by_transcript=self.val_allowed_dataset_names_by_transcript,
             seed=self.seed,
             use_ribo_replicas=self.use_ribo_replicas,
+            additional_sequence_features=self.additional_sequence_features,
         )
 
         self.val_lengths = self._get_flat_lengths(self.val_dataset_obj)

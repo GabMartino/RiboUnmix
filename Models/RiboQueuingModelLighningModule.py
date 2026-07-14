@@ -171,81 +171,6 @@ def dataset_balanced_reduce(
     return torch.stack(dataset_means).mean()
 
 
-def summarize_gradient_conflict_from_flat_grads(
-    flat_grads: dict[int, torch.Tensor],
-    eps: float = 1.0e-12,
-) -> dict[str, torch.Tensor]:
-    if not flat_grads:
-        z = torch.tensor(0.0)
-        return {
-            "num_datasets_present": z,
-            "mean_cosine": z,
-            "min_cosine": z,
-            "max_cosine": z,
-            "negative_cosine_fraction": z,
-            "mean_dot": z,
-            "min_dot": z,
-            "mean_norm": z,
-            "max_norm": z,
-            "min_norm": z,
-            "norm_ratio_max_min": z,
-            "conflict_score": z,
-            "dataset_ids": torch.empty(0, dtype=torch.long),
-            "cosine_matrix": torch.empty(0, 0),
-            "dot_matrix": torch.empty(0, 0),
-            "norms": torch.empty(0),
-        }
-
-    dataset_ids = sorted(int(k) for k in flat_grads)
-    grads = torch.stack([flat_grads[k].detach().float().reshape(-1) for k in dataset_ids])
-    norms = torch.linalg.norm(grads, dim=1)
-    dot = grads @ grads.T
-    denom = (norms[:, None] * norms[None, :]).clamp_min(float(eps))
-    cosine = torch.nan_to_num(dot / denom, nan=0.0, posinf=0.0, neginf=0.0)
-
-    n = len(dataset_ids)
-    if n > 1:
-        offdiag = ~torch.eye(n, dtype=torch.bool, device=cosine.device)
-        offdiag_cos = cosine[offdiag]
-        offdiag_dot = dot[offdiag]
-        mean_cosine = offdiag_cos.mean()
-        min_cosine = offdiag_cos.min()
-        max_cosine = offdiag_cos.max()
-        negative_fraction = (offdiag_cos < 0.0).float().mean()
-        conflict_score = torch.relu(-offdiag_cos).mean()
-        mean_dot = offdiag_dot.mean()
-        min_dot = offdiag_dot.min()
-    else:
-        mean_cosine = cosine.new_tensor(0.0)
-        min_cosine = cosine.new_tensor(0.0)
-        max_cosine = cosine.new_tensor(0.0)
-        negative_fraction = cosine.new_tensor(0.0)
-        conflict_score = cosine.new_tensor(0.0)
-        mean_dot = cosine.new_tensor(0.0)
-        min_dot = cosine.new_tensor(0.0)
-
-    norm_min = norms.min()
-    norm_max = norms.max()
-    return {
-        "num_datasets_present": torch.tensor(float(n), device=grads.device),
-        "mean_cosine": mean_cosine,
-        "min_cosine": min_cosine,
-        "max_cosine": max_cosine,
-        "negative_cosine_fraction": negative_fraction,
-        "mean_dot": mean_dot,
-        "min_dot": min_dot,
-        "mean_norm": norms.mean(),
-        "max_norm": norm_max,
-        "min_norm": norm_min,
-        "norm_ratio_max_min": norm_max / norm_min.clamp_min(float(eps)),
-        "conflict_score": conflict_score,
-        "dataset_ids": torch.tensor(dataset_ids, device=grads.device, dtype=torch.long),
-        "cosine_matrix": cosine,
-        "dot_matrix": dot,
-        "norms": norms,
-    }
-
-
 class ResidualDiagnosticsAccumulator:
     def __init__(
         self,
@@ -1022,17 +947,14 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         Active loss:
 
             loss = NB_NLL
-             + effective_pcc_weight * pcc_loss
-             + effective_zero_calibration_weight * zero_calibration_loss
-             + effective_support_calibration_weight * support_bce
+             + pcc_weight * pcc_loss
+             + support_weight * support_bce
              + gamma_reg_weight * mean(log_gamma^2)
              + additive_bias_l1_weight * mean(additive_bias)
 
     The PCC helper can compute raw, log1p, or NB-VST PCC between the output mu
     and the ground-truth profile y. All previous auxiliary
-    objectives (shape-MSE / profile-CE / contamination / additive-residual /
-    cross-dataset gamma neutrality / pooling / schedules) are removed. Optional
-    CAGrad can be applied only to the biological branch.
+    objectives and experimental gradient surgery are removed.
     """
 
     # Per-position extras plotted during validation.
@@ -1061,9 +983,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
         self.dataset_id_to_name = {int(v): str(k) for k, v in dataset_encoding.items()}
         self._val_profile_plot_logged_this_epoch = False
-        self._cagrad_bio_grad_overrides: dict[int, torch.Tensor] = {}
-        self._cagrad_hook_handles: list[Any] = []
-
         loss_cfg = self.config.loss
         legacy_pcc_weight = getattr(loss_cfg, "mu_pcc_loss_weight", None)
         self.pcc_loss_weight = float(
@@ -1076,43 +995,16 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         self.pcc_loss_enabled = bool(
             getattr(loss_cfg, "pcc_loss_enabled", self.pcc_loss_weight > 0.0)
         )
-        self.pcc_loss_warmup_epochs = int(
-            getattr(loss_cfg, "pcc_loss_warmup_epochs", 0)
-        )
         self.pcc_loss_mode = str(getattr(loss_cfg, "pcc_loss_mode", "raw")).lower()
-        self.allowed_pcc_loss_modes = {
-            "raw",
-            "log1p",
-            "nb_vst",
-            "nb_vst_weighted",
-            "nb_vst_weighted_mean_ratio_gated",
-            "hybrid_raw_nb_vst",
-            "hybrid_raw_nb_vst_weighted",
-            "hybrid_raw_nb_vst_weighted_mean_ratio_gated",
-        }
         self.min_pcc_target_var = float(getattr(loss_cfg, "min_pcc_target_var", 1.0e-6))
-        self.pcc_mean_ratio_gate_tau = float(
-            getattr(loss_cfg, "pcc_mean_ratio_gate_tau", 0.25)
-        )
-        self.pcc_reliability_min = float(getattr(loss_cfg, "pcc_reliability_min", 0.05))
-        self.pcc_reliability_max = float(getattr(loss_cfg, "pcc_reliability_max", 1.0))
         self.pcc_alpha_min = float(getattr(loss_cfg, "pcc_alpha_min", 1.0e-5))
         self.pcc_alpha_max = float(getattr(loss_cfg, "pcc_alpha_max", 20.0))
         self.pcc_detach_alpha = bool(getattr(loss_cfg, "pcc_detach_alpha", True))
-        self.pcc_detach_reliability = bool(
-            getattr(loss_cfg, "pcc_detach_reliability", True)
-        )
-        self.pcc_detach_mean_ratio_gate = bool(
-            getattr(loss_cfg, "pcc_detach_mean_ratio_gate", True)
-        )
         self.pcc_raw_component_weight = float(
             getattr(loss_cfg, "pcc_raw_component_weight", 0.03)
         )
         self.pcc_nb_vst_component_weight = float(
             getattr(loss_cfg, "pcc_nb_vst_component_weight", 0.07)
-        )
-        self.pcc_mean_ratio_gate_floor = float(
-            getattr(loss_cfg, "pcc_mean_ratio_gate_floor", 0.0)
         )
         self.dataset_balanced_loss = bool(getattr(loss_cfg, "dataset_balanced_loss", True))
         self.eps = float(getattr(loss_cfg, "eps", 1.0e-8))
@@ -1120,65 +1012,22 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         self.replica_objective = str(
             getattr(loss_cfg, "replica_objective", "replica")
         ).lower()
-        allowed_replica_objectives = {
-            "replica",
-            "consensus",
-            "consensus_plus_replica",
-        }
         self.replica_nll_weight = max(
             0.0,
             float(getattr(loss_cfg, "replica_nll_weight", 0.0)),
         )
-        self.replica_pcc_loss_weight = max(
-            0.0,
-            float(getattr(loss_cfg, "replica_pcc_loss_weight", 0.0)),
-        )
 
-        self.zero_calibration_weight = max(
-            0.0,
-            float(getattr(loss_cfg, "zero_calibration_weight", 0.0)),
-        )
-        self.zero_calibration_warmup_epochs = max(
-            0,
-            int(getattr(loss_cfg, "zero_calibration_warmup_epochs", 0)),
-        )
-        self.zero_calibration_detach_alpha = bool(
-            getattr(loss_cfg, "zero_calibration_detach_alpha", True)
-        )
-        self.zero_calibration_threshold = float(
-            getattr(loss_cfg, "zero_calibration_threshold", 0.0)
-        )
-        self.zero_calibration_source = str(
-            getattr(loss_cfg, "zero_calibration_source", "consensus")
-        ).lower()
-        allowed_zero_calibration_sources = {"consensus", "replica", "main"}
-        if self.zero_calibration_source not in allowed_zero_calibration_sources:
-            raise ValueError(
-                "zero_calibration_source must be one of "
-                f"{sorted(allowed_zero_calibration_sources)}, got "
-                f"{self.zero_calibration_source!r}."
-            )
-
-        # Direct supervision of the learned entmax support. Unlike the NB zero
-        # calibration score above, this term teaches the gate which positions
-        # should remain active; it never inserts target zeros into the forward
-        # prediction.
+        # Direct supervision teaches the entmax gate which positions should
+        # remain active without inserting target zeros into the forward pass.
         self.support_calibration_weight = max(
             0.0,
             float(getattr(loss_cfg, "support_calibration_weight", 0.0)),
-        )
-        self.support_calibration_warmup_epochs = max(
-            0,
-            int(getattr(loss_cfg, "support_calibration_warmup_epochs", 0)),
         )
         self.support_calibration_threshold = float(
             getattr(loss_cfg, "support_calibration_threshold", 0.0)
         )
         # Optional regularizers around the active NB + PCC objective.
         self.gamma_reg_weight = float(getattr(loss_cfg, "gamma_reg_weight", 0.0))
-        self.gamma_reg_warmup_epochs = int(
-            getattr(loss_cfg, "gamma_reg_warmup_epochs", 0)
-        )
         self.additive_bias_l1_weight = float(
             getattr(
                 loss_cfg,
@@ -1192,104 +1041,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         self.pcc_prediction_floor = float(
             getattr(loss_cfg, "pcc_prediction_floor", 0.0)
         )
-        model_cfg = getattr(self.config, "model", None)
-        gamma_center_cfg = (
-            getattr(model_cfg, "gamma_centering", None)
-            if model_cfg is not None
-            else None
-        )
-
-        def gamma_center_cfg_get(name: str, default: Any) -> Any:
-            if gamma_center_cfg is None:
-                return default
-            return getattr(gamma_center_cfg, name, default)
-
-        self.gamma_reference_anchor_weight = float(
-            gamma_center_cfg_get(
-                "reference_anchor_weight",
-                getattr(loss_cfg, "gamma_reference_anchor_weight", 0.0),
-            )
-        )
-        self.gamma_reference_anchor_warmup_epochs = int(
-            gamma_center_cfg_get(
-                "reference_anchor_warmup_epochs",
-                getattr(loss_cfg, "gamma_reference_anchor_warmup_epochs", 0),
-            )
-        )
-        self.additive_reference_anchor_weight = float(
-            getattr(
-                loss_cfg,
-                "additive_reference_anchor_weight",
-                getattr(model_cfg, "additive_reference_anchor_weight", 0.0)
-                if model_cfg is not None
-                else 0.0,
-            )
-        )
-        self.additive_reference_anchor_warmup_epochs = int(
-            getattr(
-                loss_cfg,
-                "additive_reference_anchor_warmup_epochs",
-                getattr(model_cfg, "additive_reference_anchor_warmup_epochs", 0)
-                if model_cfg is not None
-                else 0,
-            )
-        )
-
-        grad_cfg = getattr(self.config, "gradient_conflict_diagnostics", None)
-
-        def grad_cfg_get(name: str, default: Any) -> Any:
-            if grad_cfg is None:
-                return default
-            return getattr(grad_cfg, name, default)
-
-        self.grad_conflict_enabled = bool(grad_cfg_get("enabled", False))
-        self.grad_conflict_every_n_train_steps = int(
-            grad_cfg_get("every_n_train_steps", 200)
-        )
-        self.grad_conflict_max_batches_per_epoch = int(
-            grad_cfg_get("max_batches_per_epoch", 5)
-        )
-        self.grad_conflict_parameter_groups = list(
-            grad_cfg_get("parameter_groups", ["biological", "rest", "all"])
-        )
-        self.grad_conflict_include_pcc = bool(
-            grad_cfg_get("include_pcc_in_dataset_loss", True)
-        )
-        self.grad_conflict_include_nll = bool(
-            grad_cfg_get("include_nll_in_dataset_loss", True)
-        )
-        self.grad_conflict_component_modes = list(
-            grad_cfg_get("component_modes", ["full"])
-        )
-        self.grad_conflict_log_pairwise_matrix = bool(
-            grad_cfg_get("log_pairwise_matrix", True)
-        )
-        self.grad_conflict_log_per_dataset_norms = bool(
-            grad_cfg_get("log_per_dataset_norms", True)
-        )
-        self.grad_conflict_eps = float(grad_cfg_get("eps", 1.0e-12))
-        self._grad_conflict_batches_this_epoch = 0
-        self._grad_conflict_warned_empty_groups: set[str] = set()
-
-        cagrad_cfg = getattr(self.config, "cagrad", None)
-
-        def cagrad_cfg_get(name: str, default: Any) -> Any:
-            if cagrad_cfg is None:
-                return default
-            return getattr(cagrad_cfg, name, default)
-
-        self.cagrad_enabled = bool(cagrad_cfg_get("enabled", False))
-        self.cagrad_apply_to = str(cagrad_cfg_get("apply_to", "biological"))
-        self.cagrad_c = float(cagrad_cfg_get("c", 0.5))
-        self.cagrad_weight_lr = float(cagrad_cfg_get("weight_lr", 0.25))
-        self.cagrad_num_weight_steps = int(cagrad_cfg_get("num_weight_steps", 25))
-        self.cagrad_rescale = str(cagrad_cfg_get("rescale", "c")).lower()
-        self.cagrad_eps = float(cagrad_cfg_get("eps", 1.0e-12))
-        self.cagrad_log_diagnostics = bool(cagrad_cfg_get("log_diagnostics", True))
-        self.automatic_optimization = True
-        if self.cagrad_enabled:
-            self._register_cagrad_gradient_hooks()
-
         residual_cfg = getattr(self.config, "residual_diagnostics", None)
 
         def residual_cfg_get(name: str, default: Any) -> Any:
@@ -1301,7 +1052,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         self.residual_diag_run_on_validation = bool(
             residual_cfg_get("run_on_validation", True)
         )
-        self.residual_diag_run_on_train = bool(residual_cfg_get("run_on_train", False))
         self.residual_diag_export_csv = bool(residual_cfg_get("export_csv", True))
         self.residual_diag_export_sample_csv = bool(
             residual_cfg_get("export_sample_csv", True)
@@ -1379,7 +1129,23 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
     # ============================================================
 
     def _forward_batch(self, batch) -> dict[str, Any]:
-        if len(batch) == 11:
+        dataset_bias_sequence_features = None
+        if len(batch) == 12:
+            (
+                dataset_ids,
+                ids,
+                seq_packed,
+                target,
+                lengths,
+                mask,
+                codon_ids,
+                css,
+                sample_weights,
+                dataset_bias_sequence_features,
+                replica_profiles,
+                replica_mask,
+            ) = batch
+        elif len(batch) == 11:
             (
                 dataset_ids,
                 ids,
@@ -1393,6 +1159,21 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 replica_profiles,
                 replica_mask,
             ) = batch
+        elif len(batch) == 10:
+            (
+                dataset_ids,
+                ids,
+                seq_packed,
+                target,
+                lengths,
+                mask,
+                codon_ids,
+                css,
+                sample_weights,
+                dataset_bias_sequence_features,
+            ) = batch
+            replica_profiles = None
+            replica_mask = None
         elif len(batch) == 9:
             (
                 dataset_ids,
@@ -1409,7 +1190,8 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             replica_mask = None
         else:
             raise ValueError(
-                f"Expected a 9-tuple batch or 11-tuple replica batch, got {len(batch)}."
+                "Expected a 9/10-tuple batch, or an 11/12-tuple replica batch, "
+                f"got {len(batch)}."
             )
 
         mu, log_sigma, extras = self.model(
@@ -1418,10 +1200,8 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             id_datasets=dataset_ids,
             mask=mask,
             target=target,
-            current_epoch=int(self.current_epoch),
             sample_ids=ids,
-            replica_profiles=replica_profiles,
-            replica_mask=replica_mask,
+            dataset_bias_sequence_features=dataset_bias_sequence_features,
         )
 
         out = {
@@ -1431,6 +1211,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "mask": mask.bool(),
             "target": target,
             "codon_ids": codon_ids,
+            "dataset_bias_sequence_features": dataset_bias_sequence_features,
             "css": css,
             "sample_weights": sample_weights,
             "mu": mu,
@@ -1497,97 +1278,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
         return per_ds_mean.mean()
 
-    def _effective_pcc_loss_weight(self, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        if not self.pcc_loss_enabled:
-            return torch.tensor(0.0, device=device, dtype=dtype)
-
-        base_weight = float(self.pcc_loss_weight)
-        return self._scheduled_weight(
-            base_weight=base_weight,
-            warmup_epochs=int(self.pcc_loss_warmup_epochs),
-            device=device,
-            dtype=dtype,
-        )
-
-    def _scheduled_weight(
-        self,
-        *,
-        base_weight: float,
-        warmup_epochs: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        base_weight = float(base_weight)
-        if base_weight <= 0.0:
-            return torch.tensor(0.0, device=device, dtype=dtype)
-        warmup_epochs = int(warmup_epochs)
-        if warmup_epochs <= 0:
-            factor = 1.0
-        else:
-            epoch = float(getattr(self, "current_epoch", 0))
-            factor = min(1.0, max(0.0, epoch / float(warmup_epochs)))
-        return torch.tensor(base_weight * factor, device=device, dtype=dtype)
-
-    def _effective_gamma_reg_weight(self, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        return self._scheduled_weight(
-            base_weight=self.gamma_reg_weight,
-            warmup_epochs=self.gamma_reg_warmup_epochs,
-            device=device,
-            dtype=dtype,
-        )
-
-    def _effective_zero_calibration_weight(
-        self,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        return self._scheduled_weight(
-            base_weight=self.zero_calibration_weight,
-            warmup_epochs=self.zero_calibration_warmup_epochs,
-            device=device,
-            dtype=dtype,
-        )
-
-    def _effective_support_calibration_weight(
-        self,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        return self._scheduled_weight(
-            base_weight=self.support_calibration_weight,
-            warmup_epochs=self.support_calibration_warmup_epochs,
-            device=device,
-            dtype=dtype,
-        )
-
-    def _effective_gamma_reference_anchor_weight(
-        self,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        return self._scheduled_weight(
-            base_weight=self.gamma_reference_anchor_weight,
-            warmup_epochs=self.gamma_reference_anchor_warmup_epochs,
-            device=device,
-            dtype=dtype,
-        )
-
-    def _effective_additive_reference_anchor_weight(
-        self,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        return self._scheduled_weight(
-            base_weight=self.additive_reference_anchor_weight,
-            warmup_epochs=self.additive_reference_anchor_warmup_epochs,
-            device=device,
-            dtype=dtype,
-        )
-
     def _pcc_alpha(
         self,
         log_alpha: torch.Tensor,
@@ -1623,11 +1313,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         mask = out["mask"].bool() & torch.isfinite(out["target"].float())
         log_alpha = out.get("log_sigma")
         mode = self.pcc_loss_mode
-        hybrid_modes = {
-            "hybrid_raw_nb_vst": "nb_vst",
-            "hybrid_raw_nb_vst_weighted": "nb_vst_weighted",
-            "hybrid_raw_nb_vst_weighted_mean_ratio_gated": "nb_vst_weighted_mean_ratio_gated",
-        }
+        hybrid_modes = {"hybrid_raw_nb_vst": "nb_vst"}
 
         def masked_position_mean(v: torch.Tensor) -> torch.Tensor:
             mask_f = mask.to(dtype=v.dtype)
@@ -1637,28 +1323,8 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             valid_f = valid.to(dtype=v.dtype)
             return (v * valid_f).sum() / valid_f.sum().clamp_min(1.0)
 
-        def mean_ratio_gate() -> torch.Tensor:
-            mask_f = mask.to(dtype=mu.dtype)
-            valid_len = mask_f.sum(dim=1).clamp_min(1.0)
-            mu_mean = (mu * mask_f).sum(dim=1) / valid_len
-            target_mean = (target * mask_f).sum(dim=1) / valid_len
-            mean_ratio = mu_mean / target_mean.clamp_min(self.eps)
-            tau = max(float(self.pcc_mean_ratio_gate_tau), self.eps)
-            gate_raw = torch.exp(
-                -torch.abs(torch.log(mean_ratio.clamp_min(self.eps))) / tau
-            )
-            gate_raw = torch.nan_to_num(gate_raw, nan=0.0, posinf=0.0, neginf=0.0)
-            floor = min(max(float(self.pcc_mean_ratio_gate_floor), 0.0), 1.0)
-            gate = floor + (1.0 - floor) * gate_raw
-            if self.pcc_detach_mean_ratio_gate:
-                gate = gate.detach()
-            return gate
-
         def component(component_mode: str) -> dict[str, torch.Tensor]:
             alpha_diag = torch.ones_like(mu)
-            reliability = torch.ones_like(mu)
-            weights: torch.Tensor | None = None
-            gate = torch.ones(mu.shape[0], device=mu.device, dtype=mu.dtype)
 
             if component_mode == "raw":
                 x_pcc = mu
@@ -1666,11 +1332,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             elif component_mode == "log1p":
                 x_pcc = torch.log1p(mu.clamp_min(0.0))
                 y_pcc = torch.log1p(target.clamp_min(0.0))
-            elif component_mode in {
-                "nb_vst",
-                "nb_vst_weighted",
-                "nb_vst_weighted_mean_ratio_gated",
-            }:
+            elif component_mode == "nb_vst":
                 log_alpha_f = log_alpha.float()
                 alpha_diag = self._pcc_alpha(log_alpha_f, mu.shape).to(
                     device=mu.device,
@@ -1679,18 +1341,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 x_pcc = self._nb_vst(mu, log_alpha_f)
                 y_pcc = self._nb_vst(target, log_alpha_f)
 
-                if component_mode in {"nb_vst_weighted", "nb_vst_weighted_mean_ratio_gated"}:
-                    reliability = 1.0 / (1.0 + alpha_diag * mu.detach().clamp_min(0.0))
-                    reliability = reliability.clamp(
-                        min=self.pcc_reliability_min,
-                        max=self.pcc_reliability_max,
-                    )
-                    weights = reliability
-                    if self.pcc_detach_reliability:
-                        weights = weights.detach()
-
-                if component_mode == "nb_vst_weighted_mean_ratio_gated":
-                    gate = mean_ratio_gate()
             else:
                 raise ValueError(f"Unsupported pcc_loss_mode: {component_mode!r}.")
 
@@ -1698,12 +1348,12 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 x=x_pcc,
                 y=y_pcc,
                 mask=mask,
-                weights=weights,
+                weights=None,
                 min_target_var=self.min_pcc_target_var,
                 eps=self.eps,
             )
             valid = pcc_out["valid"]
-            loss_per_sample = gate * (1.0 - pcc_out["pcc_per_sample"])
+            loss_per_sample = 1.0 - pcc_out["pcc_per_sample"]
             loss_per_sample = torch.where(
                 valid,
                 loss_per_sample,
@@ -1720,12 +1370,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 "alpha_mean": masked_position_mean(alpha_diag),
                 "alpha_min": alpha_diag[mask].amin() if bool(mask.any()) else mu.new_tensor(0.0),
                 "alpha_max": alpha_diag[mask].amax() if bool(mask.any()) else mu.new_tensor(0.0),
-                "reliability_mean": masked_position_mean(reliability),
-                "reliability_min": reliability[mask].amin() if bool(mask.any()) else mu.new_tensor(1.0),
-                "reliability_max": reliability[mask].amax() if bool(mask.any()) else mu.new_tensor(1.0),
-                "mean_ratio_gate_mean": gate.mean() if gate.numel() > 0 else mu.new_tensor(1.0),
-                "mean_ratio_gate_min": gate.amin() if gate.numel() > 0 else mu.new_tensor(1.0),
-                "mean_ratio_gate_max": gate.amax() if gate.numel() > 0 else mu.new_tensor(1.0),
             }
 
         if mode in hybrid_modes:
@@ -1751,7 +1395,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             raw_component = active_component if mode == "raw" else component("raw")
             nb_component = (
                 active_component
-                if mode in {"nb_vst", "nb_vst_weighted", "nb_vst_weighted_mean_ratio_gated"}
+                if mode == "nb_vst"
                 else None
             )
             raw_loss_per_sample = raw_component["loss_per_sample"]
@@ -1784,12 +1428,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "alpha_mean": active_component["alpha_mean"],
             "alpha_min": active_component["alpha_min"],
             "alpha_max": active_component["alpha_max"],
-            "reliability_mean": active_component["reliability_mean"],
-            "reliability_min": active_component["reliability_min"],
-            "reliability_max": active_component["reliability_max"],
-            "mean_ratio_gate_mean": active_component["mean_ratio_gate_mean"],
-            "mean_ratio_gate_min": active_component["mean_ratio_gate_min"],
-            "mean_ratio_gate_max": active_component["mean_ratio_gate_max"],
             "raw_loss_per_sample": raw_loss_per_sample,
             "raw_value": raw_component["pcc_value"],
             "raw_loss": raw_loss_mean,
@@ -1885,44 +1523,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             return mu
         return torch.where(mu >= floor, mu, torch.zeros_like(mu))
 
-    def _reference_anchor_regularization_per_sample(
-        self,
-        out: dict[str, Any],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        target = out["target"]
-        zeros = torch.zeros(
-            target.shape[0],
-            device=target.device,
-            dtype=target.dtype,
-        )
-        extras = out["extras"]
-        anchor_mask = extras.get("gamma_reference_anchor_mask")
-        if not torch.is_tensor(anchor_mask):
-            return zeros, zeros
-
-        mask = out["mask"].bool() & anchor_mask.to(device=target.device).bool()
-        mask_f = mask.to(dtype=torch.float32)
-        denom = mask_f.sum(dim=1).clamp_min(1.0)
-        has_anchor = mask_f.sum(dim=1) > 0.0
-
-        log_gamma = extras.get("log_gamma")
-        if torch.is_tensor(log_gamma):
-            values = log_gamma.float().to(device=target.device)
-            gamma_anchor = (values.pow(2) * mask_f).sum(dim=1) / denom
-            gamma_anchor = torch.where(has_anchor, gamma_anchor, zeros.float())
-        else:
-            gamma_anchor = zeros.float()
-
-        additive_bias = extras.get("additive_bias")
-        if torch.is_tensor(additive_bias):
-            values = additive_bias.float().to(device=target.device).clamp_min(0.0)
-            additive_anchor = (values * mask_f).sum(dim=1) / denom
-            additive_anchor = torch.where(has_anchor, additive_anchor, zeros.float())
-        else:
-            additive_anchor = zeros.float()
-
-        return gamma_anchor.to(dtype=target.dtype), additive_anchor.to(dtype=target.dtype)
-
     @staticmethod
     def _average_over_valid_replicas(
         values: torch.Tensor,
@@ -1932,106 +1532,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         valid = replica_mask.bool().to(device=values.device)
         valid_f = valid.to(dtype=values.dtype)
         return (values * valid_f).sum(dim=1) / valid_f.sum(dim=1).clamp_min(1.0)
-
-    def _zero_calibration_terms(
-        self,
-        *,
-        mu: torch.Tensor,
-        log_sigma: torch.Tensor,
-        target: torch.Tensor,
-        mask: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        """Score the coarsened NB event ``target == 0``.
-
-        The score includes both zero and nonzero observations, so lowering every
-        predicted mean is not a solution. By default alpha is detached only for
-        this auxiliary score; the main NB NLL still learns dispersion normally.
-        """
-        with torch.amp.autocast(device_type=mu.device.type, enabled=False):
-            valid = mask.bool() & torch.isfinite(target)
-            target_f = torch.nan_to_num(
-                target.float(),
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
-            ).clamp_min(0.0)
-            mu_f = self.loss_fn.positive_mean_from_params(
-                mu=mu.float(),
-                log_sigma=None,
-            ).float()
-
-            if hasattr(self.loss_fn, "log_alpha_min"):
-                log_alpha = _broadcast_profile_param(log_sigma.float(), target_f.shape)
-                log_alpha = torch.nan_to_num(
-                    log_alpha,
-                    nan=0.0,
-                    posinf=float(self.loss_fn.log_alpha_max),
-                    neginf=float(self.loss_fn.log_alpha_min),
-                ).clamp(
-                    min=float(self.loss_fn.log_alpha_min),
-                    max=float(self.loss_fn.log_alpha_max),
-                )
-                alpha = torch.exp(log_alpha).clamp_min(self.eps)
-                if self.zero_calibration_detach_alpha:
-                    alpha = alpha.detach()
-                # P_NB(Y=0) = (1 + alpha * mu)^(-1 / alpha).
-                log_p0 = -torch.log1p(alpha * mu_f) / alpha
-            else:
-                # Poisson fallback: P(Y=0) = exp(-mu).
-                log_p0 = -mu_f
-
-            log_p0 = torch.nan_to_num(
-                log_p0,
-                nan=-1.0e8,
-                posinf=0.0,
-                neginf=-1.0e8,
-            ).clamp(max=0.0)
-            zero_target = target_f <= float(self.zero_calibration_threshold)
-
-            # -expm1(log_p0) evaluates 1 - p0 accurately even when p0 ~= 1.
-            log_p_nonzero = torch.log(
-                (-torch.expm1(log_p0)).clamp_min(self.eps)
-            )
-            position_loss = torch.where(
-                zero_target,
-                -log_p0,
-                -log_p_nonzero,
-            )
-            position_loss = torch.where(valid, position_loss, torch.zeros_like(position_loss))
-            loss_per_sample = reduce_sequence_nll(
-                position_loss,
-                valid,
-                str(getattr(self.loss_fn, "sequence_reduction", "mean")),
-                gamma=float(getattr(self.loss_fn, "length_temper_gamma", 1.0)),
-                length_ref=float(getattr(self.loss_fn, "length_temper_ref", 1000.0)),
-                min_weight=float(getattr(self.loss_fn, "length_temper_min_weight", 1.0)),
-                max_weight=float(getattr(self.loss_fn, "length_temper_max_weight", 1.0)),
-                eps=self.eps,
-            ).float()
-
-            p0 = torch.exp(log_p0).clamp(min=0.0, max=1.0)
-            valid_f = valid.to(dtype=p0.dtype)
-            zero_valid = valid & zero_target
-            nonzero_valid = valid & (~zero_target)
-
-            def selected_mean(values: torch.Tensor, selected: torch.Tensor) -> torch.Tensor:
-                selected_f = selected.to(dtype=values.dtype)
-                return (values * selected_f).sum() / selected_f.sum().clamp_min(1.0)
-
-            brier = selected_mean(
-                (p0 - zero_target.to(dtype=p0.dtype)).pow(2),
-                valid,
-            )
-            valid_count = valid_f.sum().clamp_min(1.0)
-
-        return {
-            "loss_per_sample": loss_per_sample,
-            "p0_mean": (p0 * valid_f).sum() / valid_count,
-            "p0_on_zeros": selected_mean(p0, zero_valid),
-            "p0_on_nonzeros": selected_mean(p0, nonzero_valid),
-            "target_zero_fraction": zero_valid.to(dtype=p0.dtype).sum() / valid_count,
-            "brier": brier,
-        }
 
     def _support_calibration_terms(
         self,
@@ -2163,20 +1663,12 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             (torch.log1p(likelihood_positive_mean) - torch.log1p(target)).pow(2),
             mask,
         )
-        zero_calibration = self._zero_calibration_terms(
-            mu=out["mu"],
-            log_sigma=out["log_sigma"],
-            target=out["target"],
-            mask=out["mask"],
-        )
-
         return {
             "nll_per_sample": nll_per_sample,
             "raw_mu_pcc_per_sample": raw_mu_pcc_per_sample,
             "pcc_diag": pcc_diag,
             "likelihood_mu_pcc_per_sample": likelihood_mu_pcc_per_sample,
             "log1p_mse_per_sample": log1p_mse_per_sample,
-            "zero_calibration": zero_calibration,
         }
 
     def _compute_replica_loss_terms(
@@ -2309,18 +1801,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             log1p_mse_flat,
             rep_mask,
         )
-        zero_calibration_flat = self._zero_calibration_terms(
-            mu=flat_mu,
-            log_sigma=flat_log_sigma,
-            target=flat_target,
-            mask=flat_mask,
-        )
-        zero_calibration = dict(zero_calibration_flat)
-        zero_calibration["loss_per_sample"] = self._average_over_valid_replicas(
-            zero_calibration_flat["loss_per_sample"],
-            rep_mask,
-        )
-
         replica_counts = rep_mask.to(dtype=target_reps.dtype).sum(dim=1)
         return {
             "nll_per_sample": nll_per_sample,
@@ -2328,11 +1808,8 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "pcc_diag": pcc_diag,
             "likelihood_mu_pcc_per_sample": likelihood_mu_pcc_per_sample,
             "log1p_mse_per_sample": log1p_mse_per_sample,
-            "zero_calibration": zero_calibration,
             "metrics": {
                 "replica_count_mean": replica_counts.mean(),
-                "replica_count_min": replica_counts.amin(),
-                "replica_count_max": replica_counts.amax(),
             },
         }
 
@@ -2364,19 +1841,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             ]
             log1p_mse_per_sample = consensus_terms["log1p_mse_per_sample"]
 
-        use_replica_zero_calibration = (
-            replica_terms is not None
-            and (
-                self.zero_calibration_source == "replica"
-                or (self.zero_calibration_source == "main" and use_replica_as_main)
-            )
-        )
-        zero_calibration_terms = (
-            replica_terms["zero_calibration"]
-            if use_replica_zero_calibration
-            else consensus_terms["zero_calibration"]
-        )
-        zero_calibration_per_sample = zero_calibration_terms["loss_per_sample"]
         support_calibration_terms = self._support_calibration_terms(
             out=out,
             target=target,
@@ -2389,53 +1853,20 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         gamma_reg_per_sample, additive_bias_l1_per_sample = (
             self._gated_additive_regularization_per_sample(out)
         )
-        (
-            gamma_reference_anchor_per_sample,
-            additive_reference_anchor_per_sample,
-        ) = self._reference_anchor_regularization_per_sample(out)
-
-        effective_pcc_weight = self._effective_pcc_loss_weight(
-            device=nll_per_sample.device,
-            dtype=nll_per_sample.dtype,
+        effective_pcc_weight = nll_per_sample.new_tensor(
+            self.pcc_loss_weight if self.pcc_loss_enabled else 0.0
         )
-        effective_gamma_reg_weight = self._effective_gamma_reg_weight(
-            device=nll_per_sample.device,
-            dtype=nll_per_sample.dtype,
-        )
-        effective_zero_calibration_weight = self._effective_zero_calibration_weight(
-            device=nll_per_sample.device,
-            dtype=nll_per_sample.dtype,
-        )
-        effective_support_calibration_weight = (
-            self._effective_support_calibration_weight(
-                device=nll_per_sample.device,
-                dtype=nll_per_sample.dtype,
-            )
-        )
-        effective_gamma_reference_anchor_weight = (
-            self._effective_gamma_reference_anchor_weight(
-                device=nll_per_sample.device,
-                dtype=nll_per_sample.dtype,
-            )
-        )
-        effective_additive_reference_anchor_weight = (
-            self._effective_additive_reference_anchor_weight(
-                device=nll_per_sample.device,
-                dtype=nll_per_sample.dtype,
-            )
+        effective_gamma_reg_weight = nll_per_sample.new_tensor(self.gamma_reg_weight)
+        effective_support_calibration_weight = nll_per_sample.new_tensor(
+            self.support_calibration_weight
         )
         per_sample_total_loss = (
             nll_per_sample
             + effective_pcc_weight * pcc_loss_per_sample
-            + effective_zero_calibration_weight * zero_calibration_per_sample
             + effective_support_calibration_weight
             * support_calibration_per_sample
             + effective_gamma_reg_weight * gamma_reg_per_sample
-            + effective_gamma_reference_anchor_weight
-            * gamma_reference_anchor_per_sample
             + self.additive_bias_l1_weight * additive_bias_l1_per_sample
-            + effective_additive_reference_anchor_weight
-            * additive_reference_anchor_per_sample
         )
         replica_aux_per_sample = torch.zeros_like(per_sample_total_loss)
         if (
@@ -2444,8 +1875,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         ):
             replica_aux_per_sample = (
                 self.replica_nll_weight * replica_terms["nll_per_sample"]
-                + self.replica_pcc_loss_weight
-                * replica_terms["pcc_diag"]["loss_per_sample"]
             )
             per_sample_total_loss = per_sample_total_loss + replica_aux_per_sample
 
@@ -2488,12 +1917,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             sample_weights,
             dataset_balanced=True,
         )
-        zero_calibration_loss = self._aggregate_per_sample(
-            zero_calibration_per_sample,
-            dataset_ids,
-            sample_weights,
-            dataset_balanced=self.dataset_balanced_loss,
-        )
         support_calibration_loss = self._aggregate_per_sample(
             support_calibration_per_sample,
             dataset_ids,
@@ -2506,20 +1929,8 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             sample_weights,
             dataset_balanced=self.dataset_balanced_loss,
         )
-        gamma_reference_anchor_loss = self._aggregate_per_sample(
-            gamma_reference_anchor_per_sample,
-            dataset_ids,
-            sample_weights,
-            dataset_balanced=self.dataset_balanced_loss,
-        )
         additive_bias_l1_reg = self._aggregate_per_sample(
             additive_bias_l1_per_sample,
-            dataset_ids,
-            sample_weights,
-            dataset_balanced=self.dataset_balanced_loss,
-        )
-        additive_reference_anchor_loss = self._aggregate_per_sample(
-            additive_reference_anchor_per_sample,
             dataset_ids,
             sample_weights,
             dataset_balanced=self.dataset_balanced_loss,
@@ -2698,14 +2109,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "gamma_centering_constraint_error",
             torch.zeros_like(extras["L_bio"]),
         )
-        gamma_reference_mask_diag = extras.get(
-            "gamma_reference_anchor_mask",
-            torch.zeros_like(extras["L_bio"], dtype=torch.bool),
-        )
-        gamma_high_reliability_mask = gamma_reliability_diag >= float(
-            getattr(self.model, "gamma_centering_min_reliability", 0.0)
-        )
-        gamma_low_reliability_mask = ~gamma_high_reliability_mask
         gamma_skipped_mask = mask & (~gamma_applied_diag.to(device=mask.device).bool())
         mean_log_gamma_per_sample = pos_mean(log_gamma_diag)
         std_log_gamma_per_sample = torch.sqrt(
@@ -2745,33 +2148,9 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "replica_pcc_loss": replica_pcc_loss,
             "replica_pcc_value": replica_pcc_value,
             "replica_nll_weight": target.new_tensor(self.replica_nll_weight),
-            "replica_pcc_loss_weight": target.new_tensor(
-                self.replica_pcc_loss_weight
-            ),
-            "zero_calibration_loss": zero_calibration_loss,
-            "zero_calibration_loss_per_sample": zero_calibration_per_sample,
-            "zero_calibration_weight": effective_zero_calibration_weight,
-            "zero_calibration_weight_configured": target.new_tensor(
-                self.zero_calibration_weight
-            ),
-            "zero_calibration_uses_replicas": target.new_tensor(
-                1.0 if use_replica_zero_calibration else 0.0
-            ),
-            "zero_calibration_p0_mean": zero_calibration_terms["p0_mean"],
-            "zero_calibration_p0_on_zeros": zero_calibration_terms["p0_on_zeros"],
-            "zero_calibration_p0_on_nonzeros": zero_calibration_terms[
-                "p0_on_nonzeros"
-            ],
-            "zero_calibration_target_zero_fraction": zero_calibration_terms[
-                "target_zero_fraction"
-            ],
-            "zero_calibration_brier": zero_calibration_terms["brier"],
             "support_calibration_loss": support_calibration_loss,
             "support_calibration_loss_per_sample": support_calibration_per_sample,
             "support_calibration_weight": effective_support_calibration_weight,
-            "support_calibration_weight_configured": target.new_tensor(
-                self.support_calibration_weight
-            ),
             "support_active_probability_mean": support_calibration_terms[
                 "active_probability_mean"
             ],
@@ -2794,18 +2173,11 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "gamma_reg_per_sample": gamma_reg_per_sample,
             "gamma_global_regularizer": gamma_reg,
             "gamma_reg_weight": effective_gamma_reg_weight,
-            "gamma_reg_weight_configured": target.new_tensor(self.gamma_reg_weight),
             "additive_bias_l1_reg": additive_bias_l1_reg,
             "additive_bias_l1_reg_per_sample": additive_bias_l1_per_sample,
             "additive_bias_l1_weight": target.new_tensor(
                 self.additive_bias_l1_weight
             ),
-            "gamma_reference_anchor_loss": gamma_reference_anchor_loss,
-            "gamma_reference_anchor_loss_per_sample": gamma_reference_anchor_per_sample,
-            "gamma_reference_anchor_weight": effective_gamma_reference_anchor_weight,
-            "additive_reference_anchor_loss": additive_reference_anchor_loss,
-            "additive_reference_anchor_loss_per_sample": additive_reference_anchor_per_sample,
-            "additive_reference_anchor_weight": effective_additive_reference_anchor_weight,
             "pcc_loss_total": pcc_loss,
             "pcc_value": pcc_value,
             "pcc_loss_weight_effective": effective_pcc_weight,
@@ -2834,12 +2206,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "pcc_alpha_mean": pcc_diag["alpha_mean"],
             "pcc_alpha_min": pcc_diag["alpha_min"],
             "pcc_alpha_max": pcc_diag["alpha_max"],
-            "pcc_reliability_mean": pcc_diag["reliability_mean"],
-            "pcc_reliability_min": pcc_diag["reliability_min"],
-            "pcc_reliability_max": pcc_diag["reliability_max"],
-            "pcc_mean_ratio_gate_mean": pcc_diag["mean_ratio_gate_mean"],
-            "pcc_mean_ratio_gate_min": pcc_diag["mean_ratio_gate_min"],
-            "pcc_mean_ratio_gate_max": pcc_diag["mean_ratio_gate_max"],
             "mu_pcc": self._aggregate_per_sample(raw_mu_pcc_per_sample, dataset_ids, sample_weights),
             "mu_pcc_per_sample": raw_mu_pcc_per_sample,
             "nb_sequence_reduction_mode": target.new_tensor(sequence_reduction_mode_id),
@@ -2907,18 +2273,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             ),
             "gamma_support_logit_mean": global_pos_mean(gamma_support_logits_diag),
             "gamma_support_logit_std": global_pos_std(gamma_support_logits_diag),
-            "gamma_split_support_head_enabled": extras.get(
-                "gamma_split_support_head_enabled",
-                target.new_tensor(0.0),
-            ).float().mean(),
-            "gamma_gate_additive_bias_enabled": extras.get(
-                "gamma_gate_additive_bias_enabled",
-                target.new_tensor(0.0),
-            ).float().mean(),
-            "gamma_sparse_transform_enabled": extras.get(
-                "gamma_sparse_transform_enabled",
-                torch.zeros_like(extras["scale_dt"]),
-            ).float().mean(),
             "gamma_centering_applied_fraction": masked_fraction(gamma_applied_diag),
             "gamma_centering_skipped_fraction": (
                 gamma_skipped_mask.to(dtype=torch.float32).sum() / valid_count
@@ -2946,22 +2300,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "gamma_correlation_with_library_depth": finite_corr_or_zero(
                 mean_log_gamma_per_sample.detach(),
                 library_depth.detach(),
-            ),
-            "gamma_reference_log_abs_mean": masked_abs_mean(
-                log_gamma_diag,
-                gamma_reference_mask_diag,
-            ),
-            "gamma_nonreference_log_abs_mean": masked_abs_mean(
-                log_gamma_diag,
-                ~gamma_reference_mask_diag.to(device=mask.device).bool(),
-            ),
-            "gamma_high_reliability_log_abs_mean": masked_abs_mean(
-                log_gamma_diag,
-                gamma_high_reliability_mask,
-            ),
-            "gamma_low_reliability_log_abs_mean": masked_abs_mean(
-                log_gamma_diag,
-                gamma_low_reliability_mask,
             ),
             "gamma_skipped_log_abs_mean": masked_abs_mean(
                 log_gamma_diag,
@@ -3002,449 +2340,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             metrics.update(replica_terms["metrics"])
         return metrics
 
-    def get_gradient_diagnostic_parameter_groups(self) -> dict[str, list[nn.Parameter]]:
-        biological_params = [
-            p
-            for name, p in self.model.named_parameters()
-            if p.requires_grad and self._is_biological_parameter_name(name)
-        ]
-        biological_param_ids = {id(p) for p in biological_params}
-        rest_params = [
-            p
-            for p in self.model.parameters()
-            if p.requires_grad and id(p) not in biological_param_ids
-        ]
-        return {
-            "biological": biological_params,
-            "rest": rest_params,
-            "all": biological_params + rest_params,
-        }
-
-    def _gradient_diagnostic_per_sample_components(
-        self,
-        metrics: dict[str, torch.Tensor],
-    ) -> dict[str, torch.Tensor]:
-        zeros = torch.zeros_like(metrics["nll_per_sample"])
-        pcc_component = (
-            metrics["pcc_loss_weight_effective"] * metrics["pcc_loss_per_sample"]
-            if self.pcc_loss_enabled
-            else zeros
-        )
-        full = zeros
-        if self.grad_conflict_include_nll:
-            full = full + metrics["nll_per_sample"]
-        if self.grad_conflict_include_pcc:
-            full = full + pcc_component
-        zero_calibration_component = (
-            metrics["zero_calibration_weight"]
-            * metrics["zero_calibration_loss_per_sample"]
-        )
-        full = full + zero_calibration_component
-        support_calibration_component = (
-            metrics["support_calibration_weight"]
-            * metrics["support_calibration_loss_per_sample"]
-        )
-        full = full + support_calibration_component
-        full = full + metrics["gamma_reg_weight"] * metrics["gamma_reg_per_sample"]
-        full = (
-            full
-            + metrics["gamma_reference_anchor_weight"]
-            * metrics["gamma_reference_anchor_loss_per_sample"]
-        )
-        full = (
-            full
-            + self.additive_bias_l1_weight
-            * metrics["additive_bias_l1_reg_per_sample"]
-        )
-        full = (
-            full
-            + metrics["additive_reference_anchor_weight"]
-            * metrics["additive_reference_anchor_loss_per_sample"]
-        )
-
-        return {
-            "full": full,
-            "nll": metrics["nll_per_sample"],
-            "pcc": pcc_component,
-            "zero_calibration": zero_calibration_component,
-            "support_calibration": support_calibration_component,
-            "gamma_reg": metrics["gamma_reg_weight"] * metrics["gamma_reg_per_sample"],
-            "gamma_reference_anchor": metrics["gamma_reference_anchor_weight"]
-            * metrics["gamma_reference_anchor_loss_per_sample"],
-            "additive_bias_l1_reg": self.additive_bias_l1_weight
-            * metrics["additive_bias_l1_reg_per_sample"],
-            "additive_reference_anchor": metrics["additive_reference_anchor_weight"]
-            * metrics["additive_reference_anchor_loss_per_sample"],
-        }
-
-    @staticmethod
-    def _build_dataset_losses(
-        per_sample_loss: torch.Tensor,
-        dataset_ids: torch.Tensor,
-    ) -> dict[int, torch.Tensor]:
-        dataset_ids = dataset_ids.reshape(-1).to(device=per_sample_loss.device)
-        per_sample_loss = per_sample_loss.reshape(-1)
-        dataset_losses: dict[int, torch.Tensor] = {}
-        for dataset_id_tensor in torch.unique(dataset_ids):
-            sample_mask = dataset_ids == dataset_id_tensor
-            if bool(sample_mask.any()):
-                dataset_losses[int(dataset_id_tensor.detach().cpu().item())] = (
-                    per_sample_loss[sample_mask].mean()
-                )
-        return dataset_losses
-
-    def compute_dataset_gradient_conflict_for_group(
-        self,
-        dataset_losses: dict[int, torch.Tensor],
-        params: list[nn.Parameter],
-        group_name: str,
-        eps: float = 1.0e-12,
-    ) -> dict[str, torch.Tensor]:
-        params = [p for p in params if p.requires_grad]
-        if not params:
-            return summarize_gradient_conflict_from_flat_grads({}, eps=eps)
-
-        flat_grads: dict[int, torch.Tensor] = {}
-        for dataset_id, loss_d in dataset_losses.items():
-            if not loss_d.requires_grad:
-                flat_grads[int(dataset_id)] = torch.cat(
-                    [torch.zeros_like(p).reshape(-1) for p in params]
-                ).float()
-                continue
-            grad_tensors = torch.autograd.grad(
-                loss_d,
-                params,
-                retain_graph=True,
-                create_graph=False,
-                allow_unused=True,
-            )
-            flat_parts = []
-            for grad, param in zip(grad_tensors, params, strict=True):
-                if grad is None:
-                    flat_parts.append(torch.zeros_like(param).reshape(-1))
-                else:
-                    flat_parts.append(grad.detach().reshape(-1))
-            flat_grads[int(dataset_id)] = torch.cat(flat_parts).float()
-
-        del group_name
-        return summarize_gradient_conflict_from_flat_grads(flat_grads, eps=eps)
-
-    def _register_cagrad_gradient_hooks(self) -> None:
-        if self._cagrad_hook_handles:
-            return
-
-        for name, param in self.model.named_parameters():
-            if not param.requires_grad or not self._is_biological_parameter_name(name):
-                continue
-
-            def make_hook(p: nn.Parameter):
-                def hook(grad: torch.Tensor) -> torch.Tensor:
-                    override = self._cagrad_bio_grad_overrides.get(id(p))
-                    if override is None:
-                        return grad
-                    return override.to(device=grad.device, dtype=grad.dtype)
-
-                return hook
-
-            self._cagrad_hook_handles.append(param.register_hook(make_hook(param)))
-
-    @staticmethod
-    def _flatten_grads_for_params(
-        grad_tensors: tuple[torch.Tensor | None, ...],
-        params: list[nn.Parameter],
-    ) -> torch.Tensor:
-        flat_parts = []
-        for grad, param in zip(grad_tensors, params, strict=True):
-            if grad is None:
-                flat_parts.append(torch.zeros_like(param).reshape(-1))
-            else:
-                flat_parts.append(grad.reshape(-1))
-        if not flat_parts:
-            return torch.empty(0)
-        return torch.cat(flat_parts)
-
-    @staticmethod
-    def _unflatten_like_params(
-        flat_grad: torch.Tensor,
-        params: list[nn.Parameter],
-    ) -> list[torch.Tensor]:
-        out = []
-        offset = 0
-        for param in params:
-            n = param.numel()
-            out.append(flat_grad[offset : offset + n].reshape_as(param))
-            offset += n
-        return out
-
-    @staticmethod
-    def _softmax_cagrad_weights(
-        grads: torch.Tensor,
-        *,
-        c: float,
-        num_steps: int,
-        weight_lr: float,
-        eps: float,
-    ) -> torch.Tensor:
-        task_count = grads.shape[0]
-        if task_count <= 1 or float(c) <= 0.0 or int(num_steps) <= 0:
-            return torch.full(
-                (task_count,),
-                1.0 / max(task_count, 1),
-                device=grads.device,
-                dtype=grads.dtype,
-            )
-
-        grads = grads.detach()
-        g0 = grads.mean(dim=0)
-        g0_norm = torch.linalg.norm(g0).clamp_min(float(eps))
-        c_scaled = float(c) * g0_norm
-        logits = torch.zeros(task_count, device=grads.device, dtype=grads.dtype)
-
-        for _ in range(int(num_steps)):
-            logits = logits.detach().requires_grad_(True)
-            weights = torch.softmax(logits, dim=0)
-            gw = weights @ grads
-            objective = torch.dot(gw, g0) + c_scaled * torch.linalg.norm(gw).clamp_min(float(eps))
-            grad_logits = torch.autograd.grad(objective, logits, retain_graph=False)[0]
-            step_scale = grad_logits.norm().clamp_min(1.0)
-            logits = logits - float(weight_lr) * grad_logits / step_scale
-
-        return torch.softmax(logits.detach(), dim=0)
-
-    @classmethod
-    def _combine_cagrad_flat_grads(
-        cls,
-        flat_grads: dict[int, torch.Tensor],
-        *,
-        c: float = 0.5,
-        num_steps: int = 25,
-        weight_lr: float = 0.25,
-        rescale: str = "c",
-        eps: float = 1.0e-12,
-    ) -> dict[str, torch.Tensor]:
-        if not flat_grads:
-            z = torch.tensor(0.0)
-            return {
-                "combined_grad": torch.empty(0),
-                "weights": torch.empty(0),
-                "dataset_ids": torch.empty(0, dtype=torch.long),
-                "mean_grad_norm": z,
-                "combined_grad_norm": z,
-            }
-
-        dataset_ids = sorted(int(k) for k in flat_grads)
-        grads = torch.stack([flat_grads[k].detach().float().reshape(-1) for k in dataset_ids])
-        mean_grad = grads.mean(dim=0)
-        weights = cls._softmax_cagrad_weights(
-            grads,
-            c=float(c),
-            num_steps=int(num_steps),
-            weight_lr=float(weight_lr),
-            eps=float(eps),
-        )
-
-        if grads.shape[0] <= 1 or float(c) <= 0.0:
-            combined = mean_grad
-        else:
-            gw = weights @ grads
-            g0_norm = torch.linalg.norm(mean_grad).clamp_min(float(eps))
-            gw_norm = torch.linalg.norm(gw).clamp_min(float(eps))
-            combined = mean_grad + (float(c) * g0_norm / gw_norm) * gw
-
-            if rescale == "c":
-                combined = combined / (1.0 + float(c))
-            elif rescale in {"c2", "c_squared", "cagrad"}:
-                combined = combined / (1.0 + float(c) * float(c))
-            elif rescale in {"none", "off", "false"}:
-                pass
-            else:
-                raise ValueError(
-                    "cagrad.rescale must be one of {'c', 'c_squared', 'none'}, "
-                    f"got {rescale!r}."
-                )
-
-        return {
-            "combined_grad": combined,
-            "weights": weights,
-            "dataset_ids": torch.tensor(dataset_ids, device=grads.device, dtype=torch.long),
-            "mean_grad_norm": torch.linalg.norm(mean_grad),
-            "combined_grad_norm": torch.linalg.norm(combined),
-        }
-
-    def _prepare_biological_cagrad(
-        self,
-        *,
-        out: dict[str, Any],
-        metrics: dict[str, torch.Tensor],
-    ) -> dict[str, torch.Tensor]:
-        self._cagrad_bio_grad_overrides = {}
-        if not self.cagrad_enabled:
-            return {}
-
-        params = self.get_gradient_diagnostic_parameter_groups().get("biological", [])
-        params = [p for p in params if p.requires_grad]
-        if not params:
-            return {}
-
-        dataset_losses = self._build_dataset_losses(
-            metrics["loss_per_sample"],
-            out["dataset_ids"],
-        )
-        if len(dataset_losses) <= 1:
-            return {
-                "cagrad/biological/num_datasets_present": torch.tensor(
-                    float(len(dataset_losses)),
-                    device=metrics["loss"].device,
-                )
-            }
-
-        flat_grads: dict[int, torch.Tensor] = {}
-        for dataset_id, loss_d in dataset_losses.items():
-            grad_tensors = torch.autograd.grad(
-                loss_d,
-                params,
-                retain_graph=True,
-                create_graph=False,
-                allow_unused=True,
-            )
-            flat_grads[int(dataset_id)] = self._flatten_grads_for_params(grad_tensors, params).detach()
-
-        combined = self._combine_cagrad_flat_grads(
-            flat_grads,
-            c=self.cagrad_c,
-            num_steps=self.cagrad_num_weight_steps,
-            weight_lr=self.cagrad_weight_lr,
-            rescale=self.cagrad_rescale,
-            eps=self.cagrad_eps,
-        )
-        combined_parts = self._unflatten_like_params(combined["combined_grad"], params)
-        self._cagrad_bio_grad_overrides = {
-            id(param): grad.to(device=param.device, dtype=param.dtype)
-            for param, grad in zip(params, combined_parts, strict=True)
-        }
-
-        if not self.cagrad_log_diagnostics:
-            return {}
-
-        conflict = summarize_gradient_conflict_from_flat_grads(flat_grads, eps=self.cagrad_eps)
-        logs: dict[str, torch.Tensor] = {
-            "cagrad/biological/enabled": metrics["loss"].new_tensor(1.0),
-            "cagrad/biological/num_datasets_present": conflict["num_datasets_present"].detach(),
-            "cagrad/biological/pre_mean_cosine": conflict["mean_cosine"].detach(),
-            "cagrad/biological/pre_conflict_score": conflict["conflict_score"].detach(),
-            "cagrad/biological/pre_negative_cosine_fraction": conflict["negative_cosine_fraction"].detach(),
-            "cagrad/biological/pre_norm_ratio_max_min": conflict["norm_ratio_max_min"].detach(),
-            "cagrad/biological/mean_grad_norm": combined["mean_grad_norm"].detach(),
-            "cagrad/biological/combined_grad_norm": combined["combined_grad_norm"].detach(),
-        }
-        for idx, dataset_id in enumerate(combined["dataset_ids"].detach().cpu().tolist()):
-            dataset_name = self._dataset_name(int(dataset_id))
-            logs[f"cagrad/biological/weight/{dataset_name}"] = combined["weights"][idx].detach()
-            logs[f"cagrad/biological/loss/{dataset_name}"] = dataset_losses[int(dataset_id)].detach()
-        return logs
-
-    def _should_run_gradient_conflict_diagnostics(self) -> bool:
-        if not self.grad_conflict_enabled:
-            return False
-        if self.training is False:
-            return False
-        if self.grad_conflict_max_batches_per_epoch >= 0:
-            if self._grad_conflict_batches_this_epoch >= self.grad_conflict_max_batches_per_epoch:
-                return False
-        every_n = max(int(self.grad_conflict_every_n_train_steps), 1)
-        global_step = int(getattr(self, "global_step", 0))
-        return global_step % every_n == 0
-
-    def _log_gradient_conflict_diagnostics(
-        self,
-        *,
-        out: dict[str, Any],
-        metrics: dict[str, torch.Tensor],
-    ) -> None:
-        if not self._should_run_gradient_conflict_diagnostics():
-            return
-        if hasattr(self, "trainer") and self.trainer is not None:
-            if not getattr(self.trainer, "is_global_zero", True):
-                return
-
-        components = self._gradient_diagnostic_per_sample_components(metrics)
-        parameter_groups = self.get_gradient_diagnostic_parameter_groups()
-        logs: dict[str, torch.Tensor] = {}
-        dataset_ids = out["dataset_ids"]
-
-        for component_name in self.grad_conflict_component_modes:
-            if component_name not in components:
-                continue
-            dataset_losses = self._build_dataset_losses(
-                components[component_name],
-                dataset_ids,
-            )
-            if not dataset_losses:
-                continue
-
-            for dataset_id, loss_d in dataset_losses.items():
-                dataset_name = self._dataset_name(dataset_id)
-                logs[f"grad_conflict/{component_name}/loss/{dataset_name}"] = loss_d.detach()
-
-            for group_name in self.grad_conflict_parameter_groups:
-                params = parameter_groups.get(str(group_name), [])
-                if not params:
-                    if group_name not in self._grad_conflict_warned_empty_groups:
-                        self._grad_conflict_warned_empty_groups.add(str(group_name))
-                    continue
-                diag = self.compute_dataset_gradient_conflict_for_group(
-                    dataset_losses=dataset_losses,
-                    params=params,
-                    group_name=str(group_name),
-                    eps=self.grad_conflict_eps,
-                )
-                prefix = f"grad_conflict/{component_name}/{group_name}"
-                for key in (
-                    "num_datasets_present",
-                    "mean_cosine",
-                    "min_cosine",
-                    "max_cosine",
-                    "negative_cosine_fraction",
-                    "mean_dot",
-                    "min_dot",
-                    "mean_norm",
-                    "max_norm",
-                    "min_norm",
-                    "norm_ratio_max_min",
-                    "conflict_score",
-                ):
-                    logs[f"{prefix}/{key}"] = diag[key].detach()
-
-                diag_dataset_ids = [int(x) for x in diag["dataset_ids"].detach().cpu().tolist()]
-                if self.grad_conflict_log_per_dataset_norms:
-                    for i, dataset_id in enumerate(diag_dataset_ids):
-                        dataset_name = self._dataset_name(dataset_id)
-                        logs[f"{prefix}/norm/{dataset_name}"] = diag["norms"][i].detach()
-
-                if self.grad_conflict_log_pairwise_matrix and len(diag_dataset_ids) <= 10:
-                    cosine = diag["cosine_matrix"]
-                    dot = diag["dot_matrix"]
-                    for i, dataset_a in enumerate(diag_dataset_ids):
-                        name_a = self._dataset_name(dataset_a)
-                        for j, dataset_b in enumerate(diag_dataset_ids):
-                            if j <= i:
-                                continue
-                            name_b = self._dataset_name(dataset_b)
-                            pair = f"{name_a}__{name_b}"
-                            logs[f"{prefix}/cosine/{pair}"] = cosine[i, j].detach()
-                            logs[f"{prefix}/dot/{pair}"] = dot[i, j].detach()
-
-        if logs:
-            self.log_dict(
-                logs,
-                on_step=True,
-                on_epoch=False,
-                prog_bar=False,
-                batch_size=int(out["target"].shape[0]),
-                sync_dist=False,
-            )
-            self._grad_conflict_batches_this_epoch += 1
-
     @staticmethod
     def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         mask_f = mask.bool().to(dtype=values.dtype)
@@ -3464,152 +2359,48 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
     # here to avoid logging the same key twice with different arguments.
     SCALAR_METRICS = (
         "nll",
-        "nll_global",
-        "nll_dataset_balanced",
         "pcc_loss",
-        "pcc_loss_global",
-        "pcc_loss_dataset_balanced",
-        "pcc_loss_total",
-        "loss_global_unbalanced",
-        "loss_dataset_balanced",
         "pcc_value",
+        "pcc_valid_fraction",
+        "pcc_raw_value",
+        "pcc_nb_vst_value",
         "consensus_nll",
-        "consensus_pcc_loss",
         "consensus_pcc_value",
-        "replica_objective_mode",
         "replica_aux_loss",
         "replica_nll",
-        "replica_pcc_loss",
-        "replica_pcc_value",
-        "replica_nll_weight",
-        "replica_pcc_loss_weight",
-        "zero_calibration_loss",
-        "zero_calibration_weight",
-        "zero_calibration_weight_configured",
-        "zero_calibration_uses_replicas",
-        "zero_calibration_p0_mean",
-        "zero_calibration_p0_on_zeros",
-        "zero_calibration_p0_on_nonzeros",
-        "zero_calibration_target_zero_fraction",
-        "zero_calibration_brier",
+        "replica_count_mean",
         "support_calibration_loss",
-        "support_calibration_weight",
-        "support_calibration_weight_configured",
-        "support_active_probability_mean",
         "support_active_probability_on_nonzeros",
         "support_active_probability_on_zeros",
-        "support_target_zero_fraction",
         "support_predicted_zero_fraction",
         "support_zero_precision",
         "support_zero_recall",
         "support_false_zero_rate",
-        "pcc_loss_weight_effective",
-        "pcc_valid_fraction",
-        "pcc_raw_loss",
-        "pcc_raw_value",
-        "pcc_raw_component_weight",
-        "pcc_raw_valid_fraction",
-        "pcc_nb_vst_loss",
-        "pcc_nb_vst_value",
-        "pcc_nb_vst_component_weight",
-        "pcc_nb_vst_valid_fraction",
-        "pcc_hybrid_raw_contribution",
-        "pcc_hybrid_nb_vst_contribution",
-        "pcc_target_var_mean",
-        "pcc_alpha_mean",
-        "pcc_alpha_min",
-        "pcc_alpha_max",
-        "pcc_reliability_mean",
-        "pcc_reliability_min",
-        "pcc_reliability_max",
-        "pcc_mean_ratio_gate_mean",
-        "pcc_mean_ratio_gate_min",
-        "pcc_mean_ratio_gate_max",
-        "nb_sequence_reduction_mode",
-        "nb_length_temper_gamma",
-        "nb_length_temper_ref",
-        "nb_length_weight_mean",
-        "nb_length_weight_min",
-        "nb_length_weight_max",
-        "nb_length_weight_short",
-        "nb_length_weight_medium",
-        "nb_length_weight_long",
         "log1p_mse",
         "mean_ratio",
-        "mu_mean",
-        "target_mean",
         "J_mean",
-        "J_min",
-        "J_max",
-        "lambda_bio_mean",
-        "lambda_bio_max",
-        "lambda_bio_min",
-        "L_bio_mean",
         "L_bio_max",
-        "rho_mean",
         "rho_max",
         "gamma_reg",
-        "gamma_global_regularizer",
-        "gamma_reg_weight",
-        "gamma_reg_weight_configured",
-        "gamma_reference_anchor_loss",
-        "gamma_reference_anchor_weight",
-        "additive_reference_anchor_loss",
-        "additive_reference_anchor_weight",
         "gamma_mean",
-        "gamma_raw_mean",
-        "gamma_raw_geometric_mean",
-        "gamma_centered_mean",
-        "gamma_centered_geometric_mean",
-        "gamma_log_mean",
-        "gamma_log_std",
-        "gamma_fraction_below_0p1",
-        "gamma_fraction_above_10",
         "gamma_exact_zero_fraction",
         "gamma_amplitude_mean",
         "gamma_amplitude_max",
-        "gamma_sparse_gate_mean",
         "gamma_sparse_gate_max",
         "gamma_sparse_gate_zero_fraction",
         "gamma_sparse_zero_precision",
         "gamma_sparse_zero_recall",
         "gamma_sparse_false_zero_rate",
-        "gamma_support_logit_mean",
         "gamma_support_logit_std",
-        "gamma_split_support_head_enabled",
-        "gamma_gate_additive_bias_enabled",
-        "gamma_sparse_transform_enabled",
         "gamma_centering_applied_fraction",
-        "gamma_centering_skipped_fraction",
-        "gamma_eligible_fraction",
-        "gamma_mean_reliability",
-        "gamma_min_reliability",
         "gamma_distinct_dataset_count_mean",
-        "gamma_total_reliability_mean",
-        "gamma_weighted_log_center_abs_mean",
         "gamma_centering_constraint_error",
-        "gamma_mean_log_per_sample",
-        "gamma_std_log_per_sample",
-        "gamma_correlation_with_scale",
-        "gamma_correlation_with_library_depth",
-        "gamma_reference_log_abs_mean",
-        "gamma_nonreference_log_abs_mean",
-        "gamma_high_reliability_log_abs_mean",
-        "gamma_low_reliability_log_abs_mean",
-        "gamma_skipped_log_abs_mean",
         "gamma_min",
         "gamma_max",
-        "log_gamma_abs_mean",
-        "gamma_cross_dataset_log_center_abs_mean",
-        "gamma_cross_dataset_center_applied_frac",
-        "gamma_cross_dataset_center_group_size_mean",
         "additive_bias_l1_reg",
         "additive_bias_mean",
         "additive_bias_max",
         "nb_alpha_mean",
-        "replica_count_mean",
-        "replica_count_min",
-        "replica_count_max",
     )
 
     def _log_stage(
@@ -3645,121 +2436,34 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             value = metrics.get(name)
             if not torch.is_tensor(value) or value.ndim != 0:
                 continue
-            log_name = f"{stage}_{name}"
-            if name in {
-                "nll_global",
-                "pcc_loss_global",
-                "loss_global_unbalanced",
-                "nll_dataset_balanced",
-                "pcc_loss_dataset_balanced",
-                "loss_dataset_balanced",
-            }:
-                log_name = f"{stage}/{name}"
-            pcc_log_name = {
-                "pcc_loss_total": "pcc/loss_total",
-                "pcc_loss_weight_effective": "pcc/loss_weight_effective",
-                "pcc_raw_loss": "pcc/raw_loss",
+            metric_path = {
                 "pcc_raw_value": "pcc/raw_value",
-                "pcc_raw_component_weight": "pcc/raw_component_weight",
-                "pcc_raw_valid_fraction": "pcc/raw_valid_fraction",
-                "pcc_nb_vst_loss": "pcc/nb_vst_loss",
                 "pcc_nb_vst_value": "pcc/nb_vst_value",
-                "pcc_nb_vst_component_weight": "pcc/nb_vst_component_weight",
-                "pcc_nb_vst_valid_fraction": "pcc/nb_vst_valid_fraction",
-                "pcc_hybrid_raw_contribution": "pcc/hybrid_raw_contribution",
-                "pcc_hybrid_nb_vst_contribution": "pcc/hybrid_nb_vst_contribution",
-                "pcc_reliability_mean": "pcc/reliability_mean",
-                "pcc_reliability_min": "pcc/reliability_min",
-                "pcc_reliability_max": "pcc/reliability_max",
-                "pcc_mean_ratio_gate_mean": "pcc/mean_ratio_gate_mean",
-                "pcc_mean_ratio_gate_min": "pcc/mean_ratio_gate_min",
-                "pcc_mean_ratio_gate_max": "pcc/mean_ratio_gate_max",
-                "nb_sequence_reduction_mode": "nb/sequence_reduction_mode",
-                "nb_length_temper_gamma": "nb/length_temper_gamma",
-                "nb_length_temper_ref": "nb/length_temper_ref",
-                "nb_length_weight_mean": "nb/length_weight_mean",
-                "nb_length_weight_min": "nb/length_weight_min",
-                "nb_length_weight_max": "nb/length_weight_max",
-                "nb_length_weight_short": "nb/length_weight_short",
-                "nb_length_weight_medium": "nb/length_weight_medium",
-                "nb_length_weight_long": "nb/length_weight_long",
-            }.get(name)
-            if pcc_log_name is not None:
-                log_name = f"{stage}/{pcc_log_name}"
-            zero_calibration_log_name = {
-                "zero_calibration_loss": "zero_calibration/loss",
-                "zero_calibration_weight": "zero_calibration/weight",
-                "zero_calibration_weight_configured": "zero_calibration/weight_configured",
-                "zero_calibration_uses_replicas": "zero_calibration/uses_replicas",
-                "zero_calibration_p0_mean": "zero_calibration/p0_mean",
-                "zero_calibration_p0_on_zeros": "zero_calibration/p0_on_zeros",
-                "zero_calibration_p0_on_nonzeros": "zero_calibration/p0_on_nonzeros",
-                "zero_calibration_target_zero_fraction": "zero_calibration/target_zero_fraction",
-                "zero_calibration_brier": "zero_calibration/brier",
-            }.get(name)
-            if zero_calibration_log_name is not None:
-                log_name = f"{stage}/{zero_calibration_log_name}"
-            support_calibration_log_name = {
                 "support_calibration_loss": "support/loss",
-                "support_calibration_weight": "support/weight",
-                "support_calibration_weight_configured": "support/weight_configured",
-                "support_active_probability_mean": "support/active_probability_mean",
                 "support_active_probability_on_nonzeros": "support/active_probability_on_nonzeros",
                 "support_active_probability_on_zeros": "support/active_probability_on_zeros",
-                "support_target_zero_fraction": "support/target_zero_fraction",
                 "support_predicted_zero_fraction": "support/predicted_zero_fraction",
                 "support_zero_precision": "support/zero_precision",
                 "support_zero_recall": "support/zero_recall",
                 "support_false_zero_rate": "support/false_zero_rate",
-            }.get(name)
-            if support_calibration_log_name is not None:
-                log_name = f"{stage}/{support_calibration_log_name}"
-            gamma_log_name = {
-                "gamma_raw_mean": "gamma/raw_mean",
-                "gamma_raw_geometric_mean": "gamma/raw_geometric_mean",
-                "gamma_centered_mean": "gamma/centered_mean",
-                "gamma_centered_geometric_mean": "gamma/centered_geometric_mean",
-                "gamma_log_mean": "gamma/log_mean",
-                "gamma_log_std": "gamma/log_std",
-                "gamma_fraction_below_0p1": "gamma/fraction_below_0.1",
-                "gamma_fraction_above_10": "gamma/fraction_above_10",
                 "gamma_exact_zero_fraction": "gamma/exact_zero_fraction",
                 "gamma_amplitude_mean": "gamma/amplitude_mean",
                 "gamma_amplitude_max": "gamma/amplitude_max",
-                "gamma_sparse_gate_mean": "gamma/sparse_gate_mean",
                 "gamma_sparse_gate_max": "gamma/sparse_gate_max",
                 "gamma_sparse_gate_zero_fraction": "gamma/sparse_gate_zero_fraction",
                 "gamma_sparse_zero_precision": "gamma/sparse_zero_precision",
                 "gamma_sparse_zero_recall": "gamma/sparse_zero_recall",
                 "gamma_sparse_false_zero_rate": "gamma/sparse_false_zero_rate",
-                "gamma_support_logit_mean": "gamma/support_logit_mean",
                 "gamma_support_logit_std": "gamma/support_logit_std",
-                "gamma_split_support_head_enabled": "gamma/split_support_head_enabled",
-                "gamma_gate_additive_bias_enabled": "gamma/gate_additive_bias_enabled",
-                "gamma_sparse_transform_enabled": "gamma/sparse_transform_enabled",
                 "gamma_centering_applied_fraction": "gamma/centering_applied_fraction",
-                "gamma_centering_skipped_fraction": "gamma/centering_skipped_fraction",
-                "gamma_eligible_fraction": "gamma/eligible_fraction",
-                "gamma_mean_reliability": "gamma/mean_reliability",
-                "gamma_min_reliability": "gamma/min_reliability",
                 "gamma_distinct_dataset_count_mean": "gamma/distinct_dataset_count_mean",
-                "gamma_total_reliability_mean": "gamma/total_reliability_mean",
-                "gamma_weighted_log_center_abs_mean": "gamma/weighted_log_center_abs_mean",
                 "gamma_centering_constraint_error": "gamma/centering_constraint_error",
-                "gamma_reference_anchor_loss": "gamma/reference_anchor_loss",
-                "gamma_global_regularizer": "gamma/global_regularizer",
-                "gamma_correlation_with_scale": "gamma/correlation_with_scale",
-                "gamma_correlation_with_library_depth": "gamma/correlation_with_library_depth",
-                "gamma_mean_log_per_sample": "gamma/mean_log_gamma_per_sample",
-                "gamma_std_log_per_sample": "gamma/std_log_gamma_per_sample",
-                "gamma_reference_log_abs_mean": "gamma/reference/log_abs_mean",
-                "gamma_nonreference_log_abs_mean": "gamma/non_reference/log_abs_mean",
-                "gamma_high_reliability_log_abs_mean": "gamma/high_reliability/log_abs_mean",
-                "gamma_low_reliability_log_abs_mean": "gamma/low_reliability/log_abs_mean",
-                "gamma_skipped_log_abs_mean": "gamma/skipped/log_abs_mean",
             }.get(name)
-            if gamma_log_name is not None:
-                log_name = f"{stage}/{gamma_log_name}"
+            log_name = (
+                f"{stage}/{metric_path}"
+                if metric_path is not None
+                else f"{stage}_{name}"
+            )
             self.log(
                 log_name,
                 value,
@@ -3785,106 +2489,56 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
     ) -> None:
         dataset_ids = out["dataset_ids"].detach().to(device=out["target"].device)
         unique_dataset_ids = torch.unique(dataset_ids)
-        if unique_dataset_ids.numel() <= 1:
-            return
-
-        batch_size = int(out["target"].shape[0])
         sync_dist = bool(getattr(self.config.trainer, "sync_dist_logs", False))
 
         per_sample = {
             "loss": metrics["loss_per_sample"],
             "nll": metrics["nll_per_sample"],
             "pcc_loss": metrics["pcc_loss_per_sample"],
-            "zero_calibration_loss": metrics["zero_calibration_loss_per_sample"],
-            "support_calibration_loss": metrics[
-                "support_calibration_loss_per_sample"
-            ],
             "pcc_raw_loss": metrics["pcc_raw_loss_per_sample"],
             "pcc_nb_vst_loss": metrics["pcc_nb_vst_loss_per_sample"],
             "mu_pcc": metrics["mu_pcc_per_sample"],
         }
 
+        extras = out["extras"]
+        gamma = extras.get("gamma", torch.ones_like(extras["L_bio"])).float()
+
         for dataset_id_tensor in unique_dataset_ids:
-            dataset_id = int(dataset_id_tensor.item())
-            dataset_name = self._dataset_name(dataset_id)
+            dataset_name = self._dataset_name(int(dataset_id_tensor.item()))
             sample_mask = dataset_ids == dataset_id_tensor
+            dataset_sample_count = int(sample_mask.sum().item())
 
             for metric_name, values in per_sample.items():
-                value = values[sample_mask].mean()
                 self.log(
                     f"{stage}_{metric_name}/{dataset_name}",
-                    value,
+                    values[sample_mask].mean(),
                     on_step=False,
                     on_epoch=True,
                     prog_bar=False,
-                    batch_size=batch_size,
+                    # Lightning weights epoch reductions by batch_size. Use the
+                    # number of samples from this dataset, not the full mixed
+                    # batch, so this is the true per-dataset sample mean.
+                    batch_size=dataset_sample_count,
                     sync_dist=sync_dist,
                 )
-                by_dataset_name = {
-                    "loss": "loss",
-                    "nll": "nll",
-                    "pcc_loss": "pcc",
-                    "zero_calibration_loss": "zero_calibration/loss",
-                    "support_calibration_loss": "support/loss",
-                    "pcc_raw_loss": "pcc/raw_loss",
-                    "pcc_nb_vst_loss": "pcc/nb_vst_loss",
-                }.get(metric_name)
-                if by_dataset_name is not None:
-                    self.log(
-                        f"{stage}/{by_dataset_name}_by_dataset/{dataset_name}",
-                        value,
-                        on_step=False,
-                        on_epoch=True,
-                        prog_bar=False,
-                        batch_size=batch_size,
-                        sync_dist=sync_dist,
-                    )
 
-            extras = out["extras"]
-            pos_mask = sample_mask.reshape(-1, 1) & out["mask"].bool()
-            if bool(pos_mask.any()):
-                gamma = extras.get("gamma", torch.ones_like(extras["L_bio"])).float()
-                log_gamma = extras.get(
-                    "log_gamma",
-                    torch.zeros_like(extras["L_bio"]),
-                ).float()
-                gamma_raw = extras.get("gamma_raw", torch.ones_like(extras["L_bio"])).float()
-                reliability = extras.get(
-                    "gamma_centering_reliability",
-                    torch.zeros_like(extras["L_bio"]),
-                ).float()
-                applied = extras.get(
-                    "gamma_centering_applied",
-                    torch.zeros_like(extras["L_bio"], dtype=torch.bool),
-                ).bool()
-                for log_key, value in {
-                    f"{stage}/gamma/log_mean_by_dataset/{dataset_name}": log_gamma[pos_mask].mean(),
-                    f"{stage}/gamma/log_std_by_dataset/{dataset_name}": (
-                        log_gamma[pos_mask].std(unbiased=False)
-                        if int(pos_mask.sum().item()) > 1
-                        else log_gamma.new_tensor(0.0)
-                    ),
-                    f"{stage}/gamma/raw_mean_by_dataset/{dataset_name}": gamma_raw[pos_mask].mean(),
-                    f"{stage}/gamma/centered_mean_by_dataset/{dataset_name}": gamma[pos_mask].mean(),
-                    f"{stage}/gamma/mean_reliability_by_dataset/{dataset_name}": reliability[pos_mask].mean(),
-                    f"{stage}/gamma/centering_applied_fraction_by_dataset/{dataset_name}": applied[pos_mask].float().mean(),
-                }.items():
-                    self.log(
-                        log_key,
-                        value,
-                        on_step=False,
-                        on_epoch=True,
-                        prog_bar=False,
-                        batch_size=batch_size,
-                        sync_dist=sync_dist,
-                    )
+            position_mask = sample_mask.reshape(-1, 1) & out["mask"].bool()
+            if bool(position_mask.any()):
+                self.log(
+                    f"{stage}/gamma/exact_zero_fraction_by_dataset/{dataset_name}",
+                    (gamma[position_mask] == 0.0).float().mean(),
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=False,
+                    # This metric is a mean over valid positions, so weight its
+                    # epoch reduction by the number of contributing positions.
+                    batch_size=int(position_mask.sum().item()),
+                    sync_dist=sync_dist,
+                )
 
     # ============================================================
     # Profile plots
     # ============================================================
-
-    def on_train_epoch_start(self) -> None:
-        self._grad_conflict_batches_this_epoch = 0
 
     def on_validation_epoch_start(self) -> None:
         self._val_profile_plot_logged_this_epoch = False
@@ -4078,16 +2732,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         out = self._forward_batch(batch)
         metrics = self._compute_loss_and_metrics(out)
         self._log_stage(stage="train", out=out, metrics=metrics)
-        cagrad_logs = self._prepare_biological_cagrad(out=out, metrics=metrics)
-        if cagrad_logs:
-            self.log_dict(
-                cagrad_logs,
-                on_step=True,
-                on_epoch=False,
-                prog_bar=False,
-                sync_dist=False,
-            )
-        self._log_gradient_conflict_diagnostics(out=out, metrics=metrics)
         return metrics["loss"]
 
     def on_before_optimizer_step(self, optimizer):
@@ -4097,7 +2741,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         if any(not torch.isfinite(p.grad).all() for p in params):
             for p in params:
                 p.grad.zero_()
-        self._cagrad_bio_grad_overrides = {}
 
     def validation_step(self, batch, batch_idx):
         out = self._forward_batch(batch)

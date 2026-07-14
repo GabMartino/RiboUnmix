@@ -101,6 +101,9 @@ class DatasetBiasSubmodel(nn.Module):
         self.dataset_embeddings_size = int(config_params["dataset_embeddings_size"])
         self.num_datasets = int(config_params["num_datasets"])
         self.num_codons = int(config_params["num_codons"])
+        self.additional_sequence_feature_dim = int(
+            config_params.get("additional_sequence_feature_dim", 0)
+        )
 
 
         self.dataset_embedding = nn.Embedding(
@@ -115,7 +118,11 @@ class DatasetBiasSubmodel(nn.Module):
 
         # This branch deliberately owns a GRU separate from the biological GRU,
         # preserving gamma as a function of only (sequence, dataset_id).
-        encoder_in = self.codon_embeddings_size + self.dataset_embeddings_size
+        encoder_in = (
+            self.codon_embeddings_size
+            + self.dataset_embeddings_size
+            + self.additional_sequence_feature_dim
+        )
         self.local_context_gru = BiGRUContextEncoder(
             in_channels=encoder_in,
             hidden_size=int(config_params.get("context_gru_hidden_size", 128)),
@@ -161,6 +168,7 @@ class DatasetBiasSubmodel(nn.Module):
         mask: torch.Tensor,
         codon_ids: torch.Tensor,
         position_features: torch.Tensor,
+        sequence_features: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         B, T = codon_ids.shape
 
@@ -180,7 +188,28 @@ class DatasetBiasSubmodel(nn.Module):
         codon_emb = self.codon_embedding(codon_ids).to(dtype=dtype)
         codon_emb = codon_emb * mask_f.unsqueeze(-1)
 
-        encoder_input = torch.cat((dataset_emb, codon_emb), dim=-1).transpose(1, 2)
+        encoder_features = [dataset_emb, codon_emb]
+        if self.additional_sequence_feature_dim > 0:
+            if sequence_features is None:
+                raise ValueError(
+                    "The dataset-bias branch expects additional sequence features "
+                    f"with dimension {self.additional_sequence_feature_dim}, but none "
+                    "were provided."
+                )
+            if sequence_features.shape != (
+                B,
+                T,
+                self.additional_sequence_feature_dim,
+            ):
+                raise ValueError(
+                    "Unexpected dataset-bias sequence feature shape: got "
+                    f"{tuple(sequence_features.shape)}, expected "
+                    f"{(B, T, self.additional_sequence_feature_dim)}."
+                )
+            sequence_features = sequence_features.to(device=device, dtype=dtype)
+            sequence_features = sequence_features * mask_f.unsqueeze(-1)
+            encoder_features.append(sequence_features)
+        encoder_input = torch.cat(encoder_features, dim=-1).transpose(1, 2)
         local_context = self.local_context_gru(
             encoder_input,
             mask=mask_b,

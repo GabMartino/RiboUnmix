@@ -43,6 +43,7 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             ribo_profile[T],
             css,
             sample_weight,
+            dataset_bias_features[T, F_bias],  # when F_bias > 0
             ribo_replicas[R, T],  # only when use_ribo_replicas=True
         )
 
@@ -57,6 +58,7 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             codon_ids_pad,         # [B, T_max]
             css_sorted,            # list
             sample_weights_sorted, # [B]
+            bias_features_pad,     # [B, T_max, F_bias], optional
             replica_pad,           # [B, R_max, T_max], optional
             replica_mask,          # [B, R_max], optional
         )
@@ -85,6 +87,7 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         precompute_features: bool = True,
         precompute_ribo: bool = True,
         use_ribo_replicas: bool = False,
+        additional_sequence_features: Mapping[str, Mapping] | None = None,
     ):
         super().__init__()
 
@@ -114,6 +117,25 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         self.precompute_features = bool(precompute_features)
         self.precompute_ribo = bool(precompute_ribo)
         self.use_ribo_replicas = bool(use_ribo_replicas)
+        self.additional_sequence_features = self._parse_additional_sequence_features(
+            additional_sequence_features
+        )
+        self.biological_feature_specs = [
+            spec
+            for spec in self.additional_sequence_features
+            if spec["route"] in {"biological", "both"}
+        ]
+        self.dataset_bias_feature_specs = [
+            spec
+            for spec in self.additional_sequence_features
+            if spec["route"] in {"dataset_bias", "both"}
+        ]
+        self.biological_extra_dim = sum(
+            spec["dimension"] for spec in self.biological_feature_specs
+        )
+        self.dataset_bias_extra_dim = sum(
+            spec["dimension"] for spec in self.dataset_bias_feature_specs
+        )
         self.ribo_replicas_records = self.data_records.get("ribo_replicas")
         if self.use_ribo_replicas and not self.ribo_replicas_records:
             raise ValueError(
@@ -163,6 +185,9 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         # One cache slot per global transcript in shared_data.
         self._feature_cache: list[np.ndarray | None] = [None] * len(self.data_records["ref"])
         self._codon_id_cache: list[np.ndarray | None] = [None] * len(self.data_records["ref"])
+        self._dataset_bias_feature_cache: list[np.ndarray | None] = [
+            None
+        ] * len(self.data_records["ref"])
 
         # Ribo cache keyed by (transcript_id, dataset_name).
         self._ribo_cache: dict[tuple[str, str], np.ndarray] = {}
@@ -310,7 +335,7 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
 
         global_idx = int(self.local_to_global_idx[local_idx])
 
-        encoded, codon_ids = self._get_encoded_and_codon_ids(global_idx)
+        encoded, codon_ids, dataset_bias_features = self._get_sequence_inputs(global_idx)
         ribo = self._get_ribo_profile(transcript_id, dataset_name)
         replicas = (
             self._get_ribo_replicas(transcript_id, dataset_name)
@@ -350,6 +375,8 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             css,
             sample_weight,
         )
+        if self.dataset_bias_extra_dim > 0:
+            sample = (*sample, dataset_bias_features)
         if replicas is not None:
             sample = (*sample, replicas)
         return sample
@@ -459,6 +486,123 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
     # Encoding / caching
     # ============================================================
 
+    @staticmethod
+    def _parse_additional_sequence_features(
+        feature_config: Mapping[str, Mapping] | None,
+    ) -> list[dict]:
+        if not feature_config:
+            return []
+
+        allowed_routes = {"none", "biological", "dataset_bias", "both"}
+        specs = []
+        for name, raw_spec in feature_config.items():
+            spec = dict(raw_spec or {})
+            route = str(spec.get("route", "none")).lower()
+            if route not in allowed_routes:
+                raise ValueError(
+                    f"Invalid route {route!r} for sequence feature {name!r}; "
+                    f"expected one of {sorted(allowed_routes)}."
+                )
+            if route == "none":
+                continue
+            dimension = int(spec.get("dimension", 1))
+            if dimension <= 0:
+                raise ValueError(
+                    f"Feature {name!r} must have a positive dimension, got {dimension}."
+                )
+            specs.append(
+                {
+                    "name": str(name),
+                    "route": route,
+                    "dimension": dimension,
+                    "scale": float(spec.get("scale", 1.0)),
+                    "missing_values": tuple(
+                        float(value) for value in spec.get("missing_values", [])
+                    ),
+                    "fill_value": float(spec.get("fill_value", 0.0)),
+                }
+            )
+        return specs
+
+    def _extract_additional_feature(
+        self,
+        *,
+        global_idx: int,
+        spec: Mapping,
+        sequence_length: int,
+    ) -> np.ndarray:
+        name = str(spec["name"])
+        feature_records = self.data_records.get("sequence_features", {})
+        if name not in feature_records:
+            raise KeyError(
+                f"Configured sequence feature {name!r} was not loaded by the datamodule."
+            )
+
+        cell = feature_records[name][global_idx]
+        try:
+            values = np.asarray(cell, dtype=np.float32)
+        except (TypeError, ValueError):
+            values = np.stack(
+                [np.asarray(row, dtype=np.float32) for row in cell], axis=0
+            )
+        if values.dtype == object:
+            values = np.stack(
+                [np.asarray(row, dtype=np.float32) for row in cell], axis=0
+            )
+        if values.ndim == 1:
+            values = values[:, None]
+        if values.ndim != 2:
+            raise ValueError(
+                f"Sequence feature {name!r} must have shape [T] or [T, C], "
+                f"got {values.shape}."
+            )
+        expected_dim = int(spec["dimension"])
+        if values.shape != (sequence_length, expected_dim):
+            raise ValueError(
+                f"Sequence feature {name!r} has shape {values.shape}; expected "
+                f"({sequence_length}, {expected_dim}) to match ref."
+            )
+        fill_value = float(spec["fill_value"])
+        missing_values = tuple(spec.get("missing_values", ()))
+        if missing_values:
+            values = np.where(
+                np.isin(values, np.asarray(missing_values, dtype=np.float32)),
+                fill_value,
+                values,
+            )
+        values = np.nan_to_num(
+            values,
+            nan=fill_value,
+            posinf=fill_value,
+            neginf=fill_value,
+        )
+        values = values * float(spec["scale"])
+        return np.ascontiguousarray(values, dtype=np.float32)
+
+    def _additional_features_for_route(
+        self,
+        *,
+        global_idx: int,
+        specs: Sequence[Mapping],
+        sequence_length: int,
+    ) -> np.ndarray:
+        if not specs:
+            return np.empty((sequence_length, 0), dtype=np.float32)
+        return np.ascontiguousarray(
+            np.concatenate(
+                [
+                    self._extract_additional_feature(
+                        global_idx=global_idx,
+                        spec=spec,
+                        sequence_length=sequence_length,
+                    )
+                    for spec in specs
+                ],
+                axis=1,
+            ),
+            dtype=np.float32,
+        )
+
     def _build_encoding_lookup_tables(self) -> None:
         """
         Builds fast lookup tables:
@@ -543,8 +687,23 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             global_idx = int(global_idx)
             ref = self.data_records["ref"][global_idx]
             encoded, codon_ids = self._extract_features_and_codon_ids(ref)
+            bio_extra = self._additional_features_for_route(
+                global_idx=global_idx,
+                specs=self.biological_feature_specs,
+                sequence_length=encoded.shape[0],
+            )
+            if bio_extra.shape[1] > 0:
+                encoded = np.ascontiguousarray(
+                    np.concatenate((encoded, bio_extra), axis=1), dtype=np.float32
+                )
+            bias_extra = self._additional_features_for_route(
+                global_idx=global_idx,
+                specs=self.dataset_bias_feature_specs,
+                sequence_length=encoded.shape[0],
+            )
             self._feature_cache[global_idx] = encoded
             self._codon_id_cache[global_idx] = codon_ids
+            self._dataset_bias_feature_cache[global_idx] = bias_extra
 
     def _precompute_ribo_profiles(self) -> None:
         """
@@ -588,17 +747,35 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
                 f"Length mismatches found in {len(mismatches)} transcript-dataset pair(s):\n{detail}"
             )
 
-    def _get_encoded_and_codon_ids(self, global_idx: int) -> tuple[np.ndarray, np.ndarray]:
+    def _get_sequence_inputs(
+        self, global_idx: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         encoded = self._feature_cache[global_idx]
         codon_ids = self._codon_id_cache[global_idx]
+        bias_features = self._dataset_bias_feature_cache[global_idx]
 
-        if encoded is None or codon_ids is None:
+        if encoded is None or codon_ids is None or bias_features is None:
             ref = self.data_records["ref"][global_idx]
             encoded, codon_ids = self._extract_features_and_codon_ids(ref)
+            bio_extra = self._additional_features_for_route(
+                global_idx=global_idx,
+                specs=self.biological_feature_specs,
+                sequence_length=encoded.shape[0],
+            )
+            if bio_extra.shape[1] > 0:
+                encoded = np.ascontiguousarray(
+                    np.concatenate((encoded, bio_extra), axis=1), dtype=np.float32
+                )
+            bias_features = self._additional_features_for_route(
+                global_idx=global_idx,
+                specs=self.dataset_bias_feature_specs,
+                sequence_length=encoded.shape[0],
+            )
             self._feature_cache[global_idx] = encoded
             self._codon_id_cache[global_idx] = codon_ids
+            self._dataset_bias_feature_cache[global_idx] = bias_features
 
-        return encoded, codon_ids
+        return encoded, codon_ids, bias_features
 
     def _get_ribo_profile(self, transcript_id: str, dataset_name: str) -> np.ndarray:
         key = (str(transcript_id), str(dataset_name))
@@ -756,7 +933,8 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
     # ============================================================
 
     def collate_fn(self, batch):
-        has_replicas = len(batch[0]) == 8
+        has_bias_features = self.dataset_bias_extra_dim > 0
+        has_replicas = len(batch[0]) == 8 + int(has_bias_features)
         (
             idx_datasets,
             ids,
@@ -765,9 +943,10 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             profiles,
             css_s,
             sample_weights,
-            *maybe_replicas,
+            *optional_values,
         ) = zip(*batch)
-        replicas = maybe_replicas[0] if has_replicas else None
+        bias_features = optional_values[0] if has_bias_features else None
+        replicas = optional_values[int(has_bias_features)] if has_replicas else None
 
         lengths = torch.as_tensor(
             [s.shape[0] for s in sequences],
@@ -795,6 +974,13 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             torch.from_numpy(np.asarray(codon_ids[i], dtype=np.int64))
             for i in order_list
         ]
+
+        bias_features_sorted = None
+        if bias_features is not None:
+            bias_features_sorted = [
+                torch.from_numpy(np.asarray(bias_features[i], dtype=np.float32))
+                for i in order_list
+            ]
 
         prof_sorted = [
             torch.from_numpy(np.asarray(profiles[i], dtype=np.float32))
@@ -831,6 +1017,14 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             batch_first=True,
             padding_value=0,
         )
+
+        bias_features_pad = None
+        if bias_features_sorted is not None:
+            bias_features_pad = pad_sequence(
+                bias_features_sorted,
+                batch_first=True,
+                padding_value=0.0,
+            )
 
         Tmax = prof_pad.size(1)
 
@@ -906,6 +1100,8 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             css_sorted,
             sample_weights_sorted,
         )
+        if bias_features_pad is not None:
+            collated = (*collated, bias_features_pad)
         if replica_pad is not None and replica_mask is not None:
             collated = (*collated, replica_pad, replica_mask)
         return collated

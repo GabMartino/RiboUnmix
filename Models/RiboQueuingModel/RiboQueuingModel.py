@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 import math
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from entmax import entmax15
 
 from Models.RiboQueuingModel.DatasetBiasSubmodel import DatasetBiasSubmodel
@@ -31,8 +30,8 @@ class RiboQueuingModel(nn.Module):
         a          = nonnegative additive background, regularized toward 0.
 
     Gamma-score centering is a multiplicative reference/gauge constraint only. It
-    does not identify the additive branch; additive-bias regularization and
-    optional reference anchors remain separate objective terms.
+    does not identify the additive branch; additive-bias regularization remains
+    a separate objective term.
     """
 
     def __init__(
@@ -40,7 +39,6 @@ class RiboQueuingModel(nn.Module):
         model_configs: dict,
         eps: float = 1.0e-8,
         mu_max: float = 1.0e8,
-        active_dataset_ids: Sequence[int] | None = None,
     ):
         super().__init__()
 
@@ -72,16 +70,39 @@ class RiboQueuingModel(nn.Module):
         # mass pushed off zeros is redistributed to the peaks automatically.
         self.mass_conservation = bool(model_configs.get("mass_conservation", True))
 
+        feature_config = model_configs.get("additional_sequence_features", {}) or {}
+        biological_extra_dim = 0
+        dataset_bias_extra_dim = 0
+        allowed_feature_routes = {"none", "biological", "dataset_bias", "both"}
+        for feature_name, raw_spec in feature_config.items():
+            spec = dict(raw_spec or {})
+            route = str(spec.get("route", "none")).lower()
+            if route not in allowed_feature_routes:
+                raise ValueError(
+                    f"Invalid route {route!r} for sequence feature {feature_name!r}; "
+                    f"expected one of {sorted(allowed_feature_routes)}."
+                )
+            if route == "none":
+                continue
+            dimension = int(spec.get("dimension", 1))
+            if dimension <= 0:
+                raise ValueError(
+                    f"Feature {feature_name!r} must have a positive dimension."
+                )
+            if route in {"biological", "both"}:
+                biological_extra_dim += dimension
+            if route in {"dataset_bias", "both"}:
+                dataset_bias_extra_dim += dimension
 
         biological_params = dict(model_configs["biological_params"])
+        biological_params["input_size"] = (
+            int(biological_params["input_size"]) + biological_extra_dim
+        )
         biological_params.setdefault("eps", self.eps)
         self.biological_model = QueuingBiologicalModel(config_params=biological_params)
 
-        # ``active_dataset_ids`` remains in the public constructor because the
-        # training entry point and historical callers pass it. Gamma no longer
-        # owns per-dataset response parameters, so it has no active use here.
-        del active_dataset_ids
         dataset_bias_params = dict(model_configs["dataset_bias_params"])
+        dataset_bias_params["additional_sequence_feature_dim"] = dataset_bias_extra_dim
         self.position_features = list(dataset_bias_params["position_features"])
         self.position_scale = float(dataset_bias_params.get("position_scale", 5000.0))
         self.position_edge_tau = float(dataset_bias_params.get("position_edge_tau", 30.0))
@@ -179,141 +200,25 @@ class RiboQueuingModel(nn.Module):
         return gamma, amplitude, sparse_gate
 
     # ============================================================
-    # Gamma-centering configuration
+    # Equal-dataset gamma centering
     # ============================================================
 
-    @staticmethod
-    def _as_plain_dict(value) -> dict:
-        if value is None:
-            return {}
-        if isinstance(value, Mapping):
-            return {str(k): v for k, v in value.items()}
-        return dict(value)
+    def _configure_gamma_centering(self, model_configs: dict) -> None:
+        cfg = dict(model_configs.get("gamma_centering", {}))
+        scope = str(cfg.get("scope", "batch_grouped")).lower()
 
-    @staticmethod
-    def _parse_reference_dataset_ids(values) -> set[int]:
-        if values is None:
-            return set()
-        ids: set[int] = set()
-        for value in list(values):
-            try:
-                ids.add(int(value))
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    "gamma_centering.reference_dataset_ids must contain integer "
-                    f"dataset ids; got {value!r}."
-                ) from exc
-        return ids
+        if scope not in {"batch_grouped", "disabled"}:
+            raise ValueError("gamma_centering.scope must be 'batch_grouped' or 'disabled'.")
 
-    def _configure_gamma_centering(self, model_configs: Mapping) -> None:
-        old_cfg = self._as_plain_dict(
-            model_configs.get("gamma_cross_dataset_centering", {})
-        )
-        new_cfg = self._as_plain_dict(model_configs.get("gamma_centering", {}))
-
-        if old_cfg and new_cfg:
-            conflict_checks = {
-                "enabled": ("enabled", bool),
-                "strength": ("strength", float),
-                "min_datasets": ("min_distinct_datasets", int),
-            }
-            for old_key, (new_key, caster) in conflict_checks.items():
-                if old_key not in old_cfg or new_key not in new_cfg:
-                    continue
-                old_value = caster(old_cfg[old_key])
-                new_value = caster(new_cfg[new_key])
-
-        cfg = dict(new_cfg)
-        if old_cfg:
-            cfg.setdefault("enabled", old_cfg.get("enabled", False))
-            cfg.setdefault("strength", old_cfg.get("strength", 1.0))
-            cfg.setdefault(
-                "min_distinct_datasets",
-                old_cfg.get("min_datasets", old_cfg.get("min_distinct_datasets", 2)),
-            )
-
-        self.gamma_cross_dataset_centering_enabled = bool(cfg.get("enabled", False))
-        self.gamma_centering_scope = str(cfg.get("scope", "batch_grouped")).lower()
-        allowed_scopes = {"batch_grouped", "global_running", "disabled"}
-        if self.gamma_centering_scope == "global_running":
-            raise NotImplementedError(
-                "gamma_centering.scope='global_running' is not implemented. Use "
-                "'batch_grouped' with transcript-grouped batches or 'disabled'."
-            )
-        if self.gamma_centering_scope == "disabled":
-            self.gamma_cross_dataset_centering_enabled = False
-
+        self.gamma_cross_dataset_centering_enabled = bool(
+            cfg.get("enabled", False)
+        ) and scope != "disabled"
         self.gamma_cross_dataset_centering_strength = float(cfg.get("strength", 1.0))
-        self.gamma_centering_eps = float(cfg.get("eps", 1.0e-8))
-        self.gamma_reference_mode = str(
-            cfg.get("reference_mode", "reliable_geometric_center")
-        ).lower()
-        allowed_modes = {
-            "all_eligible",
-            "reliable_geometric_center",
-            "trusted_datasets_only",
-            "single_reference_dataset",
-        }
-        self.gamma_reference_dataset_ids = self._parse_reference_dataset_ids(
-            cfg.get("reference_dataset_ids", [])
-        )
-        self.gamma_reference_hard_anchor = bool(cfg.get("reference_hard_anchor", False))
-
-        self.gamma_centering_reliability_mode = str(
-            cfg.get("reliability_mode", "uniform")
-        ).lower()
-        allowed_reliability_modes = {
-            "uniform",
-            "transcript_depth",
-            "local_coverage",
-            "replicate_agreement",
-            "combined",
-        }
-        self.gamma_centering_reliability_detach = bool(
-            cfg.get("reliability_detach", True)
-        )
-        self.gamma_centering_min_reliability = float(cfg.get("min_reliability", 0.0))
-        self.gamma_centering_min_total_reliability = float(
-            cfg.get("min_total_reliability", 0.0)
-        )
         self.gamma_centering_min_distinct_datasets = int(
             cfg.get("min_distinct_datasets", 2)
         )
-        # Backward-compatible alias used by older tests and metrics.
-        self.gamma_cross_dataset_centering_min_datasets = (
-            self.gamma_centering_min_distinct_datasets
-        )
-
-        self.gamma_centering_transcript_depth_kappa = float(
-            cfg.get("transcript_depth_kappa", 100.0)
-        )
-        self.gamma_centering_local_coverage_window = int(
-            cfg.get("local_coverage_window", 5)
-        )
-        self.gamma_centering_local_coverage_kappa = float(
-            cfg.get("local_coverage_kappa", 1.0)
-        )
-        self.gamma_centering_replicate_agreement_tau = float(
-            cfg.get("replicate_agreement_tau", 0.5)
-        )
-        self.gamma_centering_duplicate_dataset_reliability_reduction = str(
-            cfg.get("duplicate_dataset_reliability_reduction", "mean")
-        ).lower()
-        allowed_duplicate_reductions = {"mean", "maximum", "max", "capped_sum"}
-        self.gamma_centering_combined_reduction = str(
-            cfg.get("combined_reliability_reduction", "geometric_mean")
-        ).lower()
-
         self.gamma_log_min = float(cfg.get("log_gamma_min", -8.0))
         self.gamma_log_max = float(cfg.get("log_gamma_max", 8.0))
-        self.gamma_centering_log_diagnostics = bool(cfg.get("log_diagnostics", True))
-
-    @staticmethod
-    def _inv_softplus(x: float) -> float:
-        x = float(x)
-        if x > 20.0:
-            return x
-        return math.log(math.expm1(x))
 
     @staticmethod
     def _normalize_sample_ids(
@@ -328,269 +233,56 @@ class RiboQueuingModel(nn.Module):
             values = list(sample_ids)
         return [str(value) for value in values]
 
-    def _transcript_ids_valid_mask(
-        self,
-        sample_ids: Sequence[str] | torch.Tensor | None,
-        batch_size: int,
-        *,
-        device: torch.device,
-    ) -> tuple[list[str] | None, torch.Tensor]:
-        sample_id_list = self._normalize_sample_ids(sample_ids, batch_size)
-        valid = torch.zeros(batch_size, device=device, dtype=torch.bool)
-        if sample_id_list is None:
-            return None, valid
-        valid_values = [
-            (sid is not None)
-            and str(sid) != ""
-            and str(sid).lower() not in {"none", "nan", "null"}
-            for sid in sample_id_list
-        ]
-        valid = torch.as_tensor(valid_values, device=device, dtype=torch.bool)
-        return sample_id_list, valid
-
-    def _local_coverage_reliability(
-        self,
-        target: torch.Tensor,
-        mask_b: torch.Tensor,
-    ) -> torch.Tensor:
-        dtype = target.dtype
-        device = target.device
-        h = max(int(self.gamma_centering_local_coverage_window), 0)
-        width = 2 * h + 1
-        y = torch.nan_to_num(target.detach(), nan=0.0, posinf=0.0, neginf=0.0)
-        y = y.clamp_min(0.0) * mask_b.to(dtype=dtype)
-        m = mask_b.to(dtype=dtype)
-
-        kernel = torch.ones(1, 1, width, device=device, dtype=dtype)
-        y_sum = F.conv1d(y.unsqueeze(1), kernel, padding=h).squeeze(1)
-        m_sum = F.conv1d(m.unsqueeze(1), kernel, padding=h).squeeze(1)
-        local_mean = y_sum / m_sum.clamp_min(1.0)
-        kappa = max(float(self.gamma_centering_local_coverage_kappa), 0.0)
-        return local_mean / (local_mean + kappa + self.gamma_centering_eps)
-
-    def _transcript_depth_reliability(
-        self,
-        target: torch.Tensor,
-        mask_b: torch.Tensor,
-    ) -> torch.Tensor:
-        dtype = target.dtype
-        y = torch.nan_to_num(target.detach(), nan=0.0, posinf=0.0, neginf=0.0)
-        y = y.clamp_min(0.0) * mask_b.to(dtype=dtype)
-        depth = y.sum(dim=1, keepdim=True)
-        kappa = max(float(self.gamma_centering_transcript_depth_kappa), 0.0)
-        rel = depth / (depth + kappa + self.gamma_centering_eps)
-        return rel.expand_as(target)
-
-    def _replicate_agreement_reliability(
-        self,
-        replica_profiles: torch.Tensor | None,
-        replica_mask: torch.Tensor | None,
-        target_shape: torch.Size,
-        *,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> torch.Tensor:
-        B, T = int(target_shape[0]), int(target_shape[1])
-        rel = torch.ones(B, T, device=device, dtype=dtype)
-        if replica_profiles is None or replica_mask is None:
-            return rel
-
-        reps = replica_profiles.detach().to(device=device, dtype=dtype)
-        rep_mask = replica_mask.detach().to(device=device).bool()
-
-        tau = max(float(self.gamma_centering_replicate_agreement_tau), self.gamma_centering_eps)
-        for b in range(B):
-            valid_reps = rep_mask[b]
-            if int(valid_reps.sum().item()) < 2:
-                continue
-            values = torch.log1p(reps[b, valid_reps].clamp_min(0.0))
-            median = values.median(dim=0).values
-            mad = (values - median.unsqueeze(0)).abs().median(dim=0).values
-            rel[b] = torch.exp(-mad / tau)
-        return rel
-
-    def _build_gamma_centering_reliability_and_eligibility(
-        self,
-        *,
-        target: torch.Tensor,
-        mask_b: torch.Tensor,
-        sample_ids: Sequence[str] | torch.Tensor | None,
-        id_datasets: torch.Tensor,
-        gamma_centering_reliability: torch.Tensor | None = None,
-        gamma_centering_eligible: torch.Tensor | None = None,
-        replica_profiles: torch.Tensor | None = None,
-        replica_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, list[str] | None]:
-        B, T = target.shape
-        dtype = target.dtype
-        device = target.device
-        sample_id_list, transcript_valid = self._transcript_ids_valid_mask(
-            sample_ids,
-            B,
-            device=device,
-        )
-        dataset_valid = id_datasets.reshape(-1).to(device=device, dtype=torch.long) >= 0
-
-        if gamma_centering_reliability is not None:
-            reliability = gamma_centering_reliability.to(device=device, dtype=dtype)
-            reliability = reliability.detach()
-        else:
-            mode = self.gamma_centering_reliability_mode
-            components: list[torch.Tensor] = []
-            if mode == "uniform":
-                reliability = torch.ones_like(target, dtype=dtype)
-            else:
-                if mode in {"transcript_depth", "combined"}:
-                    components.append(self._transcript_depth_reliability(target, mask_b))
-                if mode in {"local_coverage", "combined"}:
-                    components.append(self._local_coverage_reliability(target, mask_b))
-                if mode in {"replicate_agreement", "combined"}:
-                    components.append(
-                        self._replicate_agreement_reliability(
-                            replica_profiles,
-                            replica_mask,
-                            target.shape,
-                            dtype=dtype,
-                            device=device,
-                        )
-                    )
-                if not components:
-                    reliability = torch.ones_like(target, dtype=dtype)
-                elif mode == "combined":
-                    stacked = torch.stack(
-                        [c.clamp(0.0, 1.0) for c in components],
-                        dim=0,
-                    )
-                    if self.gamma_centering_combined_reduction == "product":
-                        reliability = stacked.prod(dim=0)
-                    else:
-                        reliability = torch.exp(
-                            torch.log(stacked.clamp_min(self.gamma_centering_eps)).mean(dim=0)
-                        )
-                else:
-                    reliability = components[0]
-
-            if self.gamma_centering_reliability_detach:
-                reliability = reliability.detach()
-
-        reliability = torch.nan_to_num(
-            reliability,
-            nan=0.0,
-            posinf=1.0,
-            neginf=0.0,
-        ).clamp(0.0, 1.0)
-
-        eligible = (
-            mask_b
-            & transcript_valid.reshape(-1, 1)
-            & dataset_valid.reshape(-1, 1)
-            & (reliability >= float(self.gamma_centering_min_reliability))
-        )
-        if gamma_centering_eligible is not None:
-            supplied = gamma_centering_eligible.to(device=device).bool()
-            eligible = eligible & supplied.detach()
-
-        reliability = reliability * mask_b.to(dtype=dtype)
-        return reliability.detach(), eligible.detach(), sample_id_list
-
-    def _dataset_level_reliability(self, values: torch.Tensor) -> torch.Tensor:
-        reduction = self.gamma_centering_duplicate_dataset_reliability_reduction
-        if reduction == "mean":
-            return values.mean()
-        if reduction in {"maximum", "max"}:
-            return values.max()
-        if reduction == "capped_sum":
-            return values.sum().clamp(max=1.0)
-        raise RuntimeError(
-            "Unsupported duplicate_dataset_reliability_reduction "
-            f"{reduction!r}."
-        )
-
     def _center_log_gamma_across_transcripts(
         self,
         log_gamma_raw: torch.Tensor,
         *,
         mask_b: torch.Tensor,
-        sample_ids: Sequence[str] | torch.Tensor | None = None,
-        sample_id_list: list[str] | None = None,
+        sample_ids: Sequence[str] | torch.Tensor | None,
         id_datasets: torch.Tensor,
-        reliability: torch.Tensor,
-        eligible: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        B = int(log_gamma_raw.shape[0])
+        """Center log-amplitude equally across datasets for each transcript."""
+        B, T = log_gamma_raw.shape
         dtype = log_gamma_raw.dtype
         device = log_gamma_raw.device
-        centering_enabled = self.gamma_cross_dataset_centering_enabled
-        centering_strength = self.gamma_cross_dataset_centering_strength
-        zeros_pos = torch.zeros_like(log_gamma_raw)
-        zeros_bool = torch.zeros_like(mask_b, dtype=torch.bool)
-        zeros_count = torch.zeros_like(log_gamma_raw)
+        mask_b = mask_b.bool()
+        mask_f = mask_b.to(dtype=dtype)
+        zeros = torch.zeros_like(log_gamma_raw)
+        false = torch.zeros_like(mask_b)
         dataset_ids = id_datasets.reshape(-1).to(device=device, dtype=torch.long)
-        reference_ids = set(self.gamma_reference_dataset_ids)
+        sample_id_list = self._normalize_sample_ids(sample_ids, B)
         if sample_id_list is None:
-            sample_id_list = self._normalize_sample_ids(sample_ids, B)
-
-        # Reference-dataset anchor mask (empty unless a reference mode is used).
-        if reference_ids:
-            reference_dataset_ids_t = torch.as_tensor(
-                sorted(reference_ids), device=device, dtype=torch.long
-            )
-            is_reference_sample = (
-                dataset_ids.reshape(-1, 1) == reference_dataset_ids_t.reshape(1, -1)
-            ).any(dim=1)
-            reference_anchor_mask = (
-                is_reference_sample.reshape(-1, 1) & eligible.bool() & mask_b.bool()
-            )
+            candidate = false
         else:
-            is_reference_sample = torch.zeros(B, device=device, dtype=torch.bool)
-            reference_anchor_mask = torch.zeros_like(mask_b, dtype=torch.bool)
+            valid_ids = [
+                sid.lower() not in {"", "none", "nan", "null"}
+                for sid in sample_id_list
+            ]
+            transcript_valid = torch.as_tensor(valid_ids, device=device).reshape(-1, 1)
+            candidate = (
+                mask_b
+                & transcript_valid
+                & (dataset_ids >= 0).reshape(-1, 1)
+                & torch.isfinite(log_gamma_raw)
+            )
 
         if (
             sample_id_list is None
-            or not centering_enabled
-            or centering_strength <= 0.0
+            or not self.gamma_cross_dataset_centering_enabled
+            or self.gamma_cross_dataset_centering_strength <= 0.0
             or B <= 1
         ):
-            log_gamma = log_gamma_raw * mask_b.to(dtype=dtype)
             return {
-                "log_gamma": log_gamma,
-                "gamma_center": zeros_pos,
-                "weights": zeros_pos,
-                "applied": zeros_bool,
-                "num_distinct_datasets": zeros_count,
-                "total_reliability": zeros_pos,
-                "constraint_error": zeros_pos,
-                "reference_anchor_mask": reference_anchor_mask,
+                "log_gamma": log_gamma_raw * mask_f,
+                "gamma_center": zeros,
+                "weights": zeros,
+                "applied": false,
+                "num_distinct_datasets": zeros,
+                "total_weight": zeros,
+                "constraint_error": zeros,
+                "eligible": candidate,
             }
 
-        # ------------------------------------------------------------------
-        # Vectorized reliability-weighted cross-dataset log-gamma centering.
-        #
-        # Same semantics as the earlier per-(group, position, dataset) Python
-        # loop, but every reduction is a masked scatter over the flat [B, T]
-        # tensors. There is no Python loop over codon positions and no
-        # host<->device synchronization inside the batch, so the cost drops from
-        # O(groups * T) tiny CUDA launches to a handful of full-tensor kernels.
-        #
-        #   center[g, i] = sum_d w_d * ( sum_{s in (g,d)} r_s * loggamma_s
-        #                                / sum_{s in (g,d)} r_s )
-        # with dataset weights w_d proportional to the dataset-level reliability,
-        # applied only where at least `required_datasets` distinct datasets are
-        # present and the total reliability clears the configured floor.
-        # ------------------------------------------------------------------
-        T = int(log_gamma_raw.shape[1])
-        eps = float(self.gamma_centering_eps)
-        strength = float(centering_strength)
-        min_datasets = int(self.gamma_centering_min_distinct_datasets)
-        required_datasets = (
-            1
-            if self.gamma_reference_mode == "single_reference_dataset"
-            else min_datasets
-        )
-        mask_f = mask_b.to(dtype=dtype)
-
-        # Transcript groups: map each (string) transcript id to a dense integer.
-        # This single pass is over the batch dimension (B), never over T.
         group_lookup: dict[str, int] = {}
         group_index = torch.as_tensor(
             [group_lookup.setdefault(sid, len(group_lookup)) for sid in sample_id_list],
@@ -598,140 +290,56 @@ class RiboQueuingModel(nn.Module):
             dtype=torch.long,
         )
         num_groups = len(group_lookup)
-
-        # Datasets present in the batch, compacted to [0, num_datasets).
-        unique_dataset_ids, dataset_index = torch.unique(
-            dataset_ids, return_inverse=True
-        )
-        dataset_index = dataset_index.to(device=device, dtype=torch.long)
-        num_datasets = int(unique_dataset_ids.numel())
-
-        # Level-1 cell = (group, dataset); cell index in [0, num_groups*num_datasets).
+        unique_datasets, dataset_index = torch.unique(dataset_ids, return_inverse=True)
+        num_datasets = int(unique_datasets.numel())
         num_cells = num_groups * num_datasets
-        cell_index = group_index * num_datasets + dataset_index  # [B]
+        cell_index = group_index * num_datasets + dataset_index
         cell_group = torch.arange(num_cells, device=device, dtype=torch.long) // num_datasets
 
-        # Candidate samples: eligible, in-mask, finite, and (for reference modes)
-        # restricted to the reference datasets.
-        candidate = eligible.bool() & mask_b.bool() & torch.isfinite(log_gamma_raw)
-        if self.gamma_reference_mode in {
-            "trusted_datasets_only",
-            "single_reference_dataset",
-        }:
-            candidate = candidate & is_reference_sample.reshape(-1, 1)
         candidate_f = candidate.to(dtype=dtype)
-
-        r = reliability.to(dtype=dtype).clamp_min(0.0)
-        rc = torch.where(candidate, r, torch.zeros_like(r))  # [B, T]
-        log_safe = torch.where(
-            candidate, log_gamma_raw, torch.zeros_like(log_gamma_raw)
-        )
+        log_safe = torch.where(candidate, log_gamma_raw, zeros)
 
         def _scatter_sum(src: torch.Tensor, index: torch.Tensor, size: int) -> torch.Tensor:
             return torch.zeros(size, T, device=device, dtype=src.dtype).index_add(
                 0, index, src
             )
 
-        # Level 1: per (group, dataset) reliability-weighted mean of log-gamma.
-        rsum_cell = _scatter_sum(rc, cell_index, num_cells)          # [C, T]
-        wlog_cell = _scatter_sum(rc * log_safe, cell_index, num_cells)
         count_cell = _scatter_sum(candidate_f, cell_index, num_cells)
-        cell_active = rsum_cell > 0.0
-        dataset_log_cell = wlog_cell / rsum_cell.clamp_min(eps)      # [C, T]
-
-        # Dataset-level reliability reduction over the cell's candidate samples.
-        reduction = self.gamma_centering_duplicate_dataset_reliability_reduction
-        if reduction == "mean":
-            dataset_rel_cell = rsum_cell / count_cell.clamp_min(1.0)
-        elif reduction in {"maximum", "max"}:
-            cell_index_bt = cell_index.reshape(-1, 1).expand(B, T)
-            dataset_rel_cell = torch.zeros(
-                num_cells, T, device=device, dtype=dtype
-            ).scatter_reduce(0, cell_index_bt, rc, reduce="amax", include_self=True)
-        elif reduction == "capped_sum":
-            dataset_rel_cell = rsum_cell.clamp(max=1.0)
-        else:
-            raise RuntimeError(
-                "Unsupported duplicate_dataset_reliability_reduction "
-                f"{reduction!r}."
-            )
-
-        if self.gamma_reference_mode == "all_eligible":
-            center_rel_cell = cell_active.to(dtype=dtype)
-        else:
-            center_rel_cell = dataset_rel_cell
-        center_rel_cell = torch.nan_to_num(
-            center_rel_cell, nan=0.0, posinf=0.0, neginf=0.0
-        ).clamp_min(0.0)
-        center_rel_cell = torch.where(
-            cell_active, center_rel_cell, torch.zeros_like(center_rel_cell)
+        mean_cell = _scatter_sum(
+            log_safe, cell_index, num_cells
+        ) / count_cell.clamp_min(1.0)
+        cell_active = count_cell > 0
+        active_f = cell_active.to(dtype=dtype)
+        num_distinct_group = _scatter_sum(active_f, cell_group, num_groups)
+        sum_means_group = _scatter_sum(mean_cell * active_f, cell_group, num_groups)
+        center_group = sum_means_group / num_distinct_group.clamp_min(1.0)
+        apply_group = num_distinct_group >= float(
+            self.gamma_centering_min_distinct_datasets
         )
 
-        # Level 2: aggregate across the datasets present in each group.
-        rel_total_group = _scatter_sum(center_rel_cell, cell_group, num_groups)
-        num_distinct_group = _scatter_sum(
-            cell_active.to(dtype=dtype), cell_group, num_groups
-        )
-        weighted_log_group = _scatter_sum(
-            center_rel_cell
-            * torch.where(cell_active, dataset_log_cell, torch.zeros_like(dataset_log_cell)),
-            cell_group,
-            num_groups,
-        )
-        center_group = weighted_log_group / rel_total_group.clamp_min(eps)  # [G, T]
-
-        apply_group = (
-            (num_distinct_group >= float(required_datasets))
-            & (rel_total_group >= float(self.gamma_centering_min_total_reliability))
-            & (rel_total_group > 0.0)
-        )  # [G, T]
-
-        # Broadcast group-level results back to every masked sample in the group.
-        apply_sample = apply_group.index_select(0, group_index)      # [B, T] bool
-        center_sample = center_group.index_select(0, group_index)    # [B, T]
-        applied = apply_sample & mask_b.bool()
-        zero_bt = torch.zeros_like(center_sample)
-
-        log_center = torch.where(applied, center_sample, zero_bt)
+        apply_sample = apply_group.index_select(0, group_index)
+        center_sample = center_group.index_select(0, group_index)
+        applied = apply_sample & mask_b
+        log_center = torch.where(applied, center_sample, zeros)
         num_distinct = torch.where(
-            applied, num_distinct_group.index_select(0, group_index), zero_bt
+            applied, num_distinct_group.index_select(0, group_index), zeros
         )
-        total_reliability = torch.where(
-            applied, rel_total_group.index_select(0, group_index), zero_bt
-        )
-
-        # Per-sample contribution weights (diagnostic; hierarchical dataset mix).
-        ds_weights_cell = center_rel_cell / rel_total_group.index_select(
+        dataset_weight_cell = active_f / num_distinct_group.index_select(
             0, cell_group
-        ).clamp_min(eps)
-        sample_weights = (
-            ds_weights_cell.index_select(0, cell_index)
-            * rc
-            / rsum_cell.index_select(0, cell_index).clamp_min(eps)
-        )
+        ).clamp_min(1.0)
+        sample_weights = dataset_weight_cell.index_select(
+            0, cell_index
+        ) / count_cell.index_select(0, cell_index).clamp_min(1.0)
         sample_weights = torch.where(
             candidate & apply_sample, sample_weights, torch.zeros_like(sample_weights)
         )
-
-        # Constraint diagnostic: |sum_s w_s (loggamma_s - strength*center)| / group.
+        strength = float(self.gamma_cross_dataset_centering_strength)
         ce_contrib = sample_weights * (log_safe - strength * center_sample)
         constraint_error_group = _scatter_sum(ce_contrib, group_index, num_groups).abs()
         constraint_error = torch.where(
-            applied, constraint_error_group.index_select(0, group_index), zero_bt
+            applied, constraint_error_group.index_select(0, group_index), zeros
         )
-
-        if reference_ids:
-            reference_anchor_mask = reference_anchor_mask | (
-                is_reference_sample.reshape(-1, 1) & applied
-            )
-
         log_gamma = (log_gamma_raw - strength * log_center) * mask_f
-        if self.gamma_reference_hard_anchor and reference_ids:
-            log_gamma = torch.where(
-                reference_anchor_mask & applied,
-                torch.zeros_like(log_gamma),
-                log_gamma,
-            )
 
         return {
             "log_gamma": log_gamma,
@@ -739,38 +347,10 @@ class RiboQueuingModel(nn.Module):
             "weights": sample_weights * mask_f,
             "applied": applied & mask_b,
             "num_distinct_datasets": num_distinct * mask_f,
-            "total_reliability": total_reliability * mask_f,
+            "total_weight": num_distinct * mask_f,
             "constraint_error": constraint_error * mask_f,
-            "reference_anchor_mask": reference_anchor_mask & mask_b,
+            "eligible": candidate,
         }
-
-    def _center_log_gamma_across_sample_ids(
-        self,
-        log_gamma_raw: torch.Tensor,
-        *,
-        mask_b: torch.Tensor,
-        sample_ids: Sequence[str] | torch.Tensor | None,
-        id_datasets: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Backward-compatible wrapper around reliability-weighted centering."""
-        reliability = torch.ones_like(log_gamma_raw)
-        eligible = mask_b.bool()
-        centered = self._center_log_gamma_across_transcripts(
-            log_gamma_raw,
-            mask_b=mask_b,
-            sample_ids=sample_ids,
-            id_datasets=id_datasets,
-            reliability=reliability,
-            eligible=eligible,
-        )
-        group_size = centered["num_distinct_datasets"].amax(dim=1)
-        applied = centered["applied"].any(dim=1).to(dtype=log_gamma_raw.dtype)
-        return (
-            centered["log_gamma"],
-            centered["gamma_center"],
-            group_size,
-            applied,
-        )
 
     # ============================================================
     # Position features
@@ -838,16 +418,10 @@ class RiboQueuingModel(nn.Module):
         codon_ids: torch.Tensor,
         id_datasets: torch.Tensor,
         mask: torch.Tensor,
-        target: torch.Tensor | None = None,
-        current_epoch: int | None = None,
+        target: torch.Tensor,
         sample_ids: Sequence[str] | torch.Tensor | None = None,
-        gamma_centering_reliability: torch.Tensor | None = None,
-        gamma_centering_eligible: torch.Tensor | None = None,
-        replica_profiles: torch.Tensor | None = None,
-        replica_mask: torch.Tensor | None = None,
+        dataset_bias_sequence_features: torch.Tensor | None = None,
     ):
-        del current_epoch  # unused; kept for interface compatibility
-
         # --------------------------------------------------------
         # 1. Biological branch -> queue load
         # --------------------------------------------------------
@@ -877,6 +451,7 @@ class RiboQueuingModel(nn.Module):
             mask=mask_b,
             codon_ids=codon_ids,
             position_features=position_features,
+            sequence_features=dataset_bias_sequence_features,
         )
         gamma_log_residual = bias["gamma_raw"].to(dtype=dtype, device=device) * mask_f
         gamma_support_logits_raw = bias.get("gamma_support_logits")
@@ -893,38 +468,26 @@ class RiboQueuingModel(nn.Module):
         # --------------------------------------------------------
         # 3. Observation mean branch
         # --------------------------------------------------------
-        target_for_reliability = target.to(device=device, dtype=dtype)
         log_gamma_raw = (
             gamma_log_residual + float(self.gamma_log_init)
         ).clamp(min=self.gamma_log_min, max=self.gamma_log_max) * mask_f
         gamma_raw = torch.exp(log_gamma_raw).clamp_min(self.eps) * mask_f
-        (
-            gamma_reliability,
-            gamma_eligible,
-            sample_id_list,
-        ) = self._build_gamma_centering_reliability_and_eligibility(
-            target=target_for_reliability,
-            mask_b=mask_b,
-            sample_ids=sample_ids,
-            id_datasets=id_datasets,
-            gamma_centering_reliability=gamma_centering_reliability,
-            gamma_centering_eligible=gamma_centering_eligible,
-            replica_profiles=replica_profiles,
-            replica_mask=replica_mask,
-        )
         centered = self._center_log_gamma_across_transcripts(
             log_gamma_raw,
             mask_b=mask_b,
             sample_ids=sample_ids,
-            sample_id_list=sample_id_list,
             id_datasets=id_datasets,
-            reliability=gamma_reliability,
-            eligible=gamma_eligible,
         )
+        gamma_eligible = centered["eligible"]
+        gamma_uniform_weight = gamma_eligible.to(dtype=dtype)
         log_gamma = centered["log_gamma"]
         gamma_cross_dataset_log_center = centered["gamma_center"]
-        gamma_cross_dataset_center_group_size = centered["num_distinct_datasets"].amax(dim=1)
-        gamma_cross_dataset_center_applied = centered["applied"].any(dim=1).to(dtype=dtype)
+        gamma_cross_dataset_center_group_size = centered[
+            "num_distinct_datasets"
+        ].amax(dim=1)
+        gamma_cross_dataset_center_applied = centered["applied"].any(dim=1).to(
+            dtype=dtype
+        )
         if self.gamma_split_support_head:
             # Entmax is invariant to a constant shift, but explicit masked
             # sequence centering improves numerical conditioning and makes the
@@ -1017,11 +580,6 @@ class RiboQueuingModel(nn.Module):
                 log_gamma_raw,
                 torch.zeros_like(log_gamma_raw),
             ),
-            "gamma_center": torch.where(
-                mask_b,
-                gamma_cross_dataset_log_center,
-                torch.zeros_like(gamma_cross_dataset_log_center),
-            ),
             "gamma_cross_dataset_log_center": torch.where(
                 mask_b,
                 gamma_cross_dataset_log_center,
@@ -1029,21 +587,10 @@ class RiboQueuingModel(nn.Module):
             ),
             "gamma_cross_dataset_center_group_size": gamma_cross_dataset_center_group_size,
             "gamma_cross_dataset_center_applied": gamma_cross_dataset_center_applied,
-            "gamma_cross_dataset_center_strength": torch.full_like(
-                target_mean,
-                self.gamma_cross_dataset_centering_strength
-                if self.gamma_cross_dataset_centering_enabled
-                else 0.0,
-            ),
-            "gamma_centering_weights": torch.where(
-                mask_b,
-                centered["weights"],
-                torch.zeros_like(centered["weights"]),
-            ),
             "gamma_centering_reliability": torch.where(
                 mask_b,
-                gamma_reliability,
-                torch.zeros_like(gamma_reliability),
+                gamma_uniform_weight,
+                torch.zeros_like(gamma_uniform_weight),
             ),
             "gamma_centering_eligible": gamma_eligible & mask_b,
             "gamma_centering_applied": centered["applied"] & mask_b,
@@ -1054,15 +601,14 @@ class RiboQueuingModel(nn.Module):
             ),
             "gamma_total_reliability": torch.where(
                 mask_b,
-                centered["total_reliability"],
-                torch.zeros_like(centered["total_reliability"]),
+                centered["total_weight"],
+                torch.zeros_like(centered["total_weight"]),
             ),
             "gamma_centering_constraint_error": torch.where(
                 mask_b,
                 centered["constraint_error"],
                 torch.zeros_like(centered["constraint_error"]),
             ),
-            "gamma_reference_anchor_mask": centered["reference_anchor_mask"] & mask_b,
             "gamma": torch.where(mask_b, gamma, torch.ones_like(gamma)),
             "gamma_amplitude": torch.where(
                 mask_b,
@@ -1083,16 +629,6 @@ class RiboQueuingModel(nn.Module):
                 mask_b,
                 gamma_support_logits,
                 torch.zeros_like(gamma_support_logits),
-            ),
-            "gamma_split_support_head_enabled": target.new_tensor(
-                1.0 if self.gamma_split_support_head else 0.0
-            ),
-            "gamma_gate_additive_bias_enabled": target.new_tensor(
-                1.0 if self.gamma_gate_additive_bias else 0.0
-            ),
-            "gamma_sparse_transform_enabled": torch.full_like(
-                target_mean,
-                1.0 if self.gamma_transform == "entmax15_gated_exponential" else 0.0,
             ),
             "log_gamma": torch.where(
                 mask_b,
