@@ -10,7 +10,6 @@ import lightning as pl
 import matplotlib
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 matplotlib.use("Agg")
 
@@ -707,8 +706,6 @@ class PoissonProfileLoss(nn.Module):
     def __init__(
         self,
         eps: float = 1.0e-8,
-        mu_min: float = 1.0e-8,
-        mu_max: float = 1.0e8,
         sequence_reduction: str = "mean",
         length_temper_gamma: float = 0.85,
         length_temper_ref: float = 1000.0,
@@ -718,8 +715,6 @@ class PoissonProfileLoss(nn.Module):
         super().__init__()
 
         self.eps = float(eps)
-        self.mu_min = float(mu_min)
-        self.mu_max = float(mu_max)
         self.sequence_reduction = sequence_reduction
         self.length_temper_gamma = float(length_temper_gamma)
         self.length_temper_ref = float(length_temper_ref)
@@ -735,11 +730,11 @@ class PoissonProfileLoss(nn.Module):
         del log_sigma
         mu = torch.nan_to_num(
             mu,
-            nan=self.mu_min,
-            posinf=self.mu_max,
-            neginf=self.mu_min,
+            nan=self.eps,
+            posinf=torch.finfo(mu.dtype).max,
+            neginf=self.eps,
         )
-        return mu.clamp(min=self.mu_min, max=self.mu_max)
+        return mu.clamp_min(self.eps)
 
     def forward(
         self,
@@ -823,8 +818,6 @@ class NegativeBinomialProfileLoss(nn.Module):
     def __init__(
         self,
         eps: float = 1.0e-8,
-        mu_min: float = 1.0e-8,
-        mu_max: float = 1.0e8,
         log_alpha_min: float = -5.0,
         log_alpha_max: float = 3.0,
         sequence_reduction: str = "mean",
@@ -836,8 +829,6 @@ class NegativeBinomialProfileLoss(nn.Module):
         super().__init__()
 
         self.eps = float(eps)
-        self.mu_min = float(mu_min)
-        self.mu_max = float(mu_max)
         self.log_alpha_min = float(log_alpha_min)
         self.log_alpha_max = float(log_alpha_max)
         self.sequence_reduction = sequence_reduction
@@ -855,11 +846,11 @@ class NegativeBinomialProfileLoss(nn.Module):
         del log_sigma
         mu = torch.nan_to_num(
             mu,
-            nan=self.mu_min,
-            posinf=self.mu_max,
-            neginf=self.mu_min,
+            nan=self.eps,
+            posinf=torch.finfo(mu.dtype).max,
+            neginf=self.eps,
         )
-        return mu.clamp(min=self.mu_min, max=self.mu_max)
+        return mu.clamp_min(self.eps)
 
     def _log_alpha_from_model_output(
         self,
@@ -941,16 +932,14 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
     """
     Minimal LightningModule for the queue-load model:
 
-        gated-additive mean:
-            mu[d,t,i] = S[d,t] * (gamma[d,t,i] * L_bio[t,i] + additive[d,t,i])
+        multiplicative mean:
+            mu[d,t,i] = S[d,t] * gamma[d,t,i] * L_bio[t,i]
 
         Active loss:
 
             loss = NB_NLL
              + pcc_weight * pcc_loss
-             + support_weight * support_bce
              + gamma_reg_weight * mean(log_gamma^2)
-             + additive_bias_l1_weight * mean(additive_bias)
 
     The PCC helper can compute raw, log1p, or NB-VST PCC between the output mu
     and the ground-truth profile y. All previous auxiliary
@@ -961,9 +950,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
     PROFILE_PLOT_GROUPS = (
         ("L_bio", ("L_bio",)),
         ("rho", ("rho",)),
-        ("gamma", ("gamma", "gamma_amplitude", "gamma_sparse_gate")),
-        ("support", ("gamma_support_logits",)),
-        ("additive_bias", ("additive_bias",)),
+        ("gamma", ("gamma",)),
         ("log_sigma", ("log_sigma",)),
     )
 
@@ -1017,24 +1004,8 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             float(getattr(loss_cfg, "replica_nll_weight", 0.0)),
         )
 
-        # Direct supervision teaches the entmax gate which positions should
-        # remain active without inserting target zeros into the forward pass.
-        self.support_calibration_weight = max(
-            0.0,
-            float(getattr(loss_cfg, "support_calibration_weight", 0.0)),
-        )
-        self.support_calibration_threshold = float(
-            getattr(loss_cfg, "support_calibration_threshold", 0.0)
-        )
         # Optional regularizers around the active NB + PCC objective.
         self.gamma_reg_weight = float(getattr(loss_cfg, "gamma_reg_weight", 0.0))
-        self.additive_bias_l1_weight = float(
-            getattr(
-                loss_cfg,
-                "additive_bias_l1_weight",
-                getattr(loss_cfg, "additive_bias_weight", 0.0),
-            )
-        )
         # Predicted-value floor for PCC only: predictions below this count are
         # treated as 0 ("undetected") when computing correlation. Honest (uses
         # only the prediction, never the target); 0.0 disables.
@@ -1102,8 +1073,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         if likelihood in poisson_likelihoods:
             return PoissonProfileLoss(
                 eps=loss_cfg.eps,
-                mu_min=loss_cfg.mu_min,
-                mu_max=loss_cfg.mu_max,
                 sequence_reduction=sequence_reduction,
                 length_temper_gamma=length_temper_gamma,
                 length_temper_ref=length_temper_ref,
@@ -1113,8 +1082,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
         return NegativeBinomialProfileLoss(
             eps=loss_cfg.eps,
-            mu_min=loss_cfg.mu_min,
-            mu_max=loss_cfg.mu_max,
             log_alpha_min=float(loss_cfg_get("nb_log_alpha_min", -5.0)),
             log_alpha_max=float(loss_cfg_get("nb_log_alpha_max", 3.0)),
             sequence_reduction=sequence_reduction,
@@ -1472,10 +1439,10 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         pcc = torch.where(valid, pcc, torch.zeros_like(pcc))
         return torch.nan_to_num(pcc, nan=0.0, posinf=0.0, neginf=0.0)
 
-    def _gated_additive_regularization_per_sample(
+    def _gamma_regularization_per_sample(
         self,
         out: dict[str, Any],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         target = out["target"]
         zeros = torch.zeros(
             target.shape[0],
@@ -1485,8 +1452,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         extras = out["extras"]
         mask = out["mask"].bool()
         mask_f = mask.to(dtype=torch.float32)
-        valid_len = mask_f.sum(dim=1).clamp_min(1.0)
-
         log_gamma = extras.get("log_gamma")
         if torch.is_tensor(log_gamma):
             log_gamma = log_gamma.float()
@@ -1496,20 +1461,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             gamma_reg = (log_gamma.pow(2) * gamma_mask_f).sum(dim=1) / gamma_len
         else:
             gamma_reg = zeros
-
-        additive_bias = extras.get("additive_bias")
-        if torch.is_tensor(additive_bias):
-            additive_bias = additive_bias.float()
-            additive_mask = mask & torch.isfinite(additive_bias)
-            additive_mask_f = additive_mask.to(dtype=additive_bias.dtype)
-            additive_len = additive_mask_f.sum(dim=1).clamp_min(1.0)
-            additive_l1 = (
-                additive_bias.clamp_min(0.0) * additive_mask_f
-            ).sum(dim=1) / additive_len
-        else:
-            additive_l1 = zeros
-
-        return gamma_reg, additive_l1
+        return gamma_reg
 
     def _apply_pcc_floor(self, mu: torch.Tensor) -> torch.Tensor:
         """Treat predictions below the floor as 0 ("undetected") for PCC only.
@@ -1532,97 +1484,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         valid = replica_mask.bool().to(device=values.device)
         valid_f = valid.to(dtype=values.dtype)
         return (values * valid_f).sum(dim=1) / valid_f.sum(dim=1).clamp_min(1.0)
-
-    def _support_calibration_terms(
-        self,
-        *,
-        out: dict[str, Any],
-        target: torch.Tensor,
-        mask: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        """Balanced consensus supervision for the learned entmax support.
-
-        BCE is applied to the pre-entmax logits, so an incorrectly excluded
-        positive position continues receiving a recovery gradient even where
-        the sparse transform itself has a zero derivative.
-        """
-        valid = mask.bool() & torch.isfinite(target)
-        # Use the same sequence-centered score passed to entmax.  An arbitrary
-        # head intercept is removed by the forward transform and therefore must
-        # not make this diagnostic look calibrated when the actual gate is not.
-        logits = out["extras"].get("gamma_support_logits")
-        if not torch.is_tensor(logits):
-            logits = out["extras"].get("gamma_support_logits_raw")
-        if not torch.is_tensor(logits):
-            logits = torch.zeros_like(target)
-        logits = torch.nan_to_num(
-            logits.float().to(device=target.device),
-            nan=0.0,
-            posinf=30.0,
-            neginf=-30.0,
-        ).clamp(min=-30.0, max=30.0)
-        active_target = target.float() > float(self.support_calibration_threshold)
-        position_loss = F.binary_cross_entropy_with_logits(
-            logits,
-            active_target.to(dtype=logits.dtype),
-            reduction="none",
-        )
-        position_loss = torch.where(
-            valid,
-            position_loss,
-            torch.zeros_like(position_loss),
-        )
-
-        active_valid = valid & active_target
-        zero_valid = valid & (~active_target)
-        active_f = active_valid.to(dtype=logits.dtype)
-        zero_f = zero_valid.to(dtype=logits.dtype)
-        active_count = active_f.sum(dim=1)
-        zero_count = zero_f.sum(dim=1)
-        active_loss = (position_loss * active_f).sum(dim=1) / active_count.clamp_min(1.0)
-        zero_loss = (position_loss * zero_f).sum(dim=1) / zero_count.clamp_min(1.0)
-        has_active = active_count > 0.0
-        has_zero = zero_count > 0.0
-        class_count = has_active.to(dtype=logits.dtype) + has_zero.to(dtype=logits.dtype)
-        loss_per_sample = (
-            active_loss * has_active.to(dtype=logits.dtype)
-            + zero_loss * has_zero.to(dtype=logits.dtype)
-        ) / class_count.clamp_min(1.0)
-
-        active_probability = torch.sigmoid(logits)
-        predicted_active = logits >= 0.0
-        predicted_zero = valid & (~predicted_active)
-        true_zero = zero_valid
-        true_positive = active_valid
-
-        def selected_mean(values: torch.Tensor, selected: torch.Tensor) -> torch.Tensor:
-            selected_f = selected.to(dtype=values.dtype)
-            return (values * selected_f).sum() / selected_f.sum().clamp_min(1.0)
-
-        zero_true_positive = (predicted_zero & true_zero).to(dtype=logits.dtype).sum()
-        predicted_zero_count = predicted_zero.to(dtype=logits.dtype).sum()
-        true_zero_count = true_zero.to(dtype=logits.dtype).sum()
-        false_zero_count = (predicted_zero & true_positive).to(dtype=logits.dtype).sum()
-        true_positive_count = true_positive.to(dtype=logits.dtype).sum()
-        valid_count = valid.to(dtype=logits.dtype).sum().clamp_min(1.0)
-
-        return {
-            "loss_per_sample": loss_per_sample,
-            "active_probability_mean": selected_mean(active_probability, valid),
-            "active_probability_on_nonzeros": selected_mean(
-                active_probability,
-                active_valid,
-            ),
-            "active_probability_on_zeros": selected_mean(
-                active_probability,
-                zero_valid,
-            ),
-            "target_zero_fraction": true_zero_count / valid_count,
-            "predicted_zero_fraction": predicted_zero_count / valid_count,
-            "zero_precision": zero_true_positive / predicted_zero_count.clamp_min(1.0),
-            "zero_recall": zero_true_positive / true_zero_count.clamp_min(1.0),
-            "false_zero_rate": false_zero_count / true_positive_count.clamp_min(1.0),
-        }
 
     def _compute_consensus_loss_terms(
         self,
@@ -1712,14 +1573,11 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             shape.clamp_min(0.0),
             torch.zeros_like(shape),
         )
-        mu_rep = (scale_rep.unsqueeze(-1) * shape.unsqueeze(1)).clamp(
-            min=self.eps,
-            max=float(getattr(self.model, "mu_max", 1.0e8)),
-        )
+        mu_rep = scale_rep.unsqueeze(-1) * shape.unsqueeze(1)
         mu_rep = torch.nan_to_num(
             mu_rep,
             nan=self.eps,
-            posinf=float(getattr(self.model, "mu_max", 1.0e8)),
+            posinf=float(torch.finfo(mu_rep.dtype).max),
             neginf=self.eps,
         )
         mu_rep = torch.where(valid_pos, mu_rep, torch.ones_like(mu_rep))
@@ -1841,32 +1699,27 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             ]
             log1p_mse_per_sample = consensus_terms["log1p_mse_per_sample"]
 
-        support_calibration_terms = self._support_calibration_terms(
-            out=out,
-            target=target,
-            mask=mask,
-        )
-        support_calibration_per_sample = support_calibration_terms["loss_per_sample"]
-
         pcc_loss_per_sample = pcc_diag["loss_per_sample"]
         extras = out["extras"]
-        gamma_reg_per_sample, additive_bias_l1_per_sample = (
-            self._gated_additive_regularization_per_sample(out)
-        )
+        # L_bio is the shared biological profile, so compare it directly with
+        # the consensus target even when replicas provide the main objective.
+        # This is a diagnostic only: detaching here makes it explicit that the
+        # correlation cannot contribute gradients or otherwise affect training.
+        with torch.no_grad():
+            L_bio_pcc_per_sample = self._pearson_per_sample(
+                pred=extras["L_bio"].detach(),
+                target=target.detach(),
+                mask=mask,
+            )
+        gamma_reg_per_sample = self._gamma_regularization_per_sample(out)
         effective_pcc_weight = nll_per_sample.new_tensor(
             self.pcc_loss_weight if self.pcc_loss_enabled else 0.0
         )
         effective_gamma_reg_weight = nll_per_sample.new_tensor(self.gamma_reg_weight)
-        effective_support_calibration_weight = nll_per_sample.new_tensor(
-            self.support_calibration_weight
-        )
         per_sample_total_loss = (
             nll_per_sample
             + effective_pcc_weight * pcc_loss_per_sample
-            + effective_support_calibration_weight
-            * support_calibration_per_sample
             + effective_gamma_reg_weight * gamma_reg_per_sample
-            + self.additive_bias_l1_weight * additive_bias_l1_per_sample
         )
         replica_aux_per_sample = torch.zeros_like(per_sample_total_loss)
         if (
@@ -1917,20 +1770,8 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             sample_weights,
             dataset_balanced=True,
         )
-        support_calibration_loss = self._aggregate_per_sample(
-            support_calibration_per_sample,
-            dataset_ids,
-            sample_weights,
-            dataset_balanced=self.dataset_balanced_loss,
-        )
         gamma_reg = self._aggregate_per_sample(
             gamma_reg_per_sample,
-            dataset_ids,
-            sample_weights,
-            dataset_balanced=self.dataset_balanced_loss,
-        )
-        additive_bias_l1_reg = self._aggregate_per_sample(
-            additive_bias_l1_per_sample,
             dataset_ids,
             sample_weights,
             dataset_balanced=self.dataset_balanced_loss,
@@ -2069,18 +1910,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             torch.zeros_like(extras["L_bio"]),
         )
         gamma_diag = extras.get("gamma", torch.ones_like(extras["L_bio"]))
-        gamma_amplitude_diag = extras.get(
-            "gamma_amplitude",
-            gamma_diag,
-        )
-        gamma_sparse_gate_diag = extras.get(
-            "gamma_sparse_gate",
-            torch.ones_like(gamma_diag),
-        )
-        gamma_support_logits_diag = extras.get(
-            "gamma_support_logits",
-            torch.zeros_like(gamma_diag),
-        )
         log_gamma_diag = extras.get(
             "log_gamma",
             torch.zeros_like(extras["L_bio"]),
@@ -2115,15 +1944,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             pos_mean((log_gamma_diag - mean_log_gamma_per_sample.reshape(-1, 1)).pow(2))
         )
         library_depth = (target * mask_f).sum(dim=1)
-        target_zero_diag = mask & (
-            target <= float(self.support_calibration_threshold)
-        )
-        target_active_diag = mask & (~target_zero_diag)
-        sparse_zero_diag = mask & (gamma_sparse_gate_diag == 0.0)
-        sparse_zero_true_positive = (sparse_zero_diag & target_zero_diag).float().sum()
-        sparse_zero_count = sparse_zero_diag.float().sum()
-        target_zero_count = target_zero_diag.float().sum()
-        target_active_count = target_active_diag.float().sum()
 
         metrics: dict[str, torch.Tensor] = {
             "loss": loss,
@@ -2148,36 +1968,10 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "replica_pcc_loss": replica_pcc_loss,
             "replica_pcc_value": replica_pcc_value,
             "replica_nll_weight": target.new_tensor(self.replica_nll_weight),
-            "support_calibration_loss": support_calibration_loss,
-            "support_calibration_loss_per_sample": support_calibration_per_sample,
-            "support_calibration_weight": effective_support_calibration_weight,
-            "support_active_probability_mean": support_calibration_terms[
-                "active_probability_mean"
-            ],
-            "support_active_probability_on_nonzeros": support_calibration_terms[
-                "active_probability_on_nonzeros"
-            ],
-            "support_active_probability_on_zeros": support_calibration_terms[
-                "active_probability_on_zeros"
-            ],
-            "support_target_zero_fraction": support_calibration_terms[
-                "target_zero_fraction"
-            ],
-            "support_predicted_zero_fraction": support_calibration_terms[
-                "predicted_zero_fraction"
-            ],
-            "support_zero_precision": support_calibration_terms["zero_precision"],
-            "support_zero_recall": support_calibration_terms["zero_recall"],
-            "support_false_zero_rate": support_calibration_terms["false_zero_rate"],
             "gamma_reg": gamma_reg,
             "gamma_reg_per_sample": gamma_reg_per_sample,
             "gamma_global_regularizer": gamma_reg,
             "gamma_reg_weight": effective_gamma_reg_weight,
-            "additive_bias_l1_reg": additive_bias_l1_reg,
-            "additive_bias_l1_reg_per_sample": additive_bias_l1_per_sample,
-            "additive_bias_l1_weight": target.new_tensor(
-                self.additive_bias_l1_weight
-            ),
             "pcc_loss_total": pcc_loss,
             "pcc_value": pcc_value,
             "pcc_loss_weight_effective": effective_pcc_weight,
@@ -2208,6 +2002,12 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "pcc_alpha_max": pcc_diag["alpha_max"],
             "mu_pcc": self._aggregate_per_sample(raw_mu_pcc_per_sample, dataset_ids, sample_weights),
             "mu_pcc_per_sample": raw_mu_pcc_per_sample,
+            "L_bio_pcc": self._aggregate_per_sample(
+                L_bio_pcc_per_sample,
+                dataset_ids,
+                sample_weights,
+            ),
+            "L_bio_pcc_per_sample": L_bio_pcc_per_sample,
             "nb_sequence_reduction_mode": target.new_tensor(sequence_reduction_mode_id),
             "nb_length_temper_gamma": target.new_tensor(
                 float(getattr(self.loss_fn, "length_temper_gamma", 1.0))
@@ -2253,26 +2053,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "gamma_log_std": global_pos_std(log_gamma_diag),
             "gamma_fraction_below_0p1": masked_fraction(gamma_diag < 0.1),
             "gamma_fraction_above_10": masked_fraction(gamma_diag > 10.0),
-            "gamma_exact_zero_fraction": masked_fraction(gamma_diag == 0.0),
-            "gamma_amplitude_mean": global_pos_mean(gamma_amplitude_diag),
-            "gamma_amplitude_max": global_pos_max(gamma_amplitude_diag),
-            "gamma_sparse_gate_mean": global_pos_mean(gamma_sparse_gate_diag),
-            "gamma_sparse_gate_max": global_pos_max(gamma_sparse_gate_diag),
-            "gamma_sparse_gate_zero_fraction": masked_fraction(
-                gamma_sparse_gate_diag == 0.0
-            ),
-            "gamma_sparse_zero_precision": (
-                sparse_zero_true_positive / sparse_zero_count.clamp_min(1.0)
-            ),
-            "gamma_sparse_zero_recall": (
-                sparse_zero_true_positive / target_zero_count.clamp_min(1.0)
-            ),
-            "gamma_sparse_false_zero_rate": (
-                (sparse_zero_diag & target_active_diag).float().sum()
-                / target_active_count.clamp_min(1.0)
-            ),
-            "gamma_support_logit_mean": global_pos_mean(gamma_support_logits_diag),
-            "gamma_support_logit_std": global_pos_std(gamma_support_logits_diag),
             "gamma_centering_applied_fraction": masked_fraction(gamma_applied_diag),
             "gamma_centering_skipped_fraction": (
                 gamma_skipped_mask.to(dtype=torch.float32).sum() / valid_count
@@ -2328,12 +2108,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 "gamma_cross_dataset_center_group_size",
                 torch.zeros_like(extras["scale_dt"]),
             ).float().mean(),
-            "additive_bias_mean": global_pos_mean(
-                extras.get("additive_bias", torch.zeros_like(extras["L_bio"]))
-            ),
-            "additive_bias_max": global_pos_max(
-                extras.get("additive_bias", torch.zeros_like(extras["L_bio"]))
-            ),
             "nb_alpha_mean": pos_mean(extras["alpha"]).mean(),
         }
         if replica_terms is not None:
@@ -2369,37 +2143,19 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         "replica_aux_loss",
         "replica_nll",
         "replica_count_mean",
-        "support_calibration_loss",
-        "support_active_probability_on_nonzeros",
-        "support_active_probability_on_zeros",
-        "support_predicted_zero_fraction",
-        "support_zero_precision",
-        "support_zero_recall",
-        "support_false_zero_rate",
         "log1p_mse",
         "mean_ratio",
         "J_mean",
+        "L_bio_pcc",
         "L_bio_max",
         "rho_max",
         "gamma_reg",
         "gamma_mean",
-        "gamma_exact_zero_fraction",
-        "gamma_amplitude_mean",
-        "gamma_amplitude_max",
-        "gamma_sparse_gate_max",
-        "gamma_sparse_gate_zero_fraction",
-        "gamma_sparse_zero_precision",
-        "gamma_sparse_zero_recall",
-        "gamma_sparse_false_zero_rate",
-        "gamma_support_logit_std",
         "gamma_centering_applied_fraction",
         "gamma_distinct_dataset_count_mean",
         "gamma_centering_constraint_error",
         "gamma_min",
         "gamma_max",
-        "additive_bias_l1_reg",
-        "additive_bias_mean",
-        "additive_bias_max",
         "nb_alpha_mean",
     )
 
@@ -2439,22 +2195,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             metric_path = {
                 "pcc_raw_value": "pcc/raw_value",
                 "pcc_nb_vst_value": "pcc/nb_vst_value",
-                "support_calibration_loss": "support/loss",
-                "support_active_probability_on_nonzeros": "support/active_probability_on_nonzeros",
-                "support_active_probability_on_zeros": "support/active_probability_on_zeros",
-                "support_predicted_zero_fraction": "support/predicted_zero_fraction",
-                "support_zero_precision": "support/zero_precision",
-                "support_zero_recall": "support/zero_recall",
-                "support_false_zero_rate": "support/false_zero_rate",
-                "gamma_exact_zero_fraction": "gamma/exact_zero_fraction",
-                "gamma_amplitude_mean": "gamma/amplitude_mean",
-                "gamma_amplitude_max": "gamma/amplitude_max",
-                "gamma_sparse_gate_max": "gamma/sparse_gate_max",
-                "gamma_sparse_gate_zero_fraction": "gamma/sparse_gate_zero_fraction",
-                "gamma_sparse_zero_precision": "gamma/sparse_zero_precision",
-                "gamma_sparse_zero_recall": "gamma/sparse_zero_recall",
-                "gamma_sparse_false_zero_rate": "gamma/sparse_false_zero_rate",
-                "gamma_support_logit_std": "gamma/support_logit_std",
                 "gamma_centering_applied_fraction": "gamma/centering_applied_fraction",
                 "gamma_distinct_dataset_count_mean": "gamma/distinct_dataset_count_mean",
                 "gamma_centering_constraint_error": "gamma/centering_constraint_error",
@@ -2498,6 +2238,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "pcc_raw_loss": metrics["pcc_raw_loss_per_sample"],
             "pcc_nb_vst_loss": metrics["pcc_nb_vst_loss_per_sample"],
             "mu_pcc": metrics["mu_pcc_per_sample"],
+            "L_bio_pcc": metrics["L_bio_pcc_per_sample"],
         }
 
         extras = out["extras"]
@@ -2545,12 +2286,35 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         if self.residual_diag_enabled and self.residual_diag_run_on_validation:
             self.residual_diag.reset()
 
+    @staticmethod
+    def _metrics_to_device(
+        metrics: dict[str, torch.Tensor],
+        device: torch.device,
+    ) -> dict[str, torch.Tensor]:
+        """Move CPU-computed scalar diagnostics to the DDP reduction device."""
+        moved: dict[str, torch.Tensor] = {}
+        for name, value in metrics.items():
+            if not torch.is_tensor(value):
+                value = torch.as_tensor(value)
+            if value.numel() != 1:
+                raise ValueError(
+                    f"Logged residual metric {name!r} must be scalar, got "
+                    f"shape {tuple(value.shape)}."
+                )
+            moved[name] = value.detach().reshape(()).to(device=device)
+        return moved
+
     def on_validation_epoch_end(self) -> None:
         if not (self.residual_diag_enabled and self.residual_diag_run_on_validation):
             return
         metrics, rows, report = self.residual_diag.compute()
         if metrics:
             sync_dist = bool(getattr(self.config.trainer, "sync_dist_logs", False))
+            # ResidualDiagnosticsAccumulator intentionally works on CPU to keep
+            # full validation profiles off GPU memory. NCCL cannot all-reduce
+            # CPU tensors, so return only the final scalar summaries to the
+            # Lightning device before distributed logging.
+            metrics = self._metrics_to_device(metrics, self.device)
             self.log_dict(
                 metrics,
                 on_step=False,
@@ -2781,22 +2545,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "J": extras["J"],
             # Dataset correction
             "gamma": extras.get("gamma", torch.ones_like(extras["L_bio"])),
-            "gamma_amplitude": extras.get(
-                "gamma_amplitude",
-                extras.get("gamma", torch.ones_like(extras["L_bio"])),
-            ),
-            "gamma_sparse_gate": extras.get(
-                "gamma_sparse_gate",
-                torch.ones_like(extras["L_bio"]),
-            ),
-            "gamma_support_logits": extras.get(
-                "gamma_support_logits",
-                torch.zeros_like(extras["L_bio"]),
-            ),
-            "gamma_support_logits_raw": extras.get(
-                "gamma_support_logits_raw",
-                torch.zeros_like(extras["L_bio"]),
-            ),
             "log_gamma": extras.get(
                 "log_gamma",
                 torch.zeros_like(extras["L_bio"]),

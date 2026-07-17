@@ -49,7 +49,7 @@ data:
 
   # transcript_grouped_pairs keeps the FULL datasets (single-dataset transcripts
   # included) while packing transcript groups into batches of batch_size.
-  train_sampling_strategy: transcript_grouped_pairs # random_dataset_per_transcript
+  train_sampling_strategy: transcript_grouped_multidataset_pairs # random_dataset_per_transcript
   dataset_balance_gamma: 0.0
   train_samples_per_epoch: null
 
@@ -64,7 +64,7 @@ data:
   # shape [n_replicas, L] of raw per-codon counts) instead of the single averaged
   # `ribo` profile. The batch carries every replica; the loss is the average over
   # replicas of the per-sample loss (NB NLL + PCC), with the oracle scale S
-  # computed PER replica: mu_r = S_r * (gamma * L_bio + additive_bias).
+  # computed PER replica: mu_r = S_r * gamma * L_bio.
   # Requires dataset_config to
   # point at parquet files that contain the replica column (replica_datasets_paths
   # / weighted_datasets_ribo_replicas). The replicas are used as-is: they are
@@ -83,13 +83,13 @@ model:
   # and all non-finite values are replaced by `fill_value` before scaling.
   # Dimensions are validated against every transcript.
   additional_sequence_features:
-    exo: {dimension: 3, route: both, scale: 1.0}
-    gmp: {dimension: 3, route: both, scale: 1.0}
-    tmp: {dimension: 3, route: both, scale: 1.0}
-    openen: {dimension: 3, route: both, scale: 1.0}
+    exo: {dimension: 3, route: none, scale: 1.0}
+    gmp: {dimension: 3, route: none, scale: 1.0}
+    tmp: {dimension: 3, route: none, scale: 1.0}
+    openen: {dimension: 3, route: none, scale: 1.0}
     # tAI is undefined at stop codons: the parquet uses -1000 at every terminal
     # stop and NaN at a few internal stops. Both are mapped to neutral zero.
-    tAI_profile_codon: {dimension: 1, route: both, scale: 1.0, missing_values: [-1000.0], fill_value: 0.0}
+    tAI_profile_codon: {dimension: 1, route: none, scale: 1.0, missing_values: [-1000.0], fill_value: 0.0}
     # This parquet has fra=[1,0,0] at every position, so it has zero variance.
     fra: {dimension: 3, route: none, scale: 1.0}
 
@@ -98,40 +98,24 @@ model:
   # L_bio       = normalized biological load, so mean_valid(L_bio)=1.
   # rho         = L_bio / (1 + L_bio). High rho marks locally saturated peaks.
   # lambda      = log(1 + L_bio), so L_bio = rho / (1 - rho).
-  # Mean model: mu = S * (gamma * L_bio + additive_bias).
-  # Gamma starts neutral at 1. Its centered score is bounded by
-  # gamma_centering.log_gamma_min/max, and mean(score^2) regularization pulls
-  # dataset adaptation back toward the shared L_bio baseline.
+  # Mean model: mu = S * gamma * L_bio.
+  # Gamma starts neutral at 1. Mean(score^2) regularization can pull dataset
+  # adaptation back toward the shared L_bio baseline.
   init_gamma: 1.0
-  # Learned sparse dataset adaptation:
-  #   gamma = exp(centered_amplitude_score)
-  #           * T * entmax15(support_logits / temperature)
-  # Neutral scores give gamma=1; entmax can give exact zeros, while the
-  # independent exponential amplitude retains arbitrarily high peak capacity.
-  gamma_transform: entmax15_gated_exponential
-  gamma_entmax_temperature: 5.0
-  # Separate support and amplitude scores: entmax support decides exact zeros,
-  # while the centered exponential amplitude controls dataset-specific peaks.
-  gamma_split_support_head: true
-  # An entmax support zero suppresses additive background as well as gamma*L_bio.
-  gamma_gate_additive_bias: true
-  # Mass conservation: renormalize the shape (gamma*L_bio + additive) to mean 1
+  # gamma = exp(centered_log_score): strictly positive on valid positions and
+  # equal to one at the neutral score.
+  # Mass conservation: renormalize the shape gamma*L_bio to mean 1
   # over valid positions before applying S, so mean_valid(mu) = S exactly and
   # sum(mu) = sum(target). Makes zero-suppression mass-neutral (mass leaves the
   # zeros and lands on the peaks). gamma/L_bio stay per-position interpretable.
   mass_conservation: true
   # Equal-dataset geometric anchoring of dataset-specific gamma. This removes a
   # multiplicative reference ambiguity when enough same-transcript datasets are
-  # present in the batch. It does not identify the additive branch.
+  # present in the batch.
   gamma_centering:
     enabled: true
     scope: batch_grouped
-    strength: 1.0
-    # Every distinct dataset contributes one equal weight.
-    min_distinct_datasets: 2
-
-    log_gamma_min: -8.0
-    log_gamma_max: 8.0
+    # Centering is skipped with one dataset and applied with two or more.
 
   biological_params:
     # Base one-hot dimension. The model automatically adds the dimensions of
@@ -167,21 +151,10 @@ model:
     context_gru_hidden_size: 128
     context_gru_num_layers: 2
     context_gru_dropout: 0.0
-    # Restricting the additive head can improve separation of L_bio, gamma, and
-    # additive background in sensitivity experiments. Default keeps the original
-    # full context capacity.
-    additive_bias_input_mode: full
-
-    # Dataset correction head for gamma residuals and additive background.
+    # Dataset correction head for log-gamma residuals.
     dataset_multiplicative_allocation_bias_submodule_params:
       hidden_size: 128
       dropout: 0.1
-      # relu can produce exact zero additive backgrounds. softplus is smooth but
-      # cannot produce exact zeros at finite logits.
-      additive_bias_activation: relu
-      # Keep this positive for softplus. With relu, setting it to 0.0 gives
-      # exact-zero init but can leave the ReLU head inactive.
-      init_additive_bias: 1.0e-8
 
     dataset_log_sigma_submodule_params:
       dataset_embedding_size: 16
@@ -189,9 +162,6 @@ model:
       dropout: 0.1
       # Initial log_sigma head bias. 0.0 -> sigma = 1.
       init_log_sigma: 0.2
-      # null -> learn per-position log_sigma.
-      # Positive value -> bypass the sigma head and use this constant sigma.
-      fixed_sigma: null
 
 loss:
   # NB likelihood + configurable mu/y PCC loss:
@@ -200,9 +170,6 @@ loss:
   profile_likelihood: negative_binomial
 
   eps: 1.0e-8
-  mu_min: 0.0
-  mu_max: 100000000.0
-
   nb_log_alpha_min: -5.0
   # Dispersion cap. alpha = exp(log_alpha), Var = mu + alpha*mu^2. Lower max ->
   # NB approaches Poisson -> a nonzero mu at a true zero becomes expensive, so
@@ -239,20 +206,12 @@ loss:
   replica_objective: consensus_plus_replica
   replica_nll_weight: 0.2
 
-  # Balanced support supervision on the sequence-centered logits passed to
-  # entmax. It also supplies a recovery gradient when an active position has
-  # already been excluded by the sparse transform.
-  support_calibration_weight: 0.02
-  support_calibration_threshold: 0.0
-
   # Equal weight per dataset when combining per-sample losses.
   dataset_balanced_loss: false
 
-  # Optional regularizers around the NB + PCC objective.
-  # gamma is pulled to 1 through mean(log_gamma^2); additive_bias is pulled to 0
-  # through a nonnegative L1 penalty.
-  gamma_reg_weight: 1e-4
-  additive_bias_l1_weight: 1e-3
+  # Optional regularizer around the NB + PCC objective.
+  # Gamma is pulled to 1 through mean(log_gamma^2).
+  gamma_reg_weight: 0.0
 
   # Predicted-value floor for PCC only (honest zero handling, no extra
   # parameter): when computing Pearson correlation, predictions below this
@@ -312,7 +271,7 @@ trainer:
   gradient_clip_algorithm: norm
 
 callbacks:
-  early_stopping_patience: 10
+  early_stopping_patience: 20
 
 metrics:
   log_train_per_dataset_metrics: false

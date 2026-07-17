@@ -5,7 +5,6 @@ import math
 
 import torch
 import torch.nn as nn
-from entmax import entmax15
 
 from Models.RiboQueuingModel.DatasetBiasSubmodel import DatasetBiasSubmodel
 from Models.RiboQueuingModel.QueuingBiologicalModel import QueuingBiologicalModel
@@ -24,9 +23,8 @@ class RiboQueuingModel(nn.Module):
                      construction while S carries target scale,
         rho[t,i]   = L_bio / (1 + L_bio), so high rho marks saturated local
                      load.
-        gamma      = exp(centered_amplitude_score) times an optional
-                     length-scaled entmax support gate; neutral scores give 1
-                     and sparse mode permits exact 0,
+        gamma      = exp(centered_log_score), so it is strictly positive on
+                     valid positions and neutral scores give 1,
         a          = nonnegative additive background, regularized toward 0.
 
     Gamma-score centering is a multiplicative reference/gauge constraint only. It
@@ -38,30 +36,14 @@ class RiboQueuingModel(nn.Module):
         self,
         model_configs: dict,
         eps: float = 1.0e-8,
-        mu_max: float = 1.0e8,
     ):
         super().__init__()
 
         self.eps = float(eps)
-        self.mu_max = float(mu_max)
 
         # Scale gauge is always the mean gauge S = mean_valid(target).
         self.init_gamma = float(model_configs.get("init_gamma", 1.0))
         self.gamma_log_init = math.log(self.init_gamma)
-        self.gamma_transform = str(
-            model_configs.get("gamma_transform", "exponential")
-        ).lower()
-        self.gamma_entmax_temperature = max(
-            float(model_configs.get("gamma_entmax_temperature", 10.0)),
-            self.eps,
-        )
-        self.gamma_split_support_head = bool(
-            model_configs.get("gamma_split_support_head", False)
-        )
-        self.gamma_gate_additive_bias = bool(
-            model_configs.get("gamma_gate_additive_bias", False)
-        )
-        self._validate_gamma_transform()
         self._configure_gamma_centering(model_configs)
 
         # Mass conservation: renormalize the shape (gamma*L_bio + a) to mean 1
@@ -109,96 +91,6 @@ class RiboQueuingModel(nn.Module):
 
         self.dataset_bias_model = DatasetBiasSubmodel(config_params=dataset_bias_params)
 
-    def _validate_gamma_transform(self) -> None:
-        aliases = {
-            "exponential": "exponential",
-            "exp": "exponential",
-            "entmax15": "entmax15_gated_exponential",
-            "entmax15_gated_exponential": "entmax15_gated_exponential",
-        }
-        if self.gamma_transform not in aliases:
-            raise ValueError(
-                "gamma_transform must be one of "
-                f"{sorted(aliases)}, got {self.gamma_transform!r}."
-            )
-        self.gamma_transform = aliases[self.gamma_transform]
-
-    def set_gamma_transform(
-        self,
-        transform: str,
-        *,
-        entmax_temperature: float | None = None,
-        split_support_head: bool | None = None,
-        gate_additive_bias: bool | None = None,
-    ) -> None:
-        """Restore gamma semantics that are not encoded by tensor weights."""
-        self.gamma_transform = str(transform).lower()
-        if entmax_temperature is not None:
-            self.gamma_entmax_temperature = max(
-                float(entmax_temperature),
-                self.eps,
-            )
-        if split_support_head is not None:
-            self.gamma_split_support_head = bool(split_support_head)
-        if gate_additive_bias is not None:
-            self.gamma_gate_additive_bias = bool(gate_additive_bias)
-        self._validate_gamma_transform()
-
-    def _gamma_from_centered_score(
-        self,
-        score: torch.Tensor,
-        mask_b: torch.Tensor,
-        support_score: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Map amplitude and optional support scores to nonnegative gamma.
-
-        The sparse transform retains the exponential amplitude but multiplies it
-        by a valid-length-scaled entmax allocation. At a neutral score every
-        valid position has gate=1 and gamma=1. Entmax support exclusions give
-        exact gamma zeros; selected positions can still form large peaks.
-        """
-        mask_b = mask_b.bool()
-        mask_f = mask_b.to(dtype=score.dtype)
-        amplitude = torch.exp(score).clamp_min(self.eps) * mask_f
-
-        if self.gamma_transform == "exponential":
-            sparse_gate = mask_f
-            return amplitude, amplitude, sparse_gate
-
-        neg_large = torch.finfo(score.dtype).min
-        if support_score is None:
-            support_score = score
-        logits = (
-            support_score / float(self.gamma_entmax_temperature)
-        ).masked_fill(
-            ~mask_b,
-            neg_large,
-        )
-        allocation = entmax15(logits, dim=1)
-        allocation = torch.nan_to_num(
-            allocation,
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        ).clamp_min(0.0) * mask_f
-        allocation_mass = allocation.sum(dim=1, keepdim=True)
-        uniform = mask_f / mask_f.sum(dim=1, keepdim=True).clamp_min(1.0)
-        allocation = torch.where(
-            allocation_mass > self.eps,
-            allocation / allocation_mass.clamp_min(self.eps),
-            uniform,
-        ) * mask_f
-        valid_len = mask_f.sum(dim=1, keepdim=True).clamp_min(1.0)
-        sparse_gate = allocation * valid_len
-        gamma = amplitude * sparse_gate
-        gamma = torch.nan_to_num(
-            gamma,
-            nan=0.0,
-            posinf=self.mu_max,
-            neginf=0.0,
-        ).clamp_min(0.0) * mask_f
-        return gamma, amplitude, sparse_gate
-
     # ============================================================
     # Equal-dataset gamma centering
     # ============================================================
@@ -213,12 +105,6 @@ class RiboQueuingModel(nn.Module):
         self.gamma_cross_dataset_centering_enabled = bool(
             cfg.get("enabled", False)
         ) and scope != "disabled"
-        self.gamma_cross_dataset_centering_strength = float(cfg.get("strength", 1.0))
-        self.gamma_centering_min_distinct_datasets = int(
-            cfg.get("min_distinct_datasets", 2)
-        )
-        self.gamma_log_min = float(cfg.get("log_gamma_min", -8.0))
-        self.gamma_log_max = float(cfg.get("log_gamma_max", 8.0))
 
     @staticmethod
     def _normalize_sample_ids(
@@ -231,6 +117,10 @@ class RiboQueuingModel(nn.Module):
             values = sample_ids.detach().cpu().reshape(-1).tolist()
         else:
             values = list(sample_ids)
+        if len(values) != int(batch_size):
+            raise ValueError(
+                f"Expected {batch_size} sample IDs, got {len(values)}."
+            )
         return [str(value) for value in values]
 
     def _center_log_gamma_across_transcripts(
@@ -241,7 +131,13 @@ class RiboQueuingModel(nn.Module):
         sample_ids: Sequence[str] | torch.Tensor | None,
         id_datasets: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Center log-amplitude equally across datasets for each transcript."""
+        """Exactly center log-gamma across distinct datasets.
+
+        For every transcript-position cell, duplicate observations are first
+        averaged within dataset. Those dataset means then receive equal raw
+        weight one. Positions represented by fewer than two datasets are left
+        unchanged.
+        """
         B, T = log_gamma_raw.shape
         dtype = log_gamma_raw.dtype
         device = log_gamma_raw.device
@@ -269,7 +165,6 @@ class RiboQueuingModel(nn.Module):
         if (
             sample_id_list is None
             or not self.gamma_cross_dataset_centering_enabled
-            or self.gamma_cross_dataset_centering_strength <= 0.0
             or B <= 1
         ):
             return {
@@ -313,9 +208,9 @@ class RiboQueuingModel(nn.Module):
         num_distinct_group = _scatter_sum(active_f, cell_group, num_groups)
         sum_means_group = _scatter_sum(mean_cell * active_f, cell_group, num_groups)
         center_group = sum_means_group / num_distinct_group.clamp_min(1.0)
-        apply_group = num_distinct_group >= float(
-            self.gamma_centering_min_distinct_datasets
-        )
+        # A cross-dataset constraint is defined exactly when at least two
+        # distinct datasets contribute at this transcript position.
+        apply_group = num_distinct_group >= 2.0
 
         apply_sample = apply_group.index_select(0, group_index)
         center_sample = center_group.index_select(0, group_index)
@@ -333,13 +228,12 @@ class RiboQueuingModel(nn.Module):
         sample_weights = torch.where(
             candidate & apply_sample, sample_weights, torch.zeros_like(sample_weights)
         )
-        strength = float(self.gamma_cross_dataset_centering_strength)
-        ce_contrib = sample_weights * (log_safe - strength * center_sample)
+        ce_contrib = sample_weights * (log_safe - center_sample)
         constraint_error_group = _scatter_sum(ce_contrib, group_index, num_groups).abs()
         constraint_error = torch.where(
             applied, constraint_error_group.index_select(0, group_index), zeros
         )
-        log_gamma = (log_gamma_raw - strength * log_center) * mask_f
+        log_gamma = (log_gamma_raw - log_center) * mask_f
 
         return {
             "log_gamma": log_gamma,
@@ -454,24 +348,22 @@ class RiboQueuingModel(nn.Module):
             sequence_features=dataset_bias_sequence_features,
         )
         gamma_log_residual = bias["gamma_raw"].to(dtype=dtype, device=device) * mask_f
-        gamma_support_logits_raw = bias.get("gamma_support_logits")
-        if torch.is_tensor(gamma_support_logits_raw):
-            gamma_support_logits_raw = (
-                gamma_support_logits_raw.to(dtype=dtype, device=device) * mask_f
-            )
-        else:
-            gamma_support_logits_raw = gamma_log_residual
-        additive_bias = bias["additive_bias"].to(dtype=dtype, device=device) * mask_f
+        additive_bias = torch.zeros_like(gamma_log_residual)
         log_sigma = bias["log_sigma"].to(dtype=dtype)
         log_sigma = torch.where(mask_b, log_sigma, torch.zeros_like(log_sigma))
 
         # --------------------------------------------------------
         # 3. Observation mean branch
         # --------------------------------------------------------
-        log_gamma_raw = (
-            gamma_log_residual + float(self.gamma_log_init)
-        ).clamp(min=self.gamma_log_min, max=self.gamma_log_max) * mask_f
-        gamma_raw = torch.exp(log_gamma_raw).clamp_min(self.eps) * mask_f
+        # Center the unconstrained raw log-score directly. No transformation is
+        # applied after centering other than exp, so the exact zero-mean log
+        # constraint is preserved by the final gamma.
+        log_gamma_raw = torch.where(
+            mask_b,
+            gamma_log_residual + float(self.gamma_log_init),
+            torch.zeros_like(gamma_log_residual),
+        )
+        gamma_raw = torch.exp(log_gamma_raw)
         centered = self._center_log_gamma_across_transcripts(
             log_gamma_raw,
             mask_b=mask_b,
@@ -488,24 +380,9 @@ class RiboQueuingModel(nn.Module):
         gamma_cross_dataset_center_applied = centered["applied"].any(dim=1).to(
             dtype=dtype
         )
-        if self.gamma_split_support_head:
-            # Entmax is invariant to a constant shift, but explicit masked
-            # sequence centering improves numerical conditioning and makes the
-            # exported support scores easier to compare within a transcript.
-            support_mean = gamma_support_logits_raw.sum(dim=1, keepdim=True) / (
-                mask_f.sum(dim=1, keepdim=True).clamp_min(1.0)
-            )
-            gamma_support_logits = (
-                gamma_support_logits_raw - support_mean
-            ) * mask_f
-        else:
-            # Exact legacy behavior: the amplitude score also controls support.
-            gamma_support_logits = log_gamma
-        gamma, gamma_amplitude, gamma_sparse_gate = self._gamma_from_centered_score(
-            log_gamma,
-            mask_b,
-            support_score=gamma_support_logits,
-        )
+        # This is the final multiplicative correction. Padded positions have
+        # log_gamma=0 and therefore gamma=1; all entries are strictly positive.
+        gamma = torch.exp(log_gamma)
 
         # --------------------------------------------------------
         # 4. Target-derived mean scale S
@@ -515,13 +392,7 @@ class RiboQueuingModel(nn.Module):
         # --------------------------------------------------------
         # 5. Prediction
         # --------------------------------------------------------
-        if self.gamma_gate_additive_bias:
-            # A support zero must suppress the complete dataset-specific mean,
-            # including the additive branch; otherwise additive bias can leak
-            # positive mass through an exact gamma zero.
-            mu_inner = gamma * L_bio + gamma_sparse_gate * additive_bias
-        else:
-            mu_inner = gamma * L_bio + additive_bias
+        mu_inner = gamma * L_bio + additive_bias
         if self.mass_conservation:
             # Renormalize the shape to mean 1 over valid positions so that
             # mean_valid(mu) = S exactly. gamma, L_bio and additive_bias keep
@@ -529,8 +400,15 @@ class RiboQueuingModel(nn.Module):
             inner_valid_len = mask_f.sum(dim=1, keepdim=True).clamp_min(1.0)
             inner_mean = (mu_inner * mask_f).sum(dim=1, keepdim=True) / inner_valid_len
             mu_inner = mu_inner / inner_mean.clamp_min(self.eps)
-        mu = (scale_dt * mu_inner).clamp(self.eps, self.mu_max)
-        mu = torch.nan_to_num(mu, nan=self.eps, posinf=self.mu_max, neginf=self.eps)
+        mu = scale_dt * mu_inner
+        # The mean has no configured upper bound. Keep only finite numerical
+        # values for pathological overflow/underflow cases.
+        mu = torch.nan_to_num(
+            mu,
+            nan=self.eps,
+            posinf=torch.finfo(mu.dtype).max,
+            neginf=self.eps,
+        )
         mu = torch.where(mask_b, mu, torch.ones_like(mu))
 
         # --------------------------------------------------------
@@ -574,12 +452,8 @@ class RiboQueuingModel(nn.Module):
                 log_gamma_raw,
                 torch.zeros_like(log_gamma_raw),
             ),
-            "gamma_raw": torch.where(mask_b, gamma_raw, torch.ones_like(gamma_raw)),
-            "log_gamma_raw": torch.where(
-                mask_b,
-                log_gamma_raw,
-                torch.zeros_like(log_gamma_raw),
-            ),
+            "gamma_raw": gamma_raw,
+            "log_gamma_raw": log_gamma_raw,
             "gamma_cross_dataset_log_center": torch.where(
                 mask_b,
                 gamma_cross_dataset_log_center,
@@ -609,32 +483,8 @@ class RiboQueuingModel(nn.Module):
                 centered["constraint_error"],
                 torch.zeros_like(centered["constraint_error"]),
             ),
-            "gamma": torch.where(mask_b, gamma, torch.ones_like(gamma)),
-            "gamma_amplitude": torch.where(
-                mask_b,
-                gamma_amplitude,
-                torch.ones_like(gamma_amplitude),
-            ),
-            "gamma_sparse_gate": torch.where(
-                mask_b,
-                gamma_sparse_gate,
-                torch.ones_like(gamma_sparse_gate),
-            ),
-            "gamma_support_logits_raw": torch.where(
-                mask_b,
-                gamma_support_logits_raw,
-                torch.zeros_like(gamma_support_logits_raw),
-            ),
-            "gamma_support_logits": torch.where(
-                mask_b,
-                gamma_support_logits,
-                torch.zeros_like(gamma_support_logits),
-            ),
-            "log_gamma": torch.where(
-                mask_b,
-                log_gamma,
-                torch.zeros_like(log_gamma),
-            ),
+            "gamma": gamma,
+            "log_gamma": log_gamma,
             "additive_bias": torch.where(
                 mask_b,
                 additive_bias,

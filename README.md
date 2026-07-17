@@ -5,9 +5,9 @@
 This repository implements a queue-inspired, physics-aware neural model for
 ribosome profiling signals (Ribo-seq). The current model separates a
 dataset-invariant biological profile (`L_bio`) from dataset-specific
-multiplicative (`gamma`) and additive corrections. Gamma factorizes into an
-exponential amplitude and a sparse entmax support gate, so it is nonnegative,
-can contain exact zeros, and remains unbounded above. The dataset head uses
+multiplicative (`gamma`) and optional additive corrections. Gamma is the
+exponential of its centered log-score, so it is strictly positive on valid
+positions and remains unbounded above. The dataset head uses
 dataset, codon-context, and position features; it does not consume `L_bio`.
 Reliability-weighted gamma centering removes a multiplicative reference
 ambiguity when matched cross-dataset transcript observations are present.
@@ -26,7 +26,7 @@ mu[d,t,i] = S[d,t] * (gamma[d,t,i] * L_bio[t,i] + additive_bias[d,t,i])
 
 - `S[d,t]` is the valid-position mean of the observed target profile.
 - `L_bio` is positive and normalized to mean one over valid positions.
-- `gamma` is nonnegative and dataset-conditioned, with exact entmax zeros.
+- `gamma` is positive and dataset-conditioned.
 - `additive_bias` is nonnegative.
 - `rho_bio = L_bio / (1 + L_bio)` is the bounded occupancy representation.
 - The observation loss uses an NB2 parameterization with learned
@@ -36,8 +36,8 @@ Because `S[d,t]` is computed from the target, the current implementation models
 profile shape and relative allocation. It is not a target-free predictor of
 absolute transcript abundance.
 
-The complete current model, including entmax support, gradients, diagnostics,
-invariances, and limitations, is in
+Further model notes, including gradients, diagnostics, invariances, and
+limitations, are in
 [Docs/queueing_model.md](Docs/queueing_model.md). A longer historical
 identifiability analysis is in
 [`memory documents/modeling_mathematical_analysis_and_identifiability.md`](memory%20documents/modeling_mathematical_analysis_and_identifiability.md).

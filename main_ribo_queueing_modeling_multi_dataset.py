@@ -248,19 +248,6 @@ def format_run_tag_value(value: Any) -> str:
     )
 
 
-def make_cagrad_run_tag(cfg: DictConfig) -> str:
-    cagrad_enabled = cfg_bool(
-        cfg,
-        "cagrad.enabled",
-        cfg_bool(cfg, "optim.use_cagrad", False),
-    )
-    if not cagrad_enabled:
-        return "CAGradOff"
-
-    cagrad_c = format_run_tag_value(cfg_get(cfg, "cagrad.c", 0.5))
-    return f"CAGradOn_c{cagrad_c}"
-
-
 def make_dataset_balance_run_tag(cfg: DictConfig) -> str:
     if cfg_bool(cfg, "loss.dataset_balanced_loss", False):
         return "DBLossOn"
@@ -277,10 +264,7 @@ def make_replica_objective_run_tag(cfg: DictConfig) -> str:
         replica_nll_weight = format_run_tag_value(
             cfg_get(cfg, "loss.replica_nll_weight", 0.0)
         )
-        replica_pcc_weight = format_run_tag_value(
-            cfg_get(cfg, "loss.replica_pcc_loss_weight", 0.0)
-        )
-        return f"ConsensusReplicas_nll{replica_nll_weight}_pcc{replica_pcc_weight}"
+        return f"ConsensusReplicas_nll{replica_nll_weight}"
 
     if objective == "replica":
         return "ReplicasOnly"
@@ -337,35 +321,102 @@ def make_pcc_run_tag(cfg: DictConfig) -> str:
     return f"PCC{format_run_tag_value(mode)}_w{total_weight}"
 
 
-def make_gamma_transform_run_tag(cfg: DictConfig) -> str | None:
-    transform = str(cfg_get(cfg, "model.gamma_transform", "exponential")).lower()
-    if transform in {"exponential", "exp"}:
-        return None
-    if transform in {"entmax15", "entmax15_gated_exponential"}:
-        temperature = format_run_tag_value(
-            cfg_get(cfg, "model.gamma_entmax_temperature", 10.0)
-        )
-        return f"GammaEntmax15T{temperature}"
-    return f"Gamma{format_run_tag_value(transform)}"
+def _sequence_feature_routes(cfg: DictConfig) -> dict[str, str]:
+    raw_config = cfg_get(cfg, "model.additional_sequence_features", {}) or {}
+    return {
+        str(name): str(dict(spec or {}).get("route", "none")).lower()
+        for name, spec in raw_config.items()
+    }
 
 
-def make_gamma_support_run_tag(cfg: DictConfig) -> str | None:
-    if not bool(cfg_get(cfg, "model.gamma_split_support_head", False)):
-        return None
-    bce_weight = format_run_tag_value(
-        cfg_get(cfg, "loss.support_calibration_weight", 0.0)
-    )
-    gate_additive = bool(cfg_get(cfg, "model.gamma_gate_additive_bias", False))
-    parts = [f"SplitSupportBCEw{bce_weight}"]
-    if gate_additive:
-        parts.append("GateAdd")
-    return "".join(parts)
+def infer_sequence_features_preset(cfg: DictConfig) -> str:
+    """Infer the Slurm feature preset from the fully resolved Hydra routes."""
+    routes = _sequence_feature_routes(cfg)
+    useful_features = ("exo", "gmp", "tmp", "openen", "tAI_profile_codon")
+    useful_routes = {name: routes.get(name, "none") for name in useful_features}
+
+    if all(route == "none" for route in useful_routes.values()):
+        return "Baseline"
+    for route, label in (
+        ("biological", "Biological"),
+        ("dataset_bias", "DatasetBias"),
+        ("both", "Both"),
+    ):
+        if all(value == route for value in useful_routes.values()):
+            return label
+
+    enabled = {name: route for name, route in useful_routes.items() if route != "none"}
+    if enabled == {"openen": "biological", "tAI_profile_codon": "biological"}:
+        return "CoreBio"
+
+    single_bio_labels = {
+        "exo": "ExoBio",
+        "gmp": "GmpBio",
+        "tmp": "TmpBio",
+        "openen": "OpenenBio",
+        "tAI_profile_codon": "TaiBio",
+    }
+    if len(enabled) == 1:
+        name, route = next(iter(enabled.items()))
+        if route == "biological" and name in single_bio_labels:
+            return single_bio_labels[name]
+    return "Custom"
+
+
+def make_sequence_features_run_tag(cfg: DictConfig) -> str:
+    """Encode the readable preset and exact feature routing in output paths."""
+    raw_config = cfg_get(cfg, "model.additional_sequence_features", {}) or {}
+    aliases = {
+        "openen": "open",
+        "tai_profile_codon": "tai",
+    }
+    grouped: dict[str, list[str]] = {
+        "biological": [],
+        "dataset_bias": [],
+        "both": [],
+    }
+
+    for raw_name, raw_spec in raw_config.items():
+        spec = dict(raw_spec or {})
+        route = str(spec.get("route", "none")).lower()
+        if route == "none":
+            continue
+        if route not in grouped:
+            raise ValueError(
+                f"Invalid additional-sequence-feature route {route!r} for "
+                f"{raw_name!r}."
+            )
+
+        name = aliases.get(str(raw_name).lower(), str(raw_name).lower())
+        token = format_run_tag_value(name)
+        missing_values = list(spec.get("missing_values", []) or [])
+        fill_value = float(spec.get("fill_value", 0.0))
+        if missing_values:
+            token += f"Fill{format_run_tag_value(fill_value)}"
+        scale = float(spec.get("scale", 1.0))
+        if not np.isclose(scale, 1.0):
+            token += f"s{format_run_tag_value(scale)}"
+        grouped[route].append(token)
+
+    preset = infer_sequence_features_preset(cfg)
+    if not any(grouped.values()):
+        return f"FeatPreset{preset}_SeqFeatBase"
+
+    labels = {
+        "biological": "Bio",
+        "dataset_bias": "Bias",
+        "both": "Both",
+    }
+    parts = []
+    for route in ("biological", "dataset_bias", "both"):
+        if grouped[route]:
+            parts.append(f"{labels[route]}-{'-'.join(sorted(grouped[route]))}")
+    return f"FeatPreset{preset}_SeqFeat" + "_".join(parts)
 
 
 def make_run_tag(cfg: DictConfig) -> str:
     parts = [
         "queueNB",
-        make_cagrad_run_tag(cfg),
         make_dataset_balance_run_tag(cfg),
         make_replica_objective_run_tag(cfg),
         make_pcc_run_tag(cfg),
@@ -375,13 +426,7 @@ def make_run_tag(cfg: DictConfig) -> str:
     if sampling_tag is not None:
         parts.append(sampling_tag)
 
-    gamma_transform_tag = make_gamma_transform_run_tag(cfg)
-    if gamma_transform_tag is not None:
-        parts.append(gamma_transform_tag)
-
-    gamma_support_tag = make_gamma_support_run_tag(cfg)
-    if gamma_support_tag is not None:
-        parts.append(gamma_support_tag)
+    parts.append(make_sequence_features_run_tag(cfg))
 
     return "_".join(parts)
 
@@ -875,107 +920,6 @@ def load_weights_only(
     """
     ckpt_path = Path(ckpt_path)
 
-    # Gamma's sparse/exponential transform is parameter-free and therefore is
-    # not represented by tensor weights. Recover it from the run-local config
-    # so old exponential checkpoints are not silently evaluated with new
-    # entmax semantics (and vice versa).
-    model = getattr(lit_model, "model", None)
-    if model is not None and hasattr(model, "set_gamma_transform"):
-        saved_config_path = None
-        try:
-            checkpoint_root = Path(lit_model.config.paths.checkpoints).resolve()
-            relative_parent = ckpt_path.resolve().parent.relative_to(checkpoint_root)
-            saved_config_path = (
-                Path(lit_model.config.paths.logs).resolve()
-                / relative_parent
-                / "config.yaml"
-            )
-        except (AttributeError, ValueError):
-            saved_config_path = None
-
-        if saved_config_path is not None and saved_config_path.exists():
-            saved_cfg = OmegaConf.load(saved_config_path)
-            saved_transform = str(
-                cfg_get(saved_cfg, "model.gamma_transform", "exponential")
-            )
-            saved_temperature = float(
-                cfg_get(saved_cfg, "model.gamma_entmax_temperature", 10.0)
-            )
-            # Fields absent from historical configs intentionally restore the
-            # legacy coupled-score/additive-ungated semantics.
-            saved_split_support = bool(
-                cfg_get(saved_cfg, "model.gamma_split_support_head", False)
-            )
-            saved_gate_additive = bool(
-                cfg_get(saved_cfg, "model.gamma_gate_additive_bias", False)
-            )
-            model.set_gamma_transform(
-                saved_transform,
-                entmax_temperature=saved_temperature,
-                split_support_head=saved_split_support,
-                gate_additive_bias=saved_gate_additive,
-            )
-            OmegaConf.update(
-                lit_model.config,
-                "model.gamma_transform",
-                model.gamma_transform,
-                merge=False,
-            )
-            OmegaConf.update(
-                lit_model.config,
-                "model.gamma_entmax_temperature",
-                model.gamma_entmax_temperature,
-                merge=False,
-            )
-            OmegaConf.update(
-                lit_model.config,
-                "model.gamma_split_support_head",
-                model.gamma_split_support_head,
-                merge=False,
-            )
-            OmegaConf.update(
-                lit_model.config,
-                "model.gamma_gate_additive_bias",
-                model.gamma_gate_additive_bias,
-                merge=False,
-            )
-            print(
-                "Restored gamma transform from checkpoint run config: "
-                f"{model.gamma_transform}; split_support="
-                f"{model.gamma_split_support_head}; gate_additive="
-                f"{model.gamma_gate_additive_bias}"
-            )
-            removed_separate_trunk = bool(
-                cfg_get(saved_cfg, "model.gamma_separate_support_trunk", False)
-            )
-            removed_lbio_response = bool(
-                cfg_get(saved_cfg, "model.gamma_lbio_response_enabled", False)
-            ) and (
-                float(
-                    cfg_get(
-                        saved_cfg,
-                        "model.gamma_lbio_amplitude_response_max_abs",
-                        0.0,
-                    )
-                )
-                > 0.0
-                or float(
-                    cfg_get(
-                        saved_cfg,
-                        "model.gamma_lbio_support_response_max_abs",
-                        0.0,
-                    )
-                )
-                > 0.0
-            )
-            if removed_separate_trunk or removed_lbio_response:
-                print(
-                    "Warning: this checkpoint used an experimental gamma "
-                    "structure removed from the cleaned model. Its extra "
-                    "weights will be ignored; use the historical code to "
-                    "reproduce that checkpoint exactly."
-                )
-
     ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
 
     state_dict = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
@@ -1030,10 +974,6 @@ def predictions_to_parquet(
         "rho_bio",
         "L_bio",
         "gamma",
-        "gamma_amplitude",
-        "gamma_sparse_gate",
-        "gamma_support_logits",
-        "gamma_support_logits_raw",
         "log_gamma",
         "gamma_raw",
         "log_gamma_raw",
@@ -1529,7 +1469,6 @@ def main(cfg: DictConfig) -> None:
     torch_model = RiboQueuingModel(
         model_configs=cfg.model,
         eps=float(cfg.model.get("eps", 1e-8)),
-        mu_max=float(cfg.model.get("mu_max", 1e8)),
     )
 
     lit_model = RiboQueuingModelLightningModule(

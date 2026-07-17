@@ -36,26 +36,70 @@ source "${VENV_PATH}/bin/activate"
 # config/config_riboai_queuing_multidataset.yaml. These environment variables
 # control only execution resources and reproducibility.
 SEED="${SEED:-42}"
-BATCH_SIZE="${BATCH_SIZE:-32}"
+BATCH_SIZE="${BATCH_SIZE:-256}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
+# Optional-sequence-feature ablation. Submit, for example:
+#   sbatch --export=ALL,FEATURE_PRESET=baseline run_all_datasets.slurm
+# Supported: baseline, biological, dataset_bias, both, exo_bio, gmp_bio,
+# tmp_bio, openen_bio, tai_bio, core_bio.
+FEATURE_PRESET="${FEATURE_PRESET:-both}"
+
+FEATURE_KEYS=(exo gmp tmp openen tAI_profile_codon fra)
+declare -A FEATURE_ROUTES
+for feature in "${FEATURE_KEYS[@]}"; do
+    FEATURE_ROUTES["${feature}"]="none"
+done
+
+case "${FEATURE_PRESET}" in
+    baseline)
+        ;;
+    biological|dataset_bias|both)
+        for feature in exo gmp tmp openen tAI_profile_codon; do
+            FEATURE_ROUTES["${feature}"]="${FEATURE_PRESET}"
+        done
+        ;;
+    exo_bio) FEATURE_ROUTES[exo]="biological" ;;
+    gmp_bio) FEATURE_ROUTES[gmp]="biological" ;;
+    tmp_bio) FEATURE_ROUTES[tmp]="biological" ;;
+    openen_bio) FEATURE_ROUTES[openen]="biological" ;;
+    tai_bio) FEATURE_ROUTES[tAI_profile_codon]="biological" ;;
+    core_bio)
+        FEATURE_ROUTES[openen]="biological"
+        FEATURE_ROUTES[tAI_profile_codon]="biological"
+        ;;
+    *)
+        echo "Unknown FEATURE_PRESET=${FEATURE_PRESET}" >&2
+        exit 2
+        ;;
+esac
+
+FEATURE_OVERRIDES=()
+for feature in "${FEATURE_KEYS[@]}"; do
+    FEATURE_OVERRIDES+=(
+        "model.additional_sequence_features.${feature}.route=${FEATURE_ROUTES[${feature}]}"
+    )
+done
 
 # Persistent outputs go to $WORK; transient caches and Hydra files go to
 # $SCRATCH. Avoid writing large files to the small home quota.
 SCRATCH_DIR="${SCRATCH:-${CINECA_SCRATCH:-/leonardo_scratch/large/userexternal/${USER}}}"
 WORK_DIR="${WORK:-/leonardo_work/${SLURM_JOB_ACCOUNT:-euhpc_d35_089}/${USER}}"
 
-RUN_TAG="riboai_all_final_seed${SEED}_${SLURM_JOB_ID:-local}"
+RUN_TAG="riboai_all_${FEATURE_PRESET}_seed${SEED}_${SLURM_JOB_ID:-local}"
 OUT_DIR="${WORK_DIR}/riboai_runs/${RUN_TAG}"
 CKPT_DIR="${OUT_DIR}/checkpoints"
 LOG_DIR="${OUT_DIR}/logs"
 RESULTS_DIR="${OUT_DIR}/results"
 
-export TMPDIR="${SCRATCH_DIR}/tmp/${RUN_TAG}"
+# Python multiprocessing creates an AF_UNIX socket below TMPDIR. Linux limits
+# that socket path to about 108 bytes, so keep this path deliberately short.
+export TMPDIR="/tmp/riboai_a_${SLURM_JOB_ID:-$$}"
 export XDG_CACHE_HOME="${SCRATCH_DIR}/.cache"
 export MPLCONFIGDIR="${SCRATCH_DIR}/.cache/matplotlib"
 export TORCH_HOME="${SCRATCH_DIR}/.cache/torch"
 export HF_HOME="${SCRATCH_DIR}/.cache/huggingface"
 export TRITON_CACHE_DIR="${SCRATCH_DIR}/.cache/triton"
+export HYDRA_FULL_ERROR=1
 HYDRA_RUN_DIR="${SCRATCH_DIR}/hydra/${RUN_TAG}"
 
 mkdir -p "${CKPT_DIR}" "${LOG_DIR}" "${RESULTS_DIR}" "${TMPDIR}" \
@@ -78,6 +122,7 @@ echo "Scratch  -> ${SCRATCH_DIR}"
 echo "Seed     -> ${SEED}"
 echo "Batch    -> ${BATCH_SIZE} per DDP rank"
 echo "Workers  -> ${NUM_WORKERS} per DDP rank"
+echo "Features -> ${FEATURE_PRESET}"
 echo "GPUs     -> ${CUDA_VISIBLE_DEVICES:-managed by Slurm}"
 
 srun --ntasks=2 python main_ribo_queueing_modeling_multi_dataset.py \
@@ -92,6 +137,7 @@ srun --ntasks=2 python main_ribo_queueing_modeling_multi_dataset.py \
     trainer.sync_dist_logs=true \
     data.batch_size="${BATCH_SIZE}" \
     data.num_workers="${NUM_WORKERS}" \
+    "${FEATURE_OVERRIDES[@]}" \
     paths.checkpoints="${CKPT_DIR}" \
     paths.logs="${LOG_DIR}" \
     paths.results="${RESULTS_DIR}" \

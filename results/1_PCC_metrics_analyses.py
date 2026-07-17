@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 from pathlib import Path
 from statistics import NormalDist
 from typing import Any
@@ -32,6 +33,28 @@ COMPONENT_COLUMNS = {
     "mu": "mu",
     "L_bio": "L_bio",
 }
+# Components compared in the configured all-vs-individual analysis, and their
+# axis labels. L_bio is the shared, dataset-blind biological signal: tracking its
+# per-dataset PCC under joint (all-dataset) vs single-dataset (individual)
+# training is the direct test for whether the shared branch loses information
+# ("collapses") when it has to serve every dataset at once.
+CONFIGURED_COMPONENTS = ("mu", "L_bio")
+COMPONENT_AXIS_LABELS = {
+    "mu": "μ",
+    "L_bio": "L_bio",
+}
+FEATURE_PRESET_ORDER = ("baseline", "biological", "dataset_bias", "both", "core_bio")
+FEATURE_PRESET_LABELS = {
+    "baseline": "baseline",
+    "biological": "biological",
+    "dataset_bias": "dataset bias",
+    "both": "both",
+    "core_bio": "core bio",
+}
+CONFIGURED_RUN_PATTERN = re.compile(
+    r"^riboai_(?P<training_mode>all|individual)_(?P<feature_preset>.+)"
+    r"_seed(?P<seed>[^_]+)_(?P<job_id>[^_]+)$"
+)
 PREDICTION_PATTERNS = (
     "predictions_*.parquet",
     "comprehensive_predictions_rank*.parquet",
@@ -291,6 +314,8 @@ def duplicate_audit_row(
         "ablation_dataset_balanced_loss": metadata["ablation_dataset_balanced_loss"],
         "ablation_replica_objective": metadata["ablation_replica_objective"],
         "ablation_pcc_variant": metadata["ablation_pcc_variant"],
+        "ablation_feature_preset": metadata["ablation_feature_preset"],
+        "ablation_feature_tag": metadata["ablation_feature_tag"],
         "split": metadata["split"],
         "source_splits": ",".join(sorted(source_counts)),
         "key_columns": ",".join(key_columns),
@@ -329,6 +354,8 @@ def duplicate_detail_rows(
     details.insert(0, "run", metadata["run"])
     details.insert(0, "experiment", metadata["experiment"])
     details.insert(2, "ablation_slug", metadata["ablation_slug"])
+    details.insert(2, "ablation_feature_preset", metadata["ablation_feature_preset"])
+    details.insert(2, "ablation_feature_tag", metadata["ablation_feature_tag"])
     details.insert(2, "split", metadata["split"])
     return details
 
@@ -542,6 +569,8 @@ def per_transcript_rank_rows(
                     "run": metadata["run"],
                     "ablation_slug": metadata["ablation_slug"],
                     "ablation_label": metadata["ablation_label"],
+                    "ablation_feature_preset": metadata["ablation_feature_preset"],
+                    "ablation_feature_tag": metadata["ablation_feature_tag"],
                     "run_type": run_type,
                     "split": metadata["split"],
                     "dataset_id": dataset_id,
@@ -626,7 +655,7 @@ def paired_rank_mix_vs_single(
         return pd.DataFrame()
 
     single = per_transcript_df[per_transcript_df["run_type"] == SINGLE_RUN_TYPE]
-    mix = per_transcript_df[per_transcript_df["experiment"] == MIX_EXPERIMENT]
+    mix = per_transcript_df[per_transcript_df["run_type"] == MIX_RUN_TYPE]
     if single.empty or mix.empty:
         return pd.DataFrame()
 
@@ -689,11 +718,17 @@ def keep_mix_vs_single_rows(metrics_df: pd.DataFrame) -> pd.DataFrame:
         experiment = str(row["experiment"])
         dataset = str(row["dataset"])
 
-        if experiment == MIX_EXPERIMENT:
-            run_type = MIX_RUN_TYPE
-        elif experiment == dataset:
-            run_type = SINGLE_RUN_TYPE
-        else:
+        run_type = run_type_for_experiment(
+            experiment=experiment,
+            dataset=dataset,
+            single_label=SINGLE_RUN_TYPE,
+            mix_label=MIX_RUN_TYPE,
+            other_label="other",
+        )
+
+        # Ignore malformed/unknown directory layouts instead of silently
+        # treating them as a multi-dataset result.
+        if run_type == "other":
             continue
 
         rows.append({**row.to_dict(), "run_type": run_type})
@@ -754,9 +789,9 @@ def ordered_datasets(sub: pd.DataFrame) -> list[str]:
 
 def comparison_title(component: str, run_types: list[str]) -> str:
     if set(run_types) == set(RUN_TYPE_ORDER):
-        descriptor = f"{SINGLE_RUN_TYPE} vs {MIX_EXPERIMENT}"
+        descriptor = f"{SINGLE_RUN_TYPE} vs multi-dataset mix"
     elif run_types == [MIX_RUN_TYPE]:
-        descriptor = MIX_EXPERIMENT
+        descriptor = "multi-dataset mix"
     else:
         descriptor = SINGLE_RUN_TYPE
     return f"PCC({component}, target): {descriptor}"
@@ -772,6 +807,7 @@ def ablation_short_label(row: pd.Series) -> str:
         "raw+var",
     )
     return (
+        f"Features {row.get('ablation_feature_preset', 'unknown')}, "
         f"CG {row.get('ablation_cagrad', 'unknown')}, "
         f"DB {row.get('ablation_dataset_balanced_loss', 'unknown')}, "
         f"{replica}, PCC {pcc}"
@@ -789,6 +825,8 @@ def mix_ablation_table(sub: pd.DataFrame) -> pd.DataFrame:
         "ablation_dataset_balanced_loss",
         "ablation_replica_objective",
         "ablation_pcc_variant",
+        "ablation_feature_preset",
+        "ablation_feature_tag",
     ]
     return (
         mix_rows[cols]
@@ -898,7 +936,7 @@ def plot_component_comparison(
     ax.set_xlabel("Fisher-Z aggregated per-transcript PCC")
     ax.set_title(
         f"{comparison_title(component, runs)}\n"
-        f"All {n_ablations} mix ablation(s) in {MIX_EXPERIMENT}"
+        f"All {n_ablations} multi-dataset feature ablation(s)"
     )
     ax.grid(axis="x", linestyle="--", alpha=0.35)
     ax.legend(
@@ -985,7 +1023,7 @@ def plot_component_comparison_with_pillow(
 
     title = (
         f"{comparison_title(component, runs)} - "
-        f"all {n_ablations} mix ablation(s) in {MIX_EXPERIMENT}"
+        f"all {n_ablations} multi-dataset feature ablation(s)"
     )
     draw.text((left, 18), title, fill="black", font=title_font)
 
@@ -1063,7 +1101,9 @@ def plot_component_comparison_with_pillow(
         outline="#BBBBBB",
         width=1,
     )
-    legend_items = [("single dataset", "#333333", "square")]
+    legend_items = []
+    if SINGLE_RUN_TYPE in runs:
+        legend_items.append(("single dataset", "#333333", "square"))
     legend_items.extend(
         (
             ablation_short_label(row),
@@ -1086,6 +1126,336 @@ def plot_component_comparison_with_pillow(
     return out_path
 
 
+def discover_configured_training_runs(results_root: Path) -> list[dict[str, Any]]:
+    """Find result bundles created by the Slurm all/individual launchers."""
+    runs: list[dict[str, Any]] = []
+    if not results_root.is_dir():
+        return runs
+
+    for run_root in sorted(results_root.iterdir()):
+        if not run_root.is_dir():
+            continue
+        match = CONFIGURED_RUN_PATTERN.match(run_root.name)
+        result_dir = run_root / "results"
+        if match is None or not result_dir.is_dir():
+            continue
+        prediction_files = discover_prediction_files(result_dir)
+        if not prediction_files:
+            print(f"[WARN] Skipping {run_root.name}: no prediction files found.")
+            continue
+        runs.append(
+            {
+                **match.groupdict(),
+                "run_id": run_root.name,
+                "root": run_root,
+                "base_path": result_dir,
+                "prediction_files": prediction_files,
+            }
+        )
+    return runs
+
+
+def configured_run_metrics(
+    runs: list[dict[str, Any]],
+    *,
+    id_to_dataset: dict[int, str],
+) -> pd.DataFrame:
+    """Compute main-validation μ/L_bio PCC rows for each configured run."""
+    rows: list[dict[str, Any]] = []
+    for run in runs:
+        run_rows: list[dict[str, Any]] = []
+        for path in run["prediction_files"]:
+            metadata = prediction_metadata(path, run["base_path"])
+            # The requested comparison is against the main validation ground
+            # truth. CSS benchmark files are intentionally kept out of it.
+            if metadata["split"] != "main_val":
+                continue
+            try:
+                df = pd.read_parquet(path)
+                add_metrics_rows(
+                    run_rows,
+                    df=df,
+                    metadata=metadata,
+                    id_to_dataset=id_to_dataset,
+                )
+            except Exception as exc:
+                print(f"[WARN] Failed to process {path}: {exc}")
+
+        feature_preset = str(run["feature_preset"]).lower()
+        for row in run_rows:
+            row.update(
+                {
+                    "run_id": run["run_id"],
+                    "training_mode": run["training_mode"],
+                    "feature_preset": feature_preset,
+                    "seed": run["seed"],
+                    "job_id": run["job_id"],
+                }
+            )
+        rows.extend(run_rows)
+
+        if not run_rows:
+            print(f"[WARN] No main-validation predictions found in {run['run_id']}.")
+
+    return pd.DataFrame(rows)
+
+
+def configured_summary(metrics_df: pd.DataFrame, *, component: str = "mu") -> pd.DataFrame:
+    """Average duplicate jobs while retaining one dataset-level row per setting.
+
+    ``component`` selects which resolved profile ("mu" or "L_bio") to summarize;
+    the default keeps the original mu-only behavior for any existing caller.
+    """
+    if metrics_df.empty:
+        return metrics_df
+    subset = metrics_df[
+        (metrics_df["split"] == "main_val")
+        & (metrics_df["component"] == component)
+        & (metrics_df["n_transcripts"].fillna(0).astype(int) > 0)
+    ].copy()
+    if subset.empty:
+        return subset
+
+    group_cols = ["training_mode", "feature_preset", "dataset"]
+    summary = (
+        subset.groupby(group_cols, as_index=False)
+        .agg(
+            pcc=("pcc", "mean"),
+            ci_lower=("ci_lower", "mean"),
+            ci_upper=("ci_upper", "mean"),
+            n_transcripts=("n_transcripts", "sum"),
+            n_runs=("run_id", "nunique"),
+        )
+    )
+    return summary
+
+
+def _configured_dataset_order(summary: pd.DataFrame) -> list[str]:
+    ordering = (
+        summary.groupby("dataset")["pcc"]
+        .mean()
+        .sort_values(ascending=True)
+    )
+    return ordering.index.astype(str).tolist()
+
+
+def plot_component_all_vs_individual(
+    summary: pd.DataFrame,
+    *,
+    component: str,
+    feature_preset: str,
+    out_dir: Path,
+) -> Path | None:
+    """Plot per-dataset PCC of one component for the joint vs single-dataset run.
+
+    With ``component="L_bio"`` this is the collapse check: the orange (all-dataset)
+    bar dropping below the blue (individual) bar for a dataset means the shared
+    biological signal fits that dataset worse once it must serve every dataset.
+    """
+    axis_label = COMPONENT_AXIS_LABELS.get(component, component)
+    if plt is None:
+        print(f"[WARN] Matplotlib is unavailable; skipping {axis_label} PCC bar plots.")
+        return None
+
+    subset = summary[summary["feature_preset"] == feature_preset]
+    if subset.empty:
+        return None
+    datasets = _configured_dataset_order(subset)
+    x = np.arange(len(datasets), dtype=float)
+    width = 0.36
+    fig, ax = plt.subplots(figsize=(max(14.0, 0.52 * len(datasets)), 8.0))
+    colors = {"all": "#F58518", "individual": "#4C78A8"}
+    labels = {"all": "all datasets", "individual": "individual dataset"}
+    offsets = {"all": width / 2.0, "individual": -width / 2.0}
+    available_modes = set(subset["training_mode"])
+
+    for mode in ("all", "individual"):
+        mode_df = subset[subset["training_mode"] == mode].set_index("dataset")
+        aligned = mode_df.reindex(datasets)
+        values = aligned["pcc"].to_numpy(dtype=float)
+        ci_lower = aligned["ci_lower"].to_numpy(dtype=float)
+        ci_upper = aligned["ci_upper"].to_numpy(dtype=float)
+        valid = np.isfinite(values)
+        if not valid.any():
+            continue
+        has_ci = valid & np.isfinite(ci_lower) & np.isfinite(ci_upper)
+        lower_error = np.maximum(values - ci_lower, 0.0)
+        upper_error = np.maximum(ci_upper - values, 0.0)
+        yerr = np.vstack(
+            (
+                np.where(has_ci[valid], lower_error[valid], 0.0),
+                np.where(has_ci[valid], upper_error[valid], 0.0),
+            )
+        )
+        ax.bar(
+            x[valid] + offsets[mode],
+            values[valid],
+            width=width,
+            color=colors[mode],
+            label=labels[mode],
+            yerr=yerr,
+            error_kw={"elinewidth": 0.9, "capsize": 2.0, "ecolor": "#333333"},
+        )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(datasets, rotation=75, ha="right", fontsize=8)
+    ax.set_ylabel(f"PCC({axis_label}, target)")
+    ax.set_ylim(0.0, 1.0)
+    if available_modes == {"all", "individual"}:
+        comparison_label = "all-dataset vs individual models"
+    elif available_modes == {"all"}:
+        comparison_label = "all-dataset models (individual results unavailable)"
+    else:
+        comparison_label = "individual models (all-dataset results unavailable)"
+    ax.set_title(
+        f"{axis_label} PCC by dataset: {comparison_label} "
+        f"({FEATURE_PRESET_LABELS.get(feature_preset, feature_preset)})"
+    )
+    ax.axvline(0.0, color="#555555", linewidth=0.8)
+    ax.grid(axis="y", linestyle="--", alpha=0.35)
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{component}_pcc_all_vs_individual_{feature_preset}.png"
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+    return out_path
+
+
+def plot_component_feature_ablation(
+    summary: pd.DataFrame,
+    *,
+    component: str,
+    training_mode: str,
+    out_dir: Path,
+) -> Path | None:
+    """Plot the feature-preset ablation for every dataset, for one component."""
+    if plt is None:
+        return None
+    axis_label = COMPONENT_AXIS_LABELS.get(component, component)
+    subset = summary[summary["training_mode"] == training_mode]
+    presets = [preset for preset in FEATURE_PRESET_ORDER if preset in set(subset["feature_preset"])]
+    if subset.empty or not presets:
+        return None
+
+    datasets = _configured_dataset_order(subset)
+    x = np.arange(len(datasets), dtype=float)
+    width = min(0.75 / len(presets), 0.22)
+    fig, ax = plt.subplots(figsize=(max(14.0, 0.52 * len(datasets)), 8.0))
+    palette = ("#4C78A8", "#F58518", "#54A24B", "#E45756", "#B279A2")
+    for idx, preset in enumerate(presets):
+        preset_df = subset[subset["feature_preset"] == preset].set_index("dataset")
+        aligned = preset_df.reindex(datasets)
+        values = aligned["pcc"].to_numpy(dtype=float)
+        ci_lower = aligned["ci_lower"].to_numpy(dtype=float)
+        ci_upper = aligned["ci_upper"].to_numpy(dtype=float)
+        valid = np.isfinite(values)
+        if not valid.any():
+            continue
+        has_ci = valid & np.isfinite(ci_lower) & np.isfinite(ci_upper)
+        lower_error = np.maximum(values - ci_lower, 0.0)
+        upper_error = np.maximum(ci_upper - values, 0.0)
+        yerr = np.vstack(
+            (
+                np.where(has_ci[valid], lower_error[valid], 0.0),
+                np.where(has_ci[valid], upper_error[valid], 0.0),
+            )
+        )
+        offset = (idx - (len(presets) - 1) / 2.0) * width
+        ax.bar(
+            x[valid] + offset,
+            values[valid],
+            width=width,
+            color=palette[idx % len(palette)],
+            label=FEATURE_PRESET_LABELS.get(preset, preset),
+            yerr=yerr,
+            error_kw={"elinewidth": 0.9, "capsize": 2.0, "ecolor": "#333333"},
+        )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(datasets, rotation=75, ha="right", fontsize=8)
+    ax.set_ylabel(f"PCC({axis_label}, target)")
+    ax.set_ylim(0.0, 1.0)
+    mode_label = "all-dataset" if training_mode == "all" else "individual-dataset"
+    ax.set_title(f"{axis_label} PCC feature ablation by dataset ({mode_label} models)")
+    ax.axvline(0.0, color="#555555", linewidth=0.8)
+    ax.grid(axis="y", linestyle="--", alpha=0.35)
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{component}_pcc_feature_ablation_{training_mode}.png"
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+    return out_path
+
+
+def analyze_configured_training_runs(
+    *,
+    results_root: Path,
+    dataset_encoding_path: Path,
+) -> None:
+    """Analyze the Slurm result bundles and write per-component PCC comparisons.
+
+    Both the observation mean ``mu`` and the shared biological signal ``L_bio``
+    are compared for joint (all-dataset) vs single-dataset (individual) training
+    across every feature-preset ablation. Each component gets its own folder
+    (``<component>_pcc_plots``) and summary CSV, so the L_bio plots make an
+    eventual collapse of the shared branch under joint training directly visible.
+    """
+    runs = discover_configured_training_runs(results_root)
+    if not runs:
+        return
+    id_to_dataset = load_dataset_encoding(dataset_encoding_path)
+    metrics_df = configured_run_metrics(runs, id_to_dataset=id_to_dataset)
+    if metrics_df.empty:
+        raise RuntimeError("Configured runs were found, but no main-validation metrics were computed.")
+
+    availability = pd.DataFrame(
+        [
+            {
+                "run_id": run["run_id"],
+                "training_mode": run["training_mode"],
+                "feature_preset": run["feature_preset"],
+                "seed": run["seed"],
+                "job_id": run["job_id"],
+                "prediction_file_count": len(run["prediction_files"]),
+            }
+            for run in runs
+        ]
+    )
+    availability.to_csv(results_root / "mu_pcc_run_availability.csv", index=False)
+
+    print(f"Configured runs: {len(runs)}")
+    for component in CONFIGURED_COMPONENTS:
+        summary = configured_summary(metrics_df, component=component)
+        if summary.empty:
+            print(f"[WARN] No {component} main-validation rows; skipping {component} plots.")
+            continue
+        output_csv = results_root / f"{component}_pcc_all_vs_individual_metrics.csv"
+        summary.to_csv(output_csv, index=False)
+        plot_dir = results_root / f"{component}_pcc_plots"
+        plot_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Saved {component}-PCC summary: {output_csv}")
+        for preset in FEATURE_PRESET_ORDER:
+            out_path = plot_component_all_vs_individual(
+                summary,
+                component=component,
+                feature_preset=preset,
+                out_dir=plot_dir,
+            )
+            if out_path is not None:
+                print(f"Saved plot: {out_path}")
+        for mode in ("all", "individual"):
+            out_path = plot_component_feature_ablation(
+                summary,
+                component=component,
+                training_mode=mode,
+                out_dir=plot_dir,
+            )
+            if out_path is not None:
+                print(f"Saved plot: {out_path}")
+
+
 def resolve_base_path() -> Path:
     script_path = Path(__file__).resolve()
     repo_root = script_path.parents[1]
@@ -1104,6 +1474,15 @@ def resolve_base_path() -> Path:
 def main() -> None:
     script_path = Path(__file__).resolve()
     repo_root = script_path.parents[1]
+    results_root = repo_root / "results"
+    configured_runs = discover_configured_training_runs(results_root)
+    if configured_runs:
+        analyze_configured_training_runs(
+            results_root=results_root,
+            dataset_encoding_path=repo_root / "Datasets" / "encodings" / "dataset_encoding.yaml",
+        )
+        return
+
     base_path = resolve_base_path()
     dataset_encoding_path = repo_root / "Datasets" / "encodings" / "dataset_encoding.yaml"
 
@@ -1187,7 +1566,17 @@ def main() -> None:
 
     metrics_df = keep_mix_vs_single_rows(pd.DataFrame(rows))
     if metrics_df.empty:
-        raise RuntimeError("No single-dataset vs mix metrics were computed.")
+        raise RuntimeError(
+            "No recognized single-dataset or multi-dataset mix metrics were "
+            "computed. Check the result-directory layout and prediction files."
+        )
+
+    available_run_types = present_run_types(metrics_df)
+    if available_run_types == [MIX_RUN_TYPE]:
+        print(
+            "\n[INFO] No single-dataset training results found; continuing with "
+            "multi-dataset mix ablation analysis only."
+        )
 
     out_csv = base_path / "pcc_metrics_mu_rho_single_vs_mix.csv"
     metrics_df.to_csv(out_csv, index=False)
@@ -1229,7 +1618,7 @@ def main() -> None:
             "n_transcripts",
         ]
     ]
-    print("\n=== Single-dataset vs mix PCCs ===")
+    print(f"\n=== {comparison_title('mu', available_run_types)} ===")
     print(visible.to_string(index=False))
 
     per_transcript_df = pd.DataFrame(per_transcript_rows)

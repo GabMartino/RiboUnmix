@@ -104,8 +104,6 @@ class DatasetBiasSubmodel(nn.Module):
         self.additional_sequence_feature_dim = int(
             config_params.get("additional_sequence_feature_dim", 0)
         )
-
-
         self.dataset_embedding = nn.Embedding(
             self.num_datasets,
             self.dataset_embeddings_size,
@@ -136,27 +134,10 @@ class DatasetBiasSubmodel(nn.Module):
             + self.context_dim
             + self.position_dim
         )
-        self.additive_bias_input_mode = str(
-            config_params.get("additive_bias_input_mode", "full")
-        ).lower()
-        allowed_additive_input_modes = {
-            "full",
-            "dataset_only",
-            "dataset_and_position",
-        }
-        if self.additive_bias_input_mode == "dataset_only":
-            additive_input_size = self.dataset_embeddings_size
-        elif self.additive_bias_input_mode == "dataset_and_position":
-            additive_input_size = self.dataset_embeddings_size + self.position_dim
-        else:
-            additive_input_size = None
-
-
         self.observation_bias_head = DatasetMultiplicativeAllocationBiasHead(
             config_params=config_params.get(
             "dataset_multiplicative_allocation_bias_submodule_params"),
             input_size=head_input_size,
-            additive_input_size=additive_input_size,
         )
 
         log_sigma_cfg = dict(config_params["dataset_log_sigma_submodule_params"])
@@ -219,19 +200,10 @@ class DatasetBiasSubmodel(nn.Module):
 
         x = torch.cat(features, dim=-1)
         x = x * mask_f.unsqueeze(-1)
-        if self.additive_bias_input_mode == "dataset_only":
-            additive_x = dataset_emb
-        elif self.additive_bias_input_mode == "dataset_and_position":
-            additive_x = torch.cat((dataset_emb, position_features), dim=-1)
-        else:
-            additive_x = None
-        if additive_x is not None:
-            additive_x = additive_x * mask_f.unsqueeze(-1)
 
         out = self.observation_bias_head(
             x=x,
             mask=mask_b,
-            additive_x=additive_x,
         )
 
         log_sigma_out = self.log_sigma_head(
