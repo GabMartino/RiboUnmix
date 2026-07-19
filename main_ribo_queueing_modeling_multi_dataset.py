@@ -266,6 +266,7 @@ def make_dataset_selection_run_tag(cfg: DictConfig) -> str:
     strategy_aliases = {
         "configured": "Configured",
         "top_quality": "TopQuality",
+        "rank_stratified": "RankStratified",
         "all": "All",
     }
     strategy = strategy_aliases.get(
