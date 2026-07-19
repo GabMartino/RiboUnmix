@@ -92,7 +92,7 @@ class RiboQueuingModel(nn.Module):
         self.dataset_bias_model = DatasetBiasSubmodel(config_params=dataset_bias_params)
 
     # ============================================================
-    # Equal-dataset gamma centering
+    # Cross-dataset gamma centering
     # ============================================================
 
     def _configure_gamma_centering(self, model_configs: dict) -> None:
@@ -102,9 +102,22 @@ class RiboQueuingModel(nn.Module):
         if scope not in {"batch_grouped", "disabled"}:
             raise ValueError("gamma_centering.scope must be 'batch_grouped' or 'disabled'.")
 
+        weighting = str(cfg.get("weighting", "equal")).lower()
+        if weighting not in {"equal", "quality_rank"}:
+            raise ValueError(
+                "gamma_centering.weighting must be 'equal' or 'quality_rank'."
+            )
+        quality_rank_power = float(cfg.get("quality_rank_power", 1.0))
+        if not math.isfinite(quality_rank_power) or quality_rank_power < 0.0:
+            raise ValueError(
+                "gamma_centering.quality_rank_power must be finite and nonnegative."
+            )
+
         self.gamma_cross_dataset_centering_enabled = bool(
             cfg.get("enabled", False)
         ) and scope != "disabled"
+        self.gamma_centering_weighting = weighting
+        self.gamma_centering_quality_rank_power = quality_rank_power
 
     @staticmethod
     def _normalize_sample_ids(
@@ -130,13 +143,14 @@ class RiboQueuingModel(nn.Module):
         mask_b: torch.Tensor,
         sample_ids: Sequence[str] | torch.Tensor | None,
         id_datasets: torch.Tensor,
+        dataset_quality_weights: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Exactly center log-gamma across distinct datasets.
 
         For every transcript-position cell, duplicate observations are first
-        averaged within dataset. Those dataset means then receive equal raw
-        weight one. Positions represented by fewer than two datasets are left
-        unchanged.
+        averaged within dataset. Dataset means then receive either equal raw
+        weight one or a configured positive dataset-quality weight. Positions
+        represented by fewer than two datasets are left unchanged.
         """
         B, T = log_gamma_raw.shape
         dtype = log_gamma_raw.dtype
@@ -147,6 +161,32 @@ class RiboQueuingModel(nn.Module):
         false = torch.zeros_like(mask_b)
         dataset_ids = id_datasets.reshape(-1).to(device=device, dtype=torch.long)
         sample_id_list = self._normalize_sample_ids(sample_ids, B)
+        if (
+            self.gamma_cross_dataset_centering_enabled
+            and self.gamma_centering_weighting == "quality_rank"
+        ):
+            if dataset_quality_weights is None:
+                raise ValueError(
+                    "gamma_centering.weighting='quality_rank' requires "
+                    "dataset_quality_weights in the batch."
+                )
+            raw_dataset_weights = dataset_quality_weights.reshape(-1).to(
+                device=device, dtype=dtype
+            )
+            if raw_dataset_weights.numel() != B:
+                raise ValueError(
+                    f"Expected {B} dataset quality weights, got "
+                    f"{raw_dataset_weights.numel()}."
+                )
+            if not torch.isfinite(raw_dataset_weights).all() or torch.any(
+                raw_dataset_weights <= 0.0
+            ):
+                raise ValueError("Dataset quality weights must be finite and positive.")
+            raw_dataset_weights = raw_dataset_weights.pow(
+                self.gamma_centering_quality_rank_power
+            )
+        else:
+            raw_dataset_weights = torch.ones(B, device=device, dtype=dtype)
         if sample_id_list is None:
             candidate = false
         else:
@@ -206,8 +246,19 @@ class RiboQueuingModel(nn.Module):
         cell_active = count_cell > 0
         active_f = cell_active.to(dtype=dtype)
         num_distinct_group = _scatter_sum(active_f, cell_group, num_groups)
-        sum_means_group = _scatter_sum(mean_cell * active_f, cell_group, num_groups)
-        center_group = sum_means_group / num_distinct_group.clamp_min(1.0)
+        # Average duplicate samples within each dataset before weighting the
+        # distinct dataset means. Replicas therefore never multiply a
+        # dataset's influence on the centering gauge.
+        raw_weight_samples = candidate_f * raw_dataset_weights.reshape(-1, 1)
+        raw_weight_cell = _scatter_sum(
+            raw_weight_samples, cell_index, num_cells
+        ) / count_cell.clamp_min(1.0)
+        raw_weight_cell = raw_weight_cell * active_f
+        total_weight_group = _scatter_sum(raw_weight_cell, cell_group, num_groups)
+        weighted_sum_group = _scatter_sum(
+            mean_cell * raw_weight_cell, cell_group, num_groups
+        )
+        center_group = weighted_sum_group / total_weight_group.clamp_min(self.eps)
         # A cross-dataset constraint is defined exactly when at least two
         # distinct datasets contribute at this transcript position.
         apply_group = num_distinct_group >= 2.0
@@ -219,9 +270,9 @@ class RiboQueuingModel(nn.Module):
         num_distinct = torch.where(
             applied, num_distinct_group.index_select(0, group_index), zeros
         )
-        dataset_weight_cell = active_f / num_distinct_group.index_select(
+        dataset_weight_cell = raw_weight_cell / total_weight_group.index_select(
             0, cell_group
-        ).clamp_min(1.0)
+        ).clamp_min(self.eps)
         sample_weights = dataset_weight_cell.index_select(
             0, cell_index
         ) / count_cell.index_select(0, cell_index).clamp_min(1.0)
@@ -241,7 +292,11 @@ class RiboQueuingModel(nn.Module):
             "weights": sample_weights * mask_f,
             "applied": applied & mask_b,
             "num_distinct_datasets": num_distinct * mask_f,
-            "total_weight": num_distinct * mask_f,
+            "total_weight": torch.where(
+                applied,
+                total_weight_group.index_select(0, group_index),
+                zeros,
+            ) * mask_f,
             "constraint_error": constraint_error * mask_f,
             "eligible": candidate,
         }
@@ -315,6 +370,7 @@ class RiboQueuingModel(nn.Module):
         target: torch.Tensor,
         sample_ids: Sequence[str] | torch.Tensor | None = None,
         dataset_bias_sequence_features: torch.Tensor | None = None,
+        dataset_quality_weights: torch.Tensor | None = None,
     ):
         # --------------------------------------------------------
         # 1. Biological branch -> queue load
@@ -369,9 +425,9 @@ class RiboQueuingModel(nn.Module):
             mask_b=mask_b,
             sample_ids=sample_ids,
             id_datasets=id_datasets,
+            dataset_quality_weights=dataset_quality_weights,
         )
         gamma_eligible = centered["eligible"]
-        gamma_uniform_weight = gamma_eligible.to(dtype=dtype)
         log_gamma = centered["log_gamma"]
         gamma_cross_dataset_log_center = centered["gamma_center"]
         gamma_cross_dataset_center_group_size = centered[
@@ -463,8 +519,13 @@ class RiboQueuingModel(nn.Module):
             "gamma_cross_dataset_center_applied": gamma_cross_dataset_center_applied,
             "gamma_centering_reliability": torch.where(
                 mask_b,
-                gamma_uniform_weight,
-                torch.zeros_like(gamma_uniform_weight),
+                centered["weights"],
+                torch.zeros_like(centered["weights"]),
+            ),
+            "gamma_centering_weight": torch.where(
+                mask_b,
+                centered["weights"],
+                torch.zeros_like(centered["weights"]),
             ),
             "gamma_centering_eligible": gamma_eligible & mask_b,
             "gamma_centering_applied": centered["applied"] & mask_b,

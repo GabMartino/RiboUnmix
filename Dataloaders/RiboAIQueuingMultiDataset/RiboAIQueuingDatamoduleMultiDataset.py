@@ -29,6 +29,49 @@ def open_file(path: str):
         return yaml.safe_load(f)
 
 
+def load_dataset_quality_ranking(
+    path: str,
+    *,
+    dataset_column: str = "dataset",
+    rank_column: str = "quality_rank",
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Load dataset ranks and convert them to strictly positive quality weights.
+
+    Rank 1 is best.  With ``R`` equal to the largest rank in the complete table,
+    the deterministic conversion is ``quality_weight = (R - rank + 1) / R``.
+    Consequently the best dataset has weight 1 and even the lowest-ranked
+    dataset retains a positive weight.  The model may optionally raise these
+    weights to a configurable power during gamma centering.
+    """
+    ranking = pd.read_csv(path, sep="\t")
+    missing_columns = {dataset_column, rank_column} - set(ranking.columns)
+    if missing_columns:
+        raise KeyError(
+            f"Dataset-quality table {path!r} is missing columns "
+            f"{sorted(missing_columns)}."
+        )
+
+    names = ranking[dataset_column].astype(str)
+    if names.duplicated().any():
+        duplicates = sorted(names[names.duplicated(keep=False)].unique().tolist())
+        raise ValueError(
+            f"Dataset-quality table {path!r} contains duplicate datasets: "
+            f"{duplicates}."
+        )
+
+    ranks = pd.to_numeric(ranking[rank_column], errors="coerce").to_numpy(dtype=float)
+    if not np.isfinite(ranks).all() or np.any(ranks <= 0.0):
+        raise ValueError(
+            f"Column {rank_column!r} in {path!r} must contain finite positive ranks."
+        )
+    max_rank = float(ranks.max())
+    quality = (max_rank - ranks + 1.0) / max_rank
+
+    rank_by_dataset = dict(zip(names, ranks.astype(float)))
+    quality_by_dataset = dict(zip(names, quality.astype(float)))
+    return rank_by_dataset, quality_by_dataset
+
+
 # ============================================================
 # Utilities
 # ============================================================
@@ -836,6 +879,10 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         use_ribo_replicas: bool = False,
         ribo_replicas_column: str = "ribo_cds_replicas",
         additional_sequence_features: Optional[dict] = None,
+        dataset_quality_ranking_path: Optional[str] = None,
+        dataset_quality_dataset_column: str = "dataset",
+        dataset_quality_rank_column: str = "quality_rank",
+        dataset_quality_strict: bool = True,
     ):
         super().__init__()
         self.save_hyperparameters(
@@ -869,6 +916,10 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         self.use_ribo_replicas = bool(use_ribo_replicas)
         self.ribo_replicas_column = str(ribo_replicas_column)
         self.additional_sequence_features = dict(additional_sequence_features or {})
+        self.dataset_quality_ranking_path = dataset_quality_ranking_path
+        self.dataset_quality_dataset_column = str(dataset_quality_dataset_column)
+        self.dataset_quality_rank_column = str(dataset_quality_rank_column)
+        self.dataset_quality_strict = bool(dataset_quality_strict)
 
         self.nt_enc = open_file(nt_encoding_path)
         self.c2aa_enc = open_file(codon_to_aa_encoding_path)
@@ -1100,6 +1151,35 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         else:
             print("No transcript weight column found; using unit sample weights.")
 
+        dataset_quality_ranks = {name: float("nan") for name in loaded_datasets}
+        dataset_quality_weights = {name: 1.0 for name in loaded_datasets}
+        if self.dataset_quality_ranking_path:
+            rank_lookup, quality_lookup = load_dataset_quality_ranking(
+                self.dataset_quality_ranking_path,
+                dataset_column=self.dataset_quality_dataset_column,
+                rank_column=self.dataset_quality_rank_column,
+            )
+            missing_rankings = sorted(set(loaded_datasets) - set(rank_lookup))
+            if missing_rankings and self.dataset_quality_strict:
+                raise KeyError(
+                    "The dataset-quality ranking is missing active datasets: "
+                    f"{missing_rankings}."
+                )
+            for name in loaded_datasets:
+                if name in rank_lookup:
+                    dataset_quality_ranks[name] = rank_lookup[name]
+                    dataset_quality_weights[name] = quality_lookup[name]
+            print(
+                "Loaded dataset-quality metadata for "
+                f"{len(loaded_datasets) - len(missing_rankings)}/{len(loaded_datasets)} "
+                f"active datasets from {self.dataset_quality_ranking_path}."
+            )
+            if missing_rankings:
+                print(
+                    "Missing rankings use neutral quality weight 1.0 because "
+                    f"data.dataset_quality_ranking.strict=false: {missing_rankings}"
+                )
+
         valid_index = seq_df.index.intersection(union_index, sort=False)
         if len(valid_index) == 0:
             raise RuntimeError(
@@ -1129,6 +1209,8 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             "ribo_profiles": defaultdict(dict),
             "ribo_replicas": defaultdict(dict),
             "sample_weights": defaultdict(dict),
+            "dataset_quality_ranks": dataset_quality_ranks,
+            "dataset_quality_weights": dataset_quality_weights,
             "lengths": lengths,
             "datasets_names": list(loaded_datasets.keys()),
             "sequence_features": {

@@ -43,6 +43,8 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             ribo_profile[T],
             css,
             sample_weight,
+            dataset_quality_rank,
+            dataset_quality_weight,
             dataset_bias_features[T, F_bias],  # when F_bias > 0
             ribo_replicas[R, T],  # only when use_ribo_replicas=True
         )
@@ -58,6 +60,8 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             codon_ids_pad,         # [B, T_max]
             css_sorted,            # list
             sample_weights_sorted, # [B]
+            dataset_quality_ranks,  # [B], rank 1 is best
+            dataset_quality_weights,# [B], positive rank-derived weight
             bias_features_pad,     # [B, T_max, F_bias], optional
             replica_pad,           # [B, R_max, T_max], optional
             replica_mask,          # [B, R_max], optional
@@ -344,6 +348,9 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         )
         css = self.data_records["css"][global_idx]
         sample_weight = self._get_sample_weight(transcript_id, dataset_name)
+        dataset_quality_rank, dataset_quality_weight = self._get_dataset_quality(
+            dataset_name
+        )
 
         if len(ribo) != encoded.shape[0]:
             raise ValueError(
@@ -374,6 +381,8 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             ribo,
             css,
             sample_weight,
+            dataset_quality_rank,
+            dataset_quality_weight,
         )
         if self.dataset_bias_extra_dim > 0:
             sample = (*sample, dataset_bias_features)
@@ -827,6 +836,20 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         self._sample_weight_cache[key] = value
         return value
 
+    def _get_dataset_quality(self, dataset_name: str) -> tuple[float, float]:
+        """Return batch metadata independent of transcript/sample weights."""
+        name = str(dataset_name)
+        rank = float(self.data_records.get("dataset_quality_ranks", {}).get(name, np.nan))
+        weight = float(
+            self.data_records.get("dataset_quality_weights", {}).get(name, 1.0)
+        )
+        if not np.isfinite(weight) or weight <= 0.0:
+            raise ValueError(
+                f"Dataset quality weight for {name!r} must be finite and positive, "
+                f"got {weight}."
+            )
+        return rank, weight
+
     def _extract_features_and_codon_ids(
         self,
         nucleotide_sequence_per_codon,
@@ -934,7 +957,7 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
 
     def collate_fn(self, batch):
         has_bias_features = self.dataset_bias_extra_dim > 0
-        has_replicas = len(batch[0]) == 8 + int(has_bias_features)
+        has_replicas = len(batch[0]) == 10 + int(has_bias_features)
         (
             idx_datasets,
             ids,
@@ -943,6 +966,8 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             profiles,
             css_s,
             sample_weights,
+            dataset_quality_ranks,
+            dataset_quality_weights,
             *optional_values,
         ) = zip(*batch)
         bias_features = optional_values[0] if has_bias_features else None
@@ -997,6 +1022,14 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         css_sorted = [css_s[i] for i in order_list]
         sample_weights_sorted = torch.as_tensor(
             [sample_weights[i] for i in order_list],
+            dtype=torch.float32,
+        )
+        dataset_quality_ranks_sorted = torch.as_tensor(
+            [dataset_quality_ranks[i] for i in order_list],
+            dtype=torch.float32,
+        )
+        dataset_quality_weights_sorted = torch.as_tensor(
+            [dataset_quality_weights[i] for i in order_list],
             dtype=torch.float32,
         )
 
@@ -1099,6 +1132,8 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             codon_ids_pad,
             css_sorted,
             sample_weights_sorted,
+            dataset_quality_ranks_sorted,
+            dataset_quality_weights_sorted,
         )
         if bias_features_pad is not None:
             collated = (*collated, bias_features_pad)

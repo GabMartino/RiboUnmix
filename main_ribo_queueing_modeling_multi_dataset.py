@@ -254,6 +254,33 @@ def make_dataset_balance_run_tag(cfg: DictConfig) -> str:
     return "DBLossOff"
 
 
+def make_dataset_selection_run_tag(cfg: DictConfig) -> str:
+    """Identify the actual dataset subset in every run artifact path."""
+    datasets = sorted(normalize_dataset_list(cfg_get(cfg, "experiment.dataset", [])))
+    if not datasets:
+        return "DataN0"
+
+    strategy_raw = str(
+        cfg_get(cfg, "experiment.dataset_subset_strategy", "configured")
+    ).strip().lower()
+    strategy_aliases = {
+        "configured": "Configured",
+        "top_quality": "TopQuality",
+        "all": "All",
+    }
+    strategy = strategy_aliases.get(
+        strategy_raw,
+        format_run_tag_value(strategy_raw or "configured"),
+    )
+
+    if len(datasets) == 1:
+        dataset_token = format_run_tag_value(datasets[0])
+        return f"Data{strategy}_N1_{dataset_token}"
+
+    subset_hash = hashlib.md5("\n".join(datasets).encode()).hexdigest()[:6]
+    return f"Data{strategy}_N{len(datasets)}_h{subset_hash}"
+
+
 def make_replica_objective_run_tag(cfg: DictConfig) -> str:
     objective = str(cfg_get(cfg, "loss.replica_objective", "replica")).lower()
 
@@ -277,6 +304,23 @@ def make_sampling_run_tag(cfg: DictConfig) -> str | None:
     if sampling in {"", "default", "None", "none"}:
         return None
     return f"Sampling_{format_run_tag_value(sampling)}"
+
+
+def make_gamma_centering_run_tag(cfg: DictConfig) -> str:
+    if not cfg_bool(cfg, "model.gamma_centering.enabled", False):
+        return "GammaCtrOff"
+    scope = str(cfg_get(cfg, "model.gamma_centering.scope", "batch_grouped")).lower()
+    if scope == "disabled":
+        return "GammaCtrOff"
+    weighting = str(
+        cfg_get(cfg, "model.gamma_centering.weighting", "equal")
+    ).lower()
+    if weighting == "quality_rank":
+        power = format_run_tag_value(
+            cfg_get(cfg, "model.gamma_centering.quality_rank_power", 1.0)
+        )
+        return f"GammaCtrQRankP{power}"
+    return "GammaCtrEqual"
 
 
 def make_pcc_run_tag(cfg: DictConfig) -> str:
@@ -417,6 +461,7 @@ def make_sequence_features_run_tag(cfg: DictConfig) -> str:
 def make_run_tag(cfg: DictConfig) -> str:
     parts = [
         "queueNB",
+        make_dataset_selection_run_tag(cfg),
         make_dataset_balance_run_tag(cfg),
         make_replica_objective_run_tag(cfg),
         make_pcc_run_tag(cfg),
@@ -426,6 +471,7 @@ def make_run_tag(cfg: DictConfig) -> str:
     if sampling_tag is not None:
         parts.append(sampling_tag)
 
+    parts.append(make_gamma_centering_run_tag(cfg))
     parts.append(make_sequence_features_run_tag(cfg))
 
     return "_".join(parts)
@@ -1262,6 +1308,18 @@ def make_datamodule(
             cfg_get(cfg, "data.ribo_replicas_column", "ribo_cds_replicas")
         ),
         additional_sequence_features=feature_cfg,
+        dataset_quality_ranking_path=cfg_get(
+            cfg, "data.dataset_quality_ranking.path", None
+        ),
+        dataset_quality_dataset_column=str(
+            cfg_get(cfg, "data.dataset_quality_ranking.dataset_column", "dataset")
+        ),
+        dataset_quality_rank_column=str(
+            cfg_get(cfg, "data.dataset_quality_ranking.rank_column", "quality_rank")
+        ),
+        dataset_quality_strict=cfg_bool(
+            cfg, "data.dataset_quality_ranking.strict", True
+        ),
     )
 
 

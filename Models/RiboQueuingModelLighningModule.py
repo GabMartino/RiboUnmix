@@ -1096,69 +1096,56 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
     # ============================================================
 
     def _forward_batch(self, batch) -> dict[str, Any]:
-        dataset_bias_sequence_features = None
-        if len(batch) == 12:
-            (
-                dataset_ids,
-                ids,
-                seq_packed,
-                target,
-                lengths,
-                mask,
-                codon_ids,
-                css,
-                sample_weights,
-                dataset_bias_sequence_features,
-                replica_profiles,
-                replica_mask,
-            ) = batch
-        elif len(batch) == 11:
-            (
-                dataset_ids,
-                ids,
-                seq_packed,
-                target,
-                lengths,
-                mask,
-                codon_ids,
-                css,
-                sample_weights,
-                replica_profiles,
-                replica_mask,
-            ) = batch
-        elif len(batch) == 10:
-            (
-                dataset_ids,
-                ids,
-                seq_packed,
-                target,
-                lengths,
-                mask,
-                codon_ids,
-                css,
-                sample_weights,
-                dataset_bias_sequence_features,
-            ) = batch
-            replica_profiles = None
-            replica_mask = None
-        elif len(batch) == 9:
-            (
-                dataset_ids,
-                ids,
-                seq_packed,
-                target,
-                lengths,
-                mask,
-                codon_ids,
-                css,
-                sample_weights,
-            ) = batch
-            replica_profiles = None
-            replica_mask = None
+        if len(batch) < 9:
+            raise ValueError(f"Expected at least 9 batch fields, got {len(batch)}.")
+        (
+            dataset_ids,
+            ids,
+            seq_packed,
+            target,
+            lengths,
+            mask,
+            codon_ids,
+            css,
+            sample_weights,
+        ) = batch[:9]
+
+        # New batches always carry the raw dataset rank and its positive
+        # rank-derived quality weight. Keep the shape check so old collated
+        # batches remain readable when inspecting historical artifacts.
+        has_quality_metadata = (
+            len(batch) >= 11
+            and torch.is_tensor(batch[9])
+            and torch.is_tensor(batch[10])
+            and batch[9].ndim == 1
+            and batch[10].ndim == 1
+        )
+        if has_quality_metadata:
+            dataset_quality_ranks = batch[9]
+            dataset_quality_weights = batch[10]
+            optional_values = batch[11:]
         else:
+            dataset_quality_ranks = torch.full_like(
+                sample_weights, float("nan"), dtype=torch.float32
+            )
+            dataset_quality_weights = torch.ones_like(
+                sample_weights, dtype=torch.float32
+            )
+            optional_values = batch[9:]
+
+        dataset_bias_sequence_features = None
+        replica_profiles = None
+        replica_mask = None
+        if len(optional_values) == 1:
+            dataset_bias_sequence_features = optional_values[0]
+        elif len(optional_values) == 2:
+            replica_profiles, replica_mask = optional_values
+        elif len(optional_values) == 3:
+            dataset_bias_sequence_features, replica_profiles, replica_mask = optional_values
+        elif len(optional_values) != 0:
             raise ValueError(
-                "Expected a 9/10-tuple batch, or an 11/12-tuple replica batch, "
-                f"got {len(batch)}."
+                "Expected optional bias features and/or replica tensors after "
+                f"batch metadata, got {len(optional_values)} fields."
             )
 
         mu, log_sigma, extras = self.model(
@@ -1169,6 +1156,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             target=target,
             sample_ids=ids,
             dataset_bias_sequence_features=dataset_bias_sequence_features,
+            dataset_quality_weights=dataset_quality_weights,
         )
 
         out = {
@@ -1181,6 +1169,8 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "dataset_bias_sequence_features": dataset_bias_sequence_features,
             "css": css,
             "sample_weights": sample_weights,
+            "dataset_quality_ranks": dataset_quality_ranks,
+            "dataset_quality_weights": dataset_quality_weights,
             "mu": mu,
             "log_sigma": log_sigma,
             "extras": extras,
@@ -1944,6 +1934,22 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             pos_mean((log_gamma_diag - mean_log_gamma_per_sample.reshape(-1, 1)).pow(2))
         )
         library_depth = (target * mask_f).sum(dim=1)
+        # These are global profile-level metrics, deliberately independent of
+        # `dataset_balanced_loss`: one answers the usual unweighted validation
+        # question, the other evaluates the reliability-weighted population.
+        # The weighted value is diagnostic only and never changes gradients.
+        mu_pcc_unweighted = self._aggregate_per_sample(
+            raw_mu_pcc_per_sample,
+            dataset_ids,
+            sample_weights=None,
+            dataset_balanced=False,
+        )
+        mu_pcc_weighted = self._aggregate_per_sample(
+            raw_mu_pcc_per_sample,
+            dataset_ids,
+            sample_weights=sample_weights,
+            dataset_balanced=False,
+        )
 
         metrics: dict[str, torch.Tensor] = {
             "loss": loss,
@@ -2000,7 +2006,10 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "pcc_alpha_mean": pcc_diag["alpha_mean"],
             "pcc_alpha_min": pcc_diag["alpha_min"],
             "pcc_alpha_max": pcc_diag["alpha_max"],
-            "mu_pcc": self._aggregate_per_sample(raw_mu_pcc_per_sample, dataset_ids, sample_weights),
+            # The legacy name remains an unweighted compatibility alias.
+            "mu_pcc": mu_pcc_unweighted,
+            "mu_pcc_unweighted": mu_pcc_unweighted,
+            "mu_pcc_weighted": mu_pcc_weighted,
             "mu_pcc_per_sample": raw_mu_pcc_per_sample,
             "L_bio_pcc": self._aggregate_per_sample(
                 L_bio_pcc_per_sample,
@@ -2128,9 +2137,10 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         name = self.dataset_id_to_name.get(int(dataset_id), str(int(dataset_id)))
         return name.replace("/", "_").replace(" ", "_")
 
-    # Scalar metrics logged every stage. `loss` and `mu_pcc` are logged
-    # explicitly (prog_bar) in _log_stage, so they are intentionally omitted
-    # here to avoid logging the same key twice with different arguments.
+    # Scalar metrics logged every stage. `loss` and the explicit weighted /
+    # unweighted mu-PCC metrics are logged in _log_stage, so they are
+    # intentionally omitted here to avoid logging the same key twice with
+    # different arguments.
     SCALAR_METRICS = (
         "nll",
         "pcc_loss",
@@ -2178,13 +2188,49 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             batch_size=batch_size,
             sync_dist=sync_dist,
         )
+        # `*_mu_pcc` is retained as the unweighted compatibility alias used
+        # by checkpoint monitoring.  `*_mu_pcc_weighted` is reduced across
+        # batches using sum(sample_weight), making it the exact weighted mean
+        # over the epoch rather than a mean of batch-level weighted means.
         self.log(
             f"{stage}_mu_pcc",
-            metrics["mu_pcc"],
+            metrics["mu_pcc_unweighted"],
             on_step=False,
             on_epoch=True,
             prog_bar=True,
             batch_size=batch_size,
+            sync_dist=sync_dist,
+        )
+        self.log(
+            f"{stage}_mu_pcc_unweighted",
+            metrics["mu_pcc_unweighted"],
+            on_step=False,
+            on_epoch=True,
+            prog_bar=False,
+            batch_size=batch_size,
+            sync_dist=sync_dist,
+        )
+        sample_weights = out.get("sample_weights")
+        if sample_weights is None:
+            weighted_batch_size = metrics["mu_pcc_weighted"].new_tensor(float(batch_size))
+        else:
+            weighted_batch_size = (
+                sample_weights.detach()
+                .to(
+                    device=metrics["mu_pcc_weighted"].device,
+                    dtype=metrics["mu_pcc_weighted"].dtype,
+                )
+                .clamp_min(0.0)
+                .sum()
+                .clamp_min(self.eps)
+            )
+        self.log(
+            f"{stage}_mu_pcc_weighted",
+            metrics["mu_pcc_weighted"],
+            on_step=False,
+            on_epoch=True,
+            prog_bar=False,
+            batch_size=weighted_batch_size,
             sync_dist=sync_dist,
         )
 
@@ -2238,8 +2284,17 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "pcc_raw_loss": metrics["pcc_raw_loss_per_sample"],
             "pcc_nb_vst_loss": metrics["pcc_nb_vst_loss_per_sample"],
             "mu_pcc": metrics["mu_pcc_per_sample"],
+            "mu_pcc_unweighted": metrics["mu_pcc_per_sample"],
             "L_bio_pcc": metrics["L_bio_pcc_per_sample"],
         }
+        sample_weights = out.get("sample_weights")
+        if sample_weights is None:
+            sample_weights = torch.ones_like(metrics["mu_pcc_per_sample"])
+        else:
+            sample_weights = sample_weights.detach().to(
+                device=metrics["mu_pcc_per_sample"].device,
+                dtype=metrics["mu_pcc_per_sample"].dtype,
+            ).clamp_min(0.0)
 
         extras = out["extras"]
         gamma = extras.get("gamma", torch.ones_like(extras["L_bio"])).float()
@@ -2262,6 +2317,21 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                     batch_size=dataset_sample_count,
                     sync_dist=sync_dist,
                 )
+
+            dataset_weights = sample_weights[sample_mask]
+            weighted_pcc = (metrics["mu_pcc_per_sample"][sample_mask] * dataset_weights).sum()
+            weighted_pcc = weighted_pcc / dataset_weights.sum().clamp_min(self.eps)
+            self.log(
+                f"{stage}_mu_pcc_weighted/{dataset_name}",
+                weighted_pcc,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                # Weight this epoch reduction by the sum of transcript
+                # weights, so it is exact across mixed batches.
+                batch_size=dataset_weights.sum().clamp_min(self.eps),
+                sync_dist=sync_dist,
+            )
 
             position_mask = sample_mask.reshape(-1, 1) & out["mask"].bool()
             if bool(position_mask.any()):
@@ -2535,6 +2605,8 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "codon_ids": out["codon_ids"],
             "css": out["css"],
             "sample_weight": out["sample_weights"],
+            "dataset_quality_rank": out["dataset_quality_ranks"],
+            "dataset_quality_weight": out["dataset_quality_weights"],
             # Target / prediction
             "target": out["target"],
             "mu": out["mu"],
