@@ -150,6 +150,8 @@ class DatasetBiasSubmodel(nn.Module):
         codon_ids: torch.Tensor,
         position_features: torch.Tensor,
         sequence_features: torch.Tensor | None = None,
+        compute_log_sigma: bool = True,
+        embedding_center_ids: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         B, T = codon_ids.shape
 
@@ -161,7 +163,21 @@ class DatasetBiasSubmodel(nn.Module):
 
         dataset_ids = dataset_ids.to(device=device, dtype=torch.long)
         dataset_weight = self.dataset_embedding.weight
-        dataset_weight = dataset_weight - dataset_weight.mean(dim=0, keepdim=True)
+        if embedding_center_ids is None:
+            embedding_center = dataset_weight.mean(dim=0, keepdim=True)
+        else:
+            embedding_center_ids = embedding_center_ids.to(
+                device=dataset_weight.device,
+                dtype=torch.long,
+            ).reshape(-1)
+            if embedding_center_ids.numel() == 0:
+                raise ValueError("embedding_center_ids cannot be empty when provided.")
+            if torch.unique(embedding_center_ids).numel() != embedding_center_ids.numel():
+                raise ValueError("embedding_center_ids must contain distinct IDs.")
+            embedding_center = dataset_weight.index_select(
+                0, embedding_center_ids
+            ).mean(dim=0, keepdim=True)
+        dataset_weight = dataset_weight - embedding_center
         dataset_emb = F.embedding(dataset_ids, dataset_weight).to(dtype=dtype)
         dataset_emb = dataset_emb.unsqueeze(1).expand(B, T, -1)
 
@@ -206,17 +222,18 @@ class DatasetBiasSubmodel(nn.Module):
             mask=mask_b,
         )
 
-        log_sigma_out = self.log_sigma_head(
-            x=x,
-            mask=mask_b,
-        )
-        log_sigma = log_sigma_out["log_sigma"]  # [B, T]
-        log_sigma = torch.where(mask_b, log_sigma, torch.zeros_like(log_sigma))
-        out["log_sigma"] = log_sigma
-        log_sigma_t = (log_sigma * mask_f).sum(dim=1, keepdim=True) / mask_f.sum(
-            dim=1,
-            keepdim=True,
-        ).clamp_min(1.0)
-        out["log_sigma_t"] = log_sigma_t  # [B, 1] — masked mean log_sigma
+        if compute_log_sigma:
+            log_sigma_out = self.log_sigma_head(
+                x=x,
+                mask=mask_b,
+            )
+            log_sigma = log_sigma_out["log_sigma"]  # [B, T]
+            log_sigma = torch.where(mask_b, log_sigma, torch.zeros_like(log_sigma))
+            out["log_sigma"] = log_sigma
+            log_sigma_t = (log_sigma * mask_f).sum(dim=1, keepdim=True) / mask_f.sum(
+                dim=1,
+                keepdim=True,
+            ).clamp_min(1.0)
+            out["log_sigma_t"] = log_sigma_t  # [B, 1] — masked mean log_sigma
 
         return out

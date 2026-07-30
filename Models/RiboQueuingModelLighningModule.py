@@ -181,6 +181,7 @@ class ResidualDiagnosticsAccumulator:
         low_count_threshold: float = 1.0,
         tail_thresholds: tuple[float, ...] = (2.0, 3.0, 5.0),
         topk_fractions: tuple[float, ...] = (0.01, 0.05, 0.10),
+        quantile_max_values: int = 1_000_000,
     ) -> None:
         self.dataset_id_to_name = dict(dataset_id_to_name)
         self.eps = float(eps)
@@ -189,6 +190,7 @@ class ResidualDiagnosticsAccumulator:
         self.low_count_threshold = float(low_count_threshold)
         self.tail_thresholds = tuple(float(x) for x in tail_thresholds)
         self.topk_fractions = tuple(float(x) for x in topk_fractions)
+        self.quantile_max_values = max(1, int(quantile_max_values))
         self.reset()
 
     def reset(self) -> None:
@@ -199,11 +201,52 @@ class ResidualDiagnosticsAccumulator:
     def _dataset_name(self, dataset_id: int) -> str:
         return self.dataset_id_to_name.get(int(dataset_id), str(int(dataset_id)))
 
-    @staticmethod
-    def _safe_quantile(x: torch.Tensor, q: float) -> torch.Tensor:
+    def _quantile_values(self, x: torch.Tensor) -> torch.Tensor:
+        """Return a bounded, deterministic view used only for diagnostics.
+
+        ``torch.quantile`` rejects tensors above an internal element-count
+        limit. Large validation sets can cross that limit when all positions
+        from many datasets are concatenated. Sampling evenly across the
+        flattened tensor keeps the diagnostic reproducible and prevents both
+        that failure and an unnecessarily expensive full-data sort.
+
+        This does not affect losses, model outputs, or gradients: residual
+        diagnostics are accumulated under ``torch.no_grad()`` on CPU.
+        """
+        values = x.detach().float().reshape(-1)
+        if values.numel() <= self.quantile_max_values:
+            return values
+
+        # Midpoints of equally sized intervals cover the complete validation
+        # tensor without allocating a full randperm of a potentially huge N.
+        sample_positions = torch.arange(
+            self.quantile_max_values,
+            device=values.device,
+            dtype=torch.float64,
+        )
+        indices = torch.floor(
+            (sample_positions + 0.5)
+            * (float(values.numel()) / float(self.quantile_max_values))
+        ).to(dtype=torch.long)
+        return values.index_select(0, indices.clamp_max(values.numel() - 1))
+
+    def _safe_quantiles(
+        self,
+        x: torch.Tensor,
+        q: float | list[float] | tuple[float, ...] | torch.Tensor,
+    ) -> torch.Tensor:
         if x.numel() == 0:
-            return torch.tensor(0.0)
-        return torch.quantile(x.float(), float(q))
+            if torch.is_tensor(q) and q.ndim > 0:
+                return torch.zeros_like(q, dtype=torch.float32)
+            if isinstance(q, (list, tuple)):
+                return torch.zeros(len(q), dtype=torch.float32)
+            return x.new_tensor(0.0, dtype=torch.float32)
+        values = self._quantile_values(x)
+        q_tensor = torch.as_tensor(q, dtype=torch.float32, device=values.device)
+        return torch.quantile(values, q_tensor)
+
+    def _safe_quantile(self, x: torch.Tensor, q: float) -> torch.Tensor:
+        return self._safe_quantiles(x, float(q))
 
     @staticmethod
     def _mean_or_zero(x: torch.Tensor) -> torch.Tensor:
@@ -476,7 +519,7 @@ class ResidualDiagnosticsAccumulator:
         log_res = data["log_residual"].float()
         nb = data["nb_std"].float()
         quantiles = [0.0, 0.10, 0.25, 0.50, 0.75, 0.90, 0.99, 1.0]
-        edges = torch.quantile(mu, torch.tensor(quantiles))
+        edges = self._safe_quantiles(mu, quantiles)
         names = ["q0_q10", "q10_q25", "q25_q50", "q50_q75", "q75_q90", "q90_q99", "q99_q100"]
         for i, name in enumerate(names):
             if i == 0:
@@ -531,7 +574,7 @@ class ResidualDiagnosticsAccumulator:
         if values.numel() == 0:
             return out
         quantiles = [0.0, 0.10, 0.25, 0.50, 0.75, 0.90, 0.99, 1.0]
-        edges = torch.quantile(values, torch.tensor(quantiles))
+        edges = self._safe_quantiles(values, quantiles)
         names = ["q0_q10", "q10_q25", "q25_q50", "q50_q75", "q75_q90", "q90_q99", "q99_q100"]
         for i, name in enumerate(names):
             if i == 0:
@@ -1043,6 +1086,9 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             topk_fractions=tuple(
                 float(x)
                 for x in residual_cfg_get("topk_fractions", [0.01, 0.05, 0.10])
+            ),
+            quantile_max_values=int(
+                residual_cfg_get("quantile_max_values", 1_000_000)
             ),
         )
 
@@ -2080,6 +2126,14 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "gamma_centering_constraint_error": global_pos_mean(
                 gamma_constraint_error_diag
             ),
+            "gamma_reference_dataset_count": extras.get(
+                "gamma_reference_dataset_count",
+                torch.zeros_like(extras["scale_dt"]),
+            ).float().mean(),
+            "gamma_all_requested_in_reference": extras.get(
+                "gamma_all_requested_in_reference",
+                torch.zeros_like(extras["scale_dt"], dtype=torch.bool),
+            ).float().mean(),
             "gamma_mean_log_per_sample": mean_log_gamma_per_sample.mean(),
             "gamma_std_log_per_sample": std_log_gamma_per_sample.mean(),
             "gamma_correlation_with_scale": finite_corr_or_zero(
@@ -2653,11 +2707,65 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 "gamma_total_reliability",
                 torch.zeros_like(extras["L_bio"]),
             ),
+            "gamma_centering_constraint_error": extras.get(
+                "gamma_centering_constraint_error",
+                torch.zeros_like(extras["L_bio"]),
+            ),
+            "gamma_centering_mode": extras.get(
+                "gamma_centering_mode",
+                "disabled",
+            ),
+            "gamma_reference_dataset_count": extras.get(
+                "gamma_reference_dataset_count",
+                torch.zeros(
+                    out["mu"].shape[0],
+                    device=out["mu"].device,
+                    dtype=out["mu"].dtype,
+                ),
+            ),
+            "gamma_reference_dataset_ids": [
+                extras.get(
+                    "gamma_reference_dataset_ids",
+                    torch.empty(0, dtype=torch.long),
+                )
+                .detach()
+                .cpu()
+                .tolist()
+                for _ in range(out["mu"].shape[0])
+            ],
+            "gamma_reference_manifest_hash": extras.get(
+                "gamma_reference_manifest_hash",
+                "",
+            ),
+            "gamma_reference_weighting": extras.get(
+                "gamma_reference_weighting",
+                "equal",
+            ),
+            "gamma_reference_quality_rank_power": extras.get(
+                "gamma_reference_quality_rank_power",
+                0.0,
+            ),
+            "gamma_reference_chunk_size": extras.get(
+                "gamma_reference_chunk_size",
+                0,
+            ),
+            "gamma_all_requested_in_reference": extras.get(
+                "gamma_all_requested_in_reference",
+                torch.zeros(
+                    out["mu"].shape[0],
+                    device=out["mu"].device,
+                    dtype=torch.bool,
+                ),
+            ),
             "additive_bias": extras.get(
                 "additive_bias",
                 torch.zeros_like(extras["L_bio"]),
             ),
             "scale_dt": extras["scale_dt"],
+            "normalized_shape": extras.get(
+                "normalized_shape",
+                out["mu"] / extras["scale_dt"].reshape(-1, 1).clamp_min(self.eps),
+            ),
             # Dispersion
             "log_sigma": out["log_sigma"],
         }

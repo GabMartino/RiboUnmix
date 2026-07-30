@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import hashlib
+import json
 import math
 
 import torch
@@ -12,9 +14,9 @@ from Models.RiboQueuingModel.QueuingBiologicalModel import QueuingBiologicalMode
 
 class RiboQueuingModel(nn.Module):
     """
-    Minimal interpretable queue-load shape model with a gated-additive mean:
+    Minimal interpretable queue-load shape model with a multiplicative mean:
 
-        mu[d,t,i] = S[d,t] * (gamma[d,t,i] * L_bio[t,i] + a[d,t,i])
+        mu[d,t,i] = S[d,t] * normalize_i(gamma[d,t,i] * L_bio[t,i])
 
     where
         S[d,t]     = mean over valid positions of the ground-truth target
@@ -25,26 +27,38 @@ class RiboQueuingModel(nn.Module):
                      load.
         gamma      = exp(centered_log_score), so it is strictly positive on
                      valid positions and neutral scores give 1,
-        a          = nonnegative additive background, regularized toward 0.
-
-    Gamma-score centering is a multiplicative reference/gauge constraint only. It
-    does not identify the additive branch; additive-bias regularization remains
-    a separate objective term.
+    Gamma-score centering is a multiplicative reference/gauge constraint only.
     """
 
     def __init__(
         self,
         model_configs: dict,
         eps: float = 1.0e-8,
+        selected_dataset_names: Sequence[str] | None = None,
+        selected_dataset_ids: Sequence[int] | None = None,
+        selected_dataset_quality_weights: Sequence[float] | None = None,
+        reference_dataset_names: Sequence[str] | None = None,
+        reference_dataset_ids: Sequence[int] | None = None,
+        reference_dataset_quality_weights: Sequence[float] | None = None,
     ):
         super().__init__()
 
         self.eps = float(eps)
+        self.selected_dataset_names = tuple(str(x) for x in (selected_dataset_names or ()))
+        self.selected_dataset_ids = tuple(int(x) for x in (selected_dataset_ids or ()))
+        self.selected_dataset_quality_weights = tuple(
+            float(x) for x in (selected_dataset_quality_weights or ())
+        )
 
         # Scale gauge is always the mean gauge S = mean_valid(target).
         self.init_gamma = float(model_configs.get("init_gamma", 1.0))
         self.gamma_log_init = math.log(self.init_gamma)
-        self._configure_gamma_centering(model_configs)
+        self._configure_gamma_centering(
+            model_configs,
+            reference_dataset_names=reference_dataset_names,
+            reference_dataset_ids=reference_dataset_ids,
+            reference_dataset_quality_weights=reference_dataset_quality_weights,
+        )
 
         # Mass conservation: renormalize the shape (gamma*L_bio + a) to mean 1
         # over valid positions before applying S, so mean_valid(mu) = S exactly
@@ -95,29 +109,261 @@ class RiboQueuingModel(nn.Module):
     # Cross-dataset gamma centering
     # ============================================================
 
-    def _configure_gamma_centering(self, model_configs: dict) -> None:
+    def _configure_gamma_centering(
+        self,
+        model_configs: dict,
+        *,
+        reference_dataset_names: Sequence[str] | None,
+        reference_dataset_ids: Sequence[int] | None,
+        reference_dataset_quality_weights: Sequence[float] | None,
+    ) -> None:
         cfg = dict(model_configs.get("gamma_centering", {}))
-        scope = str(cfg.get("scope", "batch_grouped")).lower()
+        # `scope` is the historical spelling. If `mode` is absent, resolving
+        # from scope preserves old configurations and old checkpoint behavior.
+        configured_mode = str(cfg.get("mode", cfg.get("scope", "batch_grouped"))).lower()
+        mode_aliases = {
+            "legacy_batch_grouped": "batch_grouped",
+            "batch_grouped": "batch_grouped",
+            "fixed_reference": "fixed_reference",
+            "disabled": "disabled",
+        }
+        if configured_mode not in mode_aliases:
+            raise ValueError(
+                "gamma_centering.mode/scope must be one of "
+                "'fixed_reference', 'batch_grouped', 'legacy_batch_grouped', "
+                "or 'disabled'."
+            )
+        mode = mode_aliases[configured_mode]
+        if not bool(cfg.get("enabled", False)):
+            mode = "disabled"
 
-        if scope not in {"batch_grouped", "disabled"}:
-            raise ValueError("gamma_centering.scope must be 'batch_grouped' or 'disabled'.")
-
-        weighting = str(cfg.get("weighting", "equal")).lower()
+        reference_cfg = dict(cfg.get("reference", {}) or {})
+        weighting = str(
+            reference_cfg.get("weighting", cfg.get("weighting", "equal"))
+        ).lower()
         if weighting not in {"equal", "quality_rank"}:
             raise ValueError(
-                "gamma_centering.weighting must be 'equal' or 'quality_rank'."
+                "gamma_centering weighting must be 'equal' or 'quality_rank'."
             )
-        quality_rank_power = float(cfg.get("quality_rank_power", 1.0))
+        quality_rank_power = float(
+            reference_cfg.get(
+                "quality_rank_power",
+                cfg.get("quality_rank_power", 1.0),
+            )
+        )
         if not math.isfinite(quality_rank_power) or quality_rank_power < 0.0:
             raise ValueError(
                 "gamma_centering.quality_rank_power must be finite and nonnegative."
             )
 
-        self.gamma_cross_dataset_centering_enabled = bool(
-            cfg.get("enabled", False)
-        ) and scope != "disabled"
+        chunk_size = int(reference_cfg.get("chunk_size", 32))
+        minimum_datasets = int(reference_cfg.get("minimum_datasets", 2))
+        if chunk_size <= 0:
+            raise ValueError("gamma_centering.reference.chunk_size must be positive.")
+        if minimum_datasets < 1:
+            raise ValueError(
+                "gamma_centering.reference.minimum_datasets must be at least one."
+            )
+
+        names = tuple(str(x) for x in (reference_dataset_names or ()))
+        ids = tuple(int(x) for x in (reference_dataset_ids or ()))
+        quality = tuple(float(x) for x in (reference_dataset_quality_weights or ()))
+        if len(self.selected_dataset_names) != len(self.selected_dataset_ids):
+            raise ValueError(
+                "Selected experiment dataset names and IDs must have equal length."
+            )
+        if len(set(self.selected_dataset_ids)) != len(self.selected_dataset_ids):
+            raise ValueError("Duplicate selected experiment dataset IDs are not allowed.")
+        if len(names) != len(ids):
+            raise ValueError(
+                "Resolved gamma reference dataset names and IDs must have equal length."
+            )
+        if len(set(ids)) != len(ids):
+            raise ValueError("Duplicate gamma reference dataset IDs are not allowed.")
+        if len(set(names)) != len(names):
+            raise ValueError("Duplicate gamma reference dataset names are not allowed.")
+        if mode == "fixed_reference" and not self.selected_dataset_ids:
+            raise ValueError(
+                "fixed_reference gamma centering requires selected experiment IDs."
+            )
+        inactive_ids = sorted(set(ids) - set(self.selected_dataset_ids))
+        if inactive_ids:
+            raise ValueError(
+                "Gamma reference IDs must be selected in the current experiment; "
+                f"inactive IDs: {inactive_ids}."
+            )
+        if quality and len(quality) != len(ids):
+            raise ValueError(
+                "Resolved gamma reference quality weights must match the reference IDs."
+            )
+        if any((not math.isfinite(x)) or x <= 0.0 for x in quality):
+            raise ValueError(
+                "Resolved gamma reference quality weights must be finite and positive."
+            )
+        if mode == "fixed_reference" and not ids:
+            raise ValueError(
+                "fixed_reference gamma centering requires a resolved reference panel."
+            )
+
+        if weighting == "quality_rank" and quality:
+            final_weights = torch.as_tensor(quality, dtype=torch.float64).pow(
+                quality_rank_power
+            )
+        else:
+            # p=0 is exactly equal weighting, including in quality-rank mode.
+            final_weights = torch.ones(len(ids), dtype=torch.float64)
+
+        manifest = {
+            "dataset_names": list(names),
+            "dataset_ids": list(ids),
+            "weights": [float(x) for x in final_weights.tolist()],
+            "weighting": weighting,
+            "quality_rank_power": quality_rank_power,
+        }
+        manifest_hash = hashlib.sha256(
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+        self.gamma_centering_mode = mode
+        self.gamma_cross_dataset_centering_enabled = mode != "disabled"
         self.gamma_centering_weighting = weighting
         self.gamma_centering_quality_rank_power = quality_rank_power
+        self.gamma_reference_chunk_size = chunk_size
+        self.gamma_reference_minimum_datasets = minimum_datasets
+        self.gamma_reference_dataset_names = names
+        self.gamma_reference_manifest_hash = manifest_hash
+        self.gamma_reference_source = str(
+            reference_cfg.get("source", "selected_experiment_datasets")
+        )
+        self.gamma_legacy_checkpoint_policy = str(
+            reference_cfg.get("legacy_checkpoint_policy", "preserve_legacy")
+        )
+        self.register_buffer(
+            "gamma_reference_dataset_ids",
+            torch.as_tensor(ids, dtype=torch.long),
+            persistent=True,
+        )
+        self.register_buffer(
+            "gamma_selected_dataset_ids",
+            torch.as_tensor(self.selected_dataset_ids, dtype=torch.long),
+            persistent=True,
+        )
+        self.register_buffer(
+            "gamma_reference_weights",
+            final_weights.to(dtype=torch.float32),
+            persistent=True,
+        )
+
+    def set_gamma_centering_mode(self, mode: str) -> None:
+        aliases = {
+            "legacy_batch_grouped": "batch_grouped",
+            "batch_grouped": "batch_grouped",
+            "fixed_reference": "fixed_reference",
+            "disabled": "disabled",
+        }
+        key = str(mode).lower()
+        if key not in aliases:
+            raise ValueError(f"Unknown gamma-centering mode: {mode!r}.")
+        resolved = aliases[key]
+        if resolved == "fixed_reference" and self.gamma_reference_dataset_ids.numel() == 0:
+            raise ValueError("Cannot enable fixed_reference without a reference panel.")
+        self.gamma_centering_mode = resolved
+        self.gamma_cross_dataset_centering_enabled = resolved != "disabled"
+
+    def get_extra_state(self) -> dict:
+        return {
+            "version": 1,
+            "gamma_centering_mode": self.gamma_centering_mode,
+            "gamma_reference_dataset_names": list(self.gamma_reference_dataset_names),
+            "gamma_reference_manifest_hash": self.gamma_reference_manifest_hash,
+            "gamma_reference_source": self.gamma_reference_source,
+            "gamma_centering_weighting": self.gamma_centering_weighting,
+            "gamma_centering_quality_rank_power": self.gamma_centering_quality_rank_power,
+            "gamma_reference_chunk_size": self.gamma_reference_chunk_size,
+            "gamma_reference_minimum_datasets": self.gamma_reference_minimum_datasets,
+            "selected_dataset_names": list(self.selected_dataset_names),
+            "selected_dataset_ids": list(self.selected_dataset_ids),
+        }
+
+    def set_extra_state(self, state: dict | None) -> None:
+        if not state:
+            return
+        self.gamma_centering_mode = str(
+            state.get("gamma_centering_mode", self.gamma_centering_mode)
+        )
+        self.gamma_cross_dataset_centering_enabled = (
+            self.gamma_centering_mode != "disabled"
+        )
+        self.gamma_reference_dataset_names = tuple(
+            str(x)
+            for x in state.get(
+                "gamma_reference_dataset_names",
+                self.gamma_reference_dataset_names,
+            )
+        )
+        self.gamma_reference_manifest_hash = str(
+            state.get(
+                "gamma_reference_manifest_hash",
+                self.gamma_reference_manifest_hash,
+            )
+        )
+        self.gamma_reference_source = str(
+            state.get("gamma_reference_source", self.gamma_reference_source)
+        )
+        self.gamma_centering_weighting = str(
+            state.get("gamma_centering_weighting", self.gamma_centering_weighting)
+        )
+        self.gamma_centering_quality_rank_power = float(
+            state.get(
+                "gamma_centering_quality_rank_power",
+                self.gamma_centering_quality_rank_power,
+            )
+        )
+        self.gamma_reference_chunk_size = int(
+            state.get("gamma_reference_chunk_size", self.gamma_reference_chunk_size)
+        )
+        self.gamma_reference_minimum_datasets = int(
+            state.get(
+                "gamma_reference_minimum_datasets",
+                self.gamma_reference_minimum_datasets,
+            )
+        )
+        self.selected_dataset_names = tuple(
+            str(x) for x in state.get("selected_dataset_names", self.selected_dataset_names)
+        )
+        self.selected_dataset_ids = tuple(
+            int(x) for x in state.get("selected_dataset_ids", self.selected_dataset_ids)
+        )
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        # Reference-panel length is experiment-specific. Resize the registered
+        # buffers before PyTorch performs its normal shape checks.
+        for buffer_name in (
+            "gamma_reference_dataset_ids",
+            "gamma_reference_weights",
+            "gamma_selected_dataset_ids",
+        ):
+            key = prefix + buffer_name
+            if key in state_dict:
+                setattr(self, buffer_name, state_dict[key].detach().clone())
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     @staticmethod
     def _normalize_sample_ids(
@@ -301,6 +547,303 @@ class RiboQueuingModel(nn.Module):
             "eligible": candidate,
         }
 
+    @staticmethod
+    def _assert_transcript_tensor_consistency(
+        *,
+        name: str,
+        tensor: torch.Tensor | None,
+        row_indices: list[int],
+    ) -> None:
+        if tensor is None or len(row_indices) < 2:
+            return
+        reference = tensor[row_indices[0]]
+        for row_index in row_indices[1:]:
+            candidate = tensor[row_index]
+            if torch.is_floating_point(reference):
+                same = torch.allclose(
+                    reference,
+                    candidate,
+                    rtol=0.0,
+                    atol=0.0,
+                    equal_nan=True,
+                )
+            else:
+                same = torch.equal(reference, candidate)
+            if not same:
+                raise ValueError(
+                    "Fixed-reference gamma centering requires transcript-invariant "
+                    f"{name}, but repeated rows for one transcript differ "
+                    f"(rows {row_indices[0]} and {row_index})."
+                )
+
+    def _center_log_gamma_fixed_reference(
+        self,
+        log_gamma_raw: torch.Tensor,
+        *,
+        mask_b: torch.Tensor,
+        sample_ids: Sequence[str] | torch.Tensor | None,
+        id_datasets: torch.Tensor,
+        codon_ids: torch.Tensor,
+        position_features: torch.Tensor,
+        dataset_bias_sequence_features: torch.Tensor | None,
+        biological_sequence_features: torch.Tensor | None,
+    ) -> dict[str, torch.Tensor]:
+        """Center requested raw scores using a fixed, checkpointed dataset panel.
+
+        The reference panel is evaluated for one canonical sequence-derived
+        input per transcript. Its membership never comes from the requested
+        minibatch. Chunking only changes evaluation memory, not the definition
+        of the center, and all weighted sums remain in the autograd graph.
+        """
+        B, T = log_gamma_raw.shape
+        device = log_gamma_raw.device
+        dtype = log_gamma_raw.dtype
+        mask_b = mask_b.bool()
+        mask_f = mask_b.to(dtype=dtype)
+        zeros = torch.zeros_like(log_gamma_raw)
+        false = torch.zeros_like(mask_b)
+        reference_ids = self.gamma_reference_dataset_ids.to(device=device)
+        reference_weights = self.gamma_reference_weights.to(
+            device=device,
+            dtype=dtype,
+        )
+        reference_count = int(reference_ids.numel())
+
+        if (
+            not self.gamma_cross_dataset_centering_enabled
+            or reference_count < self.gamma_reference_minimum_datasets
+        ):
+            return {
+                "log_gamma": log_gamma_raw * mask_f,
+                "gamma_center": zeros,
+                "weights": zeros,
+                "applied": false,
+                "num_distinct_datasets": zeros,
+                "total_weight": zeros,
+                "constraint_error": zeros,
+                "eligible": mask_b & torch.isfinite(log_gamma_raw),
+                "reference_count": torch.full(
+                    (B,),
+                    reference_count,
+                    device=device,
+                    dtype=dtype,
+                ),
+                "all_requested_in_reference": torch.zeros(
+                    B, device=device, dtype=torch.bool
+                ),
+            }
+        if reference_weights.numel() != reference_count:
+            raise RuntimeError(
+                "Checkpoint gamma reference IDs and weights have different lengths."
+            )
+        if (
+            not torch.isfinite(reference_weights).all()
+            or torch.any(reference_weights <= 0.0)
+        ):
+            raise RuntimeError("Gamma reference weights must be finite and positive.")
+
+        sample_id_list = self._normalize_sample_ids(sample_ids, B)
+        if sample_id_list is None:
+            # A singleton/manual call need not supply IDs. Treat each row as a
+            # separate transcript; identical inputs still receive identical
+            # deterministic centers.
+            sample_id_list = [f"__gamma_reference_row_{index}" for index in range(B)]
+
+        grouped_rows: dict[str, list[int]] = {}
+        for row_index, sample_id in enumerate(sample_id_list):
+            grouped_rows.setdefault(sample_id, []).append(row_index)
+        canonical_rows = [indices[0] for indices in grouped_rows.values()]
+        group_index_by_row = torch.empty(B, device=device, dtype=torch.long)
+        for group_index, indices in enumerate(grouped_rows.values()):
+            self._assert_transcript_tensor_consistency(
+                name="codon IDs",
+                tensor=codon_ids,
+                row_indices=indices,
+            )
+            self._assert_transcript_tensor_consistency(
+                name="valid-position mask",
+                tensor=mask_b,
+                row_indices=indices,
+            )
+            self._assert_transcript_tensor_consistency(
+                name="position features",
+                tensor=position_features,
+                row_indices=indices,
+            )
+            self._assert_transcript_tensor_consistency(
+                name="dataset-bias optional sequence features",
+                tensor=dataset_bias_sequence_features,
+                row_indices=indices,
+            )
+            self._assert_transcript_tensor_consistency(
+                name="biological sequence features",
+                tensor=biological_sequence_features,
+                row_indices=indices,
+            )
+            group_index_by_row[indices] = group_index
+
+        canonical_index = torch.as_tensor(
+            canonical_rows,
+            device=device,
+            dtype=torch.long,
+        )
+        canonical_mask = mask_b.index_select(0, canonical_index)
+        canonical_codons = codon_ids.index_select(0, canonical_index)
+        canonical_position = position_features.index_select(0, canonical_index)
+        canonical_optional = (
+            None
+            if dataset_bias_sequence_features is None
+            else dataset_bias_sequence_features.index_select(0, canonical_index)
+        )
+        num_transcripts = len(canonical_rows)
+        weighted_sum = torch.zeros(
+            num_transcripts,
+            T,
+            device=device,
+            dtype=dtype,
+        )
+        weight_sum = reference_weights.sum()
+        chunk_size = min(self.gamma_reference_chunk_size, reference_count)
+        requested_ids = id_datasets.reshape(-1).to(device=device, dtype=torch.long)
+
+        for start in range(0, reference_count, chunk_size):
+            stop = min(start + chunk_size, reference_count)
+            ids_chunk = reference_ids[start:stop]
+            weights_chunk = reference_weights[start:stop]
+            chunk_count = int(ids_chunk.numel())
+            synthetic_ids = ids_chunk.repeat(num_transcripts)
+            synthetic_mask = canonical_mask.repeat_interleave(chunk_count, dim=0)
+            synthetic_codons = canonical_codons.repeat_interleave(chunk_count, dim=0)
+            synthetic_position = canonical_position.repeat_interleave(
+                chunk_count, dim=0
+            )
+            synthetic_optional = (
+                None
+                if canonical_optional is None
+                else canonical_optional.repeat_interleave(chunk_count, dim=0)
+            )
+            raw_reference = self.dataset_bias_model(
+                dataset_ids=synthetic_ids,
+                mask=synthetic_mask,
+                codon_ids=synthetic_codons,
+                position_features=synthetic_position,
+                sequence_features=synthetic_optional,
+                compute_log_sigma=False,
+                embedding_center_ids=self.gamma_selected_dataset_ids,
+            )["gamma_raw"]
+            raw_reference = (
+                raw_reference.to(device=device, dtype=dtype)
+                + float(self.gamma_log_init)
+            )
+            raw_reference = raw_reference.reshape(
+                num_transcripts,
+                chunk_count,
+                T,
+            )
+            if not self.training:
+                # Reuse is safe only when the already-computed requested value
+                # is numerically identical to the synthetic reference value.
+                # Otherwise retain the synthetic value, preserving strict
+                # requested-partner independence over speculative optimization.
+                replacement_rows = []
+                reuse_flags = []
+                grouped_indices = list(grouped_rows.values())
+                for transcript_index, row_indices in enumerate(grouped_indices):
+                    replacement_datasets = []
+                    reuse_datasets = []
+                    row_index_tensor = torch.as_tensor(
+                        row_indices,
+                        device=device,
+                        dtype=torch.long,
+                    )
+                    group_dataset_ids = requested_ids.index_select(
+                        0, row_index_tensor
+                    )
+                    for chunk_index, reference_id in enumerate(ids_chunk):
+                        matching = row_index_tensor[
+                            group_dataset_ids == reference_id
+                        ]
+                        synthetic_value = raw_reference[
+                            transcript_index,
+                            chunk_index,
+                        ]
+                        if matching.numel() > 0:
+                            requested_value = log_gamma_raw.index_select(
+                                0, matching
+                            ).mean(dim=0)
+                            safe_to_reuse = torch.equal(
+                                requested_value.detach(),
+                                synthetic_value.detach(),
+                            )
+                        else:
+                            requested_value = synthetic_value
+                            safe_to_reuse = False
+                        replacement_datasets.append(requested_value)
+                        reuse_datasets.append(safe_to_reuse)
+                    replacement_rows.append(torch.stack(replacement_datasets, dim=0))
+                    reuse_flags.append(reuse_datasets)
+                replacement = torch.stack(replacement_rows, dim=0)
+                reuse_mask = torch.as_tensor(
+                    reuse_flags,
+                    device=device,
+                    dtype=torch.bool,
+                ).unsqueeze(-1)
+                raw_reference = torch.where(
+                    reuse_mask,
+                    replacement,
+                    raw_reference,
+                )
+            weighted_sum = weighted_sum + (
+                raw_reference * weights_chunk.reshape(1, chunk_count, 1)
+            ).sum(dim=1)
+
+        center_by_transcript = weighted_sum / weight_sum.clamp_min(self.eps)
+        center = center_by_transcript.index_select(0, group_index_by_row)
+        applied = mask_b & torch.isfinite(log_gamma_raw)
+        log_center = torch.where(applied, center, zeros)
+        log_gamma = (log_gamma_raw - log_center) * mask_f
+
+        # The weighted residual is computed without retaining all reference
+        # scores: sum w(q-c) = sum(wq) - c*sum(w).
+        constraint_by_transcript = (
+            weighted_sum - center_by_transcript * weight_sum
+        ).abs() / weight_sum.clamp_min(self.eps)
+        constraint = constraint_by_transcript.index_select(0, group_index_by_row)
+
+        requested_in_reference = (
+            requested_ids.reshape(-1, 1) == reference_ids.reshape(1, -1)
+        ).any(dim=1)
+        normalized_reference_weights = reference_weights / weight_sum.clamp_min(self.eps)
+        requested_weights = torch.zeros(B, device=device, dtype=dtype)
+        for ref_index in range(reference_count):
+            requested_weights = torch.where(
+                requested_ids == reference_ids[ref_index],
+                normalized_reference_weights[ref_index],
+                requested_weights,
+            )
+
+        return {
+            "log_gamma": log_gamma,
+            "gamma_center": log_center * mask_f,
+            "weights": requested_weights.reshape(-1, 1).expand(B, T) * mask_f,
+            "applied": applied,
+            "num_distinct_datasets": torch.full_like(
+                log_gamma_raw,
+                float(reference_count),
+            )
+            * mask_f,
+            "total_weight": weight_sum.expand_as(log_gamma_raw) * mask_f,
+            "constraint_error": constraint * mask_f,
+            "eligible": applied,
+            "reference_count": torch.full(
+                (B,),
+                reference_count,
+                device=device,
+                dtype=dtype,
+            ),
+            "all_requested_in_reference": requested_in_reference.all().expand(B),
+        }
+
     # ============================================================
     # Position features
     # ============================================================
@@ -381,6 +924,7 @@ class RiboQueuingModel(nn.Module):
         dtype = L_bio.dtype
         device = L_bio.device
         mask_b = mask.bool()
+        B, _ = mask_b.shape
         mask_f = mask_b.to(dtype=dtype)
 
         # Direct-load queue: L_bio is already mean-one, no lambda clamp.
@@ -402,6 +946,11 @@ class RiboQueuingModel(nn.Module):
             codon_ids=codon_ids,
             position_features=position_features,
             sequence_features=dataset_bias_sequence_features,
+            embedding_center_ids=(
+                self.gamma_selected_dataset_ids
+                if self.gamma_centering_mode == "fixed_reference"
+                else None
+            ),
         )
         gamma_log_residual = bias["gamma_raw"].to(dtype=dtype, device=device) * mask_f
         additive_bias = torch.zeros_like(gamma_log_residual)
@@ -420,13 +969,30 @@ class RiboQueuingModel(nn.Module):
             torch.zeros_like(gamma_log_residual),
         )
         gamma_raw = torch.exp(log_gamma_raw)
-        centered = self._center_log_gamma_across_transcripts(
-            log_gamma_raw,
-            mask_b=mask_b,
-            sample_ids=sample_ids,
-            id_datasets=id_datasets,
-            dataset_quality_weights=dataset_quality_weights,
-        )
+        if self.gamma_centering_mode == "fixed_reference":
+            biological_sequence_features, _ = nn.utils.rnn.pad_packed_sequence(
+                x_packed,
+                batch_first=True,
+                total_length=mask_b.shape[1],
+            )
+            centered = self._center_log_gamma_fixed_reference(
+                log_gamma_raw,
+                mask_b=mask_b,
+                sample_ids=sample_ids,
+                id_datasets=id_datasets,
+                codon_ids=codon_ids,
+                position_features=position_features,
+                dataset_bias_sequence_features=dataset_bias_sequence_features,
+                biological_sequence_features=biological_sequence_features,
+            )
+        else:
+            centered = self._center_log_gamma_across_transcripts(
+                log_gamma_raw,
+                mask_b=mask_b,
+                sample_ids=sample_ids,
+                id_datasets=id_datasets,
+                dataset_quality_weights=dataset_quality_weights,
+            )
         gamma_eligible = centered["eligible"]
         log_gamma = centered["log_gamma"]
         gamma_cross_dataset_log_center = centered["gamma_center"]
@@ -544,6 +1110,22 @@ class RiboQueuingModel(nn.Module):
                 centered["constraint_error"],
                 torch.zeros_like(centered["constraint_error"]),
             ),
+            "gamma_centering_mode": self.gamma_centering_mode,
+            "gamma_reference_dataset_count": centered.get(
+                "reference_count",
+                torch.zeros(B, device=device, dtype=dtype),
+            ),
+            "gamma_reference_dataset_ids": self.gamma_reference_dataset_ids,
+            "gamma_reference_manifest_hash": self.gamma_reference_manifest_hash,
+            "gamma_reference_weighting": self.gamma_centering_weighting,
+            "gamma_reference_quality_rank_power": float(
+                self.gamma_centering_quality_rank_power
+            ),
+            "gamma_reference_chunk_size": int(self.gamma_reference_chunk_size),
+            "gamma_all_requested_in_reference": centered.get(
+                "all_requested_in_reference",
+                torch.zeros(B, device=device, dtype=torch.bool),
+            ),
             "gamma": gamma,
             "log_gamma": log_gamma,
             "additive_bias": torch.where(
@@ -560,6 +1142,7 @@ class RiboQueuingModel(nn.Module):
             "J_min": J_flat,
             "J_max": J_flat,
             "mu": mu,
+            "normalized_shape": mu_inner,
             "log_sigma": log_sigma,
             "log_sigma_t": (log_sigma * mask_f).sum(dim=1, keepdim=True)
             / mask_f.sum(dim=1, keepdim=True).clamp_min(1.0),

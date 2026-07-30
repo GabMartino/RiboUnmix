@@ -8,8 +8,14 @@
 #SBATCH --gres=gpu:2
 #SBATCH --mem=128G
 #SBATCH --time=1-00:00:00
-# 7 dataset-count conditions x 4 quality-rank powers = 28 jobs. At most four
-# run concurrently; change only the %4 throttle if the allocation permits it.
+# With quality-rank weighting this is 7 dataset-count conditions x 4 powers =
+# 28 jobs. With equal weighting the power is irrelevant and the grid becomes
+# 7 jobs (one per dataset count). The allocated GPUs/CPUs/memory remain
+# exclusive to each job, but the unused part of a node may host another job.
+# For the currently incomplete baseline conditions only, submit with:
+#   sbatch --array=20-27%4 \
+#     --export=ALL,FEATURE_PRESET=baseline,NUM_WORKERS=0,PREDICT_NUM_WORKERS=0 \
+#     run_all_datasets.slurm
 #SBATCH --array=0-27%4
 #SBATCH --output=job_%A_%a_riboai_qrank_ablation.out
 #SBATCH --error=job_%A_%a_riboai_qrank_ablation.err
@@ -47,13 +53,30 @@ source "${VENV_PATH}/bin/activate"
 DATASET_COUNTS=(2 5 10 20 40 80 all)
 DATASET_SUBSET_STRATEGY="${DATASET_SUBSET_STRATEGY:-rank_stratified}"
 
+# `quality_rank` uses Q_d^p; `equal` gives every active dataset weight 1.
+# Equal weighting has no meaningful power ablation, so it uses p=0 only.
+GAMMA_CENTERING_WEIGHTING="${GAMMA_CENTERING_WEIGHTING:-quality_rank}"
+case "${GAMMA_CENTERING_WEIGHTING}" in
+    quality_rank)
+        QUALITY_RANK_POWERS=(0.0 0.5 1.0 2.0)
+        ;;
+    equal)
+        QUALITY_RANK_POWERS=(0.0)
+        ;;
+    *)
+        echo "GAMMA_CENTERING_WEIGHTING must be quality_rank or equal, got '${GAMMA_CENTERING_WEIGHTING}'." >&2
+        exit 2
+        ;;
+esac
+
 # p=0 is exactly equal-dataset centering because Q_d**0 = 1. Values below one
 # soften the ranking; values above one sharpen it.
-QUALITY_RANK_POWERS=(0.0 0.5 1.0 2.0)
 
-# Array mapping (power changes fastest):
+# Array mapping for quality_rank (power changes fastest):
 #   0-3: N=2, 4-7: N=5, 8-11: N=10, 12-15: N=20,
 #   16-19: N=40, 20-23: N=80, 24-27: N=all.
+# For equal weighting, the single power p=0 gives tasks 0:N=2, 1:N=5,
+# 2:N=10, 3:N=20, 4:N=40, 5:N=80, 6:N=all.
 
 ARRAY_TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
 NUM_POWERS="${#QUALITY_RANK_POWERS[@]}"
@@ -73,7 +96,17 @@ QUALITY_RANK_POWER="${QUALITY_RANK_POWERS[POWER_INDEX]}"
 # config/config_riboai_queuing_multidataset.yaml.
 SEED="${SEED:-42}"
 BATCH_SIZE="${BATCH_SIZE:-256}"
-NUM_WORKERS="${NUM_WORKERS:-8}"
+# One persistent worker per DDP rank retains background loading while limiting
+# the in-memory dataset copies made by CUDA-safe `spawn`. Prediction defaults to
+# the main DDP process because it runs once and does not benefit from persistent
+# workers enough to justify another dataset copy.
+NUM_WORKERS="${NUM_WORKERS:-1}"
+PREDICT_NUM_WORKERS="${PREDICT_NUM_WORKERS:-0}"
+DATA_WORKER_CONTEXT="${DATA_WORKER_CONTEXT:-spawn}"
+# Residual diagnostics retain every validation position and are therefore
+# disabled for training by default. Set RESIDUAL_DIAGNOSTICS_ENABLED=true for
+# a dedicated diagnostic run (the quantile guard remains active then).
+RESIDUAL_DIAGNOSTICS_ENABLED="${RESIDUAL_DIAGNOSTICS_ENABLED:-false}"
 # Optional-sequence-feature ablation. Submit, for example:
 #   sbatch --export=ALL,FEATURE_PRESET=baseline run_all_datasets.slurm
 # Supported: baseline, biological, dataset_bias, both, exo_bio, gmp_bio,
@@ -109,6 +142,50 @@ case "${FEATURE_PRESET}" in
         ;;
 esac
 
+# These conditions were verified in the repository's results/ directory: each
+# has a non-empty last.ckpt and readable main-validation and CSS prediction
+# Parquets. Keep the full array declaration generic for other feature presets,
+# but make already completed baseline elements exit before loading data or CUDA.
+# Set SKIP_COMPLETED=0 explicitly to rerun one of these conditions.
+SKIP_COMPLETED="${SKIP_COMPLETED:-1}"
+if [[ "${SKIP_COMPLETED}" != "0" && "${SKIP_COMPLETED}" != "1" ]]; then
+    echo "SKIP_COMPLETED must be 0 or 1, got '${SKIP_COMPLETED}'." >&2
+    exit 2
+fi
+
+declare -A COMPLETED_CONDITIONS=(
+    ["rank_stratified|2|0.0|baseline|42"]="riboai_rank_stratified_n2_qrp0p0_baseline_seed42_49833044_0"
+    ["rank_stratified|2|0.5|baseline|42"]="riboai_rank_stratified_n2_qrp0p5_baseline_seed42_49859890_1"
+    ["rank_stratified|2|1.0|baseline|42"]="riboai_rank_stratified_n2_qrp1p0_baseline_seed42_49859890_2"
+    ["rank_stratified|2|2.0|baseline|42"]="riboai_rank_stratified_n2_qrp2p0_baseline_seed42_49859890_3"
+    ["rank_stratified|5|0.0|baseline|42"]="riboai_rank_stratified_n5_qrp0p0_baseline_seed42_49833044_4"
+    ["rank_stratified|5|0.5|baseline|42"]="riboai_rank_stratified_n5_qrp0p5_baseline_seed42_49833044_5"
+    ["rank_stratified|5|1.0|baseline|42"]="riboai_rank_stratified_n5_qrp1p0_baseline_seed42_49833044_6"
+    ["rank_stratified|5|2.0|baseline|42"]="riboai_rank_stratified_n5_qrp2p0_baseline_seed42_49833044_7"
+    ["rank_stratified|10|0.5|baseline|42"]="riboai_rank_stratified_n10_qrp0p5_baseline_seed42_49833044_9"
+    ["rank_stratified|10|0.0|baseline|42"]="riboai_rank_stratified_n10_qrp0p0_baseline_seed42_49909320_8"
+    ["rank_stratified|10|1.0|baseline|42"]="riboai_rank_stratified_n10_qrp1p0_baseline_seed42_49909320_10"
+    ["rank_stratified|10|2.0|baseline|42"]="riboai_rank_stratified_n10_qrp2p0_baseline_seed42_49833044_11"
+    ["rank_stratified|20|0.0|baseline|42"]="riboai_rank_stratified_n20_qrp0p0_baseline_seed42_49833044_12"
+    ["rank_stratified|20|0.5|baseline|42"]="riboai_rank_stratified_n20_qrp0p5_baseline_seed42_49833044_13"
+    ["rank_stratified|20|1.0|baseline|42"]="riboai_rank_stratified_n20_qrp1p0_baseline_seed42_49909320_14"
+    ["rank_stratified|20|2.0|baseline|42"]="riboai_rank_stratified_n20_qrp2p0_baseline_seed42_49909320_15"
+    ["rank_stratified|40|0.0|baseline|42"]="riboai_rank_stratified_n40_qrp0p0_baseline_seed42_49833044_16"
+    ["rank_stratified|40|0.5|baseline|42"]="riboai_rank_stratified_n40_qrp0p5_baseline_seed42_49909320_17"
+    ["rank_stratified|40|1.0|baseline|42"]="riboai_rank_stratified_n40_qrp1p0_baseline_seed42_49833044_18"
+    ["rank_stratified|40|2.0|baseline|42"]="riboai_rank_stratified_n40_qrp2p0_baseline_seed42_49833044_19"
+)
+
+CURRENT_CONDITION="${DATASET_SUBSET_STRATEGY}|${DATASET_COUNT_REQUEST}|${QUALITY_RANK_POWER}|${FEATURE_PRESET}|${SEED}"
+COMPLETED_RUN="${COMPLETED_CONDITIONS[${CURRENT_CONDITION}]-}"
+# The completion table describes quality-rank runs only. Equal weighting is a
+# distinct experiment even when it uses the same p=0 dataset subset.
+if [[ "${SKIP_COMPLETED}" == "1" && "${GAMMA_CENTERING_WEIGHTING}" == "quality_rank" && -n "${COMPLETED_RUN}" ]]; then
+    echo "Skipping completed condition: ${CURRENT_CONDITION}"
+    echo "Verified result: results/${COMPLETED_RUN}"
+    exit 0
+fi
+
 FEATURE_OVERRIDES=()
 for feature in "${FEATURE_KEYS[@]}"; do
     FEATURE_OVERRIDES+=(
@@ -117,64 +194,11 @@ for feature in "${FEATURE_KEYS[@]}"; do
 done
 
 # Resolve the requested nested subset from the active 114-dataset YAML and the
-# global quality table. The first output line is N; the second is a Hydra list.
-SELECTION_OUTPUT="$(python - "${DATASET_COUNT_REQUEST}" "${DATASET_SUBSET_STRATEGY}" <<'PY'
-import csv
-import sys
-from pathlib import Path
-
-import yaml
-
-requested = sys.argv[1]
-strategy = sys.argv[2].lower()
-manifest_path = Path("config/dataset_config/weighted_hek_riboseq_codon_replicas.yaml")
-ranking_path = Path("Datasets/data/HEK_riboseq_profile_quality_rank.tsv")
-
-manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
-active = list(manifest["dataset_path"])
-with ranking_path.open(encoding="utf-8", newline="") as handle:
-    rows = list(csv.DictReader(handle, delimiter="\t"))
-
-rank_by_dataset = {str(row["dataset"]): float(row["quality_rank"]) for row in rows}
-missing = sorted(set(active) - set(rank_by_dataset))
-if missing:
-    raise SystemExit(f"Active datasets missing from quality ranking: {missing}")
-
-ranked_active = sorted(active, key=lambda name: (rank_by_dataset[name], name))
-n = len(ranked_active) if requested.lower() == "all" else int(requested)
-if n < 2 or n > len(ranked_active):
-    raise SystemExit(f"Dataset count must be in [2, {len(ranked_active)}], got {n}")
-
-if strategy == "top_quality":
-    ordered = ranked_active
-elif strategy == "rank_stratified":
-    # Nested one-dimensional farthest-point ordering over the global ranks.
-    # Prefix 2 contains both extremes; every later point splits the largest
-    # uncovered rank interval. Ties are resolved toward the better rank.
-    selected_indices = [0, len(ranked_active) - 1]
-    remaining = set(range(1, len(ranked_active) - 1))
-    while remaining:
-        next_index = max(
-            remaining,
-            key=lambda index: (
-                min(abs(index - chosen) for chosen in selected_indices),
-                -index,
-            ),
-        )
-        selected_indices.append(next_index)
-        remaining.remove(next_index)
-    ordered = [ranked_active[index] for index in selected_indices]
-else:
-    raise SystemExit(
-        "DATASET_SUBSET_STRATEGY must be rank_stratified or top_quality, "
-        f"got {strategy!r}"
-    )
-
-selected = ordered[:n]
-print(n)
-print("[" + ",".join(selected) + "]")
-PY
-)"
+# global quality table. A regular Python file avoids Bash creating a temporary
+# here-document on the node-local filesystem. The first output line is N; the
+# second is a Hydra list.
+SELECTION_OUTPUT="$(python Utils/select_dataset_ablation_subset.py \
+    "${DATASET_COUNT_REQUEST}" "${DATASET_SUBSET_STRATEGY}")"
 SELECTED_DATASET_COUNT="${SELECTION_OUTPUT%%$'\n'*}"
 DATASET_OVERRIDE="${SELECTION_OUTPUT#*$'\n'}"
 
@@ -189,7 +213,13 @@ SCRATCH_DIR="${SCRATCH:-${CINECA_SCRATCH:-/leonardo_scratch/large/userexternal/$
 WORK_DIR="${WORK:-/leonardo_work/${SLURM_JOB_ACCOUNT:-euhpc_d35_089}/${USER}}"
 
 POWER_TAG="${QUALITY_RANK_POWER//./p}"
-RUN_TAG="riboai_${DATASET_SUBSET_STRATEGY}_n${SELECTED_DATASET_COUNT}_qrp${POWER_TAG}_${FEATURE_PRESET}_seed${SEED}_${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-local}}_${ARRAY_TASK_ID}"
+WEIGHTING_TAG="${GAMMA_CENTERING_WEIGHTING}"
+if [[ "${GAMMA_CENTERING_WEIGHTING}" == "quality_rank" ]]; then
+    WEIGHTING_TAG="qrank"
+else
+    WEIGHTING_TAG="equal"
+fi
+RUN_TAG="riboai_${DATASET_SUBSET_STRATEGY}_n${SELECTED_DATASET_COUNT}_gw${WEIGHTING_TAG}_qrp${POWER_TAG}_${FEATURE_PRESET}_seed${SEED}_${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-local}}_${ARRAY_TASK_ID}"
 OUT_DIR="${WORK_DIR}/riboai_runs/${RUN_TAG}"
 CKPT_DIR="${OUT_DIR}/checkpoints"
 LOG_DIR="${OUT_DIR}/logs"
@@ -199,10 +229,12 @@ RESULTS_DIR="${OUT_DIR}/results"
 # that socket path to about 108 bytes, so keep this path deliberately short.
 export TMPDIR="/tmp/riboai_a_${SLURM_JOB_ID:-$$}"
 export XDG_CACHE_HOME="${SCRATCH_DIR}/.cache"
-export MPLCONFIGDIR="${SCRATCH_DIR}/.cache/matplotlib"
 export TORCH_HOME="${SCRATCH_DIR}/.cache/torch"
 export HF_HOME="${SCRATCH_DIR}/.cache/huggingface"
-export TRITON_CACHE_DIR="${SCRATCH_DIR}/.cache/triton"
+# These caches may be written during a run, so keep them private to the array
+# element instead of allowing concurrent jobs to update the same files.
+export MPLCONFIGDIR="${TMPDIR}/matplotlib"
+export TRITON_CACHE_DIR="${TMPDIR}/triton"
 export HYDRA_FULL_ERROR=1
 HYDRA_RUN_DIR="${SCRATCH_DIR}/hydra/${RUN_TAG}"
 
@@ -217,7 +249,14 @@ trap 'rm -rf "${TMPDIR}"' EXIT
 # versions coordinated.
 export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-8}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
-export TORCH_NCCL_ENABLE_MONITORING=0
+# Avoid initializing the CUDA runtime merely to answer an availability check;
+# this is safer if workers are explicitly re-enabled. If either DDP rank fails,
+# ask NCCL and Slurm to tear down its peer instead of waiting for a long timeout.
+export PYTORCH_NVML_BASED_CUDA_CHECK=1
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+export TORCH_NCCL_ENABLE_MONITORING=1
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-300}"
+export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 
 echo "Starting dataset-count x quality-rank-power ablation"
 echo "Array    -> task ${ARRAY_TASK_ID}/$((NUM_EXPERIMENTS - 1))"
@@ -227,20 +266,31 @@ echo "Scratch  -> ${SCRATCH_DIR}"
 echo "Seed     -> ${SEED}"
 echo "Datasets -> ${SELECTED_DATASET_COUNT} (${DATASET_SUBSET_STRATEGY})"
 echo "Rank p   -> ${QUALITY_RANK_POWER}"
+echo "Gamma wt -> ${GAMMA_CENTERING_WEIGHTING}"
 echo "Batch    -> ${BATCH_SIZE} per DDP rank"
 echo "Workers  -> ${NUM_WORKERS} per DDP rank"
+echo "Pred work-> ${PREDICT_NUM_WORKERS} per DDP rank"
 echo "Features -> ${FEATURE_PRESET}"
 echo "GPUs     -> ${CUDA_VISIBLE_DEVICES:-managed by Slurm}"
+echo "Node     -> ${SLURMD_NODENAME:-${SLURM_JOB_NODELIST:-unknown}}"
+echo "Worker mp-> ${DATA_WORKER_CONTEXT}"
+
+# Fail before training if the allocated node cannot initialize the GPU driver.
+# Skip this only for the local DRY_RUN validation path.
+if [[ "${DRY_RUN:-0}" != "1" ]]; then
+    nvidia-smi --query-gpu=index,uuid,name --format=csv,noheader
+fi
 
 COMMAND=(
-    srun --ntasks=2 python main_ribo_queueing_modeling_multi_dataset.py
+    srun --ntasks=2 --kill-on-bad-exit=1 --wait=60 \
+    python main_ribo_queueing_modeling_multi_dataset.py
     "experiment.dataset=${DATASET_OVERRIDE}"
     "experiment.dataset_subset_strategy=${DATASET_SUBSET_STRATEGY}"
     split.master_dataset_universe=all
-    "model.gamma_centering.quality_rank_power=${QUALITY_RANK_POWER}"
-    model.gamma_centering.weighting=quality_rank
+    "model.gamma_centering.reference.quality_rank_power=${QUALITY_RANK_POWER}"
+    "model.gamma_centering.reference.weighting=${GAMMA_CENTERING_WEIGHTING}"
     model.gamma_centering.enabled=true
-    model.gamma_centering.scope=batch_grouped
+    model.gamma_centering.mode=fixed_reference
     "experiment.seed=${SEED}"
     experiment.from_checkpoint=false
     experiment.train=true
@@ -250,6 +300,9 @@ COMMAND=(
     trainer.sync_dist_logs=true
     "data.batch_size=${BATCH_SIZE}"
     "data.num_workers=${NUM_WORKERS}"
+    "data.predict_num_workers=${PREDICT_NUM_WORKERS}"
+    "data.multiprocessing_context=${DATA_WORKER_CONTEXT}"
+    "residual_diagnostics.enabled=${RESIDUAL_DIAGNOSTICS_ENABLED}"
     "${FEATURE_OVERRIDES[@]}"
     "paths.checkpoints=${CKPT_DIR}"
     "paths.logs=${LOG_DIR}"

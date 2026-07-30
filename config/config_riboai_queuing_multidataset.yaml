@@ -9,14 +9,14 @@ experiment:
   from_checkpoint: false
   train: true
   predict: true
-  dataset: ["sharma_2021_500U", "riepe_2018"]
+  dataset: ["andreev_2015_rep1"]
   # Descriptive only: run scripts override this for subset ablations and the
   # value is encoded in checkpoint/log/result tags.
   dataset_subset_strategy: configured
   seed: 42
 
 split:
-  master_dataset_universe: ["sharma_2021_500U", "riepe_2018"]
+  master_dataset_universe: all
   # Use the same 114-dataset mapping for training eligibility and split
   # stratification. `active` resolves to defaults.dataset_config above.
   source_dataset_config: active
@@ -44,11 +44,18 @@ paths:
 
 data:
   batch_size: 32
-  num_workers: 2
+  num_workers: 4
+  # Prediction is a one-pass operation; avoiding spawned workers here prevents
+  # another full copy of the already in-memory validation dataset per rank.
+  predict_num_workers: 0
+  # CUDA is initialized before Lightning begins iterating over the DataLoader.
+  # Spawn gives each worker a clean process instead of inheriting CUDA state
+  # through Linux fork. Ignored when num_workers is 0.
+  multiprocessing_context: fork #spawn
 
   # transcript_grouped_pairs keeps the FULL datasets (single-dataset transcripts
   # included) while packing transcript groups into batches of batch_size.
-  train_sampling_strategy: transcript_grouped_multidataset_pairs # random_dataset_per_transcript
+  train_sampling_strategy: transcript_grouped_pairs # random_dataset_per_transcript
   dataset_balance_gamma: 0.0
   train_samples_per_epoch: null
 
@@ -121,13 +128,26 @@ model:
   # reference ambiguity when enough same-transcript datasets are present.
   gamma_centering:
     enabled: true
-    scope: batch_grouped
-    # equal: every distinct dataset has raw weight 1.
-    # quality_rank: weight=(max_rank-rank+1)/max_rank, optionally exponentiated.
-    # Duplicate samples/replicas are averaged within dataset before either mean.
-    weighting: quality_rank
-    quality_rank_power: 1.0
-    # Centering is skipped with one dataset and applied with two or more.
+    # fixed_reference is deterministic across training, validation, prediction,
+    # singleton inference, requested partners, batch size, ordering, and DDP
+    # partitioning. Old configs with only scope: batch_grouped retain the
+    # historical batch-local behavior.
+    mode: fixed_reference
+    reference:
+      source: selected_experiment_datasets
+      # When non-null, this list overrides source and must be a subset of the
+      # datasets selected for this experiment.
+      dataset_names: null
+      # equal: every distinct reference dataset has weight 1.
+      # quality_rank: weight=(max_rank-rank+1)/max_rank, raised to this power.
+      weighting: quality_rank
+      quality_rank_power: 1.0
+      chunk_size: 32
+      minimum_datasets: 2
+      # Historical checkpoints have no fixed-panel provenance. Preserve their
+      # batch-grouped function unless fixed_reference is explicitly requested
+      # here for diagnostic evaluation.
+      legacy_checkpoint_policy: preserve_legacy
 
   biological_params:
     # Base one-hot dimension. The model automatically adds the dimensions of
@@ -233,8 +253,18 @@ loss:
   pcc_prediction_floor: 0.0
 
 residual_diagnostics:
-  enabled: true
+  # These summaries are expensive validation-only diagnostics and are not
+  # used by the objective, checkpoint monitor, PCC, or gamma centering. Keep
+  # them off for production/ablation training; enable explicitly for a
+  # dedicated diagnostic run.
+  enabled: false
   run_on_validation: true
+
+  # Quantiles are diagnostic-only. PyTorch rejects torch.quantile inputs above
+  # an internal size limit, so very large validation sets use this many
+  # deterministic, evenly spaced positions. Other diagnostic means/fractions
+  # still use every valid position; training and validation losses are unchanged.
+  quantile_max_values: 1000000
 
   eps: 1.0e-8
   eps_count: 1.0e-3

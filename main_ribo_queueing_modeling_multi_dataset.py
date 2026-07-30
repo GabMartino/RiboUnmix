@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import warnings
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Sequence
@@ -26,6 +27,7 @@ except ImportError:
 
 from Dataloaders.RiboAIQueuingMultiDataset.RiboAIQueuingDatamoduleMultiDataset import (
     RiboAIQueuingDatamoduleMultiDataset,
+    load_dataset_quality_ranking,
 )
 from Models.RiboQueuingModel import RiboQueuingModel
 from Models.RiboQueuingModelLighningModule import RiboQueuingModelLightningModule
@@ -310,18 +312,33 @@ def make_sampling_run_tag(cfg: DictConfig) -> str | None:
 def make_gamma_centering_run_tag(cfg: DictConfig) -> str:
     if not cfg_bool(cfg, "model.gamma_centering.enabled", False):
         return "GammaCtrOff"
-    scope = str(cfg_get(cfg, "model.gamma_centering.scope", "batch_grouped")).lower()
-    if scope == "disabled":
+    mode = str(
+        cfg_get(
+            cfg,
+            "model.gamma_centering.mode",
+            cfg_get(cfg, "model.gamma_centering.scope", "batch_grouped"),
+        )
+    ).lower()
+    if mode == "disabled":
         return "GammaCtrOff"
     weighting = str(
-        cfg_get(cfg, "model.gamma_centering.weighting", "equal")
+        cfg_get(
+            cfg,
+            "model.gamma_centering.reference.weighting",
+            cfg_get(cfg, "model.gamma_centering.weighting", "equal"),
+        )
     ).lower()
+    mode_tag = "FixedRef" if mode == "fixed_reference" else "Batch"
     if weighting == "quality_rank":
         power = format_run_tag_value(
-            cfg_get(cfg, "model.gamma_centering.quality_rank_power", 1.0)
+            cfg_get(
+                cfg,
+                "model.gamma_centering.reference.quality_rank_power",
+                cfg_get(cfg, "model.gamma_centering.quality_rank_power", 1.0),
+            )
         )
-        return f"GammaCtrQRankP{power}"
-    return "GammaCtrEqual"
+        return f"GammaCtr{mode_tag}QRankP{power}"
+    return f"GammaCtr{mode_tag}Equal"
 
 
 def make_pcc_run_tag(cfg: DictConfig) -> str:
@@ -971,7 +988,39 @@ def load_weights_only(
 
     state_dict = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
 
+    has_fixed_reference_provenance = any(
+        key.endswith("gamma_reference_dataset_ids") for key in state_dict
+    )
     incompatible = lit_model.load_state_dict(state_dict, strict=False)
+
+    torch_model = getattr(lit_model, "model", None)
+    if torch_model is not None and not has_fixed_reference_provenance:
+        policy = str(
+            getattr(torch_model, "gamma_legacy_checkpoint_policy", "preserve_legacy")
+        ).lower()
+        if policy in {"preserve_legacy", "legacy_batch_grouped", "batch_grouped"}:
+            torch_model.set_gamma_centering_mode("batch_grouped")
+            warnings.warn(
+                "This checkpoint predates fixed-reference gamma provenance. "
+                "Using its historical legacy_batch_grouped behavior. Set "
+                "gamma_centering.reference.legacy_checkpoint_policy=fixed_reference "
+                "only for an explicit diagnostic gauge change.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        elif policy == "fixed_reference":
+            warnings.warn(
+                "Evaluating a legacy batch-grouped checkpoint with fixed-reference "
+                "centering. This changes the gamma gauge and does not recreate the "
+                "function used during historical training.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        else:
+            raise ValueError(
+                "Unknown gamma legacy checkpoint policy "
+                f"{torch_model.gamma_legacy_checkpoint_policy!r}."
+            )
 
     print(f"Loaded weights from: {ckpt_path}")
 
@@ -980,6 +1029,96 @@ def load_weights_only(
 
     if len(incompatible.unexpected_keys) > 0:
         print(f"Unexpected keys: {len(incompatible.unexpected_keys)}")
+
+
+def resolve_gamma_reference_panel(
+    *,
+    cfg: DictConfig,
+    experiment_datasets: Sequence[str],
+    dataset_encoding: dict[str, int],
+) -> dict[str, list]:
+    """Resolve a fixed panel once, before model construction.
+
+    Explicit reference names override the configured source, but must remain a
+    duplicate-free subset of the datasets actually selected for this experiment.
+    """
+    selected_names = [str(name) for name in experiment_datasets]
+    selected_set = set(selected_names)
+    explicit_names = cfg_get(
+        cfg,
+        "model.gamma_centering.reference.dataset_names",
+        None,
+    )
+    if explicit_names is not None:
+        reference_names = [str(name) for name in explicit_names]
+    else:
+        source = str(
+            cfg_get(
+                cfg,
+                "model.gamma_centering.reference.source",
+                "selected_experiment_datasets",
+            )
+        ).lower()
+        if source != "selected_experiment_datasets":
+            raise ValueError(
+                "gamma_centering.reference.source currently supports only "
+                "'selected_experiment_datasets' unless dataset_names is explicit."
+            )
+        reference_names = list(selected_names)
+
+    if len(reference_names) != len(set(reference_names)):
+        raise ValueError("Duplicate gamma reference dataset names are not allowed.")
+    inactive = [name for name in reference_names if name not in selected_set]
+    if inactive:
+        raise ValueError(
+            "Gamma reference datasets must be selected and trained in this "
+            f"experiment; inactive names: {inactive}."
+        )
+    missing = [name for name in reference_names if name not in dataset_encoding]
+    if missing:
+        raise KeyError(
+            f"Gamma reference dataset(s) missing from dataset encoding: {missing}."
+        )
+
+    ranking_path = str(cfg_get(cfg, "data.dataset_quality_ranking.path", ""))
+    if not ranking_path:
+        quality_by_name = {name: 1.0 for name in selected_names}
+    else:
+        _, quality_by_name = load_dataset_quality_ranking(
+            ranking_path,
+            dataset_column=str(
+                cfg_get(cfg, "data.dataset_quality_ranking.dataset_column", "dataset")
+            ),
+            rank_column=str(
+                cfg_get(
+                    cfg,
+                    "data.dataset_quality_ranking.rank_column",
+                    "quality_rank",
+                )
+            ),
+        )
+    strict = cfg_bool(cfg, "data.dataset_quality_ranking.strict", True)
+    missing_quality = [name for name in selected_names if name not in quality_by_name]
+    if missing_quality and strict:
+        raise KeyError(
+            "Selected dataset(s) missing from the dataset-quality table: "
+            f"{missing_quality}."
+        )
+
+    selected_ids = [int(dataset_encoding[name]) for name in selected_names]
+    selected_quality = [float(quality_by_name.get(name, 1.0)) for name in selected_names]
+    reference_ids = [int(dataset_encoding[name]) for name in reference_names]
+    reference_quality = [
+        float(quality_by_name.get(name, 1.0)) for name in reference_names
+    ]
+    return {
+        "selected_names": selected_names,
+        "selected_ids": selected_ids,
+        "selected_quality": selected_quality,
+        "reference_names": reference_names,
+        "reference_ids": reference_ids,
+        "reference_quality": reference_quality,
+    }
 
 
 def choose_checkpoint(
@@ -1030,6 +1169,8 @@ def predictions_to_parquet(
         "gamma_centering_applied",
         "gamma_num_distinct_datasets",
         "gamma_total_reliability",
+        "gamma_centering_constraint_error",
+        "normalized_shape",
         "additive_bias",
         "log_sigma",
         "mask",
@@ -1288,6 +1429,7 @@ def make_datamodule(
         split=(train_fold, val_fold),
         split_p=split_size,
         num_workers=int(cfg.data.num_workers),
+        predict_num_workers=int(cfg_get(cfg, "data.predict_num_workers", 0)),
         seed=seed,
         nt_encoding_path=cfg.paths.encodings.nt,
         codon_encoding_path=cfg.paths.encodings.codon,
@@ -1304,6 +1446,9 @@ def make_datamodule(
         val_allowed_dataset_names_by_transcript=val_allowed_dataset_names_by_transcript,
         pin_memory=cfg_bool(cfg, "data.pin_memory", True),
         prefetch_factor=cfg_get(cfg, "data.prefetch_factor", 4),
+        multiprocessing_context=cfg_get(
+            cfg, "data.multiprocessing_context", "spawn"
+        ),
         use_ribo_replicas=cfg_bool(cfg, "data.use_ribo_replicas", False),
         ribo_replicas_column=str(
             cfg_get(cfg, "data.ribo_replicas_column", "ribo_cds_replicas")
@@ -1525,9 +1670,26 @@ def main(cfg: DictConfig) -> None:
             "Experiment dataset(s) missing from dataset encoding: "
             f"{missing_dataset_encodings}"
         )
+    gamma_reference_panel = resolve_gamma_reference_panel(
+        cfg=cfg,
+        experiment_datasets=experiment_datasets,
+        dataset_encoding=dataset_encoding,
+    )
     torch_model = RiboQueuingModel(
         model_configs=cfg.model,
         eps=float(cfg.model.get("eps", 1e-8)),
+        selected_dataset_names=gamma_reference_panel["selected_names"],
+        selected_dataset_ids=gamma_reference_panel["selected_ids"],
+        selected_dataset_quality_weights=gamma_reference_panel["selected_quality"],
+        reference_dataset_names=gamma_reference_panel["reference_names"],
+        reference_dataset_ids=gamma_reference_panel["reference_ids"],
+        reference_dataset_quality_weights=gamma_reference_panel["reference_quality"],
+    )
+    print(
+        "Gamma centering: "
+        f"mode={torch_model.gamma_centering_mode}, "
+        f"reference_count={torch_model.gamma_reference_dataset_ids.numel()}, "
+        f"manifest={torch_model.gamma_reference_manifest_hash[:12]}"
     )
 
     lit_model = RiboQueuingModelLightningModule(

@@ -29,6 +29,13 @@ def open_file(path: str):
         return yaml.safe_load(f)
 
 
+def seed_dataloader_worker(worker_id: int) -> None:
+    """Seed NumPy from PyTorch's per-worker seed without capturing CUDA state."""
+    del worker_id  # The worker id is already incorporated into initial_seed().
+    worker_seed = torch.initial_seed() % (2**32)
+    np.random.seed(worker_seed)
+
+
 def load_dataset_quality_ranking(
     path: str,
     *,
@@ -865,6 +872,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         datasets_encoding_path: str,
         split_p: float = 0.9,
         num_workers: int = 4,
+        predict_num_workers: int = 0,
         seed: int = 42,
         balanced_train_sampling: bool = False,
         dataset_balance_gamma: float = 0.0,
@@ -876,6 +884,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         val_allowed_dataset_names_by_transcript: Optional[dict[str, Sequence[str]]] = None,
         pin_memory: bool = True,
         prefetch_factor: Optional[int] = 4,
+        multiprocessing_context: Optional[str] = "spawn",
         use_ribo_replicas: bool = False,
         ribo_replicas_column: str = "ribo_cds_replicas",
         additional_sequence_features: Optional[dict] = None,
@@ -898,6 +907,9 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         self.split = split
         self.split_p = float(split_p)
         self.num_workers = int(num_workers)
+        self.predict_num_workers = int(predict_num_workers)
+        if self.num_workers < 0 or self.predict_num_workers < 0:
+            raise ValueError("DataLoader worker counts must be non-negative.")
         self.seed = int(seed)
 
         self.balanced_train_sampling = bool(balanced_train_sampling)
@@ -912,6 +924,16 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
 
         self.pin_memory = bool(pin_memory)
         self.prefetch_factor = prefetch_factor
+        if multiprocessing_context is None:
+            self.multiprocessing_context = None
+        else:
+            context = str(multiprocessing_context).strip().lower()
+            if context not in {"spawn", "forkserver", "fork"}:
+                raise ValueError(
+                    "multiprocessing_context must be spawn, forkserver, fork, "
+                    f"or null; got {multiprocessing_context!r}."
+                )
+            self.multiprocessing_context = context
 
         self.use_ribo_replicas = bool(use_ribo_replicas)
         self.ribo_replicas_column = str(ribo_replicas_column)
@@ -1408,32 +1430,26 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
     # Workers / DataLoaders
     # ------------------------------------------------------------
 
-    def worker_init_fn(self, worker_id: int):
-        # With persistent_workers=True this is called when workers are created,
-        # not necessarily every epoch. The new recommended sampler makes dataset
-        # choice in the main process, so this seed is mainly for dataset-level
-        # augmentation/caching randomness if any remains.
-        epoch = self.trainer.current_epoch if self.trainer is not None else 0
-        worker_seed = self.seed + worker_id + int(epoch) * 1000
-        torch.manual_seed(worker_seed)
-        np.random.seed(worker_seed)
-
     def _dist_info(self) -> tuple[int, int]:
         """Return (num_replicas, rank) for the current distributed context."""
         if self.trainer is not None and self.trainer.world_size > 1:
             return self.trainer.world_size, self.trainer.global_rank
         return 1, 0
 
-    def _dataloader_kwargs(self):
+    def _dataloader_kwargs(self, *, num_workers: Optional[int] = None):
+        workers = self.num_workers if num_workers is None else int(num_workers)
         kwargs = {
-            "num_workers": self.num_workers,
-            "persistent_workers": (self.num_workers > 0),
-            "worker_init_fn": self.worker_init_fn,
+            "num_workers": workers,
+            "persistent_workers": (workers > 0),
+            "worker_init_fn": seed_dataloader_worker,
             "pin_memory": self.pin_memory,
         }
 
-        if self.num_workers > 0 and self.prefetch_factor is not None:
-            kwargs["prefetch_factor"] = int(self.prefetch_factor)
+        if workers > 0:
+            if self.prefetch_factor is not None:
+                kwargs["prefetch_factor"] = int(self.prefetch_factor)
+            if self.multiprocessing_context is not None:
+                kwargs["multiprocessing_context"] = self.multiprocessing_context
 
         return kwargs
 
@@ -1695,5 +1711,5 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             self.val_dataset_obj,
             batch_sampler=batch_sampler,
             collate_fn=self.val_dataset_obj.collate_fn,
-            **self._dataloader_kwargs(),
+            **self._dataloader_kwargs(num_workers=self.predict_num_workers),
         )
