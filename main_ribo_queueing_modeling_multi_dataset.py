@@ -32,10 +32,7 @@ from Dataloaders.RiboAIQueuingMultiDataset.RiboAIQueuingDatamoduleMultiDataset i
     resolve_grouped_optimizer_batch_plan,
 )
 from Models.RiboQueuingModel import RiboQueuingModel
-from Models.RiboQueuingModelLighningModule import (
-    RiboQueuingModelLightningModule,
-    resolve_sample_reduction_mode,
-)
+from Models.RiboQueuingModelLighningModule import RiboQueuingModelLightningModule
 from Utils.checkpoints import find_checkpoint
 
 
@@ -255,13 +252,9 @@ def format_run_tag_value(value: Any) -> str:
     )
 
 
-def make_dataset_balance_run_tag(cfg: DictConfig) -> str:
-    reduction = resolve_sample_reduction_mode(cfg.loss)
-    if reduction == "dataset_balanced":
-        return "DBLossOn"
-    if reduction == "transcript_balanced":
-        return "TBLossOn"
-    return "DBLossOff"
+def make_dataset_balance_run_tag() -> str:
+    """Tag the fixed transcript-weighted, dataset-balanced reduction."""
+    return "DBLossOn"
 
 
 def make_dataset_selection_run_tag(cfg: DictConfig) -> str:
@@ -292,37 +285,19 @@ def make_dataset_selection_run_tag(cfg: DictConfig) -> str:
     return f"Data{strategy}_N{len(datasets)}_h{subset_hash}"
 
 
-LOSS_TERM_TAGS = {
-    "consensus_nll": "cNLL",
-    "consensus_pcc": "cPCC",
-    "replica_nll": "rNLL",
-    "replica_pcc": "rPCC",
-}
-
-
-def loss_term_weight_from_config(cfg: DictConfig, name: str) -> float:
-    value = cfg_get(cfg, f"loss.loss_terms.{name}", None)
-    if value is None:
-        raise ValueError(
-            f"Missing required loss.loss_terms.{name}; the objective no longer "
-            "uses presets or implicit term defaults."
-        )
-    if isinstance(value, bool):
-        raise TypeError(f"loss.loss_terms.{name} must be a scalar number, not bool.")
-    value = float(value)
-    if not np.isfinite(value) or value < 0.0:
-        raise ValueError(
-            f"loss.loss_terms.{name} must be finite and non-negative, got {value}."
-        )
-    return value
-
-
 def make_loss_terms_run_tag(cfg: DictConfig) -> str:
-    parts = [
-        f"{token}{format_run_tag_value(loss_term_weight_from_config(cfg, name))}"
-        for name, token in LOSS_TERM_TAGS.items()
-    ]
-    return "Loss-" + "-".join(parts)
+    nb_weight = format_run_tag_value(cfg_get(cfg, "loss.replica_nb_weight"))
+    raw_weight = format_run_tag_value(
+        cfg_get(cfg, "loss.replica_raw_pcc_weight")
+    )
+    vst_weight = format_run_tag_value(
+        cfg_get(cfg, "loss.replica_nb_vst_pcc_weight")
+    )
+    gamma_weight = format_run_tag_value(cfg_get(cfg, "loss.gamma_reg_weight"))
+    return (
+        f"Loss-rNB{nb_weight}-rPCC{raw_weight}"
+        f"-rVSTPCC{vst_weight}-Gamma{gamma_weight}"
+    )
 
 
 def make_sampling_run_tag(cfg: DictConfig) -> str | None:
@@ -362,42 +337,6 @@ def make_gamma_centering_run_tag(cfg: DictConfig) -> str:
         )
         return f"GammaCtr{mode_tag}QRankP{power}"
     return f"GammaCtr{mode_tag}Equal"
-
-
-def make_pcc_run_tag(cfg: DictConfig) -> str:
-    consensus_weight = loss_term_weight_from_config(cfg, "consensus_pcc")
-    replica_weight = loss_term_weight_from_config(cfg, "replica_pcc")
-    if consensus_weight <= 0.0 and replica_weight <= 0.0:
-        return "PCCOff"
-
-    mode = str(cfg_get(cfg, "loss.pcc_loss_mode", "raw")).lower()
-
-    if mode == "raw":
-        return "PCCraw"
-
-    if mode == "log1p":
-        return "PCClog1p"
-
-    if mode == "hybrid_raw_nb_vst":
-        raw_weight = format_run_tag_value(
-            cfg_get(cfg, "loss.pcc_raw_component_weight", 0.0)
-        )
-        nb_vst_weight = format_run_tag_value(
-            cfg_get(cfg, "loss.pcc_nb_vst_component_weight", 0.0)
-        )
-        return (
-            "PCCrawVarAdj"
-            f"_raw{raw_weight}_var{nb_vst_weight}"
-        )
-
-    if mode == "nb_vst":
-        return "PCCvarAdj"
-
-    raise ValueError(
-        "loss.pcc_loss_mode must be one of "
-        "{'raw', 'log1p', 'nb_vst', 'hybrid_raw_nb_vst'}, "
-        f"got {mode!r}."
-    )
 
 
 def _sequence_feature_routes(cfg: DictConfig) -> dict[str, str]:
@@ -497,9 +436,8 @@ def make_run_tag(cfg: DictConfig) -> str:
     parts = [
         "queueNB",
         make_dataset_selection_run_tag(cfg),
-        make_dataset_balance_run_tag(cfg),
+        make_dataset_balance_run_tag(),
         make_loss_terms_run_tag(cfg),
-        make_pcc_run_tag(cfg),
     ]
 
     sampling_tag = make_sampling_run_tag(cfg)
@@ -1443,22 +1381,17 @@ def make_datamodule(
         codon_to_aa_encoding_path=cfg.paths.encodings.codon_to_aa,
         aa_encoding_path=cfg.paths.encodings.aa,
         datasets_encoding_path=cfg.paths.encodings.datasets,
-        balanced_train_sampling=cfg_bool(cfg, "data.balanced_train_sampling", False),
-        dataset_balance_gamma=float(cfg_get(cfg, "data.dataset_balance_gamma", 0.0)),
-        train_samples_per_epoch=cfg_get(cfg, "data.train_samples_per_epoch", None),
-        dataset_aware_batching=cfg_bool(cfg, "data.dataset_aware_batching", False),
-        datasets_per_batch=int(cfg_get(cfg, "data.datasets_per_batch", 2)),
-        train_sampling_strategy=cfg_get(cfg, "data.train_sampling_strategy", "random_dataset_per_transcript"),
+        train_sampling_strategy=cfg_get(
+            cfg,
+            "data.train_sampling_strategy",
+            "transcript_grouped_multidataset_pairs",
+        ),
         train_allowed_dataset_names_by_transcript=train_allowed_dataset_names_by_transcript,
         val_allowed_dataset_names_by_transcript=val_allowed_dataset_names_by_transcript,
         pin_memory=cfg_bool(cfg, "data.pin_memory", True),
         prefetch_factor=cfg_get(cfg, "data.prefetch_factor", 4),
         multiprocessing_context=cfg_get(
             cfg, "data.multiprocessing_context", "spawn"
-        ),
-        use_ribo_replicas=cfg_bool(cfg, "data.use_ribo_replicas", False),
-        ribo_replicas_column=str(
-            cfg_get(cfg, "data.ribo_replicas_column", "ribo_cds_replicas")
         ),
         additional_sequence_features=feature_cfg,
         dataset_quality_ranking_path=cfg_get(
@@ -1691,14 +1624,7 @@ def save_grouped_optimizer_batch_manifest(
     config_name="config_riboai_queuing_multidataset",
 )
 def main(cfg: DictConfig) -> None:
-    sample_reduction = resolve_sample_reduction_mode(cfg.loss)
-    OmegaConf.update(
-        cfg,
-        "loss.sample_reduction",
-        sample_reduction,
-        merge=False,
-        force_add=True,
-    )
+    fixed_loss_reduction = "dataset_balanced_transcript_weighted"
     seed = int(cfg.experiment.seed)
 
     pl.seed_everything(seed, workers=True)
@@ -1864,12 +1790,9 @@ def main(cfg: DictConfig) -> None:
         (paths_results / "loss_reduction_manifest.json").write_text(
             json.dumps(
                 {
-                    "sample_reduction": sample_reduction,
+                    "fixed_loss_reduction": fixed_loss_reduction,
                     "train_sampling_strategy": str(
                         cfg_get(cfg, "data.train_sampling_strategy", "unknown")
-                    ),
-                    "legacy_dataset_balanced_loss_present": (
-                        "dataset_balanced_loss" in cfg.loss
                     ),
                 },
                 indent=2,
@@ -2011,19 +1934,6 @@ def main(cfg: DictConfig) -> None:
                 "training.grouped_optimizer_batch.log_batch_structure",
                 True,
             ),
-        )
-
-    if (
-        sample_reduction == "transcript_balanced"
-        and str(cfg_get(cfg, "data.train_sampling_strategy", "")).lower()
-        == "transcript_grouped_multidataset_pairs"
-    ):
-        # Metadata-only setup is idempotent. Supplying expected complete-group
-        # sizes lets the loss fail loudly if a grouped-sampler transcript is
-        # ever split, without changing the sampler or accumulation lifecycle.
-        datamodule.setup("fit")
-        lit_model.configure_transcript_group_validation(
-            datamodule.train_transcript_group_pair_counts()
         )
 
     if cfg_bool(cfg, "dry_run_batch_plan", False):

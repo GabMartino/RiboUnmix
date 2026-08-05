@@ -5,7 +5,7 @@ import os
 import warnings
 from collections import defaultdict
 from dataclasses import asdict, dataclass
-from typing import Any, Optional, Iterator, Sequence
+from typing import Any, Optional, Sequence
 
 import lightning as pl
 import numpy as np
@@ -18,13 +18,15 @@ from torch.utils.data import (
     DataLoader,
     Sampler,
     SequentialSampler,
-    WeightedRandomSampler,
 )
 from tqdm import tqdm
 
 from Dataloaders.RiboAIQueuingMultiDataset.RiboAIQueuingMultiDataset import (
     RiboAIQueuingDatasetMultiDataset,
 )
+
+
+RIBO_REPLICAS_COLUMN = "ribo_cds_replicas"
 
 
 @dataclass(frozen=True)
@@ -280,339 +282,9 @@ def _as_numpy_str(x) -> np.ndarray:
     return np.asarray(x).astype(str)
 
 
-def _dataset_pair_weights_from_ids(
-    dataset_ids: Sequence[int] | np.ndarray,
-    gamma: float,
-) -> np.ndarray:
-    """
-    Per-pair dataset balancing weights.
-
-    Let N_d be the number of flat transcript-dataset pairs in dataset d.
-
-        gamma = 0.0 -> all pairs have equal weight
-        gamma = 1.0 -> total expected dataset mass is equalized
-
-    Pair weight:
-
-        w_{t,d} = N_d^{-gamma}
-    """
-    dataset_ids = _as_numpy_int(dataset_ids)
-    gamma = float(gamma)
-
-    unique_ids, counts = np.unique(dataset_ids, return_counts=True)
-    count_map = {int(ds): float(n) for ds, n in zip(unique_ids, counts)}
-
-    weights = np.asarray(
-        [count_map[int(ds)] ** (-gamma) for ds in dataset_ids],
-        dtype=np.float64,
-    )
-
-    weights = np.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
-    if weights.sum() <= 0:
-        weights = np.ones_like(weights, dtype=np.float64)
-
-    return weights
-
-
-def _transcript_pair_weights(
-    *,
-    flat_transcript_ids: Sequence[str] | np.ndarray,
-    flat_dataset_ids: Sequence[int] | np.ndarray,
-    dataset_balance_gamma: float = 0.0,
-) -> np.ndarray:
-    """
-    Per-pair weights for a transcript-balanced flat-pair objective.
-
-    For transcript t measured in k_t datasets, each observed pair gets weight
-
-        1 / k_t
-
-    so the total contribution of one transcript is approximately one unit,
-    regardless of how many datasets measured it.
-
-    Optional mild dataset balancing can be added through N_d^{-gamma}:
-
-        w_{t,d} = (1 / k_t) * N_d^{-gamma}
-
-    Recommended for your current setting:
-
-        dataset_balance_gamma = 0.0 or 0.25
-
-    Avoid gamma=1.0 unless you explicitly want equal dataset importance.
-    """
-    flat_transcript_ids = _as_numpy_str(flat_transcript_ids)
-    flat_dataset_ids = _as_numpy_int(flat_dataset_ids)
-
-    if len(flat_transcript_ids) != len(flat_dataset_ids):
-        raise ValueError("flat_transcript_ids and flat_dataset_ids must have same length.")
-
-    transcript_counts: dict[str, int] = defaultdict(int)
-    for tid in flat_transcript_ids:
-        transcript_counts[str(tid)] += 1
-
-    transcript_factor = np.asarray(
-        [1.0 / max(transcript_counts[str(tid)], 1) for tid in flat_transcript_ids],
-        dtype=np.float64,
-    )
-
-    dataset_factor = _dataset_pair_weights_from_ids(
-        flat_dataset_ids,
-        gamma=float(dataset_balance_gamma),
-    )
-
-    weights = transcript_factor * dataset_factor
-    weights = np.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
-
-    if weights.sum() <= 0:
-        weights = np.ones_like(weights, dtype=np.float64)
-
-    return weights
-
-
 # ============================================================
 # Samplers
 # ============================================================
-
-
-class RandomDatasetPerTranscriptSampler(Sampler[int]):
-    """
-    Main recommended sampler for partially overlapping datasets.
-
-    It operates on a deterministic flat-pair dataset, where each item is a
-    transcript-dataset pair.
-
-    For each transcript, one available dataset-pair is sampled per epoch.
-
-    If transcript t appears in k_t datasets, the sampler selects one of those
-    k_t flat-pair indices. Therefore each transcript contributes approximately
-    one training example per epoch, not k_t examples.
-
-    This implements the objective:
-
-        L = mean_t mean_{d in D(t)} loss(t, d)
-
-    stochastically, without double-weighting paired transcripts.
-
-    dataset_balance_gamma optionally changes the probability of choosing a
-    dataset for transcripts with multiple dataset observations:
-
-        p(d | t) proportional to N_d^{-gamma}
-
-    where N_d is the number of flat pairs in dataset d.
-
-        gamma = 0.0 -> uniform over available datasets for that transcript
-        gamma = 0.5 -> mild preference for smaller datasets
-        gamma = 1.0 -> strong equalizing pressure
-    """
-
-    def __init__(
-        self,
-        *,
-        flat_transcript_ids: Sequence[str] | np.ndarray,
-        flat_dataset_ids: Sequence[int] | np.ndarray,
-        num_samples: Optional[int] = None,
-        dataset_balance_gamma: float = 0.0,
-        seed: int = 42,
-        shuffle_transcripts: bool = True,
-    ):
-        self.flat_transcript_ids = _as_numpy_str(flat_transcript_ids)
-        self.flat_dataset_ids = _as_numpy_int(flat_dataset_ids)
-        self.dataset_balance_gamma = float(dataset_balance_gamma)
-        self.seed = int(seed)
-        self.shuffle_transcripts = bool(shuffle_transcripts)
-        self._iter_count = 0
-
-        if len(self.flat_transcript_ids) != len(self.flat_dataset_ids):
-            raise ValueError("flat_transcript_ids and flat_dataset_ids must have same length.")
-
-        groups: dict[str, list[int]] = defaultdict(list)
-        for idx, tid in enumerate(self.flat_transcript_ids):
-            groups[str(tid)].append(int(idx))
-
-        self.transcript_ids = np.asarray(sorted(groups.keys()), dtype=object)
-        self.groups = [np.asarray(groups[str(tid)], dtype=np.int64) for tid in self.transcript_ids]
-
-        dataset_counts: dict[int, int] = defaultdict(int)
-        for ds in self.flat_dataset_ids:
-            dataset_counts[int(ds)] += 1
-        self.dataset_counts = {int(k): int(v) for k, v in dataset_counts.items()}
-
-        self.num_transcripts = len(self.groups)
-        self.num_samples = int(num_samples) if num_samples is not None else self.num_transcripts
-
-        if self.num_samples <= 0:
-            raise ValueError("num_samples must be positive.")
-
-    def __iter__(self) -> Iterator[int]:
-        rng = np.random.default_rng(self.seed + self._iter_count)
-        self._iter_count += 1
-
-        n_groups = self.num_transcripts
-
-        if self.num_samples == n_groups:
-            group_order = np.arange(n_groups, dtype=np.int64)
-            if self.shuffle_transcripts:
-                rng.shuffle(group_order)
-        else:
-            group_order = rng.integers(
-                low=0,
-                high=n_groups,
-                size=self.num_samples,
-                endpoint=False,
-                dtype=np.int64,
-            )
-
-        for group_idx in group_order:
-            pair_indices = self.groups[int(group_idx)]
-
-            if pair_indices.size == 1:
-                yield int(pair_indices[0])
-                continue
-
-            if self.dataset_balance_gamma <= 0.0:
-                probs = None
-            else:
-                ds_ids = self.flat_dataset_ids[pair_indices]
-                raw = np.asarray(
-                    [
-                        float(self.dataset_counts[int(ds)]) ** (-self.dataset_balance_gamma)
-                        for ds in ds_ids
-                    ],
-                    dtype=np.float64,
-                )
-                raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
-                probs = raw / raw.sum() if raw.sum() > 0 else None
-
-            chosen = rng.choice(pair_indices, size=1, replace=False, p=probs)
-            yield int(chosen[0])
-
-    def __len__(self) -> int:
-        return self.num_samples
-
-
-class DatasetAwareBatchSampler:
-    """
-    Legacy / explicit dataset-aware batch sampler.
-
-    Each batch contains a controlled number of datasets.
-
-    Example:
-        batch_size = 8
-        datasets_per_batch = 4
-
-    gives approximately:
-        2 samples from dataset A
-        2 samples from dataset B
-        2 samples from dataset C
-        2 samples from dataset D
-
-    This is useful when you explicitly want balanced multi-dataset batches.
-    For your current setting, this can over-equalize Grimson/Kutay and may hurt
-    the larger/cleaner dataset.
-    """
-
-    def __init__(
-        self,
-        sampler=None,   # accepted for Lightning DDP compat; not used internally
-        *,
-        dataset_ids,
-        lengths,
-        batch_size: int,
-        datasets_per_batch: int,
-        num_batches: int,
-        gamma: float = 1.0,
-        seed: int = 42,
-        drop_last: bool = False,
-        sort_by_length: bool = True,
-        num_replicas: int = 1,
-        rank: int = 0,
-    ):
-        self.dataset_ids = np.asarray(dataset_ids, dtype=np.int64)
-        self.lengths = np.asarray(lengths, dtype=np.int64)
-
-        self.batch_size = int(batch_size)
-        self.datasets_per_batch = int(datasets_per_batch)
-        self.num_batches = int(num_batches)
-        self.gamma = float(gamma)
-        self.seed = int(seed)
-        self.drop_last = bool(drop_last)
-        self.sort_by_length = bool(sort_by_length)
-        self.num_replicas = max(int(num_replicas), 1)
-        self.rank = int(rank) % self.num_replicas
-
-        if self.batch_size <= 0:
-            raise ValueError("batch_size must be positive.")
-        if self.datasets_per_batch <= 0:
-            raise ValueError("datasets_per_batch must be positive.")
-        if self.datasets_per_batch > self.batch_size:
-            raise ValueError(
-                f"datasets_per_batch={self.datasets_per_batch} cannot exceed "
-                f"batch_size={self.batch_size}."
-            )
-        if len(self.dataset_ids) != len(self.lengths):
-            raise ValueError("dataset_ids and lengths must have the same length.")
-
-        self.unique_dataset_ids = np.unique(self.dataset_ids)
-        self.indices_by_dataset = {
-            int(ds): np.flatnonzero(self.dataset_ids == ds)
-            for ds in self.unique_dataset_ids
-        }
-
-        counts = np.asarray(
-            [len(self.indices_by_dataset[int(ds)]) for ds in self.unique_dataset_ids],
-            dtype=np.float64,
-        )
-
-        # gamma = 0.0 -> sample datasets proportional to pair counts.
-        # gamma = 1.0 -> sample datasets uniformly.
-        probs = counts ** (1.0 - self.gamma)
-        self.dataset_probs = probs / probs.sum()
-        self._iter_count = 0
-
-    def __iter__(self):
-        rng = np.random.default_rng(self.seed + self._iter_count)
-        self._iter_count += 1
-
-        n_datasets = len(self.unique_dataset_ids)
-        d_per_batch = min(self.datasets_per_batch, n_datasets)
-
-        base_k = self.batch_size // d_per_batch
-        remainder = self.batch_size % d_per_batch
-
-        batches = []
-        for _ in range(self.num_batches):
-            chosen_datasets = rng.choice(
-                self.unique_dataset_ids,
-                size=d_per_batch,
-                replace=False,
-                p=self.dataset_probs,
-            )
-
-            batch = []
-            for j, ds in enumerate(chosen_datasets):
-                ds = int(ds)
-                k = base_k + (1 if j < remainder else 0)
-                pool = self.indices_by_dataset[ds]
-                sampled = rng.choice(pool, size=k, replace=True)
-                batch.extend(sampled.tolist())
-
-            if self.sort_by_length:
-                batch = sorted(
-                    batch,
-                    key=lambda idx: int(self.lengths[idx]),
-                    reverse=True,
-                )
-
-            if len(batch) == self.batch_size or not self.drop_last:
-                batches.append(batch)
-
-        yield from _shard_batches_padded(batches, self.num_replicas, self.rank)
-
-    def __len__(self):
-        # Replacement sampling fills every batch, so the global count is
-        # num_batches; ceil with no `- rank` -> equal per-rank count after padding.
-        return (self.num_batches + self.num_replicas - 1) // self.num_replicas
-
 
 def _shard_batches_padded(batches, num_replicas: int, rank: int):
     """Return this rank's shard of an already-built global batch list.
@@ -636,84 +308,6 @@ def _shard_batches_padded(batches, num_replicas: int, rank: int):
     if rem != 0:
         batches = list(batches) + [batches[j % n] for j in range(W - rem)]
     return batches[rank::W]
-
-
-class SortedLengthBatchSampler(BatchSampler):
-    """
-    Batch sampler that groups sampled indices by sequence length.
-
-    This is important for variable-length transcripts because memory depends on
-    the token budget, not only on batch_size.
-
-    It sorts all sampled indices by length, chunks into batches, and optionally
-    shuffles the order of length-homogeneous batches.
-    """
-
-    def __init__(
-        self,
-        sampler,
-        batch_size: int,
-        drop_last: bool = False,
-        lengths=None,
-        seed: int = 42,
-        shuffle: bool = True,
-        descending: bool = True,
-        num_replicas: int = 1,
-        rank: int = 0,
-    ):
-        self.sampler = sampler
-        self.batch_size = int(batch_size)
-        self.drop_last = bool(drop_last)
-        self.seed = int(seed)
-        self.shuffle = bool(shuffle)
-        self.descending = bool(descending)
-        self.num_replicas = max(int(num_replicas), 1)
-        self.rank = int(rank) % self.num_replicas
-
-        if lengths is None:
-            raise ValueError("SortedLengthBatchSampler requires lengths.")
-
-        self.lengths = np.asarray(lengths)
-        self._iter_count = 0
-
-    def __iter__(self):
-        idx = np.fromiter(iter(self.sampler), dtype=np.int64)
-
-        if idx.size == 0:
-            return
-            yield
-
-        if idx.max(initial=0) >= len(self.lengths):
-            raise IndexError(
-                f"Sampler yielded index {idx.max()} but lengths has size {len(self.lengths)}."
-            )
-
-        order = np.argsort(self.lengths[idx], kind="stable")
-        if self.descending:
-            order = order[::-1]
-        idx = idx[order]
-
-        batches = [
-            idx[i: i + self.batch_size].tolist()
-            for i in range(0, len(idx), self.batch_size)
-        ]
-
-        if self.drop_last and batches and len(batches[-1]) < self.batch_size:
-            batches = batches[:-1]
-
-        if self.shuffle and len(batches) > 1:
-            rng = np.random.default_rng(self.seed + self._iter_count)
-            self._iter_count += 1
-            batch_order = rng.permutation(len(batches))
-            batches = [batches[int(j)] for j in batch_order]
-
-        yield from _shard_batches_padded(batches, self.num_replicas, self.rank)
-
-    def __len__(self):
-        n = len(self.sampler)
-        total = n // self.batch_size if self.drop_last else (n + self.batch_size - 1) // self.batch_size
-        # ceil, with no `- rank`: padded sharding gives every rank an equal count.
-        return (total + self.num_replicas - 1) // self.num_replicas
 
 
 class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
@@ -742,8 +336,6 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
         flat_dataset_ids: Sequence[int] | np.ndarray,
         lengths,
         batch_size: int,
-        num_samples: Optional[int] = None,
-        gamma: float = 0.0,
         seed: int = 42,
         drop_last: bool = False,
         sort_by_length: bool = True,
@@ -765,8 +357,6 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
         # distributed-sampler injection in the project config).
         super().__init__(sampler=sampler, batch_size=batch_size, drop_last=drop_last)
         self.batch_size = int(batch_size)
-        self.num_samples = int(num_samples) if num_samples is not None else None
-        self.gamma = float(gamma)
         self.seed = int(seed)
         self.drop_last = bool(drop_last)
         self.sort_by_length = bool(sort_by_length)
@@ -857,40 +447,6 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
             self.batch_size,
         )
 
-        dataset_counts: dict[int, int] = defaultdict(int)
-        for ds in self.flat_dataset_ids:
-            dataset_counts[int(ds)] += 1
-        self.dataset_counts = {int(k): int(v) for k, v in dataset_counts.items()}
-
-        # Per-epoch target number of (transcript, dataset) pairs when num_samples
-        # is not given. Used by the group-selection-balancing path below.
-        self._epoch_pairs = int(self.group_pair_counts.sum())
-
-        # Group-SELECTION balancing weights. When gamma > 0, groups are drawn (with
-        # replacement) in proportion to the rarity of the datasets they contain, so
-        # transcripts measured in a rare dataset (e.g. the small one) are upsampled
-        # instead of being flooded by single-dataset groups of the abundant dataset.
-        # Weight of a group = sum over its member pairs of N_d^{-gamma}, reusing the
-        # same N_d^{-gamma} scheme as _sample_group_indices and
-        # _dataset_pair_weights_from_ids. gamma <= 0 -> None -> uniform selection
-        # (unchanged legacy behavior).
-        self.group_select_weights: Optional[np.ndarray] = None
-        if self.gamma > 0.0:
-            raw = np.asarray(
-                [
-                    sum(
-                        float(self.dataset_counts[int(self.flat_dataset_ids[idx])]) ** (-self.gamma)
-                        for idx in group
-                    )
-                    for group in self.groups
-                ],
-                dtype=np.float64,
-            )
-            raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
-            total = raw.sum()
-            if total > 0:
-                self.group_select_weights = raw / total
-
     def _sample_group_indices(
         self,
         group_index: int,
@@ -909,60 +465,14 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
                 f"physical capacity {self.batch_size}; complete groups are atomic."
             )
 
-        if self.gamma <= 0.0:
-            probs = None
-        else:
-            raw = np.asarray(
-                [
-                    float(self.dataset_counts[int(self.flat_dataset_ids[idx])]) ** (-self.gamma)
-                    for idx in group
-                ],
-                dtype=np.float64,
-            )
-            raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
-            probs = raw / raw.sum() if raw.sum() > 0 else None
-
-        sampled = rng.choice(group, size=self.batch_size, replace=False, p=probs)
+        sampled = rng.choice(group, size=self.batch_size, replace=False)
         return np.asarray(sampled, dtype=np.int64), False
 
     def _select_groups(
         self,
         rng: np.random.Generator,
     ) -> list[tuple[int, int, np.ndarray, bool]]:
-        if self.group_select_weights is not None:
-            # Dataset-rarity-weighted selection with replacement. Fill until the
-            # target pair count is reached; groups containing rare datasets are
-            # upsampled so per-epoch per-dataset representation is balanced.
-            target_pairs = (
-                int(self.num_samples)
-                if self.num_samples is not None
-                else self._epoch_pairs
-            )
-            order: list[int] = []
-            n_pairs = 0
-            num_groups = len(self.groups)
-            # Sample in chunks to avoid one rng call per group.
-            chunk = max(num_groups, 1)
-            while n_pairs < target_pairs:
-                draws = rng.choice(
-                    num_groups, size=chunk, replace=True, p=self.group_select_weights
-                )
-                for group_idx in draws:
-                    order.append(int(group_idx))
-                    n_pairs += int(self.group_pair_counts[int(group_idx)])
-                    if n_pairs >= target_pairs:
-                        break
-            group_order = np.asarray(order, dtype=np.int64)
-        elif self.num_samples is None:
-            group_order = rng.permutation(len(self.groups))
-        else:
-            order = []
-            n_pairs = 0
-            while n_pairs < self.num_samples:
-                group_idx = int(rng.integers(0, len(self.groups)))
-                order.append(group_idx)
-                n_pairs += int(self.group_pair_counts[group_idx])
-            group_order = np.asarray(order, dtype=np.int64)
+        group_order = rng.permutation(len(self.groups))
 
         selected = []
         for group_idx in group_order:
@@ -1101,61 +611,11 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
     """
     DataModule for multi-dataset ribo-seq profile training.
 
-    Recommended current strategy for partially overlapping datasets:
-
-        train_sampling_strategy: random_dataset_per_transcript
-        dataset_balance_gamma: 0.0 or 0.25
-        dataset_aware_batching: false
-
-    Why:
-        - Each transcript contributes approximately once per epoch.
-        - Common transcripts are not double-weighted just because they appear in
-          two datasets.
-        - Dataset choice for common transcripts is stochastic across epochs.
-        - Optional gamma gives mild preference to smaller datasets without fully
-          equalizing them.
-
-    Available train_sampling_strategy values:
-
-        random_dataset_per_transcript
-            Recommended. Uses deterministic flat pairs internally, but samples
-            one available dataset-pair per transcript per epoch.
-
-        transcript_balanced_pairs
-            Samples flat pairs with replacement using weight 1/k_t for each
-            transcript-dataset pair. Similar objective, less exact per epoch.
-
-        flat_pairs
-            Full deterministic flat-pair pass. Common transcripts count once per
-            dataset observation.
-
-        dataset_balanced_pairs
-            Weighted flat-pair sampling with N_d^{-gamma}. This is the previous
-            balanced_train_sampling=True behavior without dataset-aware batches.
-
-        dataset_aware_balanced_pairs
-            Explicitly balanced multi-dataset batches. Strong equalization.
-
-        transcript_grouped_pairs
-            Groups all available dataset observations for each sampled transcript
-            into the same batch. Single-dataset transcripts are included.
-
-        transcript_grouped_multidataset_pairs
-            Same as transcript_grouped_pairs, but only uses transcripts measured
-            in at least two datasets. This gives matched multi-dataset ground
-            truth per transcript inside each batch, which is useful for CAGrad.
-
-        legacy_random_dataset
-            Old behavior: dataset_choice_mode='random' inside __getitem__.
-            Kept for comparison, but less reproducible with persistent workers.
-
-    Backward compatibility:
-        If train_sampling_strategy is None:
-            - balanced_train_sampling=False -> random_dataset_per_transcript
-            - balanced_train_sampling=True and dataset_aware_batching=False
-                -> dataset_balanced_pairs
-            - balanced_train_sampling=True and dataset_aware_batching=True
-                -> dataset_aware_balanced_pairs
+    Training uses one of the transcript-grouped strategies. Groups are atomic,
+    so every retained dataset observation for a transcript is packed together.
+    The two supported strategies are ``transcript_grouped_pairs`` (including
+    single-dataset transcripts) and ``transcript_grouped_multidataset_pairs``
+    (requiring at least two dataset observations).
     """
 
     def __init__(
@@ -1174,19 +634,12 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         num_workers: int = 4,
         predict_num_workers: int = 0,
         seed: int = 42,
-        balanced_train_sampling: bool = False,
-        dataset_balance_gamma: float = 0.0,
-        train_samples_per_epoch: Optional[int] = None,
-        dataset_aware_batching: bool = False,
-        datasets_per_batch: int = 4,
         train_sampling_strategy: Optional[str] = None,
         train_allowed_dataset_names_by_transcript: Optional[dict[str, Sequence[str]]] = None,
         val_allowed_dataset_names_by_transcript: Optional[dict[str, Sequence[str]]] = None,
         pin_memory: bool = True,
         prefetch_factor: Optional[int] = 4,
         multiprocessing_context: Optional[str] = "spawn",
-        use_ribo_replicas: bool = False,
-        ribo_replicas_column: str = "ribo_cds_replicas",
         additional_sequence_features: Optional[dict] = None,
         dataset_quality_ranking_path: Optional[str] = None,
         dataset_quality_dataset_column: str = "dataset",
@@ -1226,12 +679,6 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             raise ValueError("DataLoader worker counts must be non-negative.")
         self.seed = int(seed)
 
-        self.balanced_train_sampling = bool(balanced_train_sampling)
-        self.dataset_balance_gamma = float(dataset_balance_gamma)
-        self.train_samples_per_epoch = train_samples_per_epoch
-
-        self.dataset_aware_batching = bool(dataset_aware_batching)
-        self.datasets_per_batch = int(datasets_per_batch)
         self.train_sampling_strategy = train_sampling_strategy
         self.train_allowed_dataset_names_by_transcript = train_allowed_dataset_names_by_transcript
         self.val_allowed_dataset_names_by_transcript = val_allowed_dataset_names_by_transcript
@@ -1249,8 +696,6 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
                 )
             self.multiprocessing_context = context
 
-        self.use_ribo_replicas = bool(use_ribo_replicas)
-        self.ribo_replicas_column = str(ribo_replicas_column)
         self.additional_sequence_features = dict(additional_sequence_features or {})
         self.dataset_quality_ranking_path = dataset_quality_ranking_path
         self.dataset_quality_dataset_column = str(dataset_quality_dataset_column)
@@ -1276,7 +721,6 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
 
         self.train_flat_dataset_ids = None
         self.train_flat_transcript_ids = None
-        self.train_pair_weights = None
         self.val_flat_dataset_ids = None
         self.val_flat_transcript_ids = None
 
@@ -1287,21 +731,22 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
     # ------------------------------------------------------------
 
     def _resolve_train_sampling_strategy(self) -> str:
-        if self.train_sampling_strategy is not None:
-            return str(self.train_sampling_strategy).lower()
-
-        if self.balanced_train_sampling:
-            if self.dataset_aware_batching:
-                return "dataset_aware_balanced_pairs"
-            return "dataset_balanced_pairs"
-
-        # New default replacing the old random __getitem__ dataset selection.
-        return "random_dataset_per_transcript"
+        strategy = str(
+            self.train_sampling_strategy or "transcript_grouped_pairs"
+        ).lower()
+        supported = {
+            "transcript_grouped_pairs",
+            "transcript_grouped_multidataset_pairs",
+        }
+        if strategy not in supported:
+            raise ValueError(
+                "Only transcript-grouped sampling is supported; choose one of "
+                f"{sorted(supported)}, got {strategy!r}."
+            )
+        return strategy
 
     def _training_dataset_choice_mode(self) -> str:
-        strategy = self._resolve_train_sampling_strategy()
-        if strategy == "legacy_random_dataset":
-            return "random"
+        self._resolve_train_sampling_strategy()
         return "deterministic"
 
     def _get_flat_dataset_ids(self, dataset_obj) -> np.ndarray:
@@ -1309,8 +754,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             return _as_numpy_int(dataset_obj.flat_dataset_ids)
         raise AttributeError(
             "RiboAIQueuingDatasetMultiDataset must expose flat_dataset_ids in "
-            "deterministic mode. Your existing code already appears to use this "
-            "attribute for balanced sampling."
+            "deterministic transcript-grouped mode."
         )
 
     def _get_flat_lengths(self, dataset_obj) -> np.ndarray:
@@ -1367,7 +811,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
                     if flat_idx.max(initial=0) < len(tids):
                         return tids[flat_idx]
 
-        # Fallback for flat_pairs list/dict.
+        # Fallback for a generic flat-pair list/dict.
         if hasattr(dataset_obj, "flat_pairs"):
             pairs = getattr(dataset_obj, "flat_pairs")
             tids = []
@@ -1378,7 +822,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
                             tids.append(str(p[key]))
                             break
                     else:
-                        raise AttributeError("Could not find transcript id key in flat_pairs dict.")
+                        raise AttributeError("Could not find transcript ID key in flat-pair dict.")
                 elif isinstance(p, (tuple, list)) and len(p) >= 1:
                     # Prefer first element if it is string-like; otherwise second.
                     if isinstance(p[0], str):
@@ -1387,11 +831,11 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
                         tids.append(str(p[1]))
                     else:
                         raise AttributeError(
-                            "flat_pairs exists, but tuple layout is not recognized. "
+                            "Flat-pair metadata exists, but tuple layout is not recognized. "
                             "Add dataset_obj.flat_transcript_ids explicitly."
                         )
                 else:
-                    raise AttributeError("flat_pairs layout is not recognized.")
+                    raise AttributeError("Flat-pair metadata layout is not recognized.")
             arr = _as_numpy_str(tids)
             if len(arr) == len(dataset_obj):
                 return arr
@@ -1470,16 +914,12 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
                 columns.append("weight")
                 weighted_dataset_names.append(dataset_name)
 
-            if self.use_ribo_replicas:
-                if self.ribo_replicas_column not in df.columns:
-                    raise KeyError(
-                        f"data.use_ribo_replicas=true but column "
-                        f"{self.ribo_replicas_column!r} is missing in {path}. Point "
-                        "dataset_config at the replica parquets "
-                        "(config/dataset_config/replica_datasets_paths.yaml or "
-                        "Datasets/data/weighted_datasets_ribo_replicas)."
-                    )
-                columns.append(self.ribo_replicas_column)
+            if RIBO_REPLICAS_COLUMN not in df.columns:
+                raise KeyError(
+                    f"Required replica column {RIBO_REPLICAS_COLUMN!r} is missing "
+                    f"in {path}. Point dataset_config at replica-aware parquets."
+                )
+            columns.append(RIBO_REPLICAS_COLUMN)
 
             loaded_datasets[dataset_name] = df[columns]
             union_index = union_index.union(df.index, sort=False)
@@ -1576,23 +1016,16 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         for dataset_name, df in loaded_datasets.items():
             has_weight = "weight" in df.columns
             ids = df.index.astype(str)
-            ribo_values = df["ribo"].values
             weight_values = df["weight"].values if has_weight else None
-            replica_values = (
-                df[self.ribo_replicas_column].values if self.use_ribo_replicas else None
-            )
+            replica_values = df[RIBO_REPLICAS_COLUMN].values
             for i, t_id in enumerate(ids):
                 if t_id not in valid_ids:
                     continue
-                if self.use_ribo_replicas:
-                    reps = _stack_replicas(replica_values[i])  # [R, L], CDS-aligned
-                    shared_data["ribo_replicas"][t_id][dataset_name] = reps
-                    # Representative target = replica mean (aligned to the start
-                    # codon). The single `ribo` field is +1-shifted and is
-                    # intentionally NOT used as the target in replica mode.
-                    shared_data["ribo_profiles"][t_id][dataset_name] = reps.mean(axis=0)
-                else:
-                    shared_data["ribo_profiles"][t_id][dataset_name] = ribo_values[i]
+                reps = _stack_replicas(replica_values[i])  # [R, L], CDS-aligned
+                shared_data["ribo_replicas"][t_id][dataset_name] = reps
+                # Consensus is retained for PCC and diagnostics. The NB count
+                # likelihood is always evaluated on the raw replica profiles.
+                shared_data["ribo_profiles"][t_id][dataset_name] = reps.mean(axis=0)
                 if has_weight:
                     sample_weight = float(weight_values[i])
                     if not np.isfinite(sample_weight):
@@ -1640,8 +1073,6 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         print("\n=== Training sampling strategy ===")
         print(f"strategy: {strategy}")
         print(f"dataset_choice_mode: {train_choice_mode}")
-        print(f"dataset_balance_gamma: {self.dataset_balance_gamma}")
-        print(f"train_samples_per_epoch: {self.train_samples_per_epoch}")
 
         self.train_dataset_obj = RiboAIQueuingDatasetMultiDataset(
             data=shared_data,
@@ -1655,7 +1086,6 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             dataset_choice_mode=train_choice_mode,
             allowed_dataset_names_by_transcript=self.train_allowed_dataset_names_by_transcript,
             seed=self.seed,
-            use_ribo_replicas=self.use_ribo_replicas,
             additional_sequence_features=self.additional_sequence_features,
         )
 
@@ -1664,29 +1094,12 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             self.train_flat_dataset_ids = self._get_flat_dataset_ids(self.train_dataset_obj)
             self.train_flat_transcript_ids = self._get_flat_transcript_ids(self.train_dataset_obj)
 
-            self.train_pair_weights = _transcript_pair_weights(
-                flat_transcript_ids=self.train_flat_transcript_ids,
-                flat_dataset_ids=self.train_flat_dataset_ids,
-                dataset_balance_gamma=self.dataset_balance_gamma,
-            )
-
             self._print_flat_pair_summary(
                 dataset_obj=self.train_dataset_obj,
                 flat_transcript_ids=self.train_flat_transcript_ids,
                 flat_dataset_ids=self.train_flat_dataset_ids,
                 split_name="train",
             )
-        else:
-            # Legacy random mode: one item per transcript, dataset selected in __getitem__.
-            self.train_lengths = lengths[train_indices]
-            self.train_flat_dataset_ids = None
-            self.train_flat_transcript_ids = None
-            self.train_pair_weights = None
-
-            print("\n=== Legacy random dataset mode ===")
-            print("Each transcript appears once per epoch; dataset is randomly chosen inside __getitem__. ")
-            print("For reproducibility, prefer random_dataset_per_transcript instead.")
-
         self.val_dataset_obj = RiboAIQueuingDatasetMultiDataset(
             data=shared_data,
             lengths=shared_data["lengths"],
@@ -1699,7 +1112,6 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             dataset_choice_mode="deterministic",
             allowed_dataset_names_by_transcript=self.val_allowed_dataset_names_by_transcript,
             seed=self.seed,
-            use_ribo_replicas=self.use_ribo_replicas,
             additional_sequence_features=self.additional_sequence_features,
         )
 
@@ -1808,8 +1220,6 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             flat_dataset_ids=self.train_flat_dataset_ids,
             lengths=self.train_lengths,
             batch_size=self.batch_size,
-            num_samples=self.train_samples_per_epoch,
-            gamma=self.dataset_balance_gamma,
             seed=self.seed if iteration_seed is None else int(iteration_seed),
             drop_last=False,
             sort_by_length=True,
@@ -1865,180 +1275,15 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         if self.train_dataset_obj is None:
             raise RuntimeError("setup() must be called before train_dataloader().")
 
-        strategy = self._resolve_train_sampling_strategy()
+        self._resolve_train_sampling_strategy()
         epoch = self.trainer.current_epoch if self.trainer is not None else 0
         seed = self.seed + int(epoch)
         num_replicas, rank = self._dist_info()
-
-        if strategy == "legacy_random_dataset":
-            base_sampler = SequentialSampler(self.train_dataset_obj)
-
-            batch_sampler = SortedLengthBatchSampler(
-                sampler=base_sampler,
-                batch_size=self.batch_size,
-                drop_last=False,
-                shuffle=True,
-                lengths=self.train_lengths,
-                seed=seed,
-                descending=True,
-                num_replicas=num_replicas,
-                rank=rank,
-            )
-
-        elif strategy == "random_dataset_per_transcript":
-            if self.train_flat_transcript_ids is None or self.train_flat_dataset_ids is None:
-                raise RuntimeError("random_dataset_per_transcript requires deterministic flat metadata.")
-
-            base_sampler = RandomDatasetPerTranscriptSampler(
-                flat_transcript_ids=self.train_flat_transcript_ids,
-                flat_dataset_ids=self.train_flat_dataset_ids,
-                num_samples=self.train_samples_per_epoch,
-                dataset_balance_gamma=self.dataset_balance_gamma,
-                seed=seed,
-                shuffle_transcripts=True,
-            )
-
-            batch_sampler = SortedLengthBatchSampler(
-                sampler=base_sampler,
-                batch_size=self.batch_size,
-                drop_last=False,
-                shuffle=True,
-                lengths=self.train_lengths,
-                seed=seed,
-                descending=True,
-                num_replicas=num_replicas,
-                rank=rank,
-            )
-
-        elif strategy == "transcript_balanced_pairs":
-            if self.train_pair_weights is None:
-                raise RuntimeError("transcript_balanced_pairs requires deterministic flat metadata.")
-
-            num_samples = (
-                int(self.train_samples_per_epoch)
-                if self.train_samples_per_epoch is not None
-                else len(self.train_dataset_obj)
-            )
-
-            generator = torch.Generator().manual_seed(seed)
-            base_sampler = WeightedRandomSampler(
-                weights=torch.as_tensor(self.train_pair_weights, dtype=torch.double),
-                num_samples=num_samples,
-                replacement=True,
-                generator=generator,
-            )
-
-            batch_sampler = SortedLengthBatchSampler(
-                sampler=base_sampler,
-                batch_size=self.batch_size,
-                drop_last=False,
-                shuffle=True,
-                lengths=self.train_lengths,
-                seed=seed,
-                descending=True,
-                num_replicas=num_replicas,
-                rank=rank,
-            )
-
-        elif strategy == "flat_pairs":
-            if self.train_samples_per_epoch is None:
-                base_sampler = SequentialSampler(self.train_dataset_obj)
-            else:
-                generator = torch.Generator().manual_seed(seed)
-                base_sampler = WeightedRandomSampler(
-                    weights=torch.ones(len(self.train_dataset_obj), dtype=torch.double),
-                    num_samples=int(self.train_samples_per_epoch),
-                    replacement=True,
-                    generator=generator,
-                )
-
-            batch_sampler = SortedLengthBatchSampler(
-                sampler=base_sampler,
-                batch_size=self.batch_size,
-                drop_last=False,
-                shuffle=True,
-                lengths=self.train_lengths,
-                seed=seed,
-                descending=True,
-                num_replicas=num_replicas,
-                rank=rank,
-            )
-
-        elif strategy == "dataset_balanced_pairs":
-            if self.train_flat_dataset_ids is None:
-                raise RuntimeError("dataset_balanced_pairs requires deterministic flat metadata.")
-
-            num_samples = (
-                int(self.train_samples_per_epoch)
-                if self.train_samples_per_epoch is not None
-                else len(self.train_dataset_obj)
-            )
-
-            weights = _dataset_pair_weights_from_ids(
-                self.train_flat_dataset_ids,
-                gamma=self.dataset_balance_gamma,
-            )
-
-            generator = torch.Generator().manual_seed(seed)
-            base_sampler = WeightedRandomSampler(
-                weights=torch.as_tensor(weights, dtype=torch.double),
-                num_samples=num_samples,
-                replacement=True,
-                generator=generator,
-            )
-
-            batch_sampler = SortedLengthBatchSampler(
-                sampler=base_sampler,
-                batch_size=self.batch_size,
-                drop_last=False,
-                shuffle=True,
-                lengths=self.train_lengths,
-                seed=seed,
-                descending=True,
-                num_replicas=num_replicas,
-                rank=rank,
-            )
-
-        elif strategy == "dataset_aware_balanced_pairs":
-            if self.train_flat_dataset_ids is None:
-                raise RuntimeError("dataset_aware_balanced_pairs requires deterministic flat metadata.")
-
-            num_samples = (
-                int(self.train_samples_per_epoch)
-                if self.train_samples_per_epoch is not None
-                else len(self.train_dataset_obj)
-            )
-            num_batches = (num_samples + self.batch_size - 1) // self.batch_size
-
-            batch_sampler = DatasetAwareBatchSampler(
-                dataset_ids=self.train_flat_dataset_ids,
-                lengths=self.train_lengths,
-                batch_size=self.batch_size,
-                datasets_per_batch=self.datasets_per_batch,
-                num_batches=num_batches,
-                gamma=self.dataset_balance_gamma,
-                seed=seed,
-                drop_last=False,
-                sort_by_length=True,
-                num_replicas=num_replicas,
-                rank=rank,
-            )
-
-        elif strategy in {"transcript_grouped_pairs", "transcript_grouped_multidataset_pairs"}:
-            batch_sampler = self._make_train_grouped_batch_sampler(
-                num_replicas=num_replicas,
-                rank=rank,
-                iteration_seed=seed,
-            )
-
-        else:
-            raise ValueError(
-                f"Unknown train_sampling_strategy={strategy!r}. Supported: "
-                "random_dataset_per_transcript, transcript_balanced_pairs, flat_pairs, "
-                "dataset_balanced_pairs, dataset_aware_balanced_pairs, "
-                "transcript_grouped_pairs, transcript_grouped_multidataset_pairs, "
-                "legacy_random_dataset."
-            )
+        batch_sampler = self._make_train_grouped_batch_sampler(
+            num_replicas=num_replicas,
+            rank=rank,
+            iteration_seed=seed,
+        )
 
         return DataLoader(
             self.train_dataset_obj,
@@ -2060,8 +1305,6 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             flat_dataset_ids=self.val_flat_dataset_ids,
             lengths=self.val_lengths,
             batch_size=self.batch_size,
-            num_samples=None,
-            gamma=0.0,
             seed=self.seed,
             drop_last=False,
             sort_by_length=True,
@@ -2093,8 +1336,6 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             flat_dataset_ids=self.val_flat_dataset_ids,
             lengths=self.val_lengths,
             batch_size=self.batch_size,
-            num_samples=None,
-            gamma=0.0,
             drop_last=False,
             seed=self.seed,
             sort_by_length=True,

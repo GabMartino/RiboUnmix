@@ -83,7 +83,7 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             dataset_quality_rank,
             dataset_quality_weight,
             dataset_bias_features[T, F_bias],  # when F_bias > 0
-            ribo_replicas[R, T],  # only when use_ribo_replicas=True
+            ribo_replicas[R, T],
         )
 
     Collate returns:
@@ -101,8 +101,8 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             dataset_quality_weights,# [B], positive rank-derived weight
             transcript_group_index, # [B], local IDs from ids_sorted
             bias_features_pad,     # [B, T_max, F_bias], optional
-            replica_pad,           # [B, R_max, T_max], optional
-            replica_mask,          # [B, R_max], optional
+            replica_pad,           # [B, R_max, T_max]
+            replica_mask,          # [B, R_max]
         )
 
     Speed-oriented details:
@@ -128,7 +128,6 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         allowed_dataset_names_by_transcript: Mapping[str, Sequence[str]] | None = None,
         precompute_features: bool = True,
         precompute_ribo: bool = True,
-        use_ribo_replicas: bool = False,
         additional_sequence_features: Mapping[str, Mapping] | None = None,
     ):
         super().__init__()
@@ -158,7 +157,6 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         self.seed = int(seed)
         self.precompute_features = bool(precompute_features)
         self.precompute_ribo = bool(precompute_ribo)
-        self.use_ribo_replicas = bool(use_ribo_replicas)
         self.additional_sequence_features = self._parse_additional_sequence_features(
             additional_sequence_features
         )
@@ -179,11 +177,10 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             spec["dimension"] for spec in self.dataset_bias_feature_specs
         )
         self.ribo_replicas_records = self.data_records.get("ribo_replicas")
-        if self.use_ribo_replicas and not self.ribo_replicas_records:
+        if not self.ribo_replicas_records:
             raise ValueError(
-                "use_ribo_replicas=True but data['ribo_replicas'] is empty. The "
-                "datamodule must populate per-replica profiles before constructing "
-                "the dataset."
+                "data['ribo_replicas'] is required and cannot be empty. Every "
+                "sample must carry at least one replica profile."
             )
         # Replica cache keyed by (transcript_id, dataset_name) -> [n_replicas, L].
         self._ribo_replicas_cache: dict[tuple[str, str], np.ndarray] = {}
@@ -379,11 +376,7 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
 
         encoded, codon_ids, dataset_bias_features = self._get_sequence_inputs(global_idx)
         ribo = self._get_ribo_profile(transcript_id, dataset_name)
-        replicas = (
-            self._get_ribo_replicas(transcript_id, dataset_name)
-            if self.use_ribo_replicas
-            else None
-        )
+        replicas = self._get_ribo_replicas(transcript_id, dataset_name)
         css = self.data_records["css"][global_idx]
         sample_weight = self._get_sample_weight(transcript_id, dataset_name)
         dataset_quality_rank, dataset_quality_weight = self._get_dataset_quality(
@@ -402,7 +395,7 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
                 f"seq_len={encoded.shape[0]}, codon_ids_len={len(codon_ids)}"
             )
 
-        if replicas is not None and replicas.shape[1] != encoded.shape[0]:
+        if replicas.shape[1] != encoded.shape[0]:
             raise ValueError(
                 f"Replica length mismatch for transcript_id={transcript_id}, "
                 f"dataset={dataset_name}: seq_len={encoded.shape[0]}, "
@@ -424,94 +417,7 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         )
         if self.dataset_bias_extra_dim > 0:
             sample = (*sample, dataset_bias_features)
-        if replicas is not None:
-            sample = (*sample, replicas)
-        return sample
-
-    # ============================================================
-    # Balancing / metadata helpers
-    # ============================================================
-
-    def make_dataset_balanced_weights(self, gamma: float = 1.0) -> torch.Tensor:
-        """
-        Returns one sampling weight per flat transcript-dataset pair.
-
-        For pair j from dataset d:
-
-            weight_j = N_d^(-gamma)
-
-        gamma = 0.0 -> no dataset balancing
-        gamma = 1.0 -> equal expected dataset sampling
-        gamma = 0.5 -> softened dataset balancing
-        """
-        if self.dataset_choice_mode != "deterministic":
-            raise RuntimeError(
-                "Balanced sampling requires dataset_choice_mode='deterministic'."
-            )
-
-        gamma = float(gamma)
-
-        dataset_ids = self.flat_dataset_ids
-        unique_ids, counts = np.unique(dataset_ids, return_counts=True)
-        count_map = {int(ds): int(c) for ds, c in zip(unique_ids, counts)}
-
-        weights = np.asarray(
-            [count_map[int(ds)] ** (-gamma) for ds in dataset_ids],
-            dtype=np.float64,
-        )
-
-        weights = weights / np.mean(weights)
-        return torch.as_tensor(weights, dtype=torch.double)
-
-    def make_transcript_balanced_weights(
-        self,
-        dataset_balance_gamma: float = 0.0,
-    ) -> torch.Tensor:
-        """
-        Returns one sampling weight per flat transcript-dataset pair.
-
-        For transcript t measured in k_t datasets, each pair gets 1/k_t.
-        Optional dataset balancing multiplies by N_d^(-dataset_balance_gamma).
-
-            weight_{t,d} = (1 / k_t) * N_d^(-gamma)
-
-        Recommended:
-            dataset_balance_gamma = 0.0 or 0.25
-        """
-        if self.dataset_choice_mode != "deterministic":
-            raise RuntimeError(
-                "Transcript-balanced sampling requires dataset_choice_mode='deterministic'."
-            )
-
-        gamma = float(dataset_balance_gamma)
-
-        transcript_counts: dict[str, int] = defaultdict(int)
-        for tid in self.flat_transcript_ids:
-            transcript_counts[str(tid)] += 1
-
-        unique_ds, ds_counts = np.unique(self.flat_dataset_ids, return_counts=True)
-        ds_count_map = {int(ds): float(n) for ds, n in zip(unique_ds, ds_counts)}
-
-        weights = []
-        for tid, ds_id in zip(self.flat_transcript_ids, self.flat_dataset_ids):
-            k_t = max(transcript_counts[str(tid)], 1)
-            n_d = max(ds_count_map[int(ds_id)], 1.0)
-            w = (1.0 / float(k_t)) * (n_d ** (-gamma))
-            weights.append(w)
-
-        weights = np.asarray(weights, dtype=np.float64)
-        weights = weights / np.mean(weights)
-        return torch.as_tensor(weights, dtype=torch.double)
-
-    def dataset_pair_counts(self) -> dict[int, int]:
-        unique_ids, counts = np.unique(self.flat_dataset_ids, return_counts=True)
-        return {int(ds): int(c) for ds, c in zip(unique_ids, counts)}
-
-    def transcript_dataset_counts(self) -> dict[str, int]:
-        counts: dict[str, int] = defaultdict(int)
-        for tid in self.flat_transcript_ids:
-            counts[str(tid)] += 1
-        return dict(counts)
+        return (*sample, replicas)
 
     def flat_pair_summary(self) -> dict:
         """
@@ -1025,7 +931,12 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
 
     def collate_fn(self, batch):
         has_bias_features = self.dataset_bias_extra_dim > 0
-        has_replicas = len(batch[0]) == 10 + int(has_bias_features)
+        expected_fields = 10 + int(has_bias_features)
+        if any(len(sample) != expected_fields for sample in batch):
+            raise ValueError(
+                "Every sample must contain the mandatory replica tensor; expected "
+                f"{expected_fields} fields per sample."
+            )
         (
             idx_datasets,
             ids,
@@ -1039,7 +950,7 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             *optional_values,
         ) = zip(*batch)
         bias_features = optional_values[0] if has_bias_features else None
-        replicas = optional_values[int(has_bias_features)] if has_replicas else None
+        replicas = optional_values[int(has_bias_features)]
 
         lengths = torch.as_tensor(
             [s.shape[0] for s in sequences],
@@ -1080,12 +991,10 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             for i in order_list
         ]
 
-        replicas_sorted = None
-        if replicas is not None:
-            replicas_sorted = [
-                torch.from_numpy(np.asarray(replicas[i], dtype=np.float32))
-                for i in order_list
-            ]
+        replicas_sorted = [
+            torch.from_numpy(np.asarray(replicas[i], dtype=np.float32))
+            for i in order_list
+        ]
 
         css_sorted = [css_s[i] for i in order_list]
         sample_weights_sorted = torch.as_tensor(
@@ -1156,35 +1065,34 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
 
         codon_ids_pad = codon_ids_pad.masked_fill(~mask_pad, 0)
 
-        replica_pad = None
-        replica_mask = None
-        if replicas_sorted is not None:
-            Rmax = max(int(rep.shape[0]) for rep in replicas_sorted)
-            replica_pad = torch.zeros(
-                len(replicas_sorted),
-                Rmax,
-                Tmax,
-                dtype=torch.float32,
-            )
-            replica_mask = torch.zeros(
-                len(replicas_sorted),
-                Rmax,
-                dtype=torch.bool,
-            )
-            for row_idx, rep in enumerate(replicas_sorted):
-                if rep.ndim != 2:
-                    raise ValueError(
-                        f"Expected replica tensor with shape [n_replicas, T], "
-                        f"got {tuple(rep.shape)}."
-                    )
-                n_rep, rep_len = int(rep.shape[0]), int(rep.shape[1])
-                if rep_len != int(lengths_sorted[row_idx].item()):
-                    raise ValueError(
-                        "Replica length mismatch after sorting: "
-                        f"rep_len={rep_len}, length={int(lengths_sorted[row_idx].item())}."
-                    )
-                replica_pad[row_idx, :n_rep, :rep_len] = rep
-                replica_mask[row_idx, :n_rep] = True
+        Rmax = max(int(rep.shape[0]) for rep in replicas_sorted)
+        replica_pad = torch.zeros(
+            len(replicas_sorted),
+            Rmax,
+            Tmax,
+            dtype=torch.float32,
+        )
+        replica_mask = torch.zeros(
+            len(replicas_sorted),
+            Rmax,
+            dtype=torch.bool,
+        )
+        for row_idx, rep in enumerate(replicas_sorted):
+            if rep.ndim != 2:
+                raise ValueError(
+                    f"Expected replica tensor with shape [n_replicas, T], "
+                    f"got {tuple(rep.shape)}."
+                )
+            n_rep, rep_len = int(rep.shape[0]), int(rep.shape[1])
+            if n_rep == 0:
+                raise ValueError("Every sample must contain at least one replica.")
+            if rep_len != int(lengths_sorted[row_idx].item()):
+                raise ValueError(
+                    "Replica length mismatch after sorting: "
+                    f"rep_len={rep_len}, length={int(lengths_sorted[row_idx].item())}."
+                )
+            replica_pad[row_idx, :n_rep, :rep_len] = rep
+            replica_mask[row_idx, :n_rep] = True
 
         seq_packed = pack_padded_sequence(
             seq_pad,
@@ -1209,6 +1117,4 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         )
         if bias_features_pad is not None:
             collated = (*collated, bias_features_pad)
-        if replica_pad is not None and replica_mask is not None:
-            collated = (*collated, replica_pad, replica_mask)
-        return collated
+        return (*collated, replica_pad, replica_mask)

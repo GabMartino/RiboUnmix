@@ -3,13 +3,11 @@ from __future__ import annotations
 import csv
 import json
 import math
-import warnings
 from pathlib import Path
 from typing import Any
 
 import lightning as pl
 import matplotlib
-import numpy as np
 import torch
 import torch.nn as nn
 
@@ -21,186 +19,6 @@ from matplotlib import pyplot as plt
 # ============================================================
 # Loss
 # ============================================================
-
-SAMPLE_REDUCTION_MODES = frozenset(
-    {"global_weighted", "dataset_balanced", "transcript_balanced"}
-)
-
-
-def _config_has_field(config: Any, name: str) -> bool:
-    if isinstance(config, dict):
-        return name in config
-    try:
-        return name in config
-    except TypeError:
-        return hasattr(config, name)
-
-
-def _config_field(config: Any, name: str) -> Any:
-    return config[name] if isinstance(config, dict) else getattr(config, name)
-
-
-def resolve_sample_reduction_mode(loss_config: Any) -> str:
-    """Resolve the explicit reducer while preserving the legacy boolean.
-
-    A present ``dataset_balanced_loss`` is treated as an explicit legacy
-    choice, not as a default.  Supplying both interfaces is accepted only when
-    they identify the same reduction, preventing an old run from being
-    silently reinterpreted.
-    """
-    has_mode = _config_has_field(loss_config, "sample_reduction")
-    has_legacy = _config_has_field(loss_config, "dataset_balanced_loss")
-    mode = (
-        str(_config_field(loss_config, "sample_reduction")).strip().lower()
-        if has_mode
-        else None
-    )
-    if mode is not None and mode not in SAMPLE_REDUCTION_MODES:
-        raise ValueError(
-            "loss.sample_reduction must be one of "
-            f"{sorted(SAMPLE_REDUCTION_MODES)}, got {mode!r}."
-        )
-
-    legacy_mode = None
-    if has_legacy:
-        legacy_value = _config_field(loss_config, "dataset_balanced_loss")
-        if not isinstance(legacy_value, bool):
-            raise TypeError(
-                "loss.dataset_balanced_loss must be a boolean when supplied, "
-                f"got {type(legacy_value).__name__}."
-            )
-        legacy_mode = "dataset_balanced" if legacy_value else "global_weighted"
-
-    if mode is not None and legacy_mode is not None and mode != legacy_mode:
-        raise ValueError(
-            "Conflicting sample-loss reductions: "
-            f"loss.sample_reduction={mode!r}, but "
-            f"loss.dataset_balanced_loss={legacy_value!r} resolves to "
-            f"{legacy_mode!r}. Remove the legacy field or make the two agree."
-        )
-    return mode or legacy_mode or "global_weighted"
-
-
-def reduce_per_sample_quantity(
-    values: torch.Tensor,
-    sample_weights: torch.Tensor,
-    transcript_group_ids: torch.Tensor,
-    dataset_ids: torch.Tensor,
-    mode: str,
-    eps: float = 1.0e-8,
-) -> torch.Tensor:
-    """Differentiably reduce one value per transcript-dataset sample.
-
-    ``global_weighted`` computes ``sum(w*zeta) / sum(w)``.  Writing
-    ``S_t=sum_{s:t(s)=t} w_s`` shows that this gives transcript ``t`` outer
-    mass ``S_t/sum_u S_u``.  ``transcript_balanced`` instead computes each
-    transcript's weighted mean and gives every positive-weight transcript one
-    equal outer contribution.  A directly useful sufficient condition for the
-    modes to coincide is that every transcript has the same observation count
-    and the same total sample-weight sum.  (Equal total weight is the operative
-    algebraic condition.)  In particular, this holds for unit weights and
-    exactly M observations per transcript.
-
-    Automatic gradient accumulation still averages physical-microbatch means.
-    It is optimizer-window exact only when accumulated microbatches contain the
-    same number of transcript groups.  TODO: add an optimizer-window-exact
-    group-weighted accumulation ablation if observed group-count variation is
-    substantial.
-    """
-    tensors = {
-        "values": values,
-        "sample_weights": sample_weights,
-        "transcript_group_ids": transcript_group_ids,
-        "dataset_ids": dataset_ids,
-    }
-    for name, tensor in tensors.items():
-        if not torch.is_tensor(tensor):
-            raise TypeError(f"{name} must be a torch.Tensor.")
-        if tensor.ndim != 1:
-            raise ValueError(f"{name} must have shape [B], got {tuple(tensor.shape)}.")
-    batch_size = values.shape[0]
-    for name, tensor in tensors.items():
-        if tensor.shape[0] != batch_size:
-            raise ValueError(
-                f"All reducer inputs must have the same B; values has {batch_size}, "
-                f"but {name} has {tensor.shape[0]}."
-            )
-    if not values.is_floating_point():
-        raise TypeError("values must use a floating-point dtype.")
-    if not sample_weights.is_floating_point():
-        raise TypeError("sample_weights must use a floating-point dtype.")
-    for name, tensor in (
-        ("transcript_group_ids", transcript_group_ids),
-        ("dataset_ids", dataset_ids),
-    ):
-        if tensor.is_floating_point() or tensor.dtype == torch.bool:
-            raise TypeError(f"{name} must use an integer dtype.")
-
-    mode = str(mode).strip().lower()
-    if mode not in SAMPLE_REDUCTION_MODES:
-        raise ValueError(
-            f"mode must be one of {sorted(SAMPLE_REDUCTION_MODES)}, got {mode!r}."
-        )
-    eps = float(eps)
-    if not math.isfinite(eps) or eps <= 0.0:
-        raise ValueError(f"eps must be finite and positive, got {eps}.")
-    if not bool(torch.isfinite(values).all()):
-        raise ValueError("values contains a non-finite per-sample quantity.")
-    if not bool(torch.isfinite(sample_weights).all()):
-        raise ValueError("sample_weights contains a non-finite value.")
-    if bool((sample_weights < 0.0).any()):
-        raise ValueError("sample_weights contains a negative value.")
-    if batch_size == 0:
-        return values.sum() * 0.0
-
-    device = values.device
-    accumulation_dtype = (
-        torch.float32
-        if values.dtype in {torch.float16, torch.bfloat16}
-        else values.dtype
-    )
-    values_acc = values.to(dtype=accumulation_dtype)
-    weights_acc = (
-        sample_weights.detach()
-        .to(device=device, dtype=accumulation_dtype)
-    )
-    transcript_ids = transcript_group_ids.to(device=device, dtype=torch.long)
-    datasets = dataset_ids.to(device=device, dtype=torch.long)
-    differentiable_zero = values_acc.sum() * 0.0
-
-    if mode == "global_weighted":
-        denominator = weights_acc.sum()
-        return (values_acc * weights_acc).sum() / denominator.clamp_min(eps)
-
-    grouping_ids = datasets if mode == "dataset_balanced" else transcript_ids
-    unique_groups, inverse = torch.unique(
-        grouping_ids,
-        sorted=False,
-        return_inverse=True,
-    )
-    group_count = unique_groups.numel()
-    if group_count == 0:
-        return differentiable_zero
-    numerator = torch.zeros(
-        group_count,
-        device=device,
-        dtype=accumulation_dtype,
-    )
-    denominator = torch.zeros_like(numerator)
-    numerator.index_add_(0, inverse, values_acc * weights_acc)
-    denominator.index_add_(0, inverse, weights_acc)
-    group_means = numerator / denominator.clamp_min(eps)
-
-    if mode == "dataset_balanced":
-        # Backward-compatible semantics: every represented dataset is included;
-        # a historical all-zero dataset bucket contributes a zero mean.
-        return group_means.mean()
-
-    valid_groups = denominator > eps
-    if not bool(valid_groups.any()):
-        return differentiable_zero
-    return group_means[valid_groups].mean()
-
 
 def _broadcast_profile_param(
     value: torch.Tensor,
@@ -457,11 +275,11 @@ class ResidualDiagnosticsAccumulator:
             )
             variance = (mu + alpha * mu.pow(2)).clamp_min(self.eps)
             nb_std = (target - mu) / torch.sqrt(variance + self.eps)
-            raw_residual = target - mu
+            additive = target - mu
             log_residual = torch.log(target.clamp_min(0.0) + self.eps_count) - torch.log(
                 mu.clamp_min(0.0) + self.eps_count
             )
-            relative = raw_residual / (mu + self.eps_count)
+            relative = additive / (mu + self.eps_count)
 
             B, T = target.shape
             pos = torch.arange(T).reshape(1, T).expand(B, T)
@@ -483,7 +301,7 @@ class ResidualDiagnosticsAccumulator:
                         "mu": mu[valid],
                         "alpha": alpha[valid],
                         "nb_std": nb_std[valid],
-                        "raw_residual": raw_residual[valid],
+                        "additive": additive[valid],
                         "log_residual": log_residual[valid],
                         "relative": relative[valid],
                         "L_bio": L_bio[valid],
@@ -502,7 +320,7 @@ class ResidualDiagnosticsAccumulator:
                 alpha_i = alpha[sample_idx][m]
                 nb_i = nb_std[sample_idx][m].abs()
                 nb_signed_i = nb_std[sample_idx][m]
-                raw_residual_i = raw_residual[sample_idx][m]
+                additive_i = additive[sample_idx][m]
                 log_i = log_residual[sample_idx][m]
                 abs_sum = nb_i.sum().clamp_min(self.eps)
                 y_nonneg = y_i.clamp_min(0.0)
@@ -568,8 +386,8 @@ class ResidualDiagnosticsAccumulator:
                     "nb_std_mean": float(nb_signed_i.mean().item()),
                     "nb_std_abs_mean": float(nb_i.mean().item()),
                     "nb_std_q95_abs": float(self._safe_quantile(nb_i, 0.95).item()),
-                    "mean_raw_residual": float(raw_residual_i.mean().item()),
-                    "mean_abs_raw_residual": float(raw_residual_i.abs().mean().item()),
+                    "mean_additive_residual": float(additive_i.mean().item()),
+                    "mean_abs_additive_residual": float(additive_i.abs().mean().item()),
                     "mean_log_residual": float(log_i.mean().item()),
                     "mean_abs_log_residual": float(log_i.abs().mean().item()),
                     "profile_log1p_mse": float((log1p_mu - log1p_y).pow(2).mean().item()),
@@ -612,7 +430,7 @@ class ResidualDiagnosticsAccumulator:
             return out
         nb = data["nb_std"][mask].float()
         abs_nb = nb.abs()
-        raw_residual = data["raw_residual"][mask].float()
+        additive = data["additive"][mask].float()
         log_res = data["log_residual"][mask].float()
         mu = data["mu"][mask].float()
         target = data["target"][mask].float()
@@ -647,9 +465,7 @@ class ResidualDiagnosticsAccumulator:
         high_mu_cut = self._safe_quantile(mu, 0.90)
         low_mu = mu <= low_mu_cut
         high_mu = mu >= high_mu_cut
-        out[f"{prefix}/low_mu_raw_residual_bias"] = self._mean_or_zero(
-            raw_residual[low_mu]
-        )
+        out[f"{prefix}/low_mu_additive_bias"] = self._mean_or_zero(additive[low_mu])
         out[f"{prefix}/high_mu_log_bias"] = self._mean_or_zero(log_res[high_mu])
 
         zero = target <= self.zero_threshold
@@ -677,7 +493,7 @@ class ResidualDiagnosticsAccumulator:
         if not data:
             return out
         mu = data["mu"].float()
-        raw_residual = data["raw_residual"].float()
+        additive = data["additive"].float()
         log_res = data["log_residual"].float()
         nb = data["nb_std"].float()
         quantiles = [0.0, 0.10, 0.25, 0.50, 0.75, 0.90, 0.99, 1.0]
@@ -689,8 +505,8 @@ class ResidualDiagnosticsAccumulator:
             else:
                 m = (mu > edges[i]) & (mu <= edges[i + 1])
             prefix = f"residual/mu_bin/{name}"
-            out[f"{prefix}/mean_raw_residual"] = self._mean_or_zero(raw_residual[m])
-            out[f"{prefix}/median_raw_residual"] = raw_residual[m].median() if bool(m.any()) else mu.new_tensor(0.0)
+            out[f"{prefix}/mean_additive_residual"] = self._mean_or_zero(additive[m])
+            out[f"{prefix}/median_additive_residual"] = additive[m].median() if bool(m.any()) else mu.new_tensor(0.0)
             out[f"{prefix}/mean_log_residual"] = self._mean_or_zero(log_res[m])
             out[f"{prefix}/median_log_residual"] = log_res[m].median() if bool(m.any()) else mu.new_tensor(0.0)
             out[f"{prefix}/nb_std_residual_mean"] = self._mean_or_zero(nb[m])
@@ -709,7 +525,7 @@ class ResidualDiagnosticsAccumulator:
                 f"{prefix}/nb_std_mean": z,
                 f"{prefix}/nb_std_abs_mean": z,
                 f"{prefix}/frac_abs_std_gt_3": z,
-                f"{prefix}/mean_raw_residual": z,
+                f"{prefix}/mean_additive_residual": z,
                 f"{prefix}/mean_log_residual": z,
                 f"{prefix}/mean_mu": z,
                 f"{prefix}/mean_target": z,
@@ -719,7 +535,7 @@ class ResidualDiagnosticsAccumulator:
             f"{prefix}/nb_std_mean": nb.mean(),
             f"{prefix}/nb_std_abs_mean": nb.abs().mean(),
             f"{prefix}/frac_abs_std_gt_3": (nb.abs() > 3.0).float().mean(),
-            f"{prefix}/mean_raw_residual": data["raw_residual"][mask].float().mean(),
+            f"{prefix}/mean_additive_residual": data["additive"][mask].float().mean(),
             f"{prefix}/mean_log_residual": data["log_residual"][mask].float().mean(),
             f"{prefix}/mean_mu": data["mu"][mask].float().mean(),
             f"{prefix}/mean_target": data["target"][mask].float().mean(),
@@ -816,7 +632,7 @@ class ResidualDiagnosticsAccumulator:
                     "frac_abs_std_gt_5": float(summary.get(f"residual/{self._dataset_name(dataset_id)}/fraction_abs_std_gt_5", torch.tensor(0.0)).item()),
                     "tail_mass_gt_3": float(summary.get(f"residual/{self._dataset_name(dataset_id)}/tail_mass_abs_gt_3", torch.tensor(0.0)).item()),
                     "tail_mass_gt_5": float(summary.get(f"residual/{self._dataset_name(dataset_id)}/tail_mass_abs_gt_5", torch.tensor(0.0)).item()),
-                    "low_mu_raw_residual_bias": float(summary.get(f"residual/{self._dataset_name(dataset_id)}/low_mu_raw_residual_bias", torch.tensor(0.0)).item()),
+                    "low_mu_additive_bias": float(summary.get(f"residual/{self._dataset_name(dataset_id)}/low_mu_additive_bias", torch.tensor(0.0)).item()),
                     "high_mu_log_bias": float(summary.get(f"residual/{self._dataset_name(dataset_id)}/high_mu_log_bias", torch.tensor(0.0)).item()),
                     "zero_fraction": float(summary.get(f"residual/{self._dataset_name(dataset_id)}/zero_fraction", torch.tensor(0.0)).item()),
                     "zero_mean_mu": float(summary.get(f"residual/{self._dataset_name(dataset_id)}/zero_mean_mu", torch.tensor(0.0)).item()),
@@ -855,7 +671,7 @@ class ResidualDiagnosticsAccumulator:
         nb_std = float(metrics.get("residual/nb_std_std", torch.tensor(0.0)).item())
         frac3 = float(metrics.get("residual/fraction_abs_std_gt_3", torch.tensor(0.0)).item())
         tail_mass3 = float(metrics.get("residual/tail_mass_abs_gt_3", torch.tensor(0.0)).item())
-        low_mu_bias = float(metrics.get("residual/low_mu_raw_residual_bias", torch.tensor(0.0)).item())
+        low_mu_bias = float(metrics.get("residual/low_mu_additive_bias", torch.tensor(0.0)).item())
         high_mu_log_bias = float(metrics.get("residual/high_mu_log_bias", torch.tensor(0.0)).item())
         zero_mu = float(metrics.get("residual/zero_mean_mu", torch.tensor(0.0)).item())
         zero_p0 = float(metrics.get("residual/zero_mean_nb_p0", torch.tensor(1.0)).item())
@@ -863,14 +679,9 @@ class ResidualDiagnosticsAccumulator:
         if 0.75 <= nb_std <= 1.25 and frac3 < 0.02:
             recommendations.append("NB calibration looks broadly adequate.")
         if low_mu_bias > 0.1:
-            recommendations.append(
-                "Positive low-mu residual bias indicates systematic underprediction "
-                "in the low-mean regime."
-            )
+            recommendations.append("Positive low-mu additive bias suggests additive background/floor.")
         if abs(high_mu_log_bias) > 0.25:
-            recommendations.append(
-                "High-mu log residual bias suggests gamma/L_bio or scale misspecification."
-            )
+            recommendations.append("High-mu log residual bias suggests gamma/L_bio or additive-bias adjustment.")
         if frac3 < 0.05 and tail_mass3 > 0.25:
             recommendations.append("Sparse residual tail concentration suggests outlier/contamination diagnostics.")
         if zero_mu > 1.0 and zero_p0 < 0.25:
@@ -879,7 +690,7 @@ class ResidualDiagnosticsAccumulator:
             "nb_std_std": nb_std,
             "frac_abs_std_gt_3": frac3,
             "tail_mass_abs_gt_3": tail_mass3,
-            "low_mu_raw_residual_bias": low_mu_bias,
+            "low_mu_additive_bias": low_mu_bias,
             "high_mu_log_bias": high_mu_log_bias,
             "zero_mean_mu": zero_mu,
             "zero_mean_nb_p0": zero_p0,
@@ -926,10 +737,10 @@ class NegativeBinomialProfileLoss(nn.Module):
               + (r + y) * log(r + mu)
 
     The lgamma(y + 1) term is constant w.r.t. the model parameters, so it does
-    NOT change gradients. For non-negative integer targets this is the complete
-    NB log-PMF and improves cross-dataset comparability of logged NLL values.
-    For non-integer (replicate-averaged) targets the same formula is only the
-    continuous lgamma extension, not a proper discrete likelihood.
+    NOT change gradients, but it makes the reported NLL a proper NB log-density
+    and improves cross-dataset comparability of logged NLL values. With
+    non-integer (replicate-averaged) targets the gamma terms use the continuous
+    lgamma extension.
     """
 
     def __init__(
@@ -954,37 +765,13 @@ class NegativeBinomialProfileLoss(nn.Module):
         self.length_temper_min_weight = float(length_temper_min_weight)
         self.length_temper_max_weight = float(length_temper_max_weight)
 
-        if not math.isfinite(self.eps) or self.eps <= 0.0:
-            raise ValueError("loss.eps must be finite and strictly positive.")
-        if not (
-            math.isfinite(self.log_alpha_min)
-            and math.isfinite(self.log_alpha_max)
-            and self.log_alpha_min <= self.log_alpha_max
-        ):
-            raise ValueError(
-                "loss.nb_log_alpha_min/max must be finite and min must be <= max."
-            )
-        if self.sequence_reduction not in {"mean", "sum", "length_tempered"}:
-            raise ValueError(
-                "loss.nb_sequence_reduction must be one of "
-                "{'mean', 'sum', 'length_tempered'}."
-            )
-        if not 0.0 <= self.length_temper_gamma <= 1.0:
-            raise ValueError("loss.nb_length_temper_gamma must be in [0, 1].")
-        if not math.isfinite(self.length_temper_ref) or self.length_temper_ref <= 0.0:
-            raise ValueError("loss.nb_length_temper_ref must be finite and positive.")
-        if not (
-            math.isfinite(self.length_temper_min_weight)
-            and math.isfinite(self.length_temper_max_weight)
-            and 0.0 < self.length_temper_min_weight <= self.length_temper_max_weight
-        ):
-            raise ValueError(
-                "loss NB length-tempering weights must be finite, positive, and "
-                "min_weight <= max_weight."
-            )
-
-    def sanitize_mean(self, mu: torch.Tensor) -> torch.Tensor:
-        """Return the finite positive NB mean used by losses and diagnostics."""
+    def positive_mean_from_params(
+        self,
+        *,
+        mu: torch.Tensor,
+        log_sigma: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del log_sigma
         mu = torch.nan_to_num(
             mu,
             nan=self.eps,
@@ -1025,7 +812,10 @@ class NegativeBinomialProfileLoss(nn.Module):
                 neginf=0.0,
             ).clamp_min(0.0)
 
-            mu = self.sanitize_mean(mu_phys.to(torch.float32)).to(torch.float32)
+            mu = self.positive_mean_from_params(
+                mu=mu_phys.to(torch.float32),
+                log_sigma=None,
+            ).to(torch.float32)
             log_alpha = self._log_alpha_from_model_output(
                 log_sigma=log_sigma.to(torch.float32),
                 target_shape=y.shape,
@@ -1073,14 +863,16 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         multiplicative mean:
             mu[d,t,i] = S[d,t] * gamma[d,t,i] * L_bio[t,i]
 
-        loss = w_cNLL * consensus_NB
-             + w_cPCC * consensus_PCC
-             + w_rNLL * mean_replica_NB
-             + w_rPCC * mean_replica_PCC
-             + w_gamma * mean(log_gamma^2)
+        Active loss:
 
-    The four data-term weights are explicit and mandatory. The PCC helper can
-    compute raw, log1p, NB-VST, or a normalized raw/NB-VST hybrid.
+            loss = mean_replica(
+                replica_nb_weight * NB_NLL
+                + replica_raw_pcc_weight * (1 - PCC)
+                + replica_nb_vst_pcc_weight * (1 - PCC_NB_VST)
+            ) + gamma_reg_weight * mean(log_gamma^2)
+
+    Every data-fit term uses the raw replicas. The arithmetic-mean consensus is
+    retained only for diagnostics and never enters the optimized objective.
     """
 
     # Per-position extras plotted during validation.
@@ -1090,20 +882,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         ("gamma", ("gamma",)),
         ("log_sigma", ("log_sigma",)),
     )
-
-    @property
-    def dataset_balanced_loss(self) -> bool:
-        """Legacy compatibility view of the explicit sample reduction."""
-        return self.sample_reduction == "dataset_balanced"
-
-    @dataset_balanced_loss.setter
-    def dataset_balanced_loss(self, enabled: bool) -> None:
-        # Historical tests and analysis utilities toggle this attribute after
-        # construction. Preserve that interface without allowing two active
-        # reducers at once.
-        self.sample_reduction = (
-            "dataset_balanced" if bool(enabled) else "global_weighted"
-        )
 
     def __init__(
         self,
@@ -1122,99 +900,51 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         self.dataset_id_to_name = {int(v): str(k) for k, v in dataset_encoding.items()}
         self._val_profile_plot_logged_this_epoch = False
         loss_cfg = self.config.loss
-        self.pcc_loss_mode = str(getattr(loss_cfg, "pcc_loss_mode", "raw")).lower()
-        valid_pcc_modes = {"raw", "log1p", "nb_vst", "hybrid_raw_nb_vst"}
-        if self.pcc_loss_mode not in valid_pcc_modes:
-            raise ValueError(
-                f"loss.pcc_loss_mode must be one of {sorted(valid_pcc_modes)}, "
-                f"got {self.pcc_loss_mode!r}."
-            )
-        self.min_pcc_target_var = float(getattr(loss_cfg, "min_pcc_target_var", 1.0e-6))
-        if not math.isfinite(self.min_pcc_target_var) or self.min_pcc_target_var < 0.0:
-            raise ValueError("loss.min_pcc_target_var must be finite and non-negative.")
-        self.pcc_detach_alpha = bool(getattr(loss_cfg, "pcc_detach_alpha", True))
-        self.pcc_raw_component_weight = float(
-            getattr(loss_cfg, "pcc_raw_component_weight", 0.5)
-        )
-        self.pcc_nb_vst_component_weight = float(
-            getattr(loss_cfg, "pcc_nb_vst_component_weight", 0.5)
-        )
-        if not (
-            math.isfinite(self.pcc_raw_component_weight)
-            and math.isfinite(self.pcc_nb_vst_component_weight)
-            and self.pcc_raw_component_weight >= 0.0
-            and self.pcc_nb_vst_component_weight >= 0.0
-        ):
-            raise ValueError("PCC component weights must be finite and non-negative.")
-        if self.pcc_loss_mode == "hybrid_raw_nb_vst":
-            component_sum = (
-                self.pcc_raw_component_weight
-                + self.pcc_nb_vst_component_weight
-            )
-            if not math.isclose(component_sum, 1.0, rel_tol=0.0, abs_tol=1.0e-8):
+
+        def required_nonnegative_weight(name: str) -> float:
+            sentinel = object()
+            raw_value = getattr(loss_cfg, name, sentinel)
+            if raw_value is sentinel:
+                raise ValueError(f"Missing mandatory loss coefficient loss.{name}.")
+            if isinstance(raw_value, bool):
+                raise TypeError(f"loss.{name} must be a number, not a boolean.")
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError) as exc:
+                raise TypeError(f"loss.{name} must be a finite non-negative number.") from exc
+            if not math.isfinite(value) or value < 0.0:
                 raise ValueError(
-                    "For hybrid_raw_nb_vst, loss.pcc_raw_component_weight and "
-                    "loss.pcc_nb_vst_component_weight must sum to 1. The overall "
-                    "PCC strength is controlled only by loss.loss_terms."
+                    f"loss.{name} must be a finite non-negative number, got {raw_value!r}."
                 )
-        self.sample_reduction = resolve_sample_reduction_mode(loss_cfg)
-        self.hparams["sample_reduction"] = self.sample_reduction
-        self.debug_transcript_groups = bool(
-            getattr(loss_cfg, "debug_transcript_groups", False)
+            return value
+
+        self.replica_nb_weight = required_nonnegative_weight("replica_nb_weight")
+        self.replica_raw_pcc_weight = required_nonnegative_weight(
+            "replica_raw_pcc_weight"
         )
-        self.train_sampling_strategy = str(
-            getattr(
-                getattr(self.config, "data", None),
-                "train_sampling_strategy",
-                "unknown",
-            )
-        ).strip().lower()
+        self.replica_nb_vst_pcc_weight = required_nonnegative_weight(
+            "replica_nb_vst_pcc_weight"
+        )
+        self.gamma_reg_weight = required_nonnegative_weight("gamma_reg_weight")
         if (
-            self.sample_reduction == "transcript_balanced"
-            and self.train_sampling_strategy
-            != "transcript_grouped_multidataset_pairs"
+            self.replica_nb_weight
+            + self.replica_raw_pcc_weight
+            + self.replica_nb_vst_pcc_weight
+            + self.gamma_reg_weight
+            == 0.0
         ):
-            warnings.warn(
-                "loss.sample_reduction=transcript_balanced is exact only for "
-                "complete transcript groups. With "
-                f"data.train_sampling_strategy={self.train_sampling_strategy!r}, "
-                "the reduction is batch-local and a transcript may be split "
-                "across physical batches.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+            raise ValueError("At least one of the four loss coefficients must be positive.")
+        self.min_pcc_target_var = float(getattr(loss_cfg, "min_pcc_target_var", 1.0e-6))
+        self.pcc_alpha_min = float(getattr(loss_cfg, "pcc_alpha_min", 1.0e-5))
+        self.pcc_alpha_max = float(getattr(loss_cfg, "pcc_alpha_max", 20.0))
+        self.pcc_detach_alpha = bool(getattr(loss_cfg, "pcc_detach_alpha", True))
         self.eps = float(getattr(loss_cfg, "eps", 1.0e-8))
-
-        # This is the only objective-selection interface. All four scalar
-        # weights are mandatory, which prevents hidden preset inheritance.
-        self.loss_term_weights = self._resolve_loss_term_weights(loss_cfg)
-
-        replica_weight_requested = (
-            self.loss_term_weights["replica_nll"] > 0.0
-            or self.loss_term_weights["replica_pcc"] > 0.0
-        )
-        replicas_enabled = bool(
-            getattr(getattr(self.config, "data", None), "use_ribo_replicas", False)
-        )
-        if replica_weight_requested and not replicas_enabled:
-            raise ValueError(
-                "loss.loss_terms requests a positive replica_nll or replica_pcc "
-                "weight, but data.use_ribo_replicas=false. Enable replica loading "
-                "or set both replica weights to zero."
-            )
-
-        # Optional regularizers around the active NB + PCC objective.
-        self.gamma_reg_weight = float(getattr(loss_cfg, "gamma_reg_weight", 0.0))
-        if not math.isfinite(self.gamma_reg_weight) or self.gamma_reg_weight < 0.0:
-            raise ValueError("loss.gamma_reg_weight must be finite and non-negative.")
         # Predicted-value floor for PCC only: predictions below this count are
         # treated as 0 ("undetected") when computing correlation. Honest (uses
         # only the prediction, never the target); 0.0 disables.
         self.pcc_prediction_floor = float(
             getattr(loss_cfg, "pcc_prediction_floor", 0.0)
         )
-        if not math.isfinite(self.pcc_prediction_floor) or self.pcc_prediction_floor < 0.0:
-            raise ValueError("loss.pcc_prediction_floor must be finite and non-negative.")
         residual_cfg = getattr(self.config, "residual_diagnostics", None)
 
         def residual_cfg_get(name: str, default: Any) -> Any:
@@ -1255,7 +985,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         self._grouped_optimizer_batch_plan: dict[str, Any] = {}
         self._expected_pair_rows_by_transcript: dict[str, int] = {}
         self._train_batch_structure_records: list[dict[str, Any]] = []
-        self._legacy_transcript_group_warning_emitted = False
 
     def configure_grouped_optimizer_batch_logging(
         self,
@@ -1276,81 +1005,39 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         # in Lightning hyperparameters when a full checkpoint is requested.
         self.hparams["grouped_optimizer_batch_plan"] = dict(plan)
 
-    def configure_transcript_group_validation(
-        self,
-        expected_pair_rows_by_transcript: dict[str, int],
-    ) -> None:
-        """Attach expected full-group sizes for split detection in training."""
-        self._expected_pair_rows_by_transcript = {
-            str(transcript_id): int(pair_count)
-            for transcript_id, pair_count in expected_pair_rows_by_transcript.items()
-        }
-
-    def on_save_checkpoint(self, checkpoint: dict[str, Any]) -> None:
-        checkpoint["sample_reduction"] = self.sample_reduction
-
     def _build_loss(self) -> nn.Module:
         loss_cfg = self.config.loss
+
+        def loss_cfg_get(name: str, default: Any = None) -> Any:
+            try:
+                return getattr(loss_cfg, name)
+            except (AttributeError, KeyError):
+                return default
+
+        sequence_reduction = str(loss_cfg_get("nb_sequence_reduction", "mean"))
+        length_temper_gamma = float(loss_cfg_get("nb_length_temper_gamma", 0.85))
+        length_temper_ref = float(loss_cfg_get("nb_length_temper_ref", 1000.0))
+        length_temper_min_weight = float(
+            loss_cfg_get("nb_length_temper_min_weight", 0.5)
+        )
+        length_temper_max_weight = float(
+            loss_cfg_get("nb_length_temper_max_weight", 2.0)
+        )
+
         return NegativeBinomialProfileLoss(
             eps=loss_cfg.eps,
-            log_alpha_min=float(loss_cfg.nb_log_alpha_min),
-            log_alpha_max=float(loss_cfg.nb_log_alpha_max),
-            sequence_reduction=str(loss_cfg.nb_sequence_reduction),
-            length_temper_gamma=float(loss_cfg.nb_length_temper_gamma),
-            length_temper_ref=float(loss_cfg.nb_length_temper_ref),
-            length_temper_min_weight=float(loss_cfg.nb_length_temper_min_weight),
-            length_temper_max_weight=float(loss_cfg.nb_length_temper_max_weight),
+            log_alpha_min=float(loss_cfg_get("nb_log_alpha_min", -5.0)),
+            log_alpha_max=float(loss_cfg_get("nb_log_alpha_max", 3.0)),
+            sequence_reduction=sequence_reduction,
+            length_temper_gamma=length_temper_gamma,
+            length_temper_ref=length_temper_ref,
+            length_temper_min_weight=length_temper_min_weight,
+            length_temper_max_weight=length_temper_max_weight,
         )
 
     # ============================================================
     # Forward / batch handling
     # ============================================================
-
-    @staticmethod
-    def _legacy_group_indices_from_ids(
-        ids: list[str] | tuple[str, ...],
-        *,
-        device: torch.device,
-    ) -> torch.Tensor:
-        group_by_transcript: dict[str, int] = {}
-        groups: list[int] = []
-        for raw_transcript_id in ids:
-            transcript_id = str(raw_transcript_id)
-            if transcript_id not in group_by_transcript:
-                group_by_transcript[transcript_id] = len(group_by_transcript)
-            groups.append(group_by_transcript[transcript_id])
-        return torch.tensor(groups, device=device, dtype=torch.long)
-
-    @staticmethod
-    def _assert_transcript_group_identity(
-        transcript_ids: list[str] | tuple[str, ...],
-        transcript_group_ids: torch.Tensor,
-    ) -> None:
-        group_values = transcript_group_ids.detach().cpu().reshape(-1).tolist()
-        if len(group_values) != len(transcript_ids):
-            raise AssertionError(
-                "Transcript IDs and transcript_group_index have different lengths."
-            )
-        transcript_by_group: dict[int, str] = {}
-        group_by_transcript: dict[str, int] = {}
-        for transcript_id, group_index in zip(
-            map(str, transcript_ids),
-            map(int, group_values),
-            strict=True,
-        ):
-            previous_transcript = transcript_by_group.setdefault(
-                group_index,
-                transcript_id,
-            )
-            previous_group = group_by_transcript.setdefault(
-                transcript_id,
-                group_index,
-            )
-            if previous_transcript != transcript_id or previous_group != group_index:
-                raise AssertionError(
-                    "transcript_group_index is not a one-to-one grouping of "
-                    "the physical batch transcript IDs."
-                )
 
     def _forward_batch(self, batch) -> dict[str, Any]:
         if len(batch) < 9:
@@ -1380,7 +1067,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         if has_quality_metadata:
             dataset_quality_ranks = batch[9]
             dataset_quality_weights = batch[10]
-            optional_values = list(batch[11:])
+            remaining_values = batch[11:]
         else:
             dataset_quality_ranks = torch.full_like(
                 sample_weights, float("nan"), dtype=torch.float32
@@ -1388,53 +1075,35 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             dataset_quality_weights = torch.ones_like(
                 sample_weights, dtype=torch.float32
             )
-            optional_values = list(batch[9:])
+            remaining_values = batch[9:]
 
-        transcript_group_ids = None
-        if optional_values:
-            candidate = optional_values[0]
-            if (
-                torch.is_tensor(candidate)
-                and candidate.ndim == 1
-                and candidate.shape[0] == len(ids)
-                and not candidate.is_floating_point()
-                and candidate.dtype != torch.bool
-            ):
-                transcript_group_ids = candidate.to(dtype=torch.long)
-                optional_values = optional_values[1:]
-        if transcript_group_ids is None:
-            # Compatibility for historical collated artifacts and hand-built
-            # test batches. Current dataloaders always provide integer groups,
-            # so this string path is not part of normal training.
-            if not self._legacy_transcript_group_warning_emitted:
-                warnings.warn(
-                    "Batch has no transcript_group_index; deriving it once from "
-                    "legacy transcript strings. Rebuild batches with the current "
-                    "collate function for transcript-balanced training.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-                self._legacy_transcript_group_warning_emitted = True
-            transcript_group_ids = self._legacy_group_indices_from_ids(
-                ids,
-                device=dataset_ids.device,
-            )
-        if self.debug_transcript_groups:
-            self._assert_transcript_group_identity(ids, transcript_group_ids)
+        transcript_group_index = None
+        if (
+            remaining_values
+            and torch.is_tensor(remaining_values[0])
+            and remaining_values[0].ndim == 1
+            and not remaining_values[0].is_floating_point()
+        ):
+            transcript_group_index = remaining_values[0]
+            optional_values = remaining_values[1:]
+        else:
+            optional_values = remaining_values
 
         dataset_bias_sequence_features = None
-        replica_profiles = None
-        replica_mask = None
-        if len(optional_values) == 1:
-            dataset_bias_sequence_features = optional_values[0]
-        elif len(optional_values) == 2:
+        if len(optional_values) == 2:
             replica_profiles, replica_mask = optional_values
         elif len(optional_values) == 3:
             dataset_bias_sequence_features, replica_profiles, replica_mask = optional_values
-        elif len(optional_values) != 0:
+        else:
             raise ValueError(
-                "Expected optional bias features and/or replica tensors after "
-                f"batch metadata, got {len(optional_values)} fields."
+                "Every batch must contain replica_profiles and replica_mask, with "
+                "an optional dataset-bias tensor before them; got "
+                f"{len(optional_values)} trailing fields."
+            )
+        if replica_profiles.ndim != 3 or replica_mask.ndim != 2:
+            raise ValueError(
+                "Expected replica_profiles [B, R, T] and replica_mask [B, R], "
+                f"got {tuple(replica_profiles.shape)} and {tuple(replica_mask.shape)}."
             )
 
         mu, log_sigma, extras = self.model(
@@ -1451,7 +1120,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         out = {
             "dataset_ids": dataset_ids,
             "ids": ids,
-            "transcript_group_ids": transcript_group_ids,
             "lengths": lengths,
             "mask": mask.bool(),
             "target": target,
@@ -1461,13 +1129,13 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "sample_weights": sample_weights,
             "dataset_quality_ranks": dataset_quality_ranks,
             "dataset_quality_weights": dataset_quality_weights,
+            "transcript_group_index": transcript_group_index,
             "mu": mu,
             "log_sigma": log_sigma,
             "extras": extras,
         }
-        if replica_profiles is not None and replica_mask is not None:
-            out["replica_profiles"] = replica_profiles
-            out["replica_mask"] = replica_mask
+        out["replica_profiles"] = replica_profiles
+        out["replica_mask"] = replica_mask
         return out
 
     def forward_batch(self, batch) -> dict[str, Any]:
@@ -1481,66 +1149,58 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         self,
         values: torch.Tensor,
         dataset_ids: torch.Tensor,
-        sample_weights: torch.Tensor | None = None,
-        dataset_balanced: bool | None = None,
-        transcript_group_ids: torch.Tensor | None = None,
-        mode: str | None = None,
+        sample_weights: torch.Tensor,
     ) -> torch.Tensor:
-        """Compatibility wrapper around :func:`reduce_per_sample_quantity`."""
+        """Return the mandatory transcript-weighted, dataset-balanced mean.
+
+        For per-sample values ``z_s`` and transcript reliability weights ``w_s``,
+        first calculate ``sum_s(w_s z_s) / sum_s(w_s)`` independently inside
+        every represented dataset. The returned scalar is the arithmetic mean
+        of those dataset means, so each represented dataset has one equal outer
+        vote. This reduction is fixed and has no configuration selector.
+        """
         values = values.reshape(-1)
-        if mode is not None and dataset_balanced is not None:
-            legacy_mode = (
-                "dataset_balanced" if dataset_balanced else "global_weighted"
-            )
-            if str(mode) != legacy_mode:
-                raise ValueError(
-                    f"Conflicting reducer arguments mode={mode!r} and "
-                    f"dataset_balanced={dataset_balanced!r}."
-                )
-        if mode is None:
-            mode = (
-                "dataset_balanced" if dataset_balanced else "global_weighted"
-                if dataset_balanced is not None
-                else self.sample_reduction
-            )
-        if sample_weights is None:
-            sample_weights = torch.ones(
-                values.shape[0],
-                device=values.device,
-                dtype=values.dtype,
-            )
-        if transcript_group_ids is None:
-            if mode == "transcript_balanced":
-                raise ValueError(
-                    "transcript_group_ids is required for transcript_balanced reduction."
-                )
-            transcript_group_ids = torch.arange(
-                values.shape[0],
-                device=values.device,
-                dtype=torch.long,
-            )
-        return reduce_per_sample_quantity(
-            values=values,
-            sample_weights=sample_weights.reshape(-1),
-            transcript_group_ids=transcript_group_ids.reshape(-1),
-            dataset_ids=dataset_ids.reshape(-1),
-            mode=mode,
-            eps=self.eps,
+        ids = dataset_ids.reshape(-1).to(device=values.device)
+        w = (
+            sample_weights.reshape(-1)
+            .to(device=values.device, dtype=values.dtype)
+            .clamp_min(0.0)
         )
+        if values.numel() != ids.numel() or values.numel() != w.numel():
+            raise ValueError(
+                "values, dataset_ids, and sample_weights must contain the same "
+                f"number of samples; got {values.numel()}, {ids.numel()}, and "
+                f"{w.numel()}."
+            )
+        if values.numel() == 0:
+            return values.sum() * 0.0
+
+        unique_ids, inverse = torch.unique(ids, return_inverse=True)
+        # unique_ids is sorted/deduped, so its element count is the number of
+        # dataset buckets. Reading .numel() avoids the per-call .item() GPU sync
+        # (this helper runs ~12x per step).
+        K = unique_ids.numel()
+
+        w_sums = torch.zeros(
+            K, device=values.device, dtype=values.dtype
+        ).scatter_add_(0, inverse, w)
+        wv_sums = torch.zeros_like(w_sums).scatter_add_(0, inverse, values * w)
+        per_ds_mean = wv_sums / w_sums.clamp_min(self.eps)
+
+        return per_ds_mean.mean()
 
     def _pcc_alpha(
         self,
         log_alpha: torch.Tensor,
         target_shape: torch.Size | tuple[int, ...],
     ) -> torch.Tensor:
-        # PCC and NB must use the same finite, bounded dispersion. Previously
-        # PCC had separate "min/max" fields that only replaced non-finite
-        # values and did not actually clamp finite alpha values.
-        bounded_log_alpha = self.loss_fn._log_alpha_from_model_output(
-            log_sigma=log_alpha,
-            target_shape=target_shape,
+        alpha = torch.exp(_broadcast_profile_param(log_alpha, target_shape))
+        alpha = torch.nan_to_num(
+            alpha,
+            nan=self.pcc_alpha_min,
+            posinf=self.pcc_alpha_max,
+            neginf=self.pcc_alpha_min,
         )
-        alpha = torch.exp(bounded_log_alpha)
         if self.pcc_detach_alpha:
             alpha = alpha.detach()
         return alpha
@@ -1553,7 +1213,13 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             torch.sqrt(alpha * x + eps)
         )
 
-    def _pcc_loss_per_sample(self, out: dict[str, Any]) -> dict[str, torch.Tensor]:
+    def _pcc_loss_per_sample(
+        self,
+        out: dict[str, Any],
+        *,
+        transform: str,
+    ) -> dict[str, torch.Tensor]:
+        """Calculate one explicit PCC component without a mode selector."""
         mu = out["mu"].float()
         target = torch.nan_to_num(
             out["target"].float(),
@@ -1563,8 +1229,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         )
         mask = out["mask"].bool() & torch.isfinite(out["target"].float())
         log_alpha = out.get("log_sigma")
-        mode = self.pcc_loss_mode
-        hybrid_modes = {"hybrid_raw_nb_vst": "nb_vst"}
 
         def masked_position_mean(v: torch.Tensor) -> torch.Tensor:
             mask_f = mask.to(dtype=v.dtype)
@@ -1574,121 +1238,53 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             valid_f = valid.to(dtype=v.dtype)
             return (v * valid_f).sum() / valid_f.sum().clamp_min(1.0)
 
-        def component(component_mode: str) -> dict[str, torch.Tensor]:
-            alpha_diag = torch.ones_like(mu)
-
-            if component_mode == "raw":
-                x_pcc = mu
-                y_pcc = target
-            elif component_mode == "log1p":
-                x_pcc = torch.log1p(mu.clamp_min(0.0))
-                y_pcc = torch.log1p(target.clamp_min(0.0))
-            elif component_mode == "nb_vst":
-                log_alpha_f = log_alpha.float()
-                alpha_diag = self._pcc_alpha(log_alpha_f, mu.shape).to(
-                    device=mu.device,
-                    dtype=mu.dtype,
-                )
-                x_pcc = self._nb_vst(mu, log_alpha_f)
-                y_pcc = self._nb_vst(target, log_alpha_f)
-
-            else:
-                raise ValueError(f"Unsupported pcc_loss_mode: {component_mode!r}.")
-
-            pcc_out = masked_weighted_pcc(
-                x=x_pcc,
-                y=y_pcc,
-                mask=mask,
-                weights=None,
-                min_target_var=self.min_pcc_target_var,
-                eps=self.eps,
+        alpha_diag = torch.ones_like(mu)
+        if transform == "raw":
+            x_pcc = mu
+            y_pcc = target
+        elif transform == "nb_vst":
+            if not torch.is_tensor(log_alpha):
+                raise KeyError("NB-VST PCC requires model output 'log_sigma'.")
+            log_alpha_f = log_alpha.float()
+            alpha_diag = self._pcc_alpha(log_alpha_f, mu.shape).to(
+                device=mu.device,
+                dtype=mu.dtype,
             )
-            valid = pcc_out["valid"]
-            loss_per_sample = 1.0 - pcc_out["pcc_per_sample"]
-            loss_per_sample = torch.where(
-                valid,
-                loss_per_sample,
-                torch.zeros_like(loss_per_sample),
-            )
-            return {
-                "loss_per_sample": loss_per_sample,
-                "pcc_per_sample": pcc_out["pcc_per_sample"],
-                "valid": valid,
-                "pcc_value": valid_sample_mean(pcc_out["pcc_per_sample"], valid),
-                "loss_mean": valid_sample_mean(loss_per_sample, valid),
-                "valid_fraction": pcc_out["valid_fraction"],
-                "target_var_mean": pcc_out["target_var_mean"],
-                "alpha_mean": masked_position_mean(alpha_diag),
-                "alpha_min": alpha_diag[mask].amin() if bool(mask.any()) else mu.new_tensor(0.0),
-                "alpha_max": alpha_diag[mask].amax() if bool(mask.any()) else mu.new_tensor(0.0),
-            }
-
-        if mode in hybrid_modes:
-            raw_component = component("raw")
-            nb_component = component(hybrid_modes[mode])
-            raw_weight = float(self.pcc_raw_component_weight)
-            nb_weight = float(self.pcc_nb_vst_component_weight)
-            loss_per_sample = (
-                raw_weight * raw_component["loss_per_sample"]
-                + nb_weight * nb_component["loss_per_sample"]
-            )
-            active_component = nb_component
-            raw_loss_per_sample = raw_component["loss_per_sample"]
-            nb_loss_per_sample = nb_component["loss_per_sample"]
-            pcc_per_sample = (
-                raw_weight * raw_component["pcc_per_sample"]
-                + nb_weight * nb_component["pcc_per_sample"]
-            )
-            valid = raw_component["valid"] | nb_component["valid"]
+            x_pcc = self._nb_vst(mu, log_alpha_f)
+            y_pcc = self._nb_vst(target, log_alpha_f)
         else:
-            active_component = component(mode)
-            loss_per_sample = active_component["loss_per_sample"]
-            raw_component = active_component if mode == "raw" else component("raw")
-            nb_component = (
-                active_component
-                if mode == "nb_vst"
-                else None
+            raise ValueError(
+                "PCC transform must be either 'raw' or 'nb_vst', "
+                f"got {transform!r}."
             )
-            raw_loss_per_sample = raw_component["loss_per_sample"]
-            nb_loss_per_sample = (
-                nb_component["loss_per_sample"]
-                if nb_component is not None
-                else torch.zeros_like(loss_per_sample)
-            )
-            pcc_per_sample = active_component["pcc_per_sample"]
-            valid = active_component["valid"]
 
+        pcc_out = masked_weighted_pcc(
+            x=x_pcc,
+            y=y_pcc,
+            mask=mask,
+            weights=None,
+            min_target_var=self.min_pcc_target_var,
+            eps=self.eps,
+        )
+        valid = pcc_out["valid"]
+        loss_per_sample = torch.where(
+            valid,
+            1.0 - pcc_out["pcc_per_sample"],
+            torch.zeros_like(pcc_out["pcc_per_sample"]),
+        )
         valid_f = valid.to(dtype=mu.dtype)
         valid_count = valid_f.sum().clamp_min(1.0)
-        raw_weight_t = mu.new_tensor(float(self.pcc_raw_component_weight))
-        nb_weight_t = mu.new_tensor(float(self.pcc_nb_vst_component_weight))
-        raw_loss_mean = valid_sample_mean(raw_loss_per_sample, raw_component["valid"])
-        nb_loss_mean = (
-            valid_sample_mean(nb_loss_per_sample, nb_component["valid"])
-            if nb_component is not None
-            else mu.new_tensor(0.0)
-        )
-
         return {
             "loss_per_sample": loss_per_sample,
-            "pcc_per_sample": pcc_per_sample,
+            "pcc_per_sample": pcc_out["pcc_per_sample"],
             "valid": valid,
-            "pcc_value": (pcc_per_sample * valid_f).sum() / valid_count,
-            "valid_fraction": active_component["valid_fraction"],
-            "target_var_mean": active_component["target_var_mean"],
-            "alpha_mean": active_component["alpha_mean"],
-            "alpha_min": active_component["alpha_min"],
-            "alpha_max": active_component["alpha_max"],
-            "raw_loss_per_sample": raw_loss_per_sample,
-            "raw_value": raw_component["pcc_value"],
-            "raw_loss": raw_loss_mean,
-            "raw_valid_fraction": raw_component["valid_fraction"],
-            "raw_component_weight": raw_weight_t,
-            "nb_vst_loss_per_sample": nb_loss_per_sample,
-            "nb_vst_value": nb_component["pcc_value"] if nb_component is not None else mu.new_tensor(0.0),
-            "nb_vst_loss": nb_loss_mean,
-            "nb_vst_valid_fraction": nb_component["valid_fraction"] if nb_component is not None else mu.new_tensor(0.0),
-            "nb_vst_component_weight": nb_weight_t,
+            "pcc_value": (pcc_out["pcc_per_sample"] * valid_f).sum() / valid_count,
+            "loss_mean": valid_sample_mean(loss_per_sample, valid),
+            "valid_fraction": pcc_out["valid_fraction"],
+            "target_var_mean": pcc_out["target_var_mean"],
+            "alpha_mean": masked_position_mean(alpha_diag),
+            "alpha_min": alpha_diag[mask].amin() if bool(mask.any()) else mu.new_tensor(0.0),
+            "alpha_max": alpha_diag[mask].amax() if bool(mask.any()) else mu.new_tensor(0.0),
         }
 
     def _pearson_per_sample(
@@ -1774,33 +1370,23 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         out: dict[str, Any],
         target: torch.Tensor,
         mask: torch.Tensor,
-        *,
-        compute_nll: bool = True,
     ) -> dict[str, Any]:
-        if compute_nll:
-            nll_per_sample = self.loss_fn(
-                mu_phys=out["mu"].float(),
-                log_sigma=out["log_sigma"].float(),
-                y_true=out["target"].float(),
-                mask=out["mask"].bool(),
-                return_per_sample=True,
-            )
-        else:
-            nll_per_sample = target.new_zeros(target.shape[0])
         # PCC is measured on the floored prediction (values below the floor are
         # treated as 0), so the model is rewarded for pushing mu down at zeros.
-        # This uses only the prediction, never the target.
+        # This uses only the prediction, never the target. It is a diagnostic;
+        # the consensus is not part of the optimized loss.
         mu_floored = self._apply_pcc_floor(out["mu"].float())
-        pcc_out = {**out, "mu": mu_floored}
         raw_mu_pcc_per_sample = self._pearson_per_sample(
             pred=mu_floored,
             target=target,
             mask=mask,
         )
-        pcc_diag = self._pcc_loss_per_sample(pcc_out)
 
         with torch.no_grad():
-            likelihood_positive_mean = self.loss_fn.sanitize_mean(mu_floored).float()
+            likelihood_positive_mean = self.loss_fn.positive_mean_from_params(
+                mu=mu_floored,
+                log_sigma=out["log_sigma"].float(),
+            ).float()
         likelihood_mu_pcc_per_sample = self._pearson_per_sample(
             pred=likelihood_positive_mean,
             target=target,
@@ -1811,9 +1397,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             mask,
         )
         return {
-            "nll_per_sample": nll_per_sample,
             "raw_mu_pcc_per_sample": raw_mu_pcc_per_sample,
-            "pcc_diag": pcc_diag,
             "likelihood_mu_pcc_per_sample": likelihood_mu_pcc_per_sample,
             "log1p_mse_per_sample": log1p_mse_per_sample,
         }
@@ -1821,24 +1405,29 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
     def _compute_replica_loss_terms(
         self,
         out: dict[str, Any],
-        *,
-        compute_nll: bool = True,
-        compute_pcc: bool = True,
-    ) -> dict[str, Any] | None:
+    ) -> dict[str, Any]:
         replica_profiles = out.get("replica_profiles")
         replica_mask = out.get("replica_mask")
         if not (torch.is_tensor(replica_profiles) and torch.is_tensor(replica_mask)):
-            return None
+            raise RuntimeError(
+                "Replica targets are mandatory: every batch must contain "
+                "replica_profiles and replica_mask."
+            )
 
         target_reps = replica_profiles.float()
         rep_mask = replica_mask.bool().to(device=target_reps.device)
+        if target_reps.ndim != 3 or rep_mask.ndim != 2:
+            raise ValueError(
+                "Expected replica_profiles [B, R, T] and replica_mask [B, R], "
+                f"got {tuple(target_reps.shape)} and {tuple(rep_mask.shape)}."
+            )
         B, R, T = target_reps.shape
-        replica_counts = rep_mask.to(dtype=target_reps.dtype).sum(dim=1)
-        result: dict[str, Any] = {
-            "metrics": {"replica_count_mean": replica_counts.mean()},
-        }
-        if not compute_nll and not compute_pcc:
-            return result
+        if tuple(rep_mask.shape) != (B, R):
+            raise ValueError(
+                f"replica_mask must have shape {(B, R)}, got {tuple(rep_mask.shape)}."
+            )
+        if not bool(rep_mask.any(dim=1).all()):
+            raise ValueError("Every sample must contain at least one valid replica.")
 
         base_mask = out["mask"].bool().to(device=target_reps.device)
 
@@ -1859,14 +1448,14 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         extras = out["extras"]
         if "normalized_shape" not in extras:
             raise KeyError(
-                "Model output is missing extras['normalized_shape']; replica NLL "
-                "must reuse the exact final shape used by the consensus forward."
+                "Model output is missing extras['normalized_shape']; replica NB "
+                "must reuse the exact final shape from the consensus forward."
             )
         shape = extras["normalized_shape"].float().to(device=target_reps.device)
         if tuple(shape.shape) != (B, T):
             raise ValueError(
-                "normalized_shape must match [batch, positions] for replica NLL; "
-                f"got {tuple(shape.shape)} instead of {(B, T)}."
+                "normalized_shape must match [B, T] for replica NB; got "
+                f"{tuple(shape.shape)} instead of {(B, T)}."
             )
         shape = torch.where(
             base_mask & torch.isfinite(shape),
@@ -1895,7 +1484,8 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         flat_mask = valid_pos.reshape(B * R, T)
         flat_log_sigma = log_sigma_rep.reshape(B * R, T)
 
-        if compute_nll:
+        zero_flat = flat_mu.new_zeros(B * R)
+        if self.replica_nb_weight > 0.0:
             nll_flat = self.loss_fn(
                 mu_phys=flat_mu,
                 log_sigma=flat_log_sigma,
@@ -1903,188 +1493,120 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 mask=flat_mask,
                 return_per_sample=True,
             )
-            result["nll_per_sample"] = self._average_over_valid_replicas(
-                nll_flat,
-                rep_mask,
-            )
+        else:
+            # A zero coefficient disables the NB-NLL branch completely.
+            nll_flat = zero_flat
+        nll_per_sample = self._average_over_valid_replicas(nll_flat, rep_mask)
 
-        if compute_pcc:
-            flat_out = {
-                "mu": flat_mu,
-                "target": flat_target,
-                "mask": flat_mask,
-                "log_sigma": flat_log_sigma,
+        flat_out = {
+            "mu": self._apply_pcc_floor(flat_mu),
+            "target": flat_target,
+            "mask": flat_mask,
+            "log_sigma": flat_log_sigma,
+        }
+        flat_rep_mask = rep_mask.reshape(-1).to(device=target_reps.device)
+
+        def pcc_component(
+            *,
+            coefficient: float,
+            transform: str,
+        ) -> dict[str, torch.Tensor]:
+            if coefficient == 0.0:
+                zero_sample = flat_mu.new_zeros(B)
+                zero_scalar = flat_mu.new_tensor(0.0)
+                return {
+                    "loss_per_sample": zero_sample,
+                    "pcc_per_sample": zero_sample,
+                    "valid": torch.zeros(B, device=flat_mu.device, dtype=torch.bool),
+                    "pcc_value": zero_scalar,
+                    "loss_mean": zero_scalar,
+                    "valid_fraction": zero_scalar,
+                    "target_var_mean": zero_scalar,
+                    "alpha_mean": zero_scalar,
+                    "alpha_min": zero_scalar,
+                    "alpha_max": zero_scalar,
+                }
+
+            flat_diag = self._pcc_loss_per_sample(flat_out, transform=transform)
+            active_valid = flat_diag["valid"].to(device=target_reps.device) & flat_rep_mask
+            sample_valid = active_valid.reshape(B, R).any(dim=1)
+            return {
+                **flat_diag,
+                "loss_per_sample": self._average_over_valid_replicas(
+                    flat_diag["loss_per_sample"], rep_mask
+                ),
+                "pcc_per_sample": self._average_over_valid_replicas(
+                    flat_diag["pcc_per_sample"], rep_mask
+                ),
+                "valid": sample_valid,
+                "valid_fraction": sample_valid.to(dtype=target_reps.dtype).mean(),
             }
-            pcc_flat = self._pcc_loss_per_sample(flat_out)
-            pcc_diag: dict[str, torch.Tensor] = dict(pcc_flat)
-            for key in (
-                "loss_per_sample",
-                "pcc_per_sample",
-                "raw_loss_per_sample",
-                "nb_vst_loss_per_sample",
-            ):
-                if torch.is_tensor(pcc_flat.get(key)):
-                    pcc_diag[key] = self._average_over_valid_replicas(
-                        pcc_flat[key],
-                        rep_mask,
-                    )
-            flat_rep_mask = rep_mask.reshape(-1).to(device=target_reps.device)
-            if torch.is_tensor(pcc_flat.get("valid")):
-                active_valid = (
-                    pcc_flat["valid"].to(device=target_reps.device) & flat_rep_mask
-                )
-                sample_valid = active_valid.reshape(B, R).any(dim=1)
-                pcc_diag["valid"] = sample_valid
-                pcc_diag["valid_fraction"] = sample_valid.to(
-                    dtype=target_reps.dtype
-                ).mean()
 
-            raw_mu_pcc_flat = self._pearson_per_sample(
-                pred=flat_mu,
-                target=flat_target,
-                mask=flat_mask,
-            )
-            result["raw_mu_pcc_per_sample"] = self._average_over_valid_replicas(
-                raw_mu_pcc_flat,
-                rep_mask,
-            )
-            with torch.no_grad():
-                likelihood_positive_flat = self.loss_fn.sanitize_mean(flat_mu).float()
-            likelihood_mu_pcc_flat = self._pearson_per_sample(
-                pred=likelihood_positive_flat,
-                target=flat_target,
-                mask=flat_mask,
-            )
-            result["likelihood_mu_pcc_per_sample"] = (
-                self._average_over_valid_replicas(
-                    likelihood_mu_pcc_flat,
-                    rep_mask,
-                )
-            )
-            log1p_mse_flat = self._masked_mean(
-                (torch.log1p(likelihood_positive_flat) - torch.log1p(flat_target)).pow(2),
-                flat_mask,
-            )
-            result["log1p_mse_per_sample"] = self._average_over_valid_replicas(
-                log1p_mse_flat,
-                rep_mask,
-            )
-            result["pcc_diag"] = pcc_diag
+        raw_pcc_diag = pcc_component(
+            coefficient=self.replica_raw_pcc_weight,
+            transform="raw",
+        )
+        nb_vst_pcc_diag = pcc_component(
+            coefficient=self.replica_nb_vst_pcc_weight,
+            transform="nb_vst",
+        )
 
-        return result
-
-    _LOSS_TERM_NAMES = (
-        "consensus_nll",
-        "consensus_pcc",
-        "replica_nll",
-        "replica_pcc",
-    )
-
-    def _resolve_loss_term_weights(self, loss_cfg: Any) -> dict[str, float]:
-        """Read the one explicit, complete four-term objective definition."""
-        terms_cfg = getattr(loss_cfg, "loss_terms", None)
-        if terms_cfg is None:
-            raise ValueError(
-                "loss.loss_terms is required and must explicitly define "
-                f"{', '.join(self._LOSS_TERM_NAMES)}. Implicit objective presets "
-                "are not supported."
-            )
-
-        resolved: dict[str, float] = {}
-        missing: list[str] = []
-        for name in self._LOSS_TERM_NAMES:
-            raw = getattr(terms_cfg, name, None)
-            if raw is None:
-                missing.append(name)
-                continue
-            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-                raise TypeError(
-                    f"loss.loss_terms.{name} must be a scalar number, got "
-                    f"{type(raw).__name__}."
-                )
-            value = float(raw)
-            if not math.isfinite(value) or value < 0.0:
-                raise ValueError(
-                    f"loss.loss_terms.{name} must be finite and non-negative, "
-                    f"got {value}."
-                )
-            resolved[name] = value
-
-        if missing:
-            raise ValueError(
-                "loss.loss_terms must define all four terms; missing: "
-                + ", ".join(missing)
-            )
-        if not any(value > 0.0 for value in resolved.values()):
-            raise ValueError("At least one loss.loss_terms weight must be positive.")
-        return resolved
+        with torch.no_grad():
+            likelihood_positive_flat = self.loss_fn.positive_mean_from_params(
+                mu=flat_mu,
+                log_sigma=flat_log_sigma,
+            ).float()
+        likelihood_mu_pcc_flat = self._pearson_per_sample(
+            pred=likelihood_positive_flat,
+            target=flat_target,
+            mask=flat_mask,
+        )
+        likelihood_mu_pcc_per_sample = self._average_over_valid_replicas(
+            likelihood_mu_pcc_flat,
+            rep_mask,
+        )
+        log1p_mse_flat = self._masked_mean(
+            (torch.log1p(likelihood_positive_flat) - torch.log1p(flat_target)).pow(2),
+            flat_mask,
+        )
+        log1p_mse_per_sample = self._average_over_valid_replicas(
+            log1p_mse_flat,
+            rep_mask,
+        )
+        replica_counts = rep_mask.to(dtype=target_reps.dtype).sum(dim=1)
+        return {
+            "nll_per_sample": nll_per_sample,
+            "raw_pcc_diag": raw_pcc_diag,
+            "nb_vst_pcc_diag": nb_vst_pcc_diag,
+            "likelihood_mu_pcc_per_sample": likelihood_mu_pcc_per_sample,
+            "log1p_mse_per_sample": log1p_mse_per_sample,
+            "metrics": {
+                "replica_count_mean": replica_counts.mean(),
+            },
+        }
 
     def _compute_loss_and_metrics(self, out: dict[str, Any]) -> dict[str, torch.Tensor]:
         dataset_ids = out["dataset_ids"]
         sample_weights = out.get("sample_weights")
-        transcript_group_ids = out.get("transcript_group_ids")
-        if not torch.is_tensor(transcript_group_ids):
-            transcript_ids = out.get("ids")
-            if isinstance(transcript_ids, (list, tuple)):
-                transcript_group_ids = self._legacy_group_indices_from_ids(
-                    transcript_ids,
-                    device=dataset_ids.device,
-                )
-            else:
-                # Hand-built historical diagnostic dictionaries sometimes have
-                # no transcript strings. Treat rows as distinct groups; current
-                # collated training/validation batches always carry real groups.
-                transcript_group_ids = torch.arange(
-                    dataset_ids.reshape(-1).shape[0],
-                    device=dataset_ids.device,
-                    dtype=torch.long,
-                )
-            out["transcript_group_ids"] = transcript_group_ids
         mask = out["mask"].bool() & torch.isfinite(out["target"].float())
         target = torch.nan_to_num(out["target"].float(), nan=0.0, posinf=0.0, neginf=0.0)
 
-        term_w = self.loss_term_weights
-        consensus_terms = self._compute_consensus_loss_terms(
-            out,
-            target,
-            mask,
-            compute_nll=term_w["consensus_nll"] > 0.0,
-        )
-        replica_terms = self._compute_replica_loss_terms(
-            out,
-            compute_nll=term_w["replica_nll"] > 0.0,
-            compute_pcc=term_w["replica_pcc"] > 0.0,
-        )
-        replica_available = replica_terms is not None
-        if (
-            term_w["replica_nll"] > 0.0 or term_w["replica_pcc"] > 0.0
-        ) and not replica_available:
-            raise RuntimeError(
-                "The configured objective requires replica targets, but this batch "
-                "does not contain replica_profiles and replica_mask."
-            )
+        consensus_terms = self._compute_consensus_loss_terms(out, target, mask)
+        replica_terms = self._compute_replica_loss_terms(out)
 
-        # Choose which source (consensus vs raw-replica) feeds the reported
-        # top-line NLL and PCC diagnostics: prefer whichever term actually
-        # carries positive weight in the optimized loss, preferring consensus on
-        # ties so existing dashboards keep the same meaning by default.
-        def _report_source(consensus_key: str, replica_key: str) -> dict[str, Any]:
-            consensus_on = term_w[consensus_key] > 0.0
-            replica_on = replica_available and term_w[replica_key] > 0.0
-            if consensus_on or not replica_on:
-                return consensus_terms
-            return replica_terms
+        # Fixed objective contract: all three data-fit terms use raw replicas.
+        # The consensus is diagnostic-only.
+        nll_per_sample = replica_terms["nll_per_sample"]
+        raw_pcc_diag = replica_terms["raw_pcc_diag"]
+        nb_vst_pcc_diag = replica_terms["nb_vst_pcc_diag"]
+        pcc_raw_loss_per_sample = raw_pcc_diag["loss_per_sample"]
+        pcc_nb_vst_loss_per_sample = nb_vst_pcc_diag["loss_per_sample"]
+        raw_mu_pcc_per_sample = consensus_terms["raw_mu_pcc_per_sample"]
+        likelihood_mu_pcc_per_sample = consensus_terms[
+            "likelihood_mu_pcc_per_sample"
+        ]
+        log1p_mse_per_sample = consensus_terms["log1p_mse_per_sample"]
 
-        nll_source = _report_source("consensus_nll", "replica_nll")
-        pcc_source = _report_source("consensus_pcc", "replica_pcc")
-
-        nll_per_sample = nll_source["nll_per_sample"]
-        raw_mu_pcc_per_sample = pcc_source["raw_mu_pcc_per_sample"]
-        pcc_diag = pcc_source["pcc_diag"]
-        likelihood_mu_pcc_per_sample = pcc_source["likelihood_mu_pcc_per_sample"]
-        log1p_mse_per_sample = pcc_source["log1p_mse_per_sample"]
-
-        pcc_loss_per_sample = pcc_diag["loss_per_sample"]
         extras = out["extras"]
         # L_bio is the shared biological profile, so compare it directly with
         # the consensus target even when replicas provide the main objective.
@@ -2096,138 +1618,96 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 target=target.detach(),
                 mask=mask,
             )
-        gamma_reg_per_sample = self._gamma_regularization_per_sample(out)
-        effective_gamma_reg_weight = nll_per_sample.new_tensor(self.gamma_reg_weight)
-        def _term_tensor(name: str) -> torch.Tensor:
-            return nll_per_sample.new_tensor(term_w[name])
+        if self.gamma_reg_weight > 0.0:
+            gamma_reg_per_sample = self._gamma_regularization_per_sample(out)
+        else:
+            # A zero coefficient disables gamma-regularizer computation.
+            gamma_reg_per_sample = nll_per_sample.new_zeros(nll_per_sample.shape)
 
-        # Optimized loss: one explicit weighted sum of the four elementary
-        # terms plus the gamma regularizer. A zero weight disables a term.
-        per_sample_total_loss = effective_gamma_reg_weight * gamma_reg_per_sample
-        per_sample_total_loss = per_sample_total_loss + _term_tensor(
-            "consensus_nll"
-        ) * consensus_terms["nll_per_sample"]
-        per_sample_total_loss = per_sample_total_loss + _term_tensor(
-            "consensus_pcc"
-        ) * consensus_terms["pcc_diag"]["loss_per_sample"]
-
-        weighted_replica_loss_per_sample = torch.zeros_like(per_sample_total_loss)
-        if replica_available:
-            if term_w["replica_nll"] > 0.0:
-                weighted_replica_loss_per_sample = (
-                    weighted_replica_loss_per_sample
-                    + _term_tensor("replica_nll") * replica_terms["nll_per_sample"]
-                )
-            if term_w["replica_pcc"] > 0.0:
-                weighted_replica_loss_per_sample = (
-                    weighted_replica_loss_per_sample
-                    + _term_tensor("replica_pcc")
-                    * replica_terms["pcc_diag"]["loss_per_sample"]
-                )
-            per_sample_total_loss = (
-                per_sample_total_loss + weighted_replica_loss_per_sample
-            )
-
-        def reduce_samples(
-            values: torch.Tensor,
-            reduction_mode: str | None = None,
-            weights: torch.Tensor | None = sample_weights,
-        ) -> torch.Tensor:
-            return self._aggregate_per_sample(
-                values,
-                dataset_ids,
-                weights,
-                transcript_group_ids=transcript_group_ids,
-                mode=reduction_mode or self.sample_reduction,
-            )
-
-        loss_global_weighted = reduce_samples(
-            per_sample_total_loss,
-            "global_weighted",
+        effective_replica_nb_weight = nll_per_sample.new_tensor(
+            self.replica_nb_weight
         )
-        loss_dataset_balanced = reduce_samples(
-            per_sample_total_loss,
-            "dataset_balanced",
+        effective_replica_raw_pcc_weight = nll_per_sample.new_tensor(
+            self.replica_raw_pcc_weight
         )
-        loss_transcript_balanced = reduce_samples(
-            per_sample_total_loss,
-            "transcript_balanced",
+        effective_replica_nb_vst_pcc_weight = nll_per_sample.new_tensor(
+            self.replica_nb_vst_pcc_weight
         )
-        loss_by_reduction = {
-            "global_weighted": loss_global_weighted,
-            "dataset_balanced": loss_dataset_balanced,
-            "transcript_balanced": loss_transcript_balanced,
-        }
-        loss = loss_by_reduction[self.sample_reduction]
+        effective_gamma_reg_weight = nll_per_sample.new_tensor(
+            self.gamma_reg_weight
+        )
+        pcc_loss_per_sample = (
+            effective_replica_raw_pcc_weight * pcc_raw_loss_per_sample
+            + effective_replica_nb_vst_pcc_weight * pcc_nb_vst_loss_per_sample
+        )
+        per_sample_total_loss = (
+            effective_replica_nb_weight * nll_per_sample
+            + pcc_loss_per_sample
+            + effective_gamma_reg_weight * gamma_reg_per_sample
+        )
+
+        loss = self._aggregate_per_sample(
+            per_sample_total_loss,
+            dataset_ids,
+            sample_weights,
+        )
         loss_per_sample = per_sample_total_loss
 
-        nll_global = reduce_samples(nll_per_sample, "global_weighted")
-        pcc_loss_global = reduce_samples(
-            pcc_loss_per_sample,
-            "global_weighted",
-        )
-        nll_dataset_balanced = reduce_samples(
+        nll = self._aggregate_per_sample(
             nll_per_sample,
-            "dataset_balanced",
+            dataset_ids,
+            sample_weights,
         )
-        pcc_loss_dataset_balanced = reduce_samples(
+        pcc_loss = self._aggregate_per_sample(
             pcc_loss_per_sample,
-            "dataset_balanced",
+            dataset_ids,
+            sample_weights,
         )
-        nll_transcript_balanced = reduce_samples(
-            nll_per_sample,
-            "transcript_balanced",
+        gamma_reg = self._aggregate_per_sample(
+            gamma_reg_per_sample,
+            dataset_ids,
+            sample_weights,
         )
-        pcc_loss_transcript_balanced = reduce_samples(
-            pcc_loss_per_sample,
-            "transcript_balanced",
+        pcc_raw_loss = self._aggregate_per_sample(
+            pcc_raw_loss_per_sample,
+            dataset_ids,
+            sample_weights,
         )
-        gamma_reg = reduce_samples(gamma_reg_per_sample)
-        nll = {
-            "global_weighted": nll_global,
-            "dataset_balanced": nll_dataset_balanced,
-            "transcript_balanced": nll_transcript_balanced,
-        }[self.sample_reduction]
-        pcc_loss = {
-            "global_weighted": pcc_loss_global,
-            "dataset_balanced": pcc_loss_dataset_balanced,
-            "transcript_balanced": pcc_loss_transcript_balanced,
-        }[self.sample_reduction]
-        pcc_value = reduce_samples(pcc_diag["pcc_per_sample"])
-        pcc_raw_loss = reduce_samples(pcc_diag["raw_loss_per_sample"])
-        pcc_nb_vst_loss = reduce_samples(pcc_diag["nb_vst_loss_per_sample"])
+        pcc_nb_vst_loss = self._aggregate_per_sample(
+            pcc_nb_vst_loss_per_sample,
+            dataset_ids,
+            sample_weights,
+        )
 
         def aggregate_active(v: torch.Tensor) -> torch.Tensor:
-            return reduce_samples(v)
+            return self._aggregate_per_sample(v, dataset_ids, sample_weights)
 
-        consensus_nll = aggregate_active(consensus_terms["nll_per_sample"])
-        consensus_pcc_loss = aggregate_active(
-            consensus_terms["pcc_diag"]["loss_per_sample"]
-        )
-        consensus_pcc_value = aggregate_active(
-            consensus_terms["pcc_diag"]["pcc_per_sample"]
-        )
+        consensus_pcc_value = aggregate_active(raw_mu_pcc_per_sample)
+        consensus_pcc_loss = aggregate_active(1.0 - raw_mu_pcc_per_sample)
 
-        zero_metric = target.new_tensor(0.0)
-        replica_nll = (
-            aggregate_active(replica_terms["nll_per_sample"])
-            if replica_terms is not None and "nll_per_sample" in replica_terms
-            else zero_metric
-        )
-        replica_pcc_loss = (
-            aggregate_active(replica_terms["pcc_diag"]["loss_per_sample"])
-            if replica_terms is not None and "pcc_diag" in replica_terms
-            else zero_metric
-        )
-        replica_pcc_value = (
-            aggregate_active(replica_terms["pcc_diag"]["pcc_per_sample"])
-            if replica_terms is not None and "pcc_diag" in replica_terms
-            else zero_metric
-        )
-
-        weighted_replica_loss = aggregate_active(
-            weighted_replica_loss_per_sample
-        )
+        replica_nll = aggregate_active(replica_terms["nll_per_sample"])
+        replica_pcc_loss = pcc_loss
+        pcc_weight_sum = self.replica_raw_pcc_weight + self.replica_nb_vst_pcc_weight
+        if pcc_weight_sum > 0.0:
+            replica_pcc_per_sample = (
+                self.replica_raw_pcc_weight * raw_pcc_diag["pcc_per_sample"]
+                + self.replica_nb_vst_pcc_weight
+                * nb_vst_pcc_diag["pcc_per_sample"]
+            ) / pcc_weight_sum
+        else:
+            replica_pcc_per_sample = nll_per_sample.new_zeros(nll_per_sample.shape)
+        replica_pcc_value = aggregate_active(replica_pcc_per_sample)
+        pcc_value = replica_pcc_value
+        pcc_valid = raw_pcc_diag["valid"] | nb_vst_pcc_diag["valid"]
+        pcc_valid_fraction = pcc_valid.to(dtype=target.dtype).mean()
+        if pcc_weight_sum > 0.0:
+            pcc_target_var_mean = (
+                self.replica_raw_pcc_weight * raw_pcc_diag["target_var_mean"]
+                + self.replica_nb_vst_pcc_weight
+                * nb_vst_pcc_diag["target_var_mean"]
+            ) / pcc_weight_sum
+        else:
+            pcc_target_var_mean = target.new_tensor(0.0)
 
         mask_f = mask.to(dtype=torch.float32)
         valid_len = mask_f.sum(dim=1).clamp_min(1.0)
@@ -2341,86 +1821,68 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             pos_mean((log_gamma_diag - mean_log_gamma_per_sample.reshape(-1, 1)).pow(2))
         )
         library_depth = (target * mask_f).sum(dim=1)
-        # These are global profile-level metrics, deliberately independent of
-        # the configured sample reduction: one answers the usual unweighted validation
-        # question, the other evaluates the reliability-weighted population.
-        # The weighted value is diagnostic only and never changes gradients.
-        mu_pcc_unweighted = self._aggregate_per_sample(
-            raw_mu_pcc_per_sample,
-            dataset_ids,
-            sample_weights=None,
-            dataset_balanced=False,
-        )
+        # Retain an unweighted pair-micro diagnostic alongside the mandatory
+        # transcript-weighted, dataset-balanced PCC aggregation.
+        mu_pcc_unweighted = raw_mu_pcc_per_sample.mean()
         mu_pcc_weighted = self._aggregate_per_sample(
             raw_mu_pcc_per_sample,
             dataset_ids,
             sample_weights=sample_weights,
-            dataset_balanced=False,
         )
 
         metrics: dict[str, torch.Tensor] = {
             "loss": loss,
             "loss_per_sample": loss_per_sample,
-            # Historical compatibility alias.
-            "loss_global_unbalanced": loss_global_weighted,
-            "loss_global_weighted": loss_global_weighted,
-            "loss_dataset_balanced": loss_dataset_balanced,
-            "loss_transcript_balanced": loss_transcript_balanced,
             "nll": nll,
             "nll_per_sample": nll_per_sample,
-            "nll_global": nll_global,
-            "nll_dataset_balanced": nll_dataset_balanced,
-            "nll_transcript_balanced": nll_transcript_balanced,
             "pcc_loss": pcc_loss,
             "pcc_loss_per_sample": pcc_loss_per_sample,
-            "pcc_loss_global": pcc_loss_global,
-            "pcc_loss_dataset_balanced": pcc_loss_dataset_balanced,
-            "pcc_loss_transcript_balanced": pcc_loss_transcript_balanced,
-            "consensus_nll": consensus_nll,
             "consensus_pcc_loss": consensus_pcc_loss,
             "consensus_pcc_value": consensus_pcc_value,
-            "weighted_replica_loss": weighted_replica_loss,
-            "weighted_replica_loss_per_sample": weighted_replica_loss_per_sample,
             "replica_nll": replica_nll,
             "replica_pcc_loss": replica_pcc_loss,
             "replica_pcc_value": replica_pcc_value,
-            "loss_term_weight_consensus_nll": target.new_tensor(
-                self.loss_term_weights["consensus_nll"]
-            ),
-            "loss_term_weight_consensus_pcc": target.new_tensor(
-                self.loss_term_weights["consensus_pcc"]
-            ),
-            "loss_term_weight_replica_nll": target.new_tensor(
-                self.loss_term_weights["replica_nll"]
-            ),
-            "loss_term_weight_replica_pcc": target.new_tensor(
-                self.loss_term_weights["replica_pcc"]
-            ),
             "gamma_reg": gamma_reg,
             "gamma_reg_per_sample": gamma_reg_per_sample,
+            "gamma_global_regularizer": gamma_reg,
             "gamma_reg_weight": effective_gamma_reg_weight,
+            "pcc_loss_total": pcc_loss,
             "pcc_value": pcc_value,
-            "pcc_valid_fraction": pcc_diag["valid_fraction"],
+            "replica_nb_weight": effective_replica_nb_weight,
+            "replica_raw_pcc_weight": effective_replica_raw_pcc_weight,
+            "replica_nb_vst_pcc_weight": effective_replica_nb_vst_pcc_weight,
+            "replica_nb_contribution": effective_replica_nb_weight * nll,
+            "pcc_valid_fraction": pcc_valid_fraction,
             "pcc_raw_loss": pcc_raw_loss,
-            "pcc_raw_loss_per_sample": pcc_diag["raw_loss_per_sample"],
-            "pcc_raw_value": pcc_diag["raw_value"],
-            "pcc_raw_component_weight": pcc_diag["raw_component_weight"],
-            "pcc_raw_valid_fraction": pcc_diag["raw_valid_fraction"],
+            "pcc_raw_loss_per_sample": pcc_raw_loss_per_sample,
+            "pcc_raw_value": aggregate_active(raw_pcc_diag["pcc_per_sample"]),
+            "pcc_raw_valid_fraction": raw_pcc_diag["valid_fraction"],
             "pcc_nb_vst_loss": pcc_nb_vst_loss,
-            "pcc_nb_vst_loss_per_sample": pcc_diag["nb_vst_loss_per_sample"],
-            "pcc_nb_vst_value": pcc_diag["nb_vst_value"],
-            "pcc_nb_vst_component_weight": pcc_diag["nb_vst_component_weight"],
-            "pcc_nb_vst_valid_fraction": pcc_diag["nb_vst_valid_fraction"],
-            "pcc_target_var_mean": pcc_diag["target_var_mean"],
-            "pcc_alpha_mean": pcc_diag["alpha_mean"],
-            "pcc_alpha_min": pcc_diag["alpha_min"],
-            "pcc_alpha_max": pcc_diag["alpha_max"],
+            "pcc_nb_vst_loss_per_sample": pcc_nb_vst_loss_per_sample,
+            "pcc_nb_vst_value": aggregate_active(
+                nb_vst_pcc_diag["pcc_per_sample"]
+            ),
+            "pcc_nb_vst_valid_fraction": nb_vst_pcc_diag["valid_fraction"],
+            "pcc_raw_contribution": (
+                effective_replica_raw_pcc_weight * pcc_raw_loss
+            ),
+            "pcc_nb_vst_contribution": (
+                effective_replica_nb_vst_pcc_weight * pcc_nb_vst_loss
+            ),
+            "pcc_target_var_mean": pcc_target_var_mean,
+            "pcc_alpha_mean": nb_vst_pcc_diag["alpha_mean"],
+            "pcc_alpha_min": nb_vst_pcc_diag["alpha_min"],
+            "pcc_alpha_max": nb_vst_pcc_diag["alpha_max"],
             # The legacy name remains an unweighted compatibility alias.
             "mu_pcc": mu_pcc_unweighted,
             "mu_pcc_unweighted": mu_pcc_unweighted,
             "mu_pcc_weighted": mu_pcc_weighted,
             "mu_pcc_per_sample": raw_mu_pcc_per_sample,
-            "L_bio_pcc": reduce_samples(L_bio_pcc_per_sample),
+            "L_bio_pcc": self._aggregate_per_sample(
+                L_bio_pcc_per_sample,
+                dataset_ids,
+                sample_weights,
+            ),
             "L_bio_pcc_per_sample": L_bio_pcc_per_sample,
             "nb_sequence_reduction_mode": target.new_tensor(sequence_reduction_mode_id),
             "nb_length_temper_gamma": target.new_tensor(
@@ -2437,10 +1899,12 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 (sample_lengths >= 500.0) & (sample_lengths < 1500.0)
             ),
             "nb_length_weight_long": length_weight_bin_mean(sample_lengths >= 1500.0),
-            "likelihood_mu_pcc": reduce_samples(
-                likelihood_mu_pcc_per_sample
+            "likelihood_mu_pcc": self._aggregate_per_sample(
+                likelihood_mu_pcc_per_sample,
+                dataset_ids,
+                sample_weights,
             ),
-            "log1p_mse": reduce_samples(log1p_mse_per_sample),
+            "log1p_mse": self._aggregate_per_sample(log1p_mse_per_sample, dataset_ids, sample_weights),
             "mean_ratio": extras["mean_ratio"].float().mean(),
             "mu_mean": extras["mu_mean"].float().mean(),
             "target_mean": extras["target_mean"].float().mean(),
@@ -2530,8 +1994,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             ).float().mean(),
             "nb_alpha_mean": pos_mean(extras["alpha"]).mean(),
         }
-        if replica_terms is not None:
-            metrics.update(replica_terms["metrics"])
+        metrics.update(replica_terms["metrics"])
         return metrics
 
     @staticmethod
@@ -2559,16 +2022,9 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         "pcc_valid_fraction",
         "pcc_raw_value",
         "pcc_nb_vst_value",
-        "consensus_nll",
         "consensus_pcc_value",
-        "weighted_replica_loss",
         "replica_nll",
-        "replica_pcc_value",
         "replica_count_mean",
-        "loss_term_weight_consensus_nll",
-        "loss_term_weight_consensus_pcc",
-        "loss_term_weight_replica_nll",
-        "loss_term_weight_replica_pcc",
         "log1p_mse",
         "mean_ratio",
         "J_mean",
@@ -2604,19 +2060,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             batch_size=batch_size,
             sync_dist=sync_dist,
         )
-        # All three views reuse the already-computed per-sample objective; no
-        # second forward pass is performed. ``*_loss`` above remains the
-        # configured checkpoint/early-stopping objective.
-        for reduction_mode in sorted(SAMPLE_REDUCTION_MODES):
-            self.log(
-                f"{stage}/loss_{reduction_mode}",
-                metrics[f"loss_{reduction_mode}"],
-                on_step=False,
-                on_epoch=True,
-                prog_bar=False,
-                batch_size=batch_size,
-                sync_dist=sync_dist,
-            )
         # `*_mu_pcc` is retained as the unweighted compatibility alias used
         # by checkpoint monitoring.  `*_mu_pcc_weighted` is reduced across
         # batches using sum(sample_weight), making it the exact weighted mean
@@ -2847,7 +2290,10 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
     def _likelihood_positive_mean(self, out: dict[str, Any]) -> torch.Tensor:
         with torch.no_grad():
-            return self.loss_fn.sanitize_mean(out["mu"].detach().float()).float()
+            return self.loss_fn.positive_mean_from_params(
+                mu=out["mu"].detach().float(),
+                log_sigma=out["log_sigma"].detach().float(),
+            ).float()
 
     def _sequence_for_plot(self, value: torch.Tensor, *, sample_idx: int, mask_i: torch.Tensor):
         value = value.detach().float().cpu()
@@ -3008,76 +2454,42 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
     def on_train_epoch_start(self) -> None:
         self._train_batch_structure_records = []
 
-    def _record_train_batch_structure(self, out: dict[str, Any]) -> None:
-        validate_complete_groups = (
-            self.sample_reduction == "transcript_balanced"
-            and self.train_sampling_strategy
-            == "transcript_grouped_multidataset_pairs"
-            and bool(self._expected_pair_rows_by_transcript)
-        )
-        if not self._grouped_batch_logging_enabled and not validate_complete_groups:
+    def _record_train_batch_structure(self, batch) -> None:
+        if not self._grouped_batch_logging_enabled:
             return
-        dataset_ids = out["dataset_ids"].detach().reshape(-1).long()
-        transcript_group_ids = (
-            out["transcript_group_ids"].detach().reshape(-1).long()
-        )
-        transcript_ids = [str(value) for value in out["ids"]]
-        if dataset_ids.shape != transcript_group_ids.shape:
-            raise RuntimeError(
-                "Batch dataset IDs and transcript group IDs have different shapes."
-            )
-        unique_groups, inverse = torch.unique(
-            transcript_group_ids,
-            sorted=False,
-            return_inverse=True,
-        )
-        group_count = unique_groups.numel()
-        row_counts = torch.bincount(inverse, minlength=group_count)
-        unique_group_dataset_pairs = torch.unique(
-            torch.stack((inverse, dataset_ids), dim=1),
-            dim=0,
-        )
-        distinct_dataset_counts = torch.bincount(
-            unique_group_dataset_pairs[:, 0],
-            minlength=group_count,
-        )
-        sample_weights = out.get("sample_weights")
-        if sample_weights is None:
-            sample_weights = torch.ones_like(inverse, dtype=torch.float32)
+        dataset_ids = batch[0]
+        transcript_ids = [str(value) for value in batch[1]]
+        if torch.is_tensor(dataset_ids):
+            dataset_id_values = dataset_ids.detach().reshape(-1).cpu().tolist()
         else:
-            sample_weights = sample_weights.detach().reshape(-1).float()
-        transcript_weight_sums = torch.zeros(
-            group_count,
-            device=sample_weights.device,
-            dtype=torch.float32,
-        )
-        transcript_weight_sums.index_add_(0, inverse, sample_weights)
+            dataset_id_values = list(dataset_ids)
+        if len(dataset_id_values) != len(transcript_ids):
+            raise RuntimeError(
+                "Batch dataset IDs and transcript IDs have different row counts."
+            )
 
-        inverse_cpu = inverse.detach().cpu().tolist()
-        row_counts_cpu = row_counts.detach().cpu().tolist()
-        distinct_counts_cpu = distinct_dataset_counts.detach().cpu().tolist()
-        transcript_by_local_group: dict[int, str] = {}
-        for transcript_id, local_group in zip(
+        rows_by_transcript: dict[str, int] = {}
+        datasets_by_transcript: dict[str, set[int]] = {}
+        for transcript_id, dataset_id in zip(
             transcript_ids,
-            inverse_cpu,
+            dataset_id_values,
             strict=True,
         ):
-            previous = transcript_by_local_group.setdefault(
-                int(local_group),
-                transcript_id,
+            rows_by_transcript[transcript_id] = (
+                rows_by_transcript.get(transcript_id, 0) + 1
             )
-            if self.debug_transcript_groups and previous != transcript_id:
-                raise AssertionError(
-                    "A transcript loss group contains multiple transcript IDs."
-                )
+            datasets_by_transcript.setdefault(transcript_id, set()).add(
+                int(dataset_id)
+            )
 
+        datasets_per_transcript = tuple(
+            len(datasets_by_transcript[transcript_id])
+            for transcript_id in rows_by_transcript
+        )
         complete_groups = 0
-        incomplete_transcripts: list[str] = []
-        for local_group in range(group_count):
-            transcript_id = transcript_by_local_group[local_group]
-            row_count = int(row_counts_cpu[local_group])
-            distinct_count = int(distinct_counts_cpu[local_group])
+        for transcript_id, row_count in rows_by_transcript.items():
             expected = self._expected_pair_rows_by_transcript.get(transcript_id)
+            distinct_count = len(datasets_by_transcript[transcript_id])
             if (
                 expected is not None
                 and expected > 0
@@ -3086,70 +2498,18 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 and row_count % expected == 0
             ):
                 complete_groups += 1
-            elif expected is not None:
-                incomplete_transcripts.append(transcript_id)
-        if (
-            incomplete_transcripts
-            and self.sample_reduction == "transcript_balanced"
-            and self.train_sampling_strategy
-            == "transcript_grouped_multidataset_pairs"
-        ):
-            preview = ", ".join(incomplete_transcripts[:5])
-            raise RuntimeError(
-                "Transcript-balanced loss received incomplete grouped-sampler "
-                f"transcript group(s): {preview}. The reduction would only be "
-                "batch-local, so training is stopped instead of silently using "
-                "an incomplete transcript."
-            )
 
-        if not self._grouped_batch_logging_enabled:
-            return
-
-        datasets_per_transcript = tuple(map(int, distinct_counts_cpu))
-        transcript_weight_sum_values = tuple(
-            map(float, transcript_weight_sums.detach().cpu().tolist())
-        )
+        group_count = len(rows_by_transcript)
         self._train_batch_structure_records.append(
             {
                 "pair_row_count": len(transcript_ids),
                 "unique_transcript_count": group_count,
-                "distinct_dataset_count": int(torch.unique(dataset_ids).numel()),
+                "distinct_dataset_count": len(set(map(int, dataset_id_values))),
                 "datasets_per_transcript": datasets_per_transcript,
-                "transcript_weight_sums": transcript_weight_sum_values,
                 "complete_group_count": complete_groups,
                 "group_count": group_count,
             }
         )
-
-        ds_values = distinct_dataset_counts.float()
-        weight_values = transcript_weight_sums.float()
-        weight_mean = weight_values.mean() if group_count else weight_values.new_tensor(0.0)
-        weight_cv = (
-            weight_values.std(unbiased=False) / weight_mean.clamp_min(self.eps)
-            if group_count
-            else weight_values.new_tensor(0.0)
-        )
-        step_metrics = {
-            "train_batch/pairs": float(len(transcript_ids)),
-            "train_batch/unique_transcripts": float(group_count),
-            "train_batch/unique_transcripts_per_microbatch": float(group_count),
-            "train_batch/datasets_per_transcript_mean": ds_values.mean(),
-            "train_batch/datasets_per_transcript_min": ds_values.amin(),
-            "train_batch/datasets_per_transcript_max": ds_values.amax(),
-            "train_batch/transcript_weight_sum_mean": weight_mean,
-            "train_batch/transcript_weight_sum_min": weight_values.amin(),
-            "train_batch/transcript_weight_sum_max": weight_values.amax(),
-            "train_batch/transcript_weight_sum_cv": weight_cv,
-        }
-        for name, value in step_metrics.items():
-            self.log(
-                name,
-                torch.as_tensor(value, device=self.device, dtype=torch.float32),
-                on_step=True,
-                on_epoch=False,
-                prog_bar=False,
-                sync_dist=False,
-            )
 
     @staticmethod
     def _gather_batch_structure_records(
@@ -3189,11 +2549,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             for record in records
             for value in record["datasets_per_transcript"]
         ]
-        transcript_weight_sums = [
-            float(value)
-            for record in records
-            for value in record["transcript_weight_sums"]
-        ]
         complete_groups = sum(
             int(record["complete_group_count"]) for record in records
         )
@@ -3221,17 +2576,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             unique_transcripts
         )
         ds_mean, ds_median, ds_min, ds_max = summary(datasets_per_transcript)
-        weight_mean, _, weight_min, weight_max = summary(transcript_weight_sums)
-        unique_cv = (
-            float(np.std(unique_transcripts) / max(unique_mean, self.eps))
-            if unique_transcripts
-            else 0.0
-        )
-        weight_cv = (
-            float(np.std(transcript_weight_sums) / max(weight_mean, self.eps))
-            if transcript_weight_sums
-            else 0.0
-        )
         complete_fraction = complete_groups / max(total_groups, 1)
         plan = self._grouped_optimizer_batch_plan
         estimated_total_steps = float(self.trainer.estimated_stepping_batches)
@@ -3243,15 +2587,10 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "train_batch/unique_transcripts_median": unique_median,
             "train_batch/unique_transcripts_min": unique_min,
             "train_batch/unique_transcripts_max": unique_max,
-            "train_batch/unique_transcripts_per_microbatch_cv": unique_cv,
             "train_batch/datasets_per_transcript_mean": ds_mean,
             "train_batch/datasets_per_transcript_median": ds_median,
             "train_batch/datasets_per_transcript_min": ds_min,
             "train_batch/datasets_per_transcript_max": ds_max,
-            "train_batch/transcript_weight_sum_mean": weight_mean,
-            "train_batch/transcript_weight_sum_min": weight_min,
-            "train_batch/transcript_weight_sum_max": weight_max,
-            "train_batch/transcript_weight_sum_cv": weight_cv,
             "train_batch/complete_group_fraction": complete_fraction,
             "train_batch/oversized_group_count": float(
                 plan.get("oversized_group_count", 0)
@@ -3313,14 +2652,13 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 sync_dist=False,
             )
 
-        # TODO: if unique_transcripts_per_microbatch_cv is substantial, add an
-        # optional optimizer-window-exact transcript reduction. Lightning's
-        # automatic accumulation gives every physical microbatch mean equal
-        # weight; it is exact across the window only for equal group counts.
+        # TODO: if variable group sizes make microbatch-mean accumulation too
+        # approximate, add a separate exact group-weighted manual accumulation
+        # ablation. Do not change the active loss reduction in this feature.
 
     def training_step(self, batch, batch_idx):
+        self._record_train_batch_structure(batch)
         out = self._forward_batch(batch)
-        self._record_train_batch_structure(out)
         metrics = self._compute_loss_and_metrics(out)
         self._log_stage(stage="train", out=out, metrics=metrics)
         return metrics["loss"]
@@ -3459,6 +2797,10 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                     device=out["mu"].device,
                     dtype=torch.bool,
                 ),
+            ),
+            "additive_bias": extras.get(
+                "additive_bias",
+                torch.zeros_like(extras["L_bio"]),
             ),
             "scale_dt": extras["scale_dt"],
             "normalized_shape": extras.get(

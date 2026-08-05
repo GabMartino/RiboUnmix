@@ -32,7 +32,7 @@ split:
   css_benchmark_frac: 0.1
 
 paths:
-  sequences_path: "./Datasets/data/sequence/MANE.selection.sequence_embeddings_with_css.parquet"
+  sequences_path: "./Datasets/data/sequence/sequence_embeddings_with_css.parquet"
   css_split: "./Datasets/data/sequence/css_split.json"
 
   checkpoints: "./checkpoints/riboai_queueing"
@@ -65,28 +65,14 @@ data:
 
   # transcript_grouped_pairs keeps the FULL datasets (single-dataset transcripts
   # included) while packing transcript groups into batches of batch_size.
-  train_sampling_strategy: transcript_grouped_multidataset_pairs # random_dataset_per_transcript
-  dataset_balance_gamma: 0.0
-  train_samples_per_epoch: null
-
-  # Unused by transcript_grouped_pairs; only used by dataset_aware_balanced_pairs.
-  datasets_per_batch: 16
+  train_sampling_strategy: transcript_grouped_multidataset_pairs
 
   pin_memory: true
   prefetch_factor: 2
 
-  # --- Raw-replica targets ---
-  # When true, every raw biological replica is included in the batch in addition
-  # to the arithmetic-mean `ribo` consensus. Which targets enter optimization is
-  # controlled only by loss.loss_terms. Replica terms average their loss over
-  # valid replicas within each transcript-dataset sample, with a separate
-  # observed scale S_r for each replica and the same final normalized shape.
-  # Requires dataset_config to
-  # point at parquet files that contain the replica column. The new HEK profiles
-  # are already CDS/start-codon aligned (codon 0 = ATG); `ribo` is their precise
-  # arithmetic mean and remains available to consensus terms and diagnostics.
-  use_ribo_replicas: true
-  ribo_replicas_column: ribo_cds_replicas
+  # Every input parquet must contain `ribo_cds_replicas` with shape [R, L].
+  # All optimized data terms use replicas; the replica mean is diagnostic-only.
+  # There is no replica-loading switch or configurable column name.
 
   # Dataset-level profile-quality metadata. Rank 1 is best. The dataloader puts
   # both `dataset_quality_rank` and a positive rank-derived quality weight in
@@ -130,12 +116,6 @@ training:
   # The preview normally finds about two transcripts per physical microbatch,
   # producing accumulate_grad_batches ~= ceil(32 / 2) = 16.
 
-# Recommended transcript-balanced configuration:
-# data:
-#   train_sampling_strategy: transcript_grouped_multidataset_pairs
-# loss:
-#   sample_reduction: transcript_balanced
-
 model:
   # Optional per-codon columns from paths.sequences_path. `route` may be:
   #   none          -> do not load or use the column (current baseline)
@@ -161,7 +141,7 @@ model:
   # L_bio       = normalized biological load, so mean_valid(L_bio)=1.
   # rho         = L_bio / (1 + L_bio). High rho marks locally saturated peaks.
   # lambda      = log(1 + L_bio), so L_bio = rho / (1 - rho).
-  # Mean model: mu = S * normalize_valid_mean(gamma * L_bio).
+  # Mean model: mu = S * gamma * L_bio.
   # Gamma starts neutral at 1. Mean(score^2) regularization can pull dataset
   # adaptation back toward the shared L_bio baseline.
   init_gamma: 1.0
@@ -178,8 +158,7 @@ model:
     enabled: true
     # fixed_reference is deterministic across training, validation, prediction,
     # singleton inference, requested partners, batch size, ordering, and DDP
-    # partitioning. batch_grouped remains available as an explicit alternative
-    # for benchmarking checkpoints trained with batch-local centering.
+    # partitioning. batch_grouped remains an explicit alternative.
     mode: fixed_reference
     reference:
       source: selected_experiment_datasets
@@ -192,7 +171,6 @@ model:
       quality_rank_power: 1.0
       chunk_size: 32
       minimum_datasets: 2
-
 
   biological_params:
     # Base one-hot dimension. The model automatically adds the dimensions of
@@ -241,9 +219,16 @@ model:
       init_log_sigma: 0.2
 
 loss:
-  # The observation likelihood is fixed to NB2. There is no likelihood selector
-  # or implicit objective preset: `loss_terms` below is the only source of term
-  # activation and overall term weights.
+  # The observation likelihood is fixed to NB2. There is no loss-mode or PCC
+  # enable selector: each explicit coefficient below controls exactly one term.
+  # A term whose coefficient is zero is skipped instead of being computed.
+  # For each transcript-dataset pair, the three data terms are averaged over
+  # its valid raw replicas; gamma regularization is evaluated once per pair.
+  replica_nb_weight: 1.0
+  replica_raw_pcc_weight: 0.5
+  replica_nb_vst_pcc_weight: 0.5
+  gamma_reg_weight: 0.0
+
   eps: 1.0e-8
   nb_log_alpha_min: -5.0
   # Dispersion cap. alpha = exp(log_alpha), Var = mu + alpha*mu^2. Lower max ->
@@ -263,52 +248,22 @@ loss:
   nb_length_temper_min_weight: 0.5
   nb_length_temper_max_weight: 2.0
 
-  # PCC transform. For the hybrid, the two component weights must be
-  # non-negative and sum exactly to 1; the overall PCC coefficient belongs only
-  # in loss_terms.consensus_pcc or loss_terms.replica_pcc.
-  pcc_loss_mode: hybrid_raw_nb_vst
-  pcc_raw_component_weight: 0.5
-  pcc_nb_vst_component_weight: 0.5
   min_pcc_target_var: 1.0e-6
-  # When true, PCC-NB-VST uses the same bounded alpha as NB2 but does not send
-  # PCC gradients into the dispersion head.
+  pcc_alpha_min: 1.0e-5
+  pcc_alpha_max: 20.0
   pcc_detach_alpha: true
 
-  # Complete, explicit objective. All four scalar entries are mandatory:
-  #   loss = consensus_nll * NB(mu, consensus_mean)
-  #        + consensus_pcc * PCC(mu, consensus_mean)
-  #        + replica_nll   * mean_r NB(mu_r, replica_r)
-  #        + replica_pcc   * mean_r PCC(mu_r, replica_r)
-  #        + gamma_reg_weight * mean(log_gamma^2)
-  #
-  # Current setup: consensus PCC supplies the profile-shape correlation signal;
-  # raw-replica NB2 is the count likelihood. Consensus NB2 is disabled because
-  # a replica mean is generally fractional, and replica PCC is disabled because
-  # the consensus is the lower-noise correlation target.
-  loss_terms:
-    consensus_nll: 0.0
-    consensus_pcc: 1.0
-    replica_nll: 1.0
-    replica_pcc: 0.0
+  # Fixed objective structure (only the four coefficients above are tunable):
+  #   mean_r [
+  #       replica_nb_weight * NB_NLL(replica_r)
+  #     + replica_raw_pcc_weight * (1 - PCC(mu_r, replica_r))
+  #     + replica_nb_vst_pcc_weight * (1 - PCC(VST(mu_r), VST(replica_r)))
+  #   ]
+  #   + gamma_reg_weight * mean_valid(log_gamma^2)
+  # The arithmetic consensus remains available only for diagnostics.
 
-  # Outer reduction of transcript-dataset sample losses:
-  #   global_weighted
-  #       Local reliability weights control both within-transcript dataset
-  #       influence and the transcript's total outer influence.
-  #   dataset_balanced
-  #       Local weights operate within datasets; every represented dataset gets
-  #       one equal outer contribution.
-  #   transcript_balanced
-  #       Local weights operate only within each transcript; every represented
-  #       transcript gets one equal outer contribution. Recommended with:
-  #       data.train_sampling_strategy: transcript_grouped_multidataset_pairs
-  # The legacy dataset_balanced_loss boolean remains accepted when this field is
-  # absent, but supplying conflicting old/new fields is an error.
-  sample_reduction: transcript_balanced
-
-  # Optional regularizer around the NB + PCC objective.
-  # Gamma is pulled to 1 through mean(log_gamma^2).
-  gamma_reg_weight: 0.0
+  # Per-sample losses are always combined as an equal outer mean over datasets;
+  # transcript reliability weights define the weighted mean inside each dataset.
 
   # Predicted-value floor for PCC only (honest zero handling, no extra
   # parameter): when computing Pearson correlation, predictions below this
