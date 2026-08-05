@@ -50,17 +50,11 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
     """
     Dataset for ribo-seq transcript-dataset pairs.
 
-    Two access modes are supported:
+    The dataset exposes deterministic transcript-dataset pairs. The grouped
+    samplers rely on ``__len__`` and ``__getitem__`` referring to the flat pair
+    index, so there is no random per-transcript dataset-selection mode.
 
-    1. dataset_choice_mode="random"
-        __len__ returns the number of unique transcripts.
-        __getitem__(i) selects one available dataset randomly for transcript i.
-
-    2. dataset_choice_mode="deterministic"
-        __len__ returns the number of flat transcript-dataset pairs.
-        __getitem__(j) returns the exact pair j = (transcript_id, dataset_name).
-
-    The deterministic mode exposes flat-pair metadata:
+    It exposes flat-pair metadata:
 
         self.flat_transcript_ids     # [num_pairs], transcript id per pair
         self.flat_local_indices      # [num_pairs], local transcript index per pair
@@ -123,8 +117,6 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         transcripts_ids: list,
         data: dict | None = None,
         lengths: np.ndarray | None = None,
-        seed: int = 42,
-        dataset_choice_mode: str = "random",  # "random" or "deterministic"
         allowed_dataset_names_by_transcript: Mapping[str, Sequence[str]] | None = None,
         precompute_features: bool = True,
         precompute_ribo: bool = True,
@@ -153,8 +145,6 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         self.n_codons = len(self.codon_map)
         self.n_aa = len(self.aa_map)
 
-        self.dataset_choice_mode = str(dataset_choice_mode)
-        self.seed = int(seed)
         self.precompute_features = bool(precompute_features)
         self.precompute_ribo = bool(precompute_ribo)
         self.additional_sequence_features = self._parse_additional_sequence_features(
@@ -192,9 +182,6 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             if allowed_dataset_names_by_transcript is not None
             else None
         )
-
-        if self.dataset_choice_mode not in {"random", "deterministic"}:
-            raise ValueError(f"Unknown dataset_choice_mode={self.dataset_choice_mode}")
 
         # Global transcript id -> global sequence-table index.
         self.global_idx_by_tid = {
@@ -348,29 +335,12 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
     # ============================================================
 
     def __len__(self) -> int:
-        if self.dataset_choice_mode == "random":
-            return len(self.transcripts_ids)
-
-        if self.dataset_choice_mode == "deterministic":
-            return self.total_length
-
-        raise ValueError(f"Unknown dataset_choice_mode={self.dataset_choice_mode}")
+        return self.total_length
 
     def __getitem__(self, index: int):
-        if self.dataset_choice_mode == "random":
-            local_idx = int(index)
-            transcript_id = str(self.local_to_tid[local_idx])
-
-            available_names = self.available_dataset_names_by_local[local_idx]
-            dataset_name = str(np.random.choice(available_names))
-
-        elif self.dataset_choice_mode == "deterministic":
-            local_idx = int(self.flat_local_indices[index])
-            transcript_id = str(self.flat_transcript_ids[index])
-            dataset_name = str(self.flat_dataset_names[index])
-
-        else:
-            raise ValueError(f"Unknown dataset_choice_mode={self.dataset_choice_mode}")
+        local_idx = int(self.flat_local_indices[index])
+        transcript_id = str(self.flat_transcript_ids[index])
+        dataset_name = str(self.flat_dataset_names[index])
 
         global_idx = int(self.local_to_global_idx[local_idx])
 
@@ -423,13 +393,18 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         """
         Small metadata summary useful for debugging datamodule sampling.
         """
-        k_values = np.asarray(list(self.transcript_dataset_counts().values()), dtype=np.int64)
+        _, k_values = np.unique(self.flat_transcript_ids, return_counts=True)
         unique_k, k_counts = np.unique(k_values, return_counts=True)
+
+        dataset_pair_counts: dict[int, int] = {}
+        for dataset_id in self.flat_dataset_ids:
+            dataset_id = int(dataset_id)
+            dataset_pair_counts[dataset_id] = dataset_pair_counts.get(dataset_id, 0) + 1
 
         return {
             "num_flat_pairs": int(self.total_length),
             "num_unique_transcripts": int(len(np.unique(self.flat_transcript_ids))),
-            "dataset_pair_counts": self.dataset_pair_counts(),
+            "dataset_pair_counts": dataset_pair_counts,
             "transcripts_by_num_datasets": {
                 int(k): int(n) for k, n in zip(unique_k, k_counts)
             },

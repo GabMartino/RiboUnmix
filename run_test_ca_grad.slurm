@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=rbcagrad
+#SBATCH --job-name=riboai_2gpu_smoke
 #SBATCH --partition=p_csunivie_gres
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -18,6 +18,5 @@ srun python main_ribo_queueing_modeling_multi_dataset.py \
     trainer.devices=[0,1] \
     data.batch_size=128 \
     data.num_workers=8 \
-    cagrad.enabled=true \
     experiment.dataset="['kutay_2021', 'grimson_2019', 'sako_2020']" \
     split.master_dataset_universe="['kutay_2021', 'grimson_2019', 'sako_2020']"

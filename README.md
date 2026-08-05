@@ -107,15 +107,6 @@ python main_ribo_queueing_modeling_multi_dataset.py \
   'trainer.devices=[0]'
 ```
 
-Enable CAGrad for a matched multi-dataset run:
-
-```bash
-python main_ribo_queueing_modeling_multi_dataset.py \
-  cagrad.enabled=true \
-  experiment.dataset="['kutay_2021','grimson_2019','sako_2020']" \
-  split.master_dataset_universe="['kutay_2021','grimson_2019','sako_2020']"
-```
-
 Run prediction from a checkpoint without training:
 
 ```bash

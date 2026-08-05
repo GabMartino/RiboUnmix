@@ -983,23 +983,17 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         )
         self._grouped_batch_logging_enabled = False
         self._grouped_optimizer_batch_plan: dict[str, Any] = {}
-        self._expected_pair_rows_by_transcript: dict[str, int] = {}
         self._train_batch_structure_records: list[dict[str, Any]] = []
 
     def configure_grouped_optimizer_batch_logging(
         self,
         *,
         plan: dict[str, Any],
-        expected_pair_rows_by_transcript: dict[str, int],
         enabled: bool = True,
     ) -> None:
         """Attach the pre-Trainer grouped accumulation plan to this run."""
         self._grouped_batch_logging_enabled = bool(enabled)
         self._grouped_optimizer_batch_plan = dict(plan)
-        self._expected_pair_rows_by_transcript = {
-            str(transcript_id): int(pair_count)
-            for transcript_id, pair_count in expected_pair_rows_by_transcript.items()
-        }
         # The project uses weights-only checkpoints, so the resolved Hydra config
         # and JSON manifest are the durable provenance. Keep the same compact plan
         # in Lightning hyperparameters when a full checkpoint is requested.
@@ -2486,19 +2480,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             len(datasets_by_transcript[transcript_id])
             for transcript_id in rows_by_transcript
         )
-        complete_groups = 0
-        for transcript_id, row_count in rows_by_transcript.items():
-            expected = self._expected_pair_rows_by_transcript.get(transcript_id)
-            distinct_count = len(datasets_by_transcript[transcript_id])
-            if (
-                expected is not None
-                and expected > 0
-                and distinct_count == expected
-                and row_count >= expected
-                and row_count % expected == 0
-            ):
-                complete_groups += 1
-
         group_count = len(rows_by_transcript)
         self._train_batch_structure_records.append(
             {
@@ -2506,8 +2487,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 "unique_transcript_count": group_count,
                 "distinct_dataset_count": len(set(map(int, dataset_id_values))),
                 "datasets_per_transcript": datasets_per_transcript,
-                "complete_group_count": complete_groups,
-                "group_count": group_count,
             }
         )
 
@@ -2549,10 +2528,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             for record in records
             for value in record["datasets_per_transcript"]
         ]
-        complete_groups = sum(
-            int(record["complete_group_count"]) for record in records
-        )
-        total_groups = sum(int(record["group_count"]) for record in records)
 
         def summary(values: list[float]) -> tuple[float, float, float, float]:
             if not values:
@@ -2576,7 +2551,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             unique_transcripts
         )
         ds_mean, ds_median, ds_min, ds_max = summary(datasets_per_transcript)
-        complete_fraction = complete_groups / max(total_groups, 1)
         plan = self._grouped_optimizer_batch_plan
         estimated_total_steps = float(self.trainer.estimated_stepping_batches)
         metrics = {
@@ -2591,13 +2565,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "train_batch/datasets_per_transcript_median": ds_median,
             "train_batch/datasets_per_transcript_min": ds_min,
             "train_batch/datasets_per_transcript_max": ds_max,
-            "train_batch/complete_group_fraction": complete_fraction,
-            "train_batch/oversized_group_count": float(
-                plan.get("oversized_group_count", 0)
-            ),
-            "train_batch/subsampled_group_count": float(
-                plan.get("subsampled_group_count", 0)
-            ),
             "train_batch/accumulation_factor": float(
                 plan.get("resolved_accumulate_grad_batches", 1)
             ),

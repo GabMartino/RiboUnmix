@@ -1354,7 +1354,6 @@ def make_datamodule(
     val_fold: list[str],
     train_allowed_dataset_names_by_transcript: dict[str, list[str]] | None = None,
     val_allowed_dataset_names_by_transcript: dict[str, list[str]] | None = None,
-    split_size: float,
     seed: int,
 ) -> RiboAIQueuingDatamoduleMultiDataset:
     feature_cfg = cfg_get(cfg, "model.additional_sequence_features", {})
@@ -1366,13 +1365,7 @@ def make_datamodule(
         sequences_path=cfg.paths.sequences_path,
         datasets_paths=datasets_paths,
         batch_size=int(cfg.data.batch_size),
-        max_pair_rows_per_microbatch=cfg_get(
-            cfg,
-            "data.max_pair_rows_per_microbatch",
-            None,
-        ),
         split=(train_fold, val_fold),
-        split_p=split_size,
         num_workers=int(cfg.data.num_workers),
         predict_num_workers=int(cfg_get(cfg, "data.predict_num_workers", 0)),
         seed=seed,
@@ -1405,13 +1398,6 @@ def make_datamodule(
         ),
         dataset_quality_strict=cfg_bool(
             cfg, "data.dataset_quality_ranking.strict", True
-        ),
-        oversized_group_policy=str(
-            cfg_get(
-                cfg,
-                "training.grouped_optimizer_batch.oversized_group_policy",
-                "error",
-            )
         ),
     )
 
@@ -1483,9 +1469,6 @@ def resolve_training_grouped_optimizer_batching(
             cfg_get(cfg, f"{grouped_cfg_path}.target_scope", "per_rank")
         ),
         world_size=world_size,
-        oversized_group_policy=str(
-            cfg_get(cfg, f"{grouped_cfg_path}.oversized_group_policy", "error")
-        ),
         forced_accumulate_grad_batches=(None if auto else configured_accumulation),
     )
     OmegaConf.update(
@@ -1581,9 +1564,6 @@ def print_grouped_optimizer_batch_plan(
             f"{plan.expected_optimizer_steps_from_transcript_target} "
             f"(ratio={plan.optimizer_step_expectation_ratio:.3f})",
         ),
-        ("oversized groups", str(statistics.oversized_group_count)),
-        ("subsampled groups", str(statistics.subsampled_group_count)),
-        ("complete-group fraction", f"{statistics.complete_group_fraction:.6f}"),
     )
     width = max(len(label) for label, _ in rows)
     for label, value in rows:
@@ -1890,7 +1870,6 @@ def main(cfg: DictConfig) -> None:
         val_fold=main_val_fold_for_experiment,
         train_allowed_dataset_names_by_transcript=train_allowed_datasets,
         val_allowed_dataset_names_by_transcript=val_allowed_datasets,
-        split_size=split_size,
         seed=seed,
     )
 
@@ -1916,35 +1895,13 @@ def main(cfg: DictConfig) -> None:
         lit_model.configure_grouped_optimizer_batch_logging(
             plan={
                 **grouped_optimizer_plan.to_dict(),
-                "oversized_group_count": (
-                    grouped_batch_statistics.oversized_group_count
-                ),
-                "subsampled_group_count": (
-                    grouped_batch_statistics.subsampled_group_count
-                ),
-                "preview_complete_group_fraction": (
-                    grouped_batch_statistics.complete_group_fraction
-                ),
             },
-            expected_pair_rows_by_transcript=(
-                datamodule.train_transcript_group_pair_counts()
-            ),
             enabled=cfg_bool(
                 cfg,
                 "training.grouped_optimizer_batch.log_batch_structure",
                 True,
             ),
         )
-
-    if cfg_bool(cfg, "dry_run_batch_plan", False):
-        if grouped_batch_statistics is None or grouped_optimizer_plan is None:
-            raise RuntimeError(
-                "dry_run_batch_plan=true requires "
-                "data.train_sampling_strategy=transcript_grouped_multidataset_pairs "
-                "and training.grouped_optimizer_batch.enabled=true."
-            )
-        print("\ndry_run_batch_plan=true: exiting before Trainer construction.")
-        return
 
     css_benchmark_fold_for_experiment = filter_ids_available_in_experiment(
         ids=css_benchmark_fold,
@@ -1969,7 +1926,6 @@ def main(cfg: DictConfig) -> None:
             val_fold=css_benchmark_fold_for_experiment,
             train_allowed_dataset_names_by_transcript=train_allowed_datasets,
             val_allowed_dataset_names_by_transcript=css_allowed_datasets,
-            split_size=split_size,
             seed=seed,
         )
     else:
@@ -2071,11 +2027,10 @@ def main(cfg: DictConfig) -> None:
     if n_devices > 1:
         trainer_kwargs["strategy"] = "ddp_find_unused_parameters_true"
 
-    # CAGrad has its own biological-gradient override; keep Trainer clipping for
-    # non-CAGrad runs only.
-    if not cfg_bool(cfg, "cagrad.enabled", cfg_bool(cfg, "optim.use_cagrad", False)):
-        trainer_kwargs["gradient_clip_val"] = cfg_get(cfg, "trainer.gradient_clip_val", 0.0)
-        trainer_kwargs["gradient_clip_algorithm"] = cfg_get(cfg, "trainer.gradient_clip_algorithm", "norm")
+    trainer_kwargs["gradient_clip_val"] = cfg_get(cfg, "trainer.gradient_clip_val", 0.0)
+    trainer_kwargs["gradient_clip_algorithm"] = cfg_get(
+        cfg, "trainer.gradient_clip_algorithm", "norm"
+    )
 
     trainer = pl.Trainer(**trainer_kwargs)
 

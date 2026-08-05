@@ -307,7 +307,6 @@ COMMAND=(
     training.grouped_optimizer_batch.enabled=true
     training.grouped_optimizer_batch.auto_accumulate_grad_batches=true
     training.grouped_optimizer_batch.target_unique_transcripts_per_optimizer_step=32
-    training.grouped_optimizer_batch.oversized_group_policy=error
     "data.num_workers=${NUM_WORKERS}"
     "data.predict_num_workers=${PREDICT_NUM_WORKERS}"
     "data.multiprocessing_context=${DATA_WORKER_CONTEXT}"

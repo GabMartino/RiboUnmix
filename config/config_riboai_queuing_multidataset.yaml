@@ -1,9 +1,5 @@
 name: ribo_queueing_multi_datasets
 
-# Construct and print the grouped physical/optimizer-batch plan, then exit
-# before Trainer construction. Override to true from the command line.
-dry_run_batch_plan: false
-
 defaults:
   # All weighted HEK datasets with their raw per-codon replica profiles.
   - dataset_config: weighted_hek_riboseq_codon_replicas
@@ -32,7 +28,7 @@ split:
   css_benchmark_frac: 0.1
 
 paths:
-  sequences_path: "./Datasets/data/sequence/sequence_embeddings_with_css.parquet"
+  sequences_path: "./Datasets/data/sequence/MANE.selection.sequence_embeddings_with_css.parquet"
   css_split: "./Datasets/data/sequence/css_split.json"
 
   checkpoints: "./checkpoints/riboai_queueing"
@@ -50,10 +46,7 @@ data:
   # Physical GPU microbatch capacity measured in transcript-dataset pair rows,
   # not unique transcripts. All rows of one transcript group remain atomic.
   # run_all_datasets.slurm overrides this to 256 for multidataset experiments.
-  batch_size: 32
-  # Optional clearer alias for batch_size. Leave null for backward compatibility.
-  # If non-null it must exactly equal batch_size.
-  max_pair_rows_per_microbatch: null
+  batch_size: 16
   num_workers: 4
   # Prediction is a one-pass operation; avoiding spawned workers here prevents
   # another full copy of the already in-memory validation dataset per rank.
@@ -103,7 +96,6 @@ training:
     target_scope: per_rank  # per_rank | global
     # A complete transcript group must fit one physical microbatch. Gradient
     # accumulation cannot repair a group split across microbatches.
-    oversized_group_policy: error  # error | subsample (legacy, unsafe warning)
     log_batch_structure: true
 
     # Resolved values are inserted here at runtime and are also written to

@@ -48,10 +48,6 @@ class GroupedBatchStatistics:
     median_unique_transcripts_per_microbatch: float
     mean_unique_transcripts_per_microbatch: float
     maximum_unique_transcripts_per_microbatch: int
-    incomplete_group_count: int
-    oversized_group_count: int
-    subsampled_group_count: int
-    complete_group_fraction: float
 
     @property
     def median_pair_rows_per_microbatch(self) -> float:
@@ -90,7 +86,6 @@ class GroupedOptimizerBatchPlan:
     optimizer_step_expectation_ratio: float
     accumulation_clamped_at_maximum: bool
     physical_pair_microbatch_size: int
-    oversized_group_policy: str
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -130,7 +125,6 @@ def resolve_grouped_optimizer_batch_plan(
     max_accumulate_grad_batches: int = 32,
     target_scope: str = "per_rank",
     world_size: int = 1,
-    oversized_group_policy: str = "error",
     forced_accumulate_grad_batches: int | None = None,
 ) -> GroupedOptimizerBatchPlan:
     """Resolve a common accumulation factor from an actual grouped epoch plan."""
@@ -210,7 +204,6 @@ def resolve_grouped_optimizer_batch_plan(
         optimizer_step_expectation_ratio=float(ratio),
         accumulation_clamped_at_maximum=clamped_at_maximum,
         physical_pair_microbatch_size=int(statistics.physical_pair_capacity),
-        oversized_group_policy=str(oversized_group_policy),
     )
 
 
@@ -343,7 +336,6 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
         shuffle_batches: bool = True,
         num_replicas: int = 1,
         rank: int = 0,
-        oversized_group_policy: str = "error",
     ):
         self.flat_transcript_ids = _as_numpy_str(flat_transcript_ids)
         self.flat_dataset_ids = _as_numpy_int(flat_dataset_ids)
@@ -364,18 +356,11 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
         self.shuffle_batches = bool(shuffle_batches)
         self.num_replicas = max(int(num_replicas), 1)
         self.rank = int(rank) % self.num_replicas
-        self.oversized_group_policy = str(oversized_group_policy).strip().lower()
         self._iter_count = 0
         self.last_epoch_statistics: GroupedBatchStatistics | None = None
-        self.subsampled_group_count = 0
 
         if self.batch_size <= 0:
             raise ValueError("batch_size must be positive.")
-        if self.oversized_group_policy not in {"error", "subsample"}:
-            raise ValueError(
-                "oversized_group_policy must be 'error' or 'subsample'; got "
-                f"{oversized_group_policy!r}."
-            )
         if len(self.flat_transcript_ids) != len(self.flat_dataset_ids):
             raise ValueError("flat_transcript_ids and flat_dataset_ids must have same length.")
         if len(self.flat_transcript_ids) != len(self.lengths):
@@ -416,8 +401,7 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
         oversized_indices = np.flatnonzero(
             self.group_full_pair_counts > self.batch_size
         )
-        self.oversized_group_count = int(oversized_indices.size)
-        if self.oversized_group_count and self.oversized_group_policy == "error":
+        if oversized_indices.size:
             group_index = int(oversized_indices[0])
             transcript_id = self.group_transcript_ids[group_index]
             group_size = int(self.group_full_pair_counts[group_index])
@@ -428,58 +412,29 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
                 f"physical_pair_capacity={self.batch_size}, "
                 f"distinct_datasets={dataset_count}, suggested_minimum_batch_size="
                 f"{group_size}. Increasing gradient accumulation does not solve an "
-                "oversized individual group; data.batch_size (or "
-                "data.max_pair_rows_per_microbatch) must fit at least one complete "
-                "transcript group. Use oversized_group_policy='subsample' only to "
-                "reproduce the legacy incomplete-centering behavior."
+                "oversized individual group; data.batch_size must fit at least one complete "
+                "transcript group."
             )
-        if self.oversized_group_count:
-            warnings.warn(
-                "PROMINENT WARNING: oversized_group_policy='subsample' will remove "
-                f"dataset rows from {self.oversized_group_count} eligible transcript "
-                "group(s). Batch-grouped gamma centering will use an incomplete "
-                "dataset participant set for every selected oversized group.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        self.group_pair_counts = np.minimum(
-            self.group_full_pair_counts,
-            self.batch_size,
-        )
 
     def _sample_group_indices(
         self,
         group_index: int,
-        rng: np.random.Generator,
-    ) -> tuple[np.ndarray, bool]:
+    ) -> np.ndarray:
         group = self.groups[int(group_index)]
-        if group.size <= self.batch_size:
-            return group.copy(), True
-
-        if self.oversized_group_policy == "error":
-            # Constructor validation normally makes this unreachable. Keep the
-            # guard local so future dynamic group sources cannot silently split.
-            transcript_id = self.group_transcript_ids[int(group_index)]
-            raise RuntimeError(
-                f"Transcript {transcript_id!r} has {group.size} pair rows, exceeding "
-                f"physical capacity {self.batch_size}; complete groups are atomic."
-            )
-
-        sampled = rng.choice(group, size=self.batch_size, replace=False)
-        return np.asarray(sampled, dtype=np.int64), False
+        return group.copy()
 
     def _select_groups(
         self,
         rng: np.random.Generator,
-    ) -> list[tuple[int, int, np.ndarray, bool]]:
+    ) -> list[tuple[int, int, np.ndarray]]:
         group_order = rng.permutation(len(self.groups))
 
         selected = []
         for group_idx in group_order:
             group_idx = int(group_idx)
-            indices, complete = self._sample_group_indices(group_idx, rng)
+            indices = self._sample_group_indices(group_idx)
             length = int(self.group_lengths[group_idx])
-            selected.append((length, group_idx, indices, complete))
+            selected.append((length, group_idx, indices))
 
         if self.sort_by_length:
             selected.sort(key=lambda item: item[0], reverse=True)
@@ -495,13 +450,12 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
         selected_groups = self._select_groups(rng)
 
         # Each batch carries its selected group records until statistics are
-        # computed. A record is (transcript ID, selected dataset count,
-        # complete flag); the emitted DataLoader batch remains a plain index list.
-        packed: list[tuple[list[int], list[tuple[str, int, bool]]]] = []
+        # computed. The emitted DataLoader batch remains a plain index list.
+        packed: list[tuple[list[int], list[tuple[str, int]]]] = []
         batch: list[int] = []
-        batch_groups: list[tuple[str, int, bool]] = []
+        batch_groups: list[tuple[str, int]] = []
 
-        for _, group_index, group, complete in selected_groups:
+        for _, group_index, group in selected_groups:
             group_list = group.tolist()
 
             if batch and len(batch) + len(group_list) > self.batch_size:
@@ -517,7 +471,6 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
                 (
                     self.group_transcript_ids[group_index],
                     selected_dataset_count,
-                    bool(complete),
                 )
             )
 
@@ -537,14 +490,6 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
         )
         group_records = [record for _, records in packed for record in records]
         datasets_per_group = tuple(int(record[1]) for record in group_records)
-        incomplete_count = sum(not bool(record[2]) for record in group_records)
-        selected_group_count = len(group_records)
-        complete_fraction = (
-            1.0
-            if selected_group_count == 0
-            else float((selected_group_count - incomplete_count) / selected_group_count)
-        )
-
         def _minimum(values: tuple[int, ...]) -> int:
             return int(min(values)) if values else 0
 
@@ -573,10 +518,6 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
             median_unique_transcripts_per_microbatch=_median(unique_transcripts),
             mean_unique_transcripts_per_microbatch=_mean(unique_transcripts),
             maximum_unique_transcripts_per_microbatch=_maximum(unique_transcripts),
-            incomplete_group_count=int(incomplete_count),
-            oversized_group_count=self.oversized_group_count,
-            subsampled_group_count=int(incomplete_count),
-            complete_group_fraction=complete_fraction,
         )
         return batches, statistics
 
@@ -593,7 +534,6 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
         batches, statistics = self._build_epoch_plan(iteration_index)
         self._iter_count += 1
         self.last_epoch_statistics = statistics
-        self.subsampled_group_count = statistics.subsampled_group_count
         yield from batches
 
     def __len__(self):
@@ -629,8 +569,6 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         codon_encoding_path: str,
         aa_encoding_path: str,
         datasets_encoding_path: str,
-        max_pair_rows_per_microbatch: Optional[int] = None,
-        split_p: float = 0.9,
         num_workers: int = 4,
         predict_num_workers: int = 0,
         seed: int = 42,
@@ -645,7 +583,6 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         dataset_quality_dataset_column: str = "dataset",
         dataset_quality_rank_column: str = "quality_rank",
         dataset_quality_strict: bool = True,
-        oversized_group_policy: str = "error",
     ):
         super().__init__()
         self.save_hyperparameters(
@@ -657,22 +594,10 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
 
         self.sequences_path = sequences_path
         self.datasets_paths = list(datasets_paths)
-        legacy_batch_size = int(batch_size)
-        if max_pair_rows_per_microbatch is None:
-            self.batch_size = legacy_batch_size
-        else:
-            alias_batch_size = int(max_pair_rows_per_microbatch)
-            if alias_batch_size != legacy_batch_size:
-                raise ValueError(
-                    "data.batch_size and data.max_pair_rows_per_microbatch both "
-                    "describe the physical transcript-dataset pair-row capacity "
-                    f"but disagree ({legacy_batch_size} != {alias_batch_size})."
-                )
-            self.batch_size = alias_batch_size
+        self.batch_size = int(batch_size)
         if self.batch_size <= 0:
             raise ValueError("Physical pair-row microbatch capacity must be positive.")
         self.split = split
-        self.split_p = float(split_p)
         self.num_workers = int(num_workers)
         self.predict_num_workers = int(predict_num_workers)
         if self.num_workers < 0 or self.predict_num_workers < 0:
@@ -701,11 +626,6 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         self.dataset_quality_dataset_column = str(dataset_quality_dataset_column)
         self.dataset_quality_rank_column = str(dataset_quality_rank_column)
         self.dataset_quality_strict = bool(dataset_quality_strict)
-        self.oversized_group_policy = str(oversized_group_policy).strip().lower()
-        if self.oversized_group_policy not in {"error", "subsample"}:
-            raise ValueError(
-                "oversized_group_policy must be 'error' or 'subsample'."
-            )
 
         self.nt_enc = open_file(nt_encoding_path)
         self.c2aa_enc = open_file(codon_to_aa_encoding_path)
@@ -745,10 +665,6 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             )
         return strategy
 
-    def _training_dataset_choice_mode(self) -> str:
-        self._resolve_train_sampling_strategy()
-        return "deterministic"
-
     def _get_flat_dataset_ids(self, dataset_obj) -> np.ndarray:
         if hasattr(dataset_obj, "flat_dataset_ids"):
             return _as_numpy_int(dataset_obj.flat_dataset_ids)
@@ -765,87 +681,18 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         )
 
     def _get_flat_transcript_ids(self, dataset_obj) -> np.ndarray:
-        """
-        Tries to recover one transcript ID per flat pair.
-
-        Best fix in the dataset class:
-            self.flat_transcript_ids = [...]
-
-        This helper includes fallbacks for common attribute names, but if none
-        exist, add flat_transcript_ids to RiboAIQueuingDatasetMultiDataset when
-        building flat pairs.
-        """
-        candidate_attrs = [
-            "flat_transcript_ids",
-            "flat_ids",
-            "flat_transcripts",
-            "flat_transcript_id",
-        ]
-
-        for attr in candidate_attrs:
-            if hasattr(dataset_obj, attr):
-                val = getattr(dataset_obj, attr)
-                arr = _as_numpy_str(val)
-                if len(arr) == len(dataset_obj):
-                    return arr
-
-        # Fallback: infer from flat_indices / flat_global_indices plus transcript_ids.
-        index_attrs = [
-            "flat_transcript_indices",
-            "flat_global_indices",
-            "flat_ref_indices",
-            "flat_indices",
-        ]
-        transcript_id_attrs = ["transcripts_ids", "transcript_ids", "ids"]
-
-        for idx_attr in index_attrs:
-            if not hasattr(dataset_obj, idx_attr):
-                continue
-            flat_idx = _as_numpy_int(getattr(dataset_obj, idx_attr))
-            if len(flat_idx) != len(dataset_obj):
-                continue
-
-            for tid_attr in transcript_id_attrs:
-                if hasattr(dataset_obj, tid_attr):
-                    tids = _as_numpy_str(getattr(dataset_obj, tid_attr))
-                    if flat_idx.max(initial=0) < len(tids):
-                        return tids[flat_idx]
-
-        # Fallback for a generic flat-pair list/dict.
-        if hasattr(dataset_obj, "flat_pairs"):
-            pairs = getattr(dataset_obj, "flat_pairs")
-            tids = []
-            for p in pairs:
-                if isinstance(p, dict):
-                    for key in ["transcript_id", "id", "tid"]:
-                        if key in p:
-                            tids.append(str(p[key]))
-                            break
-                    else:
-                        raise AttributeError("Could not find transcript ID key in flat-pair dict.")
-                elif isinstance(p, (tuple, list)) and len(p) >= 1:
-                    # Prefer first element if it is string-like; otherwise second.
-                    if isinstance(p[0], str):
-                        tids.append(str(p[0]))
-                    elif len(p) >= 2 and isinstance(p[1], str):
-                        tids.append(str(p[1]))
-                    else:
-                        raise AttributeError(
-                            "Flat-pair metadata exists, but tuple layout is not recognized. "
-                            "Add dataset_obj.flat_transcript_ids explicitly."
-                        )
-                else:
-                    raise AttributeError("Flat-pair metadata layout is not recognized.")
-            arr = _as_numpy_str(tids)
-            if len(arr) == len(dataset_obj):
-                return arr
-
-        raise AttributeError(
-            "Could not infer flat_transcript_ids. Add this attribute to "
-            "RiboAIQueuingDatasetMultiDataset when building deterministic flat pairs:\n\n"
-            "    self.flat_transcript_ids = np.asarray([...], dtype=str)\n\n"
-            "It must have length == len(dataset_obj), one transcript ID per flat pair."
-        )
+        """Return the explicit transcript ID stored for every flat pair."""
+        if not hasattr(dataset_obj, "flat_transcript_ids"):
+            raise AttributeError(
+                "Deterministic datasets must expose flat_transcript_ids."
+            )
+        transcript_ids = _as_numpy_str(dataset_obj.flat_transcript_ids)
+        if len(transcript_ids) != len(dataset_obj):
+            raise ValueError(
+                "flat_transcript_ids must contain one ID per flat pair; got "
+                f"{len(transcript_ids)} IDs for a dataset of length {len(dataset_obj)}."
+            )
+        return transcript_ids
 
     # ------------------------------------------------------------
     # Setup
@@ -1068,11 +915,10 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         print(f"Validation transcripts: {len(val_ids)}")
 
         strategy = self._resolve_train_sampling_strategy()
-        train_choice_mode = self._training_dataset_choice_mode()
+        print("dataset pair mode: deterministic flat pairs")
 
         print("\n=== Training sampling strategy ===")
         print(f"strategy: {strategy}")
-        print(f"dataset_choice_mode: {train_choice_mode}")
 
         self.train_dataset_obj = RiboAIQueuingDatasetMultiDataset(
             data=shared_data,
@@ -1083,23 +929,20 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             aa_encoding=self.aa_enc,
             datasets_encoding=self.datasets_enc,
             transcripts_ids=train_ids,
-            dataset_choice_mode=train_choice_mode,
             allowed_dataset_names_by_transcript=self.train_allowed_dataset_names_by_transcript,
-            seed=self.seed,
             additional_sequence_features=self.additional_sequence_features,
         )
 
-        if train_choice_mode == "deterministic":
-            self.train_lengths = self._get_flat_lengths(self.train_dataset_obj)
-            self.train_flat_dataset_ids = self._get_flat_dataset_ids(self.train_dataset_obj)
-            self.train_flat_transcript_ids = self._get_flat_transcript_ids(self.train_dataset_obj)
+        self.train_lengths = self._get_flat_lengths(self.train_dataset_obj)
+        self.train_flat_dataset_ids = self._get_flat_dataset_ids(self.train_dataset_obj)
+        self.train_flat_transcript_ids = self._get_flat_transcript_ids(self.train_dataset_obj)
 
-            self._print_flat_pair_summary(
-                dataset_obj=self.train_dataset_obj,
-                flat_transcript_ids=self.train_flat_transcript_ids,
-                flat_dataset_ids=self.train_flat_dataset_ids,
-                split_name="train",
-            )
+        self._print_flat_pair_summary(
+            dataset_obj=self.train_dataset_obj,
+            flat_transcript_ids=self.train_flat_transcript_ids,
+            flat_dataset_ids=self.train_flat_dataset_ids,
+            split_name="train",
+        )
         self.val_dataset_obj = RiboAIQueuingDatasetMultiDataset(
             data=shared_data,
             lengths=shared_data["lengths"],
@@ -1109,9 +952,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             aa_encoding=self.aa_enc,
             datasets_encoding=self.datasets_enc,
             transcripts_ids=val_ids,
-            dataset_choice_mode="deterministic",
             allowed_dataset_names_by_transcript=self.val_allowed_dataset_names_by_transcript,
-            seed=self.seed,
             additional_sequence_features=self.additional_sequence_features,
         )
 
@@ -1228,7 +1069,6 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             ),
             num_replicas=max(int(num_replicas), 1),
             rank=int(rank),
-            oversized_group_policy=self.oversized_group_policy,
         )
 
     def preview_train_grouped_batch_statistics(
@@ -1252,24 +1092,6 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         return sampler.preview_epoch_batch_statistics(
             iteration_index=int(iteration_index)
         )
-
-    def train_transcript_group_pair_counts(self) -> dict[str, int]:
-        """Expected complete pair-row count for each eligible train transcript."""
-        if self.train_dataset_obj is None:
-            raise RuntimeError("setup('fit') must run before reading group metadata.")
-        sampler = self._make_train_grouped_batch_sampler(
-            num_replicas=1,
-            rank=0,
-            iteration_seed=self.seed,
-        )
-        return {
-            transcript_id: int(pair_count)
-            for transcript_id, pair_count in zip(
-                sampler.group_transcript_ids,
-                sampler.group_full_pair_counts,
-                strict=True,
-            )
-        }
 
     def train_dataloader(self):
         if self.train_dataset_obj is None:
@@ -1312,7 +1134,6 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             shuffle_batches=False,
             num_replicas=num_replicas,
             rank=rank,
-            oversized_group_policy=self.oversized_group_policy,
         )
 
         return DataLoader(
@@ -1343,7 +1164,6 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             shuffle_batches=False,
             num_replicas=num_replicas,
             rank=rank,
-            oversized_group_policy=self.oversized_group_policy,
         )
 
         return DataLoader(
