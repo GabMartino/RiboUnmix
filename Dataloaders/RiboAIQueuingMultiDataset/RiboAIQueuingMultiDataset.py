@@ -9,6 +9,43 @@ from torch.nn.utils.rnn import pack_padded_sequence, pad_sequence
 from torch.utils.data import Dataset
 
 
+def transcript_group_indices_from_ids(
+    transcript_ids: Sequence[str],
+) -> torch.LongTensor:
+    """Assign deterministic, microbatch-local integer IDs to transcripts.
+
+    The first distinct transcript receives group zero, the next unseen
+    transcript group one, and so on.  The same sorted transcript-ID list is
+    passed to gamma centering, so loss grouping and gamma grouping share one
+    source of truth without doing string grouping in the training step.
+    """
+    group_by_transcript: dict[str, int] = {}
+    group_indices: list[int] = []
+    for raw_transcript_id in transcript_ids:
+        transcript_id = str(raw_transcript_id)
+        group_index = group_by_transcript.get(transcript_id)
+        if group_index is None:
+            group_index = len(group_by_transcript)
+            group_by_transcript[transcript_id] = group_index
+        group_indices.append(group_index)
+
+    result = torch.tensor(group_indices, dtype=torch.long)
+    if __debug__:
+        transcript_by_group: dict[int, str] = {}
+        for transcript_id, group_index in zip(
+            map(str, transcript_ids),
+            group_indices,
+            strict=True,
+        ):
+            previous = transcript_by_group.setdefault(group_index, transcript_id)
+            if previous != transcript_id:
+                raise AssertionError(
+                    "One transcript_group_index was assigned to different "
+                    f"transcripts: {previous!r} and {transcript_id!r}."
+                )
+    return result
+
+
 class RiboAIQueuingDatasetMultiDataset(Dataset):
     """
     Dataset for ribo-seq transcript-dataset pairs.
@@ -62,6 +99,7 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             sample_weights_sorted, # [B]
             dataset_quality_ranks,  # [B], rank 1 is best
             dataset_quality_weights,# [B], positive rank-derived weight
+            transcript_group_index, # [B], local IDs from ids_sorted
             bias_features_pad,     # [B, T_max, F_bias], optional
             replica_pad,           # [B, R_max, T_max], optional
             replica_mask,          # [B, R_max], optional
@@ -793,6 +831,17 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         if ribo is None:
             ribo_raw = self.data_records["ribo_profiles"][transcript_id][dataset_name]
             ribo = np.ascontiguousarray(np.asarray(ribo_raw, dtype=np.float32))
+            if ribo.ndim != 1:
+                raise ValueError(
+                    "Expected consensus profile with shape [positions] for "
+                    f"transcript={transcript_id}, dataset={dataset_name}, got "
+                    f"shape {ribo.shape}."
+                )
+            if not np.isfinite(ribo).all() or bool((ribo < 0.0).any()):
+                raise ValueError(
+                    "Consensus targets must be finite and non-negative for "
+                    f"transcript={transcript_id}, dataset={dataset_name}."
+                )
             self._ribo_cache[key] = ribo
 
         return ribo
@@ -810,6 +859,16 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
                     f"Expected replicas with shape [n_replicas, L] for "
                     f"transcript={transcript_id}, dataset={dataset_name}, got "
                     f"shape {replicas.shape}."
+                )
+            if replicas.shape[0] == 0:
+                raise ValueError(
+                    f"No replicas for transcript={transcript_id}, "
+                    f"dataset={dataset_name}."
+                )
+            if not np.isfinite(replicas).all() or bool((replicas < 0.0).any()):
+                raise ValueError(
+                    "Replica targets must be finite and non-negative for "
+                    f"transcript={transcript_id}, dataset={dataset_name}."
                 )
             self._ribo_replicas_cache[key] = replicas
 
@@ -830,9 +889,18 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
 
         value = float(value)
         if not np.isfinite(value):
-            value = 1.0
+            raise ValueError(
+                "Transcript sample weight must be finite for "
+                f"transcript={transcript_id}, dataset={dataset_name}; got {value}."
+            )
+        if value < 0.0:
+            raise ValueError(
+                "Transcript sample weight must be non-negative for "
+                f"transcript={transcript_id}, dataset={dataset_name}; got {value}."
+            )
 
-        value = float(np.clip(value, 0.0, 1.0))
+        # Zero is retained only for historical weighted parquets.  Positive
+        # median-normalized weights, including values above one, are preserved.
         self._sample_weight_cache[key] = value
         return value
 
@@ -1032,6 +1100,9 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             [dataset_quality_weights[i] for i in order_list],
             dtype=torch.float32,
         )
+        transcript_group_indices_sorted = transcript_group_indices_from_ids(
+            ids_sorted
+        )
 
         seq_pad = pad_sequence(
             seq_sorted,
@@ -1134,6 +1205,7 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             sample_weights_sorted,
             dataset_quality_ranks_sorted,
             dataset_quality_weights_sorted,
+            transcript_group_indices_sorted,
         )
         if bias_features_pad is not None:
             collated = (*collated, bias_features_pad)

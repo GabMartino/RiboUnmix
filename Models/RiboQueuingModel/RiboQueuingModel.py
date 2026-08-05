@@ -118,23 +118,21 @@ class RiboQueuingModel(nn.Module):
         reference_dataset_quality_weights: Sequence[float] | None,
     ) -> None:
         cfg = dict(model_configs.get("gamma_centering", {}))
-        # `scope` is the historical spelling. If `mode` is absent, resolving
-        # from scope preserves old configurations and old checkpoint behavior.
-        configured_mode = str(cfg.get("mode", cfg.get("scope", "batch_grouped"))).lower()
-        mode_aliases = {
-            "legacy_batch_grouped": "batch_grouped",
-            "batch_grouped": "batch_grouped",
-            "fixed_reference": "fixed_reference",
-            "disabled": "disabled",
-        }
-        if configured_mode not in mode_aliases:
+        centering_enabled = bool(cfg.get("enabled", False))
+        if centering_enabled and "mode" not in cfg:
             raise ValueError(
-                "gamma_centering.mode/scope must be one of "
-                "'fixed_reference', 'batch_grouped', 'legacy_batch_grouped', "
-                "or 'disabled'."
+                "gamma_centering.mode is required when gamma centering is enabled. "
+                "Choose 'fixed_reference' or 'batch_grouped' explicitly."
             )
-        mode = mode_aliases[configured_mode]
-        if not bool(cfg.get("enabled", False)):
+        configured_mode = str(cfg.get("mode", "disabled")).lower()
+        valid_modes = {"batch_grouped", "fixed_reference", "disabled"}
+        if configured_mode not in valid_modes:
+            raise ValueError(
+                "gamma_centering.mode must be one of 'fixed_reference', "
+                "'batch_grouped', or 'disabled'."
+            )
+        mode = configured_mode
+        if not centering_enabled:
             mode = "disabled"
 
         reference_cfg = dict(cfg.get("reference", {}) or {})
@@ -235,9 +233,6 @@ class RiboQueuingModel(nn.Module):
         self.gamma_reference_source = str(
             reference_cfg.get("source", "selected_experiment_datasets")
         )
-        self.gamma_legacy_checkpoint_policy = str(
-            reference_cfg.get("legacy_checkpoint_policy", "preserve_legacy")
-        )
         self.register_buffer(
             "gamma_reference_dataset_ids",
             torch.as_tensor(ids, dtype=torch.long),
@@ -255,20 +250,14 @@ class RiboQueuingModel(nn.Module):
         )
 
     def set_gamma_centering_mode(self, mode: str) -> None:
-        aliases = {
-            "legacy_batch_grouped": "batch_grouped",
-            "batch_grouped": "batch_grouped",
-            "fixed_reference": "fixed_reference",
-            "disabled": "disabled",
-        }
+        valid_modes = {"batch_grouped", "fixed_reference", "disabled"}
         key = str(mode).lower()
-        if key not in aliases:
+        if key not in valid_modes:
             raise ValueError(f"Unknown gamma-centering mode: {mode!r}.")
-        resolved = aliases[key]
-        if resolved == "fixed_reference" and self.gamma_reference_dataset_ids.numel() == 0:
+        if key == "fixed_reference" and self.gamma_reference_dataset_ids.numel() == 0:
             raise ValueError("Cannot enable fixed_reference without a reference panel.")
-        self.gamma_centering_mode = resolved
-        self.gamma_cross_dataset_centering_enabled = resolved != "disabled"
+        self.gamma_centering_mode = key
+        self.gamma_cross_dataset_centering_enabled = key != "disabled"
 
     def get_extra_state(self) -> dict:
         return {
@@ -937,7 +926,7 @@ class RiboQueuingModel(nn.Module):
         L_bio = L_bio.to(dtype=dtype, device=device) * mask_f
 
         # --------------------------------------------------------
-        # 2. Dataset bias branch -> gamma residual + additive background
+        # 2. Dataset branch -> gamma residual + NB dispersion
         # --------------------------------------------------------
         position_features = self.make_position_features(mask=mask_b, dtype=dtype)
         bias = self.dataset_bias_model(
@@ -953,7 +942,6 @@ class RiboQueuingModel(nn.Module):
             ),
         )
         gamma_log_residual = bias["gamma_raw"].to(dtype=dtype, device=device) * mask_f
-        additive_bias = torch.zeros_like(gamma_log_residual)
         log_sigma = bias["log_sigma"].to(dtype=dtype)
         log_sigma = torch.where(mask_b, log_sigma, torch.zeros_like(log_sigma))
 
@@ -1014,11 +1002,11 @@ class RiboQueuingModel(nn.Module):
         # --------------------------------------------------------
         # 5. Prediction
         # --------------------------------------------------------
-        mu_inner = gamma * L_bio + additive_bias
+        mu_inner = gamma * L_bio
         if self.mass_conservation:
             # Renormalize the shape to mean 1 over valid positions so that
-            # mean_valid(mu) = S exactly. gamma, L_bio and additive_bias keep
-            # their per-position meaning; only the overall shape level is pinned.
+            # mean_valid(mu) = S exactly. gamma and L_bio keep their
+            # per-position meaning; only the overall shape level is pinned.
             inner_valid_len = mask_f.sum(dim=1, keepdim=True).clamp_min(1.0)
             inner_mean = (mu_inner * mask_f).sum(dim=1, keepdim=True) / inner_valid_len
             mu_inner = mu_inner / inner_mean.clamp_min(self.eps)
@@ -1128,11 +1116,6 @@ class RiboQueuingModel(nn.Module):
             ),
             "gamma": gamma,
             "log_gamma": log_gamma,
-            "additive_bias": torch.where(
-                mask_b,
-                additive_bias,
-                torch.zeros_like(additive_bias),
-            ),
             "lambda_bio_mean": lambda_bio_mean,
             "lambda_bio_max": lambda_bio_max,
             "lambda_bio_min": lambda_bio_min,

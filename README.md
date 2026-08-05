@@ -5,12 +5,13 @@
 This repository implements a queue-inspired, physics-aware neural model for
 ribosome profiling signals (Ribo-seq). The current model separates a
 dataset-invariant biological profile (`L_bio`) from dataset-specific
-multiplicative (`gamma`) and optional additive corrections. Gamma is the
+multiplicative (`gamma`) corrections. Gamma is the
 exponential of its centered log-score, so it is strictly positive on valid
 positions and remains unbounded above. The dataset head uses
 dataset, codon-context, and position features; it does not consume `L_bio`.
-Reliability-weighted gamma centering removes a multiplicative reference
-ambiguity when matched cross-dataset transcript observations are present.
+The recommended fixed-reference gamma centering uses one checkpointed dataset
+panel in every stage, while batch-grouped centering remains available for old
+experiments.
 
 Training, validation, prediction, checkpointing, and logging use PyTorch
 Lightning. Hydra controls the model, data, split, optimizer, and runtime
@@ -21,15 +22,16 @@ configuration.
 For transcript `t`, dataset `d`, and codon position `i`, the active mean model is
 
 ```text
-mu[d,t,i] = S[d,t] * (gamma[d,t,i] * L_bio[t,i] + additive_bias[d,t,i])
+shape[d,t,i] = mean_normalize(gamma[d,t,i] * L_bio[t,i])
+mu[d,t,i] = S[d,t] * shape[d,t,i]
 ```
 
 - `S[d,t]` is the valid-position mean of the observed target profile.
 - `L_bio` is positive and normalized to mean one over valid positions.
 - `gamma` is positive and dataset-conditioned.
-- `additive_bias` is nonnegative.
 - `rho_bio = L_bio / (1 + L_bio)` is the bounded occupancy representation.
-- The observation loss uses an NB2 parameterization with learned
+- The explicit active objective is consensus hybrid PCC plus raw-replica NB2.
+- NB2 uses learned
   per-position log-dispersion, exposed as `log_sigma` for compatibility.
 
 Because `S[d,t]` is computed from the target, the current implementation models
@@ -76,7 +78,7 @@ hardware.
 
 The default configuration is
 [`config/config_riboai_queuing_multidataset.yaml`](config/config_riboai_queuing_multidataset.yaml).
-It selects `weighted_datasets_paths_replicas` and expects:
+It selects `weighted_hek_riboseq_codon_replicas` and expects:
 
 - Sequence features at
   `Datasets/data/sequence/sequence_embeddings_with_css.parquet`.
@@ -172,13 +174,12 @@ training launch using `hydra.compose` from Python.
 
 ## Current Identifiability Boundary
 
-Gamma centering needs repeated transcript observations across datasets in the
-same centering scope. Singleton transcripts and disconnected overlap components
-do not share a data-driven multiplicative reference. The unrestricted additive
-branch also permits decompositions that produce the same mean profile. Practical
-next steps include hard reference-dataset anchoring, connected-component gauges,
-low-dimensional additive nuisance models, and explicit cross-dataset consensus
-losses. These options and their mathematical conditions are detailed in the
-modeling analysis document linked above.
+Fixed-reference centering defines a deterministic cross-dataset gamma gauge,
+including for singleton requested inference. This algebraically fixes the
+weighted common gamma mode over the configured reference panel, but it does not
+prove that `L_bio` is purely biological or that gamma is purely technical:
+sequence-correlated technical effects and genuine dataset-specific biology are
+not labeled separately by the data. These conditions are detailed in
+`Docs/model_mathematics.html`.
 
 No license file is currently included.

@@ -96,6 +96,7 @@ QUALITY_RANK_POWER="${QUALITY_RANK_POWERS[POWER_INDEX]}"
 # config/config_riboai_queuing_multidataset.yaml.
 SEED="${SEED:-42}"
 BATCH_SIZE="${BATCH_SIZE:-256}"
+TRAIN_SAMPLING_STRATEGY="${TRAIN_SAMPLING_STRATEGY:-transcript_grouped_multidataset_pairs}"
 # One persistent worker per DDP rank retains background loading while limiting
 # the in-memory dataset copies made by CUDA-safe `spawn`. Prediction defaults to
 # the main DDP process because it runs once and does not benefit from persistent
@@ -142,10 +143,12 @@ case "${FEATURE_PRESET}" in
         ;;
 esac
 
-# These conditions were verified in the repository's results/ directory: each
+# These historical transcript_grouped_pairs conditions were verified in the
+# repository's results/ directory: each
 # has a non-empty last.ckpt and readable main-validation and CSS prediction
 # Parquets. Keep the full array declaration generic for other feature presets,
-# but make already completed baseline elements exit before loading data or CUDA.
+# but only skip them when TRAIN_SAMPLING_STRATEGY=transcript_grouped_pairs.
+# The new grouped-multidataset optimizer-batching runs are distinct.
 # Set SKIP_COMPLETED=0 explicitly to rerun one of these conditions.
 SKIP_COMPLETED="${SKIP_COMPLETED:-1}"
 if [[ "${SKIP_COMPLETED}" != "0" && "${SKIP_COMPLETED}" != "1" ]]; then
@@ -180,7 +183,7 @@ CURRENT_CONDITION="${DATASET_SUBSET_STRATEGY}|${DATASET_COUNT_REQUEST}|${QUALITY
 COMPLETED_RUN="${COMPLETED_CONDITIONS[${CURRENT_CONDITION}]-}"
 # The completion table describes quality-rank runs only. Equal weighting is a
 # distinct experiment even when it uses the same p=0 dataset subset.
-if [[ "${SKIP_COMPLETED}" == "1" && "${GAMMA_CENTERING_WEIGHTING}" == "quality_rank" && -n "${COMPLETED_RUN}" ]]; then
+if [[ "${SKIP_COMPLETED}" == "1" && "${TRAIN_SAMPLING_STRATEGY}" == "transcript_grouped_pairs" && "${GAMMA_CENTERING_WEIGHTING}" == "quality_rank" && -n "${COMPLETED_RUN}" ]]; then
     echo "Skipping completed condition: ${CURRENT_CONDITION}"
     echo "Verified result: results/${COMPLETED_RUN}"
     exit 0
@@ -267,7 +270,8 @@ echo "Seed     -> ${SEED}"
 echo "Datasets -> ${SELECTED_DATASET_COUNT} (${DATASET_SUBSET_STRATEGY})"
 echo "Rank p   -> ${QUALITY_RANK_POWER}"
 echo "Gamma wt -> ${GAMMA_CENTERING_WEIGHTING}"
-echo "Batch    -> ${BATCH_SIZE} per DDP rank"
+echo "Batch    -> ${BATCH_SIZE} physical pair rows per DDP-rank microbatch"
+echo "Sampling -> ${TRAIN_SAMPLING_STRATEGY}"
 echo "Workers  -> ${NUM_WORKERS} per DDP rank"
 echo "Pred work-> ${PREDICT_NUM_WORKERS} per DDP rank"
 echo "Features -> ${FEATURE_PRESET}"
@@ -299,6 +303,11 @@ COMMAND=(
     trainer.use_distributed_sampler=false
     trainer.sync_dist_logs=true
     "data.batch_size=${BATCH_SIZE}"
+    "data.train_sampling_strategy=${TRAIN_SAMPLING_STRATEGY}"
+    training.grouped_optimizer_batch.enabled=true
+    training.grouped_optimizer_batch.auto_accumulate_grad_batches=true
+    training.grouped_optimizer_batch.target_unique_transcripts_per_optimizer_step=32
+    training.grouped_optimizer_batch.oversized_group_policy=error
     "data.num_workers=${NUM_WORKERS}"
     "data.predict_num_workers=${PREDICT_NUM_WORKERS}"
     "data.multiprocessing_context=${DATA_WORKER_CONTEXT}"

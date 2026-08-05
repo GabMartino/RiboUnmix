@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import warnings
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Sequence
@@ -26,11 +25,17 @@ except ImportError:
     AnyNode = None
 
 from Dataloaders.RiboAIQueuingMultiDataset.RiboAIQueuingDatamoduleMultiDataset import (
+    GroupedBatchStatistics,
+    GroupedOptimizerBatchPlan,
     RiboAIQueuingDatamoduleMultiDataset,
     load_dataset_quality_ranking,
+    resolve_grouped_optimizer_batch_plan,
 )
 from Models.RiboQueuingModel import RiboQueuingModel
-from Models.RiboQueuingModelLighningModule import RiboQueuingModelLightningModule
+from Models.RiboQueuingModelLighningModule import (
+    RiboQueuingModelLightningModule,
+    resolve_sample_reduction_mode,
+)
 from Utils.checkpoints import find_checkpoint
 
 
@@ -251,8 +256,11 @@ def format_run_tag_value(value: Any) -> str:
 
 
 def make_dataset_balance_run_tag(cfg: DictConfig) -> str:
-    if cfg_bool(cfg, "loss.dataset_balanced_loss", False):
+    reduction = resolve_sample_reduction_mode(cfg.loss)
+    if reduction == "dataset_balanced":
         return "DBLossOn"
+    if reduction == "transcript_balanced":
+        return "TBLossOn"
     return "DBLossOff"
 
 
@@ -284,22 +292,37 @@ def make_dataset_selection_run_tag(cfg: DictConfig) -> str:
     return f"Data{strategy}_N{len(datasets)}_h{subset_hash}"
 
 
-def make_replica_objective_run_tag(cfg: DictConfig) -> str:
-    objective = str(cfg_get(cfg, "loss.replica_objective", "replica")).lower()
+LOSS_TERM_TAGS = {
+    "consensus_nll": "cNLL",
+    "consensus_pcc": "cPCC",
+    "replica_nll": "rNLL",
+    "replica_pcc": "rPCC",
+}
 
-    if objective == "consensus":
-        return "ConsensusOnly"
 
-    if objective == "consensus_plus_replica":
-        replica_nll_weight = format_run_tag_value(
-            cfg_get(cfg, "loss.replica_nll_weight", 0.0)
+def loss_term_weight_from_config(cfg: DictConfig, name: str) -> float:
+    value = cfg_get(cfg, f"loss.loss_terms.{name}", None)
+    if value is None:
+        raise ValueError(
+            f"Missing required loss.loss_terms.{name}; the objective no longer "
+            "uses presets or implicit term defaults."
         )
-        return f"ConsensusReplicas_nll{replica_nll_weight}"
+    if isinstance(value, bool):
+        raise TypeError(f"loss.loss_terms.{name} must be a scalar number, not bool.")
+    value = float(value)
+    if not np.isfinite(value) or value < 0.0:
+        raise ValueError(
+            f"loss.loss_terms.{name} must be finite and non-negative, got {value}."
+        )
+    return value
 
-    if objective == "replica":
-        return "ReplicasOnly"
 
-    return f"ReplicaObj{format_run_tag_value(objective)}"
+def make_loss_terms_run_tag(cfg: DictConfig) -> str:
+    parts = [
+        f"{token}{format_run_tag_value(loss_term_weight_from_config(cfg, name))}"
+        for name, token in LOSS_TERM_TAGS.items()
+    ]
+    return "Loss-" + "-".join(parts)
 
 
 def make_sampling_run_tag(cfg: DictConfig) -> str | None:
@@ -316,7 +339,7 @@ def make_gamma_centering_run_tag(cfg: DictConfig) -> str:
         cfg_get(
             cfg,
             "model.gamma_centering.mode",
-            cfg_get(cfg, "model.gamma_centering.scope", "batch_grouped"),
+            "disabled",
         )
     ).lower()
     if mode == "disabled":
@@ -342,25 +365,20 @@ def make_gamma_centering_run_tag(cfg: DictConfig) -> str:
 
 
 def make_pcc_run_tag(cfg: DictConfig) -> str:
-    if not cfg_bool(cfg, "loss.pcc_loss_enabled", False):
+    consensus_weight = loss_term_weight_from_config(cfg, "consensus_pcc")
+    replica_weight = loss_term_weight_from_config(cfg, "replica_pcc")
+    if consensus_weight <= 0.0 and replica_weight <= 0.0:
         return "PCCOff"
 
     mode = str(cfg_get(cfg, "loss.pcc_loss_mode", "raw")).lower()
-    total_weight = format_run_tag_value(cfg_get(cfg, "loss.pcc_loss_weight", 1.0))
 
     if mode == "raw":
-        return f"PCCraw_w{total_weight}"
+        return "PCCraw"
 
     if mode == "log1p":
-        return f"PCClog1p_w{total_weight}"
+        return "PCClog1p"
 
-    if mode.startswith("hybrid_raw_nb_vst"):
-        suffix = ""
-        if "weighted" in mode:
-            suffix += "Weighted"
-        if "mean_ratio_gated" in mode:
-            suffix += "Gated"
-
+    if mode == "hybrid_raw_nb_vst":
         raw_weight = format_run_tag_value(
             cfg_get(cfg, "loss.pcc_raw_component_weight", 0.0)
         )
@@ -368,19 +386,18 @@ def make_pcc_run_tag(cfg: DictConfig) -> str:
             cfg_get(cfg, "loss.pcc_nb_vst_component_weight", 0.0)
         )
         return (
-            f"PCCrawVarAdj{suffix}_w{total_weight}"
+            "PCCrawVarAdj"
             f"_raw{raw_weight}_var{nb_vst_weight}"
         )
 
-    if mode.startswith("nb_vst"):
-        suffix = ""
-        if "weighted" in mode:
-            suffix += "Weighted"
-        if "mean_ratio_gated" in mode:
-            suffix += "Gated"
-        return f"PCCvarAdj{suffix}_w{total_weight}"
+    if mode == "nb_vst":
+        return "PCCvarAdj"
 
-    return f"PCC{format_run_tag_value(mode)}_w{total_weight}"
+    raise ValueError(
+        "loss.pcc_loss_mode must be one of "
+        "{'raw', 'log1p', 'nb_vst', 'hybrid_raw_nb_vst'}, "
+        f"got {mode!r}."
+    )
 
 
 def _sequence_feature_routes(cfg: DictConfig) -> dict[str, str]:
@@ -481,7 +498,7 @@ def make_run_tag(cfg: DictConfig) -> str:
         "queueNB",
         make_dataset_selection_run_tag(cfg),
         make_dataset_balance_run_tag(cfg),
-        make_replica_objective_run_tag(cfg),
+        make_loss_terms_run_tag(cfg),
         make_pcc_run_tag(cfg),
     ]
 
@@ -991,36 +1008,22 @@ def load_weights_only(
     has_fixed_reference_provenance = any(
         key.endswith("gamma_reference_dataset_ids") for key in state_dict
     )
-    incompatible = lit_model.load_state_dict(state_dict, strict=False)
-
     torch_model = getattr(lit_model, "model", None)
-    if torch_model is not None and not has_fixed_reference_provenance:
-        policy = str(
-            getattr(torch_model, "gamma_legacy_checkpoint_policy", "preserve_legacy")
-        ).lower()
-        if policy in {"preserve_legacy", "legacy_batch_grouped", "batch_grouped"}:
-            torch_model.set_gamma_centering_mode("batch_grouped")
-            warnings.warn(
-                "This checkpoint predates fixed-reference gamma provenance. "
-                "Using its historical legacy_batch_grouped behavior. Set "
-                "gamma_centering.reference.legacy_checkpoint_policy=fixed_reference "
-                "only for an explicit diagnostic gauge change.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        elif policy == "fixed_reference":
-            warnings.warn(
-                "Evaluating a legacy batch-grouped checkpoint with fixed-reference "
-                "centering. This changes the gamma gauge and does not recreate the "
-                "function used during historical training.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        else:
-            raise ValueError(
-                "Unknown gamma legacy checkpoint policy "
-                f"{torch_model.gamma_legacy_checkpoint_policy!r}."
-            )
+    if (
+        torch_model is not None
+        and getattr(torch_model, "gamma_centering_mode", "disabled")
+        == "fixed_reference"
+        and not has_fixed_reference_provenance
+    ):
+        raise RuntimeError(
+            "Checkpoint is incompatible with fixed-reference gamma centering: "
+            "it has no checkpointed gamma reference-panel provenance. Load it "
+            "with model.gamma_centering.mode=batch_grouped to reproduce its "
+            "historical function. Applying a new fixed-reference gauge to old "
+            "weights is not supported implicitly."
+        )
+
+    incompatible = lit_model.load_state_dict(state_dict, strict=False)
 
     print(f"Loaded weights from: {ckpt_path}")
 
@@ -1171,7 +1174,6 @@ def predictions_to_parquet(
         "gamma_total_reliability",
         "gamma_centering_constraint_error",
         "normalized_shape",
-        "additive_bias",
         "log_sigma",
         "mask",
         "codon_ids",
@@ -1426,6 +1428,11 @@ def make_datamodule(
         sequences_path=cfg.paths.sequences_path,
         datasets_paths=datasets_paths,
         batch_size=int(cfg.data.batch_size),
+        max_pair_rows_per_microbatch=cfg_get(
+            cfg,
+            "data.max_pair_rows_per_microbatch",
+            None,
+        ),
         split=(train_fold, val_fold),
         split_p=split_size,
         num_workers=int(cfg.data.num_workers),
@@ -1466,6 +1473,211 @@ def make_datamodule(
         dataset_quality_strict=cfg_bool(
             cfg, "data.dataset_quality_ranking.strict", True
         ),
+        oversized_group_policy=str(
+            cfg_get(
+                cfg,
+                "training.grouped_optimizer_batch.oversized_group_policy",
+                "error",
+            )
+        ),
+    )
+
+
+def configured_trainer_world_size(cfg: DictConfig) -> int:
+    """Infer the common pre-Trainer DDP world size from resolved config."""
+    devices = cfg_get(cfg, "trainer.devices", 1)
+    if isinstance(devices, (list, tuple, ListConfig)):
+        devices_per_node = max(len(devices), 1)
+    else:
+        try:
+            devices_per_node = max(int(devices), 1)
+        except (TypeError, ValueError):
+            devices_per_node = 1
+    num_nodes = max(int(cfg_get(cfg, "trainer.num_nodes", 1)), 1)
+    return devices_per_node * num_nodes
+
+
+def resolve_training_grouped_optimizer_batching(
+    *,
+    cfg: DictConfig,
+    datamodule: RiboAIQueuingDatamoduleMultiDataset,
+) -> tuple[GroupedBatchStatistics | None, GroupedOptimizerBatchPlan | None]:
+    """Resolve accumulation before Trainer/optimizer/scheduler construction."""
+    grouped_cfg_path = "training.grouped_optimizer_batch"
+    enabled = cfg_bool(cfg, f"{grouped_cfg_path}.enabled", False)
+    strategy = str(cfg_get(cfg, "data.train_sampling_strategy", "")).lower()
+    if not enabled or strategy != "transcript_grouped_multidataset_pairs":
+        return None, None
+
+    datamodule.setup("fit")
+    statistics = datamodule.preview_train_grouped_batch_statistics(iteration_index=0)
+    world_size = configured_trainer_world_size(cfg)
+    auto = cfg_bool(
+        cfg,
+        f"{grouped_cfg_path}.auto_accumulate_grad_batches",
+        True,
+    )
+    configured_accumulation = int(
+        cfg_get(cfg, "trainer.accumulate_grad_batches", 1)
+    )
+    if auto and configured_accumulation != 1:
+        raise ValueError(
+            "Automatic grouped optimizer batching conflicts with explicit "
+            f"trainer.accumulate_grad_batches={configured_accumulation}. Set it "
+            "to 1, or set training.grouped_optimizer_batch."
+            "auto_accumulate_grad_batches=false to keep the explicit value."
+        )
+
+    plan = resolve_grouped_optimizer_batch_plan(
+        statistics,
+        target_unique_transcripts_per_optimizer_step=int(
+            cfg_get(
+                cfg,
+                f"{grouped_cfg_path}.target_unique_transcripts_per_optimizer_step",
+                32,
+            )
+        ),
+        accumulation_statistic=str(
+            cfg_get(cfg, f"{grouped_cfg_path}.accumulation_statistic", "median")
+        ),
+        min_accumulate_grad_batches=int(
+            cfg_get(cfg, f"{grouped_cfg_path}.min_accumulate_grad_batches", 1)
+        ),
+        max_accumulate_grad_batches=int(
+            cfg_get(cfg, f"{grouped_cfg_path}.max_accumulate_grad_batches", 32)
+        ),
+        target_scope=str(
+            cfg_get(cfg, f"{grouped_cfg_path}.target_scope", "per_rank")
+        ),
+        world_size=world_size,
+        oversized_group_policy=str(
+            cfg_get(cfg, f"{grouped_cfg_path}.oversized_group_policy", "error")
+        ),
+        forced_accumulate_grad_batches=(None if auto else configured_accumulation),
+    )
+    OmegaConf.update(
+        cfg,
+        "trainer.accumulate_grad_batches",
+        int(plan.resolved_accumulate_grad_batches),
+        merge=False,
+        force_add=True,
+    )
+    OmegaConf.update(
+        cfg,
+        f"{grouped_cfg_path}.resolved",
+        {
+            **plan.to_dict(),
+            "batch_statistics": statistics.to_dict(),
+        },
+        merge=False,
+        force_add=True,
+    )
+    return statistics, plan
+
+
+def print_grouped_optimizer_batch_plan(
+    *,
+    selected_datasets: Sequence[str],
+    statistics: GroupedBatchStatistics,
+    plan: GroupedOptimizerBatchPlan,
+) -> None:
+    pair_rows = np.asarray(statistics.pair_rows_per_microbatch, dtype=float)
+    unique_transcripts = np.asarray(
+        statistics.unique_transcripts_per_microbatch,
+        dtype=float,
+    )
+    unique_transcript_cv = (
+        float(unique_transcripts.std() / unique_transcripts.mean())
+        if unique_transcripts.size and unique_transcripts.mean() > 0.0
+        else 0.0
+    )
+
+    def range_text(values: np.ndarray) -> str:
+        if values.size == 0:
+            return "n/a"
+        return (
+            f"{values.min():.0f} / {np.median(values):.1f} / "
+            f"{values.mean():.2f} / {values.max():.0f}"
+        )
+
+    print("\n=== Group-aware optimizer batch plan ===")
+    rows = (
+        ("selected datasets", str(len(selected_datasets))),
+        ("eligible transcript groups", str(statistics.eligible_transcript_groups)),
+        ("physical pair capacity", str(statistics.physical_pair_capacity)),
+        (
+            "group-size min / median / mean / max",
+            f"{statistics.minimum_group_size} / {statistics.median_group_size:.1f} / "
+            f"{statistics.mean_group_size:.2f} / {statistics.maximum_group_size}",
+        ),
+        ("pair rows/microbatch min/median/mean/max", range_text(pair_rows)),
+        (
+            "unique transcripts/microbatch min/median/mean/max",
+            range_text(unique_transcripts),
+        ),
+        ("unique transcripts/microbatch CV", f"{unique_transcript_cv:.6f}"),
+        (
+            "configured target transcripts/update",
+            str(plan.configured_target_unique_transcripts),
+        ),
+        (
+            "effective local target transcripts/update",
+            str(plan.effective_local_target_unique_transcripts),
+        ),
+        ("target scope / world size", f"{plan.target_scope} / {plan.world_size}"),
+        ("resolved accumulation factor", str(plan.resolved_accumulate_grad_batches)),
+        (
+            "estimated local transcripts/update",
+            f"{plan.estimated_unique_transcripts_per_optimizer_step:.2f}",
+        ),
+        (
+            "estimated pair rows/update",
+            f"{plan.estimated_pair_rows_per_optimizer_step:.2f}",
+        ),
+        (
+            "estimated microbatches/epoch/rank",
+            str(plan.microbatches_per_epoch_per_rank),
+        ),
+        (
+            "estimated optimizer steps/epoch",
+            str(plan.estimated_optimizer_steps_per_epoch),
+        ),
+        (
+            "steps vs transcript-target expectation",
+            f"{plan.estimated_optimizer_steps_per_epoch} vs "
+            f"{plan.expected_optimizer_steps_from_transcript_target} "
+            f"(ratio={plan.optimizer_step_expectation_ratio:.3f})",
+        ),
+        ("oversized groups", str(statistics.oversized_group_count)),
+        ("subsampled groups", str(statistics.subsampled_group_count)),
+        ("complete-group fraction", f"{statistics.complete_group_fraction:.6f}"),
+    )
+    width = max(len(label) for label, _ in rows)
+    for label, value in rows:
+        print(f"{label:<{width}} : {value}")
+    print(
+        "Automatic accumulation averages microbatch gradients. It approximates "
+        "one materialized target-transcript batch; it is not exact when group "
+        "sizes, pair-row counts, or sample weights vary."
+    )
+
+
+def save_grouped_optimizer_batch_manifest(
+    *,
+    output_path: Path,
+    statistics: GroupedBatchStatistics,
+    plan: GroupedOptimizerBatchPlan,
+    selected_datasets: Sequence[str],
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "selected_datasets": list(map(str, selected_datasets)),
+        "plan": plan.to_dict(),
+        "batch_statistics": statistics.to_dict(),
+    }
+    output_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True),
+        encoding="utf-8",
     )
 
 
@@ -1479,6 +1691,14 @@ def make_datamodule(
     config_name="config_riboai_queuing_multidataset",
 )
 def main(cfg: DictConfig) -> None:
+    sample_reduction = resolve_sample_reduction_mode(cfg.loss)
+    OmegaConf.update(
+        cfg,
+        "loss.sample_reduction",
+        sample_reduction,
+        merge=False,
+        force_add=True,
+    )
     seed = int(cfg.experiment.seed)
 
     pl.seed_everything(seed, workers=True)
@@ -1639,6 +1859,25 @@ def main(cfg: DictConfig) -> None:
     paths_results = Path(cfg.paths.results) / dataset_str / run_tag
     paths_checkpoints = Path(cfg.paths.checkpoints) / dataset_str / run_tag
 
+    if env_global_rank() == 0:
+        paths_results.mkdir(parents=True, exist_ok=True)
+        (paths_results / "loss_reduction_manifest.json").write_text(
+            json.dumps(
+                {
+                    "sample_reduction": sample_reduction,
+                    "train_sampling_strategy": str(
+                        cfg_get(cfg, "data.train_sampling_strategy", "unknown")
+                    ),
+                    "legacy_dataset_balanced_loss_present": (
+                        "dataset_balanced_loss" in cfg.loss
+                    ),
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+
     # Save split provenance once. Under Slurm+srun, every rank executes this
     # script before the Lightning Trainer exists, so use the environment rank
     # guard rather than trainer.is_global_zero.
@@ -1731,6 +1970,71 @@ def main(cfg: DictConfig) -> None:
         split_size=split_size,
         seed=seed,
     )
+
+    grouped_batch_statistics, grouped_optimizer_plan = (
+        resolve_training_grouped_optimizer_batching(
+            cfg=cfg,
+            datamodule=datamodule,
+        )
+    )
+    if grouped_batch_statistics is not None and grouped_optimizer_plan is not None:
+        print_grouped_optimizer_batch_plan(
+            selected_datasets=experiment_datasets,
+            statistics=grouped_batch_statistics,
+            plan=grouped_optimizer_plan,
+        )
+        if env_global_rank() == 0:
+            save_grouped_optimizer_batch_manifest(
+                output_path=paths_results / "grouped_optimizer_batch_plan.json",
+                statistics=grouped_batch_statistics,
+                plan=grouped_optimizer_plan,
+                selected_datasets=experiment_datasets,
+            )
+        lit_model.configure_grouped_optimizer_batch_logging(
+            plan={
+                **grouped_optimizer_plan.to_dict(),
+                "oversized_group_count": (
+                    grouped_batch_statistics.oversized_group_count
+                ),
+                "subsampled_group_count": (
+                    grouped_batch_statistics.subsampled_group_count
+                ),
+                "preview_complete_group_fraction": (
+                    grouped_batch_statistics.complete_group_fraction
+                ),
+            },
+            expected_pair_rows_by_transcript=(
+                datamodule.train_transcript_group_pair_counts()
+            ),
+            enabled=cfg_bool(
+                cfg,
+                "training.grouped_optimizer_batch.log_batch_structure",
+                True,
+            ),
+        )
+
+    if (
+        sample_reduction == "transcript_balanced"
+        and str(cfg_get(cfg, "data.train_sampling_strategy", "")).lower()
+        == "transcript_grouped_multidataset_pairs"
+    ):
+        # Metadata-only setup is idempotent. Supplying expected complete-group
+        # sizes lets the loss fail loudly if a grouped-sampler transcript is
+        # ever split, without changing the sampler or accumulation lifecycle.
+        datamodule.setup("fit")
+        lit_model.configure_transcript_group_validation(
+            datamodule.train_transcript_group_pair_counts()
+        )
+
+    if cfg_bool(cfg, "dry_run_batch_plan", False):
+        if grouped_batch_statistics is None or grouped_optimizer_plan is None:
+            raise RuntimeError(
+                "dry_run_batch_plan=true requires "
+                "data.train_sampling_strategy=transcript_grouped_multidataset_pairs "
+                "and training.grouped_optimizer_batch.enabled=true."
+            )
+        print("\ndry_run_batch_plan=true: exiting before Trainer construction.")
+        return
 
     css_benchmark_fold_for_experiment = filter_ids_available_in_experiment(
         ids=css_benchmark_fold,
@@ -1836,6 +2140,7 @@ def main(cfg: DictConfig) -> None:
     trainer_kwargs = {
         "accelerator": cfg.trainer.accelerator,
         "devices": devices_cfg,
+        "num_nodes": int(cfg_get(cfg, "trainer.num_nodes", 1)),
         "precision": cfg.trainer.precision,
         "max_epochs": int(cfg.trainer.max_epochs),
         "logger": tb_logger,
