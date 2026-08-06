@@ -81,10 +81,14 @@ The default configuration is
 It selects `weighted_hek_riboseq_codon_replicas` and expects:
 
 - Sequence features at
-  `Datasets/data/sequence/sequence_embeddings_with_css.parquet`.
+  `Datasets/data/sequence/MANE.selection.sequence_embeddings_with_css.parquet`.
 - Dataset-specific profiles registered under `config/dataset_config/`.
 - Encoding maps under `Datasets/encodings/`.
-- The CSS split at `Datasets/data/sequence/css_split.json`.
+
+The sequence parquet's CSS annotations guide joint validation stratification;
+there is no separate CSS benchmark split or CSS holdout percentage. Validation
+uses one deterministic transcript panel common to the configured master dataset
+universe, and every other available transcript is assigned to training.
 
 Each sample represents a transcript-dataset pair. The dataset implementation
 precomputes sequence features and codon IDs, caches contiguous ribosome profiles,

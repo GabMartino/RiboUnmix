@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from collections import defaultdict
 from pathlib import Path
@@ -117,46 +118,6 @@ def open_file(path: str | Path) -> dict[str, Any]:
     return {} if data is None else data
 
 
-def resolve_dataset_config_path(name_or_path: str | Path) -> Path:
-    path = Path(str(name_or_path))
-
-    if path.suffix in {".yaml", ".yml"} or len(path.parts) > 1:
-        return path
-
-    return Path(__file__).resolve().parent / "config" / "dataset_config" / f"{path}.yaml"
-
-
-def dataset_path_mapping_from_source(
-    cfg: DictConfig,
-    source: Any,
-) -> tuple[dict[str, str], str]:
-    """
-    Resolve a dataset_path mapping.
-
-    source:
-        None / "active" / "dataset_config"
-            Use the active Hydra dataset_config.
-        "datasets_paths"
-            Load config/dataset_config/datasets_paths.yaml.
-        path/to/file.yaml
-            Load an explicit YAML config with a dataset_path mapping.
-    """
-    if source is None:
-        return dict(cfg.dataset_config.dataset_path), "active dataset_config"
-
-    source_str = str(source).strip()
-    if source_str.lower() in {"", "active", "dataset_config", "same"}:
-        return dict(cfg.dataset_config.dataset_path), "active dataset_config"
-
-    source_path = resolve_dataset_config_path(source_str)
-    source_cfg = open_file(source_path)
-
-    if "dataset_path" not in source_cfg:
-        raise KeyError(f"dataset_path missing in split source config: {source_path}")
-
-    return dict(source_cfg["dataset_path"]), str(source_path)
-
-
 def dataset_paths_for(
     *,
     mapping: dict[str, str],
@@ -198,26 +159,28 @@ def get_datasets(cfg: DictConfig) -> list[str]:
     return normalize_dataset_list(raw)
 
 
-def get_split_universe_datasets(cfg: DictConfig, experiment_datasets: list[str]) -> list[str]:
+def get_split_universe_datasets(
+    cfg: DictConfig,
+    experiment_datasets: list[str],
+) -> list[str]:
     """
-    Dataset universe used ONLY to build the transcript split.
-
-    This is the important fairness fix.
+    Dataset universe used for both the transcript pool and fixed validation.
 
     Example:
         experiment.dataset: ["grimson_2019"]
         split.master_dataset_universe: ["grimson_2019", "kutay_2021"]
 
-    Then the split is generated from Grimson ∪ Kutay, but the datamodule
-    later filters the train/val transcript IDs to Grimson-available pairs.
+    The overall pool is generated from Grimson ∪ Kutay and validation
+    candidates must be present in both. The resulting validation IDs stay fixed
+    when an experiment later selects only Grimson.
     """
     raw = cfg_get(cfg, "split.master_dataset_universe", None)
 
     if raw is None:
         print(
             "\n[split] No split.master_dataset_universe provided. "
-            "Using experiment.dataset as split universe. "
-            "This is NOT ideal for single-vs-multi comparisons.\n"
+            "Using experiment.dataset as split universe; validation will not "
+            "be fixed across runs with different experiment datasets.\n"
         )
         return list(experiment_datasets)
 
@@ -263,29 +226,15 @@ def make_dataset_selection_run_tag(cfg: DictConfig) -> str:
     if not datasets:
         return "DataN0"
 
-    strategy_raw = str(
-        cfg_get(cfg, "experiment.dataset_subset_strategy", "configured")
-    ).strip().lower()
-    strategy_aliases = {
-        "configured": "Configured",
-        "top_quality": "TopQuality",
-        "rank_stratified": "RankStratified",
-        "all": "All",
-    }
-    strategy = strategy_aliases.get(
-        strategy_raw,
-        format_run_tag_value(strategy_raw or "configured"),
-    )
-
     if len(datasets) == 1:
         dataset_token = format_run_tag_value(datasets[0])
-        return f"Data{strategy}_N1_{dataset_token}"
+        return f"DataN1_{dataset_token}"
 
     subset_hash = hashlib.md5("\n".join(datasets).encode()).hexdigest()[:6]
-    return f"Data{strategy}_N{len(datasets)}_h{subset_hash}"
+    return f"DataN{len(datasets)}_h{subset_hash}"
 
 
-def make_loss_terms_run_tag(cfg: DictConfig) -> str:
+def make_loss_run_tag(cfg: DictConfig) -> str:
     nb_weight = format_run_tag_value(cfg_get(cfg, "loss.replica_nb_weight"))
     raw_weight = format_run_tag_value(
         cfg_get(cfg, "loss.replica_raw_pcc_weight")
@@ -308,8 +257,6 @@ def make_sampling_run_tag(cfg: DictConfig) -> str | None:
 
 
 def make_gamma_centering_run_tag(cfg: DictConfig) -> str:
-    if not cfg_bool(cfg, "model.gamma_centering.enabled", False):
-        return "GammaCtrOff"
     mode = str(
         cfg_get(
             cfg,
@@ -323,7 +270,7 @@ def make_gamma_centering_run_tag(cfg: DictConfig) -> str:
         cfg_get(
             cfg,
             "model.gamma_centering.reference.weighting",
-            cfg_get(cfg, "model.gamma_centering.weighting", "equal"),
+            "equal",
         )
     ).lower()
     mode_tag = "FixedRef" if mode == "fixed_reference" else "Batch"
@@ -332,7 +279,7 @@ def make_gamma_centering_run_tag(cfg: DictConfig) -> str:
             cfg_get(
                 cfg,
                 "model.gamma_centering.reference.quality_rank_power",
-                cfg_get(cfg, "model.gamma_centering.quality_rank_power", 1.0),
+                1.0,
             )
         )
         return f"GammaCtr{mode_tag}QRankP{power}"
@@ -437,7 +384,7 @@ def make_run_tag(cfg: DictConfig) -> str:
         "queueNB",
         make_dataset_selection_run_tag(cfg),
         make_dataset_balance_run_tag(),
-        make_loss_terms_run_tag(cfg),
+        make_loss_run_tag(cfg),
     ]
 
     sampling_tag = make_sampling_run_tag(cfg)
@@ -487,7 +434,7 @@ def env_global_rank() -> int:
 
 
 # ============================================================
-# CSS + dataset-availability-aware split logic
+# Fixed common-transcript, reliability/CSS-stratified split logic
 # ============================================================
 
 def css_count(x: Any) -> int:
@@ -560,31 +507,6 @@ def css_bin(n_css: int) -> str:
     if n_css <= 3:
         return "css_2_3"
     return "css_4_plus"
-
-
-def split_ids(
-    ids: Sequence[str],
-    *,
-    val_frac: float,
-    rng: np.random.Generator,
-) -> tuple[list[str], list[str]]:
-    ids = list(map(str, ids))
-
-    if len(ids) == 0:
-        return [], []
-
-    if len(ids) == 1:
-        return ids, []
-
-    n_val = int(round(len(ids) * float(val_frac)))
-    n_val = max(1, min(n_val, len(ids) - 1))
-
-    perm = rng.permutation(ids)
-
-    val_ids = list(map(str, perm[:n_val]))
-    train_ids = list(map(str, perm[n_val:]))
-
-    return train_ids, val_ids
 
 
 def build_transcript_metadata(
@@ -671,6 +593,174 @@ def build_transcript_metadata(
     return metadata
 
 
+def load_common_transcript_reliability(
+    *,
+    datasets_paths: Sequence[str | Path],
+    eligible_ids: Sequence[str],
+) -> tuple[list[str], dict[str, float], list[str]]:
+    """Load positive pair weights and aggregate them for common transcripts.
+
+    A validation candidate must have one retained row in every supplied dataset.
+    Its scalar reliability score is the ordinary median of its dataset-specific,
+    median-normalized transcript weights.  The score is used only to stratify
+    validation selection; the original pair weights remain unchanged and are
+    later used by the loss.
+    """
+    if not datasets_paths:
+        raise ValueError("At least one validation dataset path is required.")
+
+    eligible = set(map(str, eligible_ids))
+    common_ids: set[str] | None = None
+    weights_by_dataset: list[dict[str, float]] = []
+    dataset_names: list[str] = []
+
+    for path in datasets_paths:
+        path = Path(path)
+        dataset_name = dataset_name_from_path(path)
+        if dataset_name in dataset_names:
+            raise ValueError(
+                f"Duplicate validation dataset name {dataset_name!r} from {path}."
+            )
+
+        available_columns = set(pq.read_schema(path).names)
+        missing = {"id", "weight"} - available_columns
+        if missing:
+            raise KeyError(
+                f"Validation split requires columns {sorted(missing)} in "
+                f"dataset={dataset_name}, path={path}."
+            )
+
+        frame = pd.read_parquet(path, columns=["id", "weight"])
+        transcript_ids = frame["id"].astype(str)
+        if bool(transcript_ids.duplicated().any()):
+            duplicate = str(transcript_ids[transcript_ids.duplicated()].iloc[0])
+            raise ValueError(
+                "Duplicate transcript ID while building the validation split: "
+                f"dataset={dataset_name}, transcript={duplicate}."
+            )
+
+        weights = pd.to_numeric(frame["weight"], errors="coerce").to_numpy(
+            dtype=np.float64,
+            copy=False,
+        )
+        invalid_finite = ~np.isfinite(weights)
+        if bool(invalid_finite.any()):
+            index = int(np.flatnonzero(invalid_finite)[0])
+            raise ValueError(
+                "Non-finite transcript weight while building the validation "
+                f"split: dataset={dataset_name}, "
+                f"transcript={transcript_ids.iloc[index]}, weight={weights[index]}."
+            )
+        nonpositive = weights <= 0.0
+        if bool(nonpositive.any()):
+            index = int(np.flatnonzero(nonpositive)[0])
+            raise ValueError(
+                "Validation splitting requires strictly positive transcript "
+                f"weights: dataset={dataset_name}, "
+                f"transcript={transcript_ids.iloc[index]}, weight={weights[index]}."
+            )
+
+        weight_map = dict(zip(transcript_ids.tolist(), weights.tolist(), strict=True))
+        ids_here = set(weight_map).intersection(eligible)
+        common_ids = ids_here if common_ids is None else common_ids.intersection(ids_here)
+        weights_by_dataset.append(weight_map)
+        dataset_names.append(dataset_name)
+
+    common = sorted(common_ids or set())
+    if not common:
+        raise RuntimeError(
+            "No transcript with a valid sequence and positive weight is common to "
+            f"all selected validation datasets: {dataset_names}."
+        )
+
+    aggregate_scores = {
+        tid: float(np.median([weight_map[tid] for weight_map in weights_by_dataset]))
+        for tid in common
+    }
+    if not all(np.isfinite(score) and score > 0.0 for score in aggregate_scores.values()):
+        raise RuntimeError("Common-transcript reliability aggregation produced an invalid score.")
+
+    return common, aggregate_scores, dataset_names
+
+
+def assign_reliability_quantile_bins(
+    scores: dict[str, float],
+    *,
+    number_of_bins: int,
+) -> dict[str, int]:
+    """Assign deterministic rank-quantile bins spanning low to high reliability."""
+    number_of_bins = int(number_of_bins)
+    if number_of_bins < 2:
+        raise ValueError("split.validation_weight_bins must be at least 2.")
+    if not scores:
+        return {}
+
+    ordered = sorted(scores, key=lambda tid: (float(scores[tid]), str(tid)))
+    effective_bins = min(number_of_bins, len(ordered))
+    return {
+        tid: min((rank * effective_bins) // len(ordered), effective_bins - 1)
+        for rank, tid in enumerate(ordered)
+    }
+
+
+def sample_stratified_validation_ids(
+    *,
+    candidate_ids: Sequence[str],
+    stratum_by_transcript: dict[str, str],
+    target_count: int,
+    rng: np.random.Generator,
+) -> list[str]:
+    """Sample an exact-sized validation set proportionally across strata."""
+    candidates = sorted(set(map(str, candidate_ids)))
+    target_count = int(target_count)
+    if target_count <= 0:
+        return []
+    if target_count >= len(candidates):
+        raise ValueError(
+            "The main validation target must be smaller than the number of "
+            f"eligible common transcripts; target={target_count}, "
+            f"eligible={len(candidates)}."
+        )
+
+    strata: dict[str, list[str]] = defaultdict(list)
+    for tid in candidates:
+        if tid not in stratum_by_transcript:
+            raise KeyError(f"Missing validation stratum for transcript {tid}.")
+        strata[str(stratum_by_transcript[tid])].append(tid)
+
+    total = len(candidates)
+    ideal = {
+        bin_id: target_count * len(ids) / total
+        for bin_id, ids in strata.items()
+    }
+    quotas = {bin_id: int(np.floor(value)) for bin_id, value in ideal.items()}
+    remaining = target_count - sum(quotas.values())
+    remainder_order = sorted(
+        strata,
+        key=lambda bin_id: (-(ideal[bin_id] - quotas[bin_id]), bin_id),
+    )
+    for bin_id in remainder_order:
+        if remaining <= 0:
+            break
+        if quotas[bin_id] < len(strata[bin_id]):
+            quotas[bin_id] += 1
+            remaining -= 1
+    if remaining != 0:
+        raise RuntimeError(f"Could not allocate {remaining} validation transcripts.")
+
+    selected: list[str] = []
+    for bin_id in sorted(strata):
+        ids = np.asarray(sorted(strata[bin_id]), dtype=object)
+        permutation = rng.permutation(len(ids))
+        selected.extend(map(str, ids[permutation[: quotas[bin_id]]]))
+
+    if len(selected) != target_count:
+        raise RuntimeError(
+            f"Validation sampling selected {len(selected)} IDs, expected {target_count}."
+        )
+    return sorted(selected)
+
+
 def print_split_summary(
     *,
     name: str,
@@ -679,7 +769,7 @@ def print_split_summary(
 ) -> None:
     ids = list(map(str, ids))
 
-    availability_counts: dict[str, int] = defaultdict(int)
+    support_counts: dict[int, int] = defaultdict(int)
     css_bin_counts: dict[str, int] = defaultdict(int)
 
     css_total = 0
@@ -688,7 +778,7 @@ def print_split_summary(
     for tid in ids:
         m = metadata[tid]
 
-        availability_counts[str(m["availability"])] += 1
+        support_counts[len(m["datasets"])] += 1
         css_bin_counts[str(m["css_bin"])] += 1
 
         css_total += int(m["css_count"])
@@ -699,112 +789,128 @@ def print_split_summary(
     print(f"CSS-positive transcripts: {css_positive}")
     print(f"total CSS sites: {css_total}")
 
-    print("availability:")
-    for key, value in sorted(availability_counts.items()):
-        print(f"  {key:45s} {value}")
+    print("transcripts by retained dataset count:")
+    for dataset_count, value in sorted(support_counts.items()):
+        print(f"  datasets={dataset_count:3d}: {value}")
 
     print("CSS bins:")
     for key, value in sorted(css_bin_counts.items()):
         print(f"  {key:12s} {value}")
 
+    reliability_scores = [
+        float(metadata[tid]["validation_reliability_score"])
+        for tid in ids
+        if metadata[tid].get("validation_reliability_score") is not None
+    ]
+    if reliability_scores:
+        score_array = np.asarray(reliability_scores, dtype=np.float64)
+        print(
+            "common-transcript reliability: "
+            f"n={len(score_array)}, min={score_array.min():.4f}, "
+            f"median={np.median(score_array):.4f}, "
+            f"max={score_array.max():.4f}"
+        )
 
-def css_and_availability_aware_splits(
+        bin_counts: dict[int, int] = defaultdict(int)
+        for tid in ids:
+            bin_id = metadata[tid].get("validation_reliability_bin")
+            if bin_id is not None:
+                bin_counts[int(bin_id)] += 1
+        print("validation reliability bins:")
+        for bin_id, value in sorted(bin_counts.items()):
+            print(f"  qbin_{bin_id:02d}: {value}")
+
+
+def fixed_common_validation_split(
     *,
     sequences_path: str | Path,
-    datasets_paths: Sequence[str | Path],
-    css_split_path: str | Path,
-    train_frac: float = 0.85,
-    main_val_frac: float = 0.10,
-    css_benchmark_frac: float = 0.05,
+    split_universe_dataset_paths: Sequence[str | Path],
+    validation_frac: float = 0.10,
     random_seed: int = 42,
-) -> tuple[list[str], list[str], list[str], dict[str, dict[str, Any]]]:
+    validation_weight_bins: int = 10,
+) -> tuple[list[str], list[str], dict[str, dict[str, Any]]]:
+    """Build one fixed common validation panel and use all other IDs for training.
+
+    Validation candidates have a retained positive-weight row in every dataset
+    of the master split universe. Their split-only reliability score is
+
+        median_d(weight[d, transcript]).
+
+    Candidates are stratified jointly by reliability rank-quantile and CSS-count
+    bin. CSS is therefore a sampling signal, not a separately held-out split and
+    not a fixed validation quota. The same master universe, seed, and input data
+    always produce the same validation IDs, independent of experiment.dataset.
+
+    Every other transcript in the master union is assigned to training. Each
+    selected dataset later contributes the subset of those training IDs for
+    which it has a retained row, so training sizes may differ by dataset.
     """
-    Build three transcript-level splits:
-
-        train_ids
-            Used for training.
-
-        main_val_ids
-            Representative validation set for profile loss/PCC, early stopping,
-            and LR scheduling.
-
-        css_benchmark_ids
-            CSS-enriched held-out set for biological-branch CSS/peak recall.
-            Do not use this set for early stopping.
-
-    No transcript appears in more than one split.
-    """
-    train_frac = float(train_frac)
-    main_val_frac = float(main_val_frac)
-    css_benchmark_frac = float(css_benchmark_frac)
-
-    if not np.isclose(train_frac + main_val_frac + css_benchmark_frac, 1.0):
-        raise ValueError("train_frac + main_val_frac + css_benchmark_frac must sum to 1.")
+    validation_frac = float(validation_frac)
+    if not math.isfinite(validation_frac) or not 0.0 < validation_frac < 1.0:
+        raise ValueError("split.validation_frac must be finite and in (0, 1).")
 
     rng = np.random.default_rng(int(random_seed))
 
     metadata = build_transcript_metadata(
         sequences_path=sequences_path,
-        datasets_paths=datasets_paths,
+        datasets_paths=split_universe_dataset_paths,
     )
 
     all_ids = sorted(metadata.keys())
+    common_ids, reliability_scores, validation_dataset_names = (
+        load_common_transcript_reliability(
+            datasets_paths=split_universe_dataset_paths,
+            eligible_ids=all_ids,
+        )
+    )
+    common_id_set = set(common_ids)
+    for tid, transcript_metadata in metadata.items():
+        is_common = tid in common_id_set
+        transcript_metadata["common_to_validation_datasets"] = is_common
+        transcript_metadata["validation_reliability_score"] = (
+            float(reliability_scores[tid]) if is_common else None
+        )
+        transcript_metadata["validation_reliability_bin"] = None
+        transcript_metadata["validation_stratum"] = None
 
-    with Path(css_split_path).open("r", encoding="utf-8") as f:
-        css_split = json.load(f)
+    validation_target = int(round(len(common_ids) * validation_frac))
+    if validation_target <= 0:
+        raise ValueError(
+            "validation_frac produces an empty validation target; increase "
+            "split.validation_frac."
+        )
+    if validation_target >= len(common_ids):
+        raise ValueError(
+            "The fixed validation target must leave at least one common "
+            f"transcript for training; requested={validation_target}, "
+            f"common={len(common_ids)}."
+        )
 
-    old_css_val = set(map(str, css_split.get("validation_set", [])))
+    reliability_bins = assign_reliability_quantile_bins(
+        reliability_scores,
+        number_of_bins=validation_weight_bins,
+    )
+    validation_strata: dict[str, str] = {}
+    for tid, bin_id in reliability_bins.items():
+        metadata[tid]["validation_reliability_bin"] = int(bin_id)
+        stratum = f"qbin_{int(bin_id):02d}__{metadata[tid]['css_bin']}"
+        metadata[tid]["validation_stratum"] = stratum
+        validation_strata[tid] = stratum
 
-    css_positive = [tid for tid in all_ids if metadata[tid]["has_css"]]
-    css_positive_old_val = [tid for tid in css_positive if tid in old_css_val]
-    css_positive_other = [tid for tid in css_positive if tid not in old_css_val]
-
-    n_css_benchmark = int(round(len(all_ids) * css_benchmark_frac))
-    n_css_benchmark = min(n_css_benchmark, len(css_positive))
-
-    rng.shuffle(css_positive_old_val)
-    rng.shuffle(css_positive_other)
-
-    css_benchmark_ids = css_positive_old_val[:n_css_benchmark]
-
-    if len(css_benchmark_ids) < n_css_benchmark:
-        need = n_css_benchmark - len(css_benchmark_ids)
-        css_benchmark_ids += css_positive_other[:need]
-
-    css_benchmark_set = set(map(str, css_benchmark_ids))
-
-    remaining = [tid for tid in all_ids if tid not in css_benchmark_set]
-
-    strata: dict[tuple[str, str], list[str]] = defaultdict(list)
-
-    for tid in remaining:
-        key = (str(metadata[tid]["availability"]), str(metadata[tid]["css_bin"]))
-        strata[key].append(tid)
-
-    main_val_target = int(round(len(all_ids) * main_val_frac))
-    remaining_val_frac = main_val_target / max(len(remaining), 1)
-
-    train_ids: list[str] = []
-    main_val_ids: list[str] = []
-
-    for _, ids in sorted(strata.items(), key=lambda kv: str(kv[0])):
-        tr, va = split_ids(ids, val_frac=remaining_val_frac, rng=rng)
-
-        train_ids.extend(tr)
-        main_val_ids.extend(va)
+    validation_ids = sample_stratified_validation_ids(
+        candidate_ids=common_ids,
+        stratum_by_transcript=validation_strata,
+        target_count=validation_target,
+        rng=rng,
+    )
+    validation_set = set(validation_ids)
+    train_ids = sorted(set(all_ids) - validation_set)
 
     train_set = set(train_ids)
-    main_val_set = set(main_val_ids)
-    css_set = set(css_benchmark_ids)
+    if train_set & validation_set:
+        raise RuntimeError("Overlap between train and validation splits.")
 
-    if train_set & main_val_set:
-        raise RuntimeError("Overlap between train and main validation splits.")
-    if train_set & css_set:
-        raise RuntimeError("Overlap between train and CSS benchmark splits.")
-    if main_val_set & css_set:
-        raise RuntimeError("Overlap between main validation and CSS benchmark splits.")
-
-    covered = train_set | main_val_set | css_set
+    covered = train_set | validation_set
 
     if covered != set(all_ids):
         missing = set(all_ids) - covered
@@ -815,14 +921,29 @@ def css_and_availability_aware_splits(
         )
 
     train_ids = sorted(train_set)
-    main_val_ids = sorted(main_val_set)
-    css_benchmark_ids = sorted(css_set)
+    validation_ids = sorted(validation_set)
+
+    for tid in train_ids:
+        metadata[tid]["split_role"] = "train"
+    for tid in validation_ids:
+        metadata[tid]["split_role"] = "validation"
+
+    if not all(metadata[tid]["common_to_validation_datasets"] for tid in validation_ids):
+        raise RuntimeError(
+            "Internal split error: validation contains a transcript that is not "
+            "common to every master-universe dataset."
+        )
 
     print_split_summary(name="Train", ids=train_ids, metadata=metadata)
-    print_split_summary(name="Main validation", ids=main_val_ids, metadata=metadata)
-    print_split_summary(name="CSS biological benchmark", ids=css_benchmark_ids, metadata=metadata)
+    print_split_summary(name="Validation", ids=validation_ids, metadata=metadata)
+    print(
+        "\n[split] Fixed validation panel is common to all master datasets: "
+        f"datasets={len(validation_dataset_names)}, candidates={len(common_ids)}, "
+        f"selected={len(validation_ids)}, "
+        f"weight_bins={min(int(validation_weight_bins), len(common_ids))}."
+    )
 
-    return train_ids, main_val_ids, css_benchmark_ids, metadata
+    return train_ids, validation_ids, metadata
 
 
 def save_split_manifest(
@@ -833,29 +954,57 @@ def save_split_manifest(
     split_dataset_source: str | None = None,
     split_dataset_paths: Sequence[str] | None = None,
     training_dataset_paths: Sequence[str] | None = None,
-    extra_train_ids: Sequence[str] | None = None,
+    validation_weight_bins: int = 10,
     train_ids: Sequence[str],
-    main_val_ids: Sequence[str],
-    css_benchmark_ids: Sequence[str],
+    validation_ids: Sequence[str],
     metadata: dict[str, dict[str, Any]],
     seed: int,
-    train_frac: float,
-    main_val_frac: float,
-    css_benchmark_frac: float,
+    validation_frac: float,
 ) -> None:
-    """
-    Save split provenance so you can verify that single-dataset and multi-dataset
-    experiments used the same master transcript split.
-    """
+    """Save the fixed validation panel and master-universe provenance."""
     out_file.parent.mkdir(parents=True, exist_ok=True)
 
-    def availability_counts(ids: Sequence[str]) -> dict[str, int]:
+    def metadata_value_counts(ids: Sequence[str], field: str) -> dict[str, int]:
         counts: dict[str, int] = defaultdict(int)
-
         for tid in map(str, ids):
-            counts[str(metadata[tid]["availability"])] += 1
-
+            value = metadata[tid].get(field)
+            if value is not None:
+                counts[str(value)] += 1
         return dict(sorted(counts.items()))
+
+    def reliability_bin_counts(ids: Sequence[str]) -> dict[str, int]:
+        counts: dict[str, int] = defaultdict(int)
+        for tid in map(str, ids):
+            bin_id = metadata[tid].get("validation_reliability_bin")
+            if bin_id is not None:
+                counts[f"qbin_{int(bin_id):02d}"] += 1
+        return dict(sorted(counts.items()))
+
+    def reliability_summary(ids: Sequence[str]) -> dict[str, float | int | None]:
+        values = np.asarray(
+            [
+                float(metadata[tid]["validation_reliability_score"])
+                for tid in map(str, ids)
+                if metadata[tid].get("validation_reliability_score") is not None
+            ],
+            dtype=np.float64,
+        )
+        if values.size == 0:
+            return {"count": 0, "min": None, "median": None, "mean": None, "max": None}
+        return {
+            "count": int(values.size),
+            "min": float(values.min()),
+            "median": float(np.median(values)),
+            "mean": float(values.mean()),
+            "max": float(values.max()),
+        }
+
+    common_ids = [
+        tid
+        for tid, transcript_metadata in metadata.items()
+        if bool(transcript_metadata.get("common_to_validation_datasets", False))
+    ]
+    universe_count = len(metadata)
 
     manifest = {
         "seed": int(seed),
@@ -864,63 +1013,66 @@ def save_split_manifest(
         "split_dataset_source": split_dataset_source,
         "split_dataset_paths": list(map(str, split_dataset_paths or [])),
         "training_dataset_paths": list(map(str, training_dataset_paths or [])),
-        "extra_train_ids_from_training_datasets": list(map(str, extra_train_ids or [])),
-        "fractions": {
-            "train_frac": float(train_frac),
-            "main_val_frac": float(main_val_frac),
-            "css_benchmark_frac": float(css_benchmark_frac),
+        "validation_selection": {
+            "strategy": "fixed_master_common_weight_css_stratified",
+            "reference_datasets": list(map(str, split_universe_datasets)),
+            "candidate_rule": (
+                "retained positive-weight row in every master-universe dataset"
+            ),
+            "aggregate_reliability": "median_dataset_specific_weight",
+            "weight_bins": int(validation_weight_bins),
+            "css_role": "joint stratification signal; no separate split or quota",
+            "configured_fraction_of_common_candidates": float(validation_frac),
+            "fixed_across_experiment_dataset_subsets": True,
+            "all_validation_ids_are_common": all(
+                bool(metadata[tid].get("common_to_validation_datasets", False))
+                for tid in map(str, validation_ids)
+            ),
+        },
+        "realized_fractions": {
+            "train_of_master_union": len(train_ids) / max(universe_count, 1),
+            "validation_of_master_union": len(validation_ids) / max(universe_count, 1),
+            "validation_of_common_candidates": len(validation_ids) / max(len(common_ids), 1),
         },
         "counts": {
+            "master_union": universe_count,
+            "common_validation_candidates": len(common_ids),
             "train": len(train_ids),
-            "main_val": len(main_val_ids),
-            "css_benchmark": len(css_benchmark_ids),
+            "validation": len(validation_ids),
         },
-        "availability_counts": {
-            "train": availability_counts(train_ids),
-            "main_val": availability_counts(main_val_ids),
-            "css_benchmark": availability_counts(css_benchmark_ids),
+        "css_bin_counts": {
+            "common_candidates": metadata_value_counts(common_ids, "css_bin"),
+            "train": metadata_value_counts(train_ids, "css_bin"),
+            "validation": metadata_value_counts(validation_ids, "css_bin"),
+        },
+        "validation_stratum_counts": {
+            "common_candidates": metadata_value_counts(
+                common_ids,
+                "validation_stratum",
+            ),
+            "validation": metadata_value_counts(
+                validation_ids,
+                "validation_stratum",
+            ),
+        },
+        "validation_reliability_bin_counts": {
+            "common_candidates": reliability_bin_counts(common_ids),
+            "train": reliability_bin_counts(train_ids),
+            "validation": reliability_bin_counts(validation_ids),
+        },
+        "validation_reliability_summary": {
+            "common_candidates": reliability_summary(common_ids),
+            "train": reliability_summary(train_ids),
+            "validation": reliability_summary(validation_ids),
         },
         "train_ids": list(map(str, train_ids)),
-        "main_val_ids": list(map(str, main_val_ids)),
-        "css_benchmark_ids": list(map(str, css_benchmark_ids)),
+        "validation_ids": list(map(str, validation_ids)),
     }
 
     with out_file.open("w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
 
     print(f"Saved split manifest: {out_file}")
-
-
-def filter_ids_available_in_experiment(
-    *,
-    ids: Sequence[str],
-    metadata: dict[str, dict[str, Any]],
-    experiment_datasets: Sequence[str],
-) -> list[str]:
-    experiment_dataset_set = set(map(str, experiment_datasets))
-    filtered = []
-
-    for tid in map(str, ids):
-        dataset_names = set(map(str, metadata.get(tid, {}).get("datasets", [])))
-        if dataset_names & experiment_dataset_set:
-            filtered.append(tid)
-
-    return filtered
-
-
-def dataset_names_by_transcript(
-    *,
-    ids: Sequence[str],
-    metadata: dict[str, dict[str, Any]],
-) -> dict[str, list[str]]:
-    allowed: dict[str, list[str]] = {}
-
-    for tid in map(str, ids):
-        if tid not in metadata:
-            continue
-        allowed[tid] = list(map(str, metadata[tid].get("datasets", [])))
-
-    return allowed
 
 
 # ============================================================
@@ -935,7 +1087,8 @@ def load_weights_only(
     Loads only model weights.
 
     Correct for checkpoints saved with save_weights_only=True.
-    It intentionally does not restore optimizer/scheduler state.
+    It intentionally does not restore optimizer/scheduler state, but the model
+    state itself must match exactly. Partial legacy loads are not supported.
     """
     ckpt_path = Path(ckpt_path)
 
@@ -961,15 +1114,16 @@ def load_weights_only(
             "weights is not supported implicitly."
         )
 
-    incompatible = lit_model.load_state_dict(state_dict, strict=False)
+    try:
+        lit_model.load_state_dict(state_dict, strict=True)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Checkpoint {ckpt_path} is incompatible with the current model "
+            "state. Partial or legacy state-dict loading is disabled; use a "
+            "checkpoint produced by the current configuration."
+        ) from exc
 
     print(f"Loaded weights from: {ckpt_path}")
-
-    if len(incompatible.missing_keys) > 0:
-        print(f"Missing keys: {len(incompatible.missing_keys)}")
-
-    if len(incompatible.unexpected_keys) > 0:
-        print(f"Unexpected keys: {len(incompatible.unexpected_keys)}")
 
 
 def resolve_gamma_reference_panel(
@@ -980,8 +1134,9 @@ def resolve_gamma_reference_panel(
 ) -> dict[str, list]:
     """Resolve a fixed panel once, before model construction.
 
-    Explicit reference names override the configured source, but must remain a
-    duplicate-free subset of the datasets actually selected for this experiment.
+    By default the panel is every experiment dataset. Explicit reference names
+    override that default, but must remain a duplicate-free subset of the
+    datasets actually selected for this experiment.
     """
     selected_names = [str(name) for name in experiment_datasets]
     selected_set = set(selected_names)
@@ -993,18 +1148,6 @@ def resolve_gamma_reference_panel(
     if explicit_names is not None:
         reference_names = [str(name) for name in explicit_names]
     else:
-        source = str(
-            cfg_get(
-                cfg,
-                "model.gamma_centering.reference.source",
-                "selected_experiment_datasets",
-            )
-        ).lower()
-        if source != "selected_experiment_datasets":
-            raise ValueError(
-                "gamma_centering.reference.source currently supports only "
-                "'selected_experiment_datasets' unless dataset_names is explicit."
-            )
         reference_names = list(selected_names)
 
     if len(reference_names) != len(set(reference_names)):
@@ -1047,7 +1190,6 @@ def resolve_gamma_reference_panel(
         )
 
     selected_ids = [int(dataset_encoding[name]) for name in selected_names]
-    selected_quality = [float(quality_by_name.get(name, 1.0)) for name in selected_names]
     reference_ids = [int(dataset_encoding[name]) for name in reference_names]
     reference_quality = [
         float(quality_by_name.get(name, 1.0)) for name in reference_names
@@ -1055,7 +1197,6 @@ def resolve_gamma_reference_panel(
     return {
         "selected_names": selected_names,
         "selected_ids": selected_ids,
-        "selected_quality": selected_quality,
         "reference_names": reference_names,
         "reference_ids": reference_ids,
         "reference_quality": reference_quality,
@@ -1352,8 +1493,6 @@ def make_datamodule(
     datasets_paths: list[str],
     train_fold: list[str],
     val_fold: list[str],
-    train_allowed_dataset_names_by_transcript: dict[str, list[str]] | None = None,
-    val_allowed_dataset_names_by_transcript: dict[str, list[str]] | None = None,
     seed: int,
 ) -> RiboAIQueuingDatamoduleMultiDataset:
     feature_cfg = cfg_get(cfg, "model.additional_sequence_features", {})
@@ -1379,8 +1518,6 @@ def make_datamodule(
             "data.train_sampling_strategy",
             "transcript_grouped_multidataset_pairs",
         ),
-        train_allowed_dataset_names_by_transcript=train_allowed_dataset_names_by_transcript,
-        val_allowed_dataset_names_by_transcript=val_allowed_dataset_names_by_transcript,
         pin_memory=cfg_bool(cfg, "data.pin_memory", True),
         prefetch_factor=cfg_get(cfg, "data.prefetch_factor", 4),
         multiprocessing_context=cfg_get(
@@ -1425,7 +1562,11 @@ def resolve_training_grouped_optimizer_batching(
     grouped_cfg_path = "training.grouped_optimizer_batch"
     enabled = cfg_bool(cfg, f"{grouped_cfg_path}.enabled", False)
     strategy = str(cfg_get(cfg, "data.train_sampling_strategy", "")).lower()
-    if not enabled or strategy != "transcript_grouped_multidataset_pairs":
+    grouped_strategies = {
+        "transcript_grouped_pairs",
+        "transcript_grouped_multidataset_pairs",
+    }
+    if not enabled or strategy not in grouped_strategies:
         return None, None
 
     datamodule.setup("fit")
@@ -1458,9 +1599,6 @@ def resolve_training_grouped_optimizer_batching(
         ),
         accumulation_statistic=str(
             cfg_get(cfg, f"{grouped_cfg_path}.accumulation_statistic", "median")
-        ),
-        min_accumulate_grad_batches=int(
-            cfg_get(cfg, f"{grouped_cfg_path}.min_accumulate_grad_batches", 1)
         ),
         max_accumulate_grad_batches=int(
             cfg_get(cfg, f"{grouped_cfg_path}.max_accumulate_grad_batches", 32)
@@ -1520,7 +1658,14 @@ def print_grouped_optimizer_batch_plan(
     rows = (
         ("selected datasets", str(len(selected_datasets))),
         ("eligible transcript groups", str(statistics.eligible_transcript_groups)),
-        ("physical pair capacity", str(statistics.physical_pair_capacity)),
+        (
+            "per-dataset pair capacity",
+            str(statistics.per_dataset_pair_capacity),
+        ),
+        (
+            "nominal total pair capacity/rank",
+            str(statistics.physical_pair_capacity),
+        ),
         (
             "group-size min / median / mean / max",
             f"{statistics.minimum_group_size} / {statistics.median_group_size:.1f} / "
@@ -1547,8 +1692,12 @@ def print_grouped_optimizer_batch_plan(
             f"{plan.estimated_unique_transcripts_per_optimizer_step:.2f}",
         ),
         (
-            "estimated pair rows/update",
+            "estimated local pair rows/update",
             f"{plan.estimated_pair_rows_per_optimizer_step:.2f}",
+        ),
+        (
+            "estimated global pair rows/update",
+            f"{plan.estimated_global_pair_rows_per_optimizer_step:.2f}",
         ),
         (
             "estimated microbatches/epoch/rank",
@@ -1570,8 +1719,9 @@ def print_grouped_optimizer_batch_plan(
         print(f"{label:<{width}} : {value}")
     print(
         "Automatic accumulation averages microbatch gradients. It approximates "
-        "one materialized target-transcript batch; it is not exact when group "
-        "sizes, pair-row counts, or sample weights vary."
+        "one materialized target-transcript batch per rank; DDP additionally "
+        "averages across ranks. It is not exact when group sizes, pair-row "
+        "counts, or sample weights vary."
     )
 
 
@@ -1617,21 +1767,17 @@ def main(cfg: DictConfig) -> None:
     #     actual datasets used for training/validation/prediction.
     #
     # split_universe_datasets:
-    #     fixed master universe used to generate transcript IDs.
-    #
-    # For fair single-vs-multi comparison:
-    #
-    #   experiment.dataset: ["grimson_2019"]
-    #   split.master_dataset_universe: ["grimson_2019", "kutay_2021"]
-    #
-    #   experiment.dataset: ["kutay_2021"]
-    #   split.master_dataset_universe: ["grimson_2019", "kutay_2021"]
-    #
-    #   experiment.dataset: ["grimson_2019", "kutay_2021"]
-    #   split.master_dataset_universe: ["grimson_2019", "kutay_2021"]
+    #     master universe used both for the complete transcript ID pool and for
+    #     the common-transcript validation candidate set. This makes validation
+    #     IDs fixed across experiment.dataset subset ablations.
     # ------------------------------------------------------------
     experiment_datasets = get_datasets(cfg)
-    split_universe_datasets = get_split_universe_datasets(cfg, experiment_datasets)
+    split_dataset_mapping = dict(cfg.dataset_config.dataset_path)
+    split_dataset_source_label = "active dataset_config"
+    split_universe_datasets = get_split_universe_datasets(
+        cfg,
+        experiment_datasets,
+    )
 
     experiment_dataset_paths = dataset_paths_for(
         mapping=dict(cfg.dataset_config.dataset_path),
@@ -1639,24 +1785,21 @@ def main(cfg: DictConfig) -> None:
         source_label="active dataset_config",
     )
 
-    split_source = cfg_get(cfg, "split.source_dataset_config", None)
-    split_dataset_mapping, split_dataset_source_label = dataset_path_mapping_from_source(
-        cfg,
-        split_source,
-    )
     split_universe_dataset_paths = dataset_paths_for(
         mapping=split_dataset_mapping,
         datasets=split_universe_datasets,
         source_label=split_dataset_source_label,
     )
 
-    split_size = float(
-        cfg_get(
-            cfg,
-            "experiment.split_size",
-            cfg_get(cfg, "split.train_frac", 0.90),
-        )
+    datasets_outside_split_universe = sorted(
+        set(experiment_datasets) - set(split_universe_datasets)
     )
+    if datasets_outside_split_universe:
+        raise ValueError(
+            "Every experiment dataset must belong to split.master_dataset_universe "
+            "so the fixed validation panel is guaranteed to be present. Missing: "
+            f"{datasets_outside_split_universe}."
+        )
 
     print("\n=== Dataset configuration ===")
     print(f"Experiment datasets:     {experiment_datasets}")
@@ -1667,91 +1810,27 @@ def main(cfg: DictConfig) -> None:
     # ------------------------------------------------------------
     # Split strategy
     # ------------------------------------------------------------
-    # main_val_fold is representative and is used for early stopping.
-    # css_benchmark_fold is CSS-enriched and is used only for biological-branch
-    # peak/CSS analysis after training.
-    #
-    # Important:
-    #     The split is generated from split_universe_dataset_paths, not from
-    #     experiment_dataset_paths.
+    # Validation is one deterministic panel drawn from transcripts retained in
+    # every master-universe dataset. Reliability rank and CSS-count bin jointly
+    # stratify the sample; CSS has no reserved quota and no separate split.
+    # Every other master-union transcript is assigned to training. Individual
+    # datasets naturally contribute only the training IDs that they contain.
     # ------------------------------------------------------------
-    train_frac = float(cfg_get(cfg, "split.train_frac", split_size))
-    main_val_frac = float(cfg_get(cfg, "split.main_val_frac", 1.0 - split_size))
+    validation_frac = float(cfg_get(cfg, "split.validation_frac", 0.10))
+    validation_weight_bins = int(cfg_get(cfg, "split.validation_weight_bins", 10))
+    print("\n=== Fixed split configuration ===")
+    print(f"validation fraction of common candidates: {validation_frac}")
+    print(f"validation reliability bins:              {validation_weight_bins}")
 
-    # Use the actual key. Keep backward-compatible fallback to default.
-    css_benchmark_frac = float(cfg_get(cfg, "split.css_benchmark_frac", -1.0))
-
-    if css_benchmark_frac < 0.0:
-        css_benchmark_frac = float(cfg_get(cfg, "split.default_css_benchmark_frac", 0.05))
-        main_val_frac = max(1.0 - train_frac - css_benchmark_frac, 0.0)
-
-    total_frac = train_frac + main_val_frac + css_benchmark_frac
-
-    if not np.isclose(total_frac, 1.0):
-        main_val_frac = 1.0 - train_frac - css_benchmark_frac
-
-        if main_val_frac <= 0.0:
-            raise ValueError(
-                "Invalid split fractions. Need train_frac + css_benchmark_frac < 1."
-            )
-
-    print("\n=== Split fractions ===")
-    print(f"train_frac:         {train_frac}")
-    print(f"main_val_frac:      {main_val_frac}")
-    print(f"css_benchmark_frac: {css_benchmark_frac}")
-
-    train_fold, main_val_fold, css_benchmark_fold, split_metadata = css_and_availability_aware_splits(
+    train_fold, validation_fold, split_metadata = fixed_common_validation_split(
         sequences_path=cfg.paths.sequences_path,
-        datasets_paths=split_universe_dataset_paths,
-        css_split_path=cfg.paths.css_split,
-        train_frac=train_frac,
-        main_val_frac=main_val_frac,
-        css_benchmark_frac=css_benchmark_frac,
+        split_universe_dataset_paths=split_universe_dataset_paths,
+        validation_frac=validation_frac,
         random_seed=seed,
+        validation_weight_bins=validation_weight_bins,
     )
-
-    extra_train_ids: list[str] = []
-    if cfg_bool(cfg, "split.include_experiment_only_train_ids", False):
-        experiment_metadata = build_transcript_metadata(
-            sequences_path=cfg.paths.sequences_path,
-            datasets_paths=experiment_dataset_paths,
-        )
-        split_id_set = set(map(str, split_metadata.keys()))
-        extra_train_ids = sorted(set(experiment_metadata.keys()) - split_id_set)
-
-        if extra_train_ids:
-            print(
-                "\n[split] Adding training-only transcript IDs available in the "
-                "active experiment datasets but absent from the split source: "
-                f"{len(extra_train_ids)}"
-            )
-            train_fold = sorted(set(map(str, train_fold)).union(extra_train_ids))
-            for tid in extra_train_ids:
-                split_metadata[tid] = {
-                    **experiment_metadata[tid],
-                    "split_role": "extra_train_from_training_datasets",
-                }
-        else:
-            print("\n[split] No extra training-only IDs found outside the split source.")
-
-    main_val_fold_for_experiment = filter_ids_available_in_experiment(
-        ids=main_val_fold,
-        metadata=split_metadata,
-        experiment_datasets=experiment_datasets,
-    )
-    removed_main_val_ids = len(main_val_fold) - len(main_val_fold_for_experiment)
-    if removed_main_val_ids > 0:
-        print(
-            "\n[split] Filtering main validation IDs to transcripts available "
-            "in the active experiment datasets: "
-            f"{len(main_val_fold_for_experiment)} kept, {removed_main_val_ids} removed."
-        )
-    if len(main_val_fold_for_experiment) == 0:
-        raise RuntimeError(
-            "Main validation split is empty after filtering to active experiment "
-            f"datasets {experiment_datasets}. Check split.master_dataset_universe "
-            "or experiment.dataset."
-        )
+    if len(validation_fold) == 0:
+        raise RuntimeError("Validation split is empty.")
 
     dataset_str = make_dataset_signature(experiment_datasets)
     split_universe_str = make_dataset_signature(split_universe_datasets)
@@ -1792,15 +1871,12 @@ def main(cfg: DictConfig) -> None:
             split_dataset_source=split_dataset_source_label,
             split_dataset_paths=split_universe_dataset_paths,
             training_dataset_paths=experiment_dataset_paths,
-            extra_train_ids=extra_train_ids,
+            validation_weight_bins=validation_weight_bins,
             train_ids=train_fold,
-            main_val_ids=main_val_fold,
-            css_benchmark_ids=css_benchmark_fold,
+            validation_ids=validation_fold,
             metadata=split_metadata,
             seed=seed,
-            train_frac=train_frac,
-            main_val_frac=main_val_frac,
-            css_benchmark_frac=css_benchmark_frac,
+            validation_frac=validation_frac,
         )
 
     dataset_encoding = open_file(cfg.paths.encodings.datasets)
@@ -1822,7 +1898,6 @@ def main(cfg: DictConfig) -> None:
         eps=float(cfg.model.get("eps", 1e-8)),
         selected_dataset_names=gamma_reference_panel["selected_names"],
         selected_dataset_ids=gamma_reference_panel["selected_ids"],
-        selected_dataset_quality_weights=gamma_reference_panel["selected_quality"],
         reference_dataset_names=gamma_reference_panel["reference_names"],
         reference_dataset_ids=gamma_reference_panel["reference_ids"],
         reference_dataset_quality_weights=gamma_reference_panel["reference_quality"],
@@ -1840,36 +1915,15 @@ def main(cfg: DictConfig) -> None:
         dataset_encoding=dataset_encoding,
     )
 
-    restrict_train_pairs_to_split_source = cfg_bool(
-        cfg, "split.restrict_train_pairs_to_split_source", False
-    )
-    restrict_val_pairs_to_split_source = cfg_bool(
-        cfg, "split.restrict_val_pairs_to_split_source", False
-    )
-    train_allowed_datasets = (
-        dataset_names_by_transcript(ids=train_fold, metadata=split_metadata)
-        if restrict_train_pairs_to_split_source
-        else None
-    )
-    val_allowed_datasets = (
-        dataset_names_by_transcript(
-            ids=main_val_fold_for_experiment,
-            metadata=split_metadata,
-        )
-        if restrict_val_pairs_to_split_source
-        else None
-    )
-
-    # Actual datamodules use the experiment datasets, but receive the split IDs.
-    # When configured, validation flat pairs are restricted to the filtered split
-    # source availability even though training/prediction can load raw profiles.
+    # Actual datamodules use the experiment datasets but receive the fixed
+    # master-universe split IDs. Validation IDs are present in every selected
+    # dataset. Training is the remaining ID pool, intersected independently
+    # with the rows available in each selected dataset by the dataloader.
     datamodule = make_datamodule(
         cfg=cfg,
         datasets_paths=experiment_dataset_paths,
         train_fold=train_fold,
-        val_fold=main_val_fold_for_experiment,
-        train_allowed_dataset_names_by_transcript=train_allowed_datasets,
-        val_allowed_dataset_names_by_transcript=val_allowed_datasets,
+        val_fold=validation_fold,
         seed=seed,
     )
 
@@ -1901,37 +1955,6 @@ def main(cfg: DictConfig) -> None:
                 "training.grouped_optimizer_batch.log_batch_structure",
                 True,
             ),
-        )
-
-    css_benchmark_fold_for_experiment = filter_ids_available_in_experiment(
-        ids=css_benchmark_fold,
-        metadata=split_metadata,
-        experiment_datasets=experiment_datasets,
-    )
-
-    css_datamodule = None
-    if len(css_benchmark_fold_for_experiment) > 0:
-        css_allowed_datasets = (
-            dataset_names_by_transcript(
-                ids=css_benchmark_fold_for_experiment,
-                metadata=split_metadata,
-            )
-            if restrict_val_pairs_to_split_source
-            else None
-        )
-        css_datamodule = make_datamodule(
-            cfg=cfg,
-            datasets_paths=experiment_dataset_paths,
-            train_fold=train_fold,
-            val_fold=css_benchmark_fold_for_experiment,
-            train_allowed_dataset_names_by_transcript=train_allowed_datasets,
-            val_allowed_dataset_names_by_transcript=css_allowed_datasets,
-            seed=seed,
-        )
-    else:
-        print(
-            "\nNo CSS benchmark transcripts are available for the selected "
-            f"experiment datasets {experiment_datasets}. CSS prediction will be skipped.\n"
         )
 
     logger_version = shared_logger_version_from_environment()
@@ -2058,7 +2081,7 @@ def main(cfg: DictConfig) -> None:
         print(f"Checkpoint selected from disk: {selected_ckpt}")
 
     # ------------------------------------------------------------
-    # Training on train_fold, validating on representative main_val_fold
+    # Training on every non-validation ID, validating on the fixed common panel
     # ------------------------------------------------------------
     if do_train:
         if selected_ckpt is not None:
@@ -2093,8 +2116,7 @@ def main(cfg: DictConfig) -> None:
         else:
             print("No checkpoint found. Predicting with current model weights.")
 
-        # Predict representative main validation.
-        print("Predicting on representative main validation set...")
+        print("Predicting on the fixed common validation set...")
         main_predictions = trainer.predict(
             model=lit_model,
             datamodule=datamodule,
@@ -2109,32 +2131,9 @@ def main(cfg: DictConfig) -> None:
         )
 
         if trainer.is_global_zero and main_prediction_rows > 0:
-            print(f"Main validation prediction complete: {out_file}")
+            print(f"Fixed validation prediction complete: {out_file}")
         elif trainer.is_global_zero:
-            print("No main validation predictions were returned.")
-
-        # Predict CSS-enriched biological benchmark.
-        if css_datamodule is not None:
-            print("Predicting on CSS biological benchmark set...")
-            css_predictions = trainer.predict(
-                model=lit_model,
-                datamodule=css_datamodule,
-                ckpt_path=None,
-            )
-
-            out_file = paths_results / f"predictions_css_benchmark_{dataset_str}.parquet"
-            css_prediction_rows = save_predictions_for_trainer(
-                predictions=css_predictions,
-                out_file=out_file,
-                trainer=trainer,
-            )
-
-            if trainer.is_global_zero and css_prediction_rows > 0:
-                print(f"CSS benchmark prediction complete: {out_file}")
-            elif trainer.is_global_zero:
-                print("No CSS benchmark predictions were returned.")
-        elif trainer.is_global_zero:
-            print("Skipping CSS benchmark prediction because the CSS benchmark split is empty.")
+            print("No fixed validation predictions were returned.")
 
 
 if __name__ == "__main__":

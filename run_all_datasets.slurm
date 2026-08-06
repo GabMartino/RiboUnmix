@@ -95,7 +95,7 @@ QUALITY_RANK_POWER="${QUALITY_RANK_POWERS[POWER_INDEX]}"
 # Model and loss settings not explicitly overridden below are inherited from
 # config/config_riboai_queuing_multidataset.yaml.
 SEED="${SEED:-42}"
-BATCH_SIZE="${BATCH_SIZE:-256}"
+BATCH_SIZE="${BATCH_SIZE:-2}"
 TRAIN_SAMPLING_STRATEGY="${TRAIN_SAMPLING_STRATEGY:-transcript_grouped_multidataset_pairs}"
 # One persistent worker per DDP rank retains background loading while limiting
 # the in-memory dataset copies made by CUDA-safe `spawn`. Prediction defaults to
@@ -270,7 +270,8 @@ echo "Seed     -> ${SEED}"
 echo "Datasets -> ${SELECTED_DATASET_COUNT} (${DATASET_SUBSET_STRATEGY})"
 echo "Rank p   -> ${QUALITY_RANK_POWER}"
 echo "Gamma wt -> ${GAMMA_CENTERING_WEIGHTING}"
-echo "Batch    -> ${BATCH_SIZE} physical pair rows per DDP-rank microbatch"
+echo "Batch    -> ${BATCH_SIZE} pair rows per dataset per DDP-rank microbatch"
+echo "Pair cap -> $((BATCH_SIZE * SELECTED_DATASET_COUNT)) nominal rows per rank"
 echo "Sampling -> ${TRAIN_SAMPLING_STRATEGY}"
 echo "Workers  -> ${NUM_WORKERS} per DDP rank"
 echo "Pred work-> ${PREDICT_NUM_WORKERS} per DDP rank"
@@ -289,11 +290,9 @@ COMMAND=(
     srun --ntasks=2 --kill-on-bad-exit=1 --wait=60 \
     python main_ribo_queueing_modeling_multi_dataset.py
     "experiment.dataset=${DATASET_OVERRIDE}"
-    "experiment.dataset_subset_strategy=${DATASET_SUBSET_STRATEGY}"
     split.master_dataset_universe=all
     "model.gamma_centering.reference.quality_rank_power=${QUALITY_RANK_POWER}"
     "model.gamma_centering.reference.weighting=${GAMMA_CENTERING_WEIGHTING}"
-    model.gamma_centering.enabled=true
     model.gamma_centering.mode=fixed_reference
     "experiment.seed=${SEED}"
     experiment.from_checkpoint=false

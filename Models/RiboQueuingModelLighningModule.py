@@ -88,11 +88,63 @@ def sequence_length_temper_weights(
     )
 
 
-def masked_weighted_pcc(
+def reduce_dataset_balanced_weighted_mean(
+    values: torch.Tensor,
+    dataset_ids: torch.Tensor,
+    sample_weights: torch.Tensor,
+) -> torch.Tensor:
+    """Return an equal outer mean of reliability-weighted dataset means.
+
+    All three inputs contain one entry per transcript--dataset pair.  Weights
+    are required to be finite and strictly positive: zero-coverage rows are
+    removed by preprocessing, so accepting a zero here would hide a broken
+    input contract.  Accumulation is promoted to float32 under mixed precision
+    while preserving autograd with respect to ``values``.
+    """
+    values = values.reshape(-1)
+    dataset_ids = dataset_ids.reshape(-1).to(device=values.device, dtype=torch.long)
+    sample_weights = sample_weights.reshape(-1).to(device=values.device)
+    if not (
+        values.numel() == dataset_ids.numel() == sample_weights.numel()
+    ):
+        raise ValueError(
+            "values, dataset_ids, and sample_weights must contain the same "
+            f"number of pairs; got {values.numel()}, {dataset_ids.numel()}, "
+            f"and {sample_weights.numel()}."
+        )
+    if values.numel() == 0:
+        return values.sum() * 0.0
+    if not bool(torch.isfinite(values).all()):
+        raise ValueError("Per-pair loss values must all be finite.")
+    if not bool(torch.isfinite(sample_weights).all()):
+        raise ValueError("Transcript reliability weights must all be finite.")
+    if bool((sample_weights <= 0.0).any()):
+        raise ValueError("Transcript reliability weights must all be strictly positive.")
+
+    accumulation_dtype = (
+        torch.float32
+        if values.dtype in {torch.float16, torch.bfloat16}
+        else values.dtype
+    )
+    values_acc = values.to(dtype=accumulation_dtype)
+    weights_acc = sample_weights.to(dtype=accumulation_dtype)
+    _, inverse = torch.unique(dataset_ids, sorted=False, return_inverse=True)
+    dataset_count = int(inverse.max().item()) + 1
+    numerator = torch.zeros(
+        dataset_count,
+        device=values.device,
+        dtype=accumulation_dtype,
+    )
+    denominator = torch.zeros_like(numerator)
+    numerator.index_add_(0, inverse, values_acc * weights_acc)
+    denominator.index_add_(0, inverse, weights_acc)
+    return (numerator / denominator).mean()
+
+
+def masked_pcc(
     x: torch.Tensor,
     y: torch.Tensor,
     mask: torch.Tensor,
-    weights: torch.Tensor | None = None,
     min_target_var: float = 1.0e-6,
     eps: float = 1.0e-8,
 ) -> dict[str, torch.Tensor]:
@@ -104,15 +156,7 @@ def masked_weighted_pcc(
     x = torch.where(mask_b, x, torch.zeros_like(x))
     y = torch.where(mask_b, y, torch.zeros_like(y))
 
-    if weights is None:
-        w = mask_f
-    else:
-        w = torch.nan_to_num(
-            weights.to(device=x.device, dtype=x.dtype),
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        ).clamp_min(0.0) * mask_f
+    w = mask_f
 
     w_sum = w.sum(dim=1, keepdim=True).clamp_min(float(eps))
     x_mean = (w * x).sum(dim=1, keepdim=True) / w_sum
@@ -133,18 +177,14 @@ def masked_weighted_pcc(
 
     valid_f = valid.to(dtype=x.dtype)
     valid_count = valid_f.sum().clamp_min(1.0)
-    mean_pcc = (pcc * valid_f).sum() / valid_count
     valid_fraction = valid_f.mean() if valid_f.numel() > 0 else x.new_tensor(0.0)
     target_var_mean = (target_var * valid_f).sum() / valid_count
 
     return {
         "pcc_per_sample": pcc,
         "valid": valid,
-        "mean_pcc": mean_pcc,
         "valid_fraction": valid_fraction,
-        "target_var": target_var,
         "target_var_mean": target_var_mean,
-        "weights": w,
     }
 
 
@@ -765,6 +805,34 @@ class NegativeBinomialProfileLoss(nn.Module):
         self.length_temper_min_weight = float(length_temper_min_weight)
         self.length_temper_max_weight = float(length_temper_max_weight)
 
+        if not math.isfinite(self.eps) or self.eps <= 0.0:
+            raise ValueError("loss.eps must be finite and strictly positive.")
+        if not (
+            math.isfinite(self.log_alpha_min)
+            and math.isfinite(self.log_alpha_max)
+            and self.log_alpha_min <= self.log_alpha_max
+        ):
+            raise ValueError(
+                "loss.nb_log_alpha_min/max must be finite and min must be <= max."
+            )
+        if self.sequence_reduction not in {"mean", "sum", "length_tempered"}:
+            raise ValueError(
+                "loss.nb_sequence_reduction must be one of "
+                "{'mean', 'sum', 'length_tempered'}."
+            )
+        if not 0.0 <= self.length_temper_gamma <= 1.0:
+            raise ValueError("loss.nb_length_temper_gamma must be in [0, 1].")
+        if not math.isfinite(self.length_temper_ref) or self.length_temper_ref <= 0.0:
+            raise ValueError("loss.nb_length_temper_ref must be finite and positive.")
+        if not (
+            math.isfinite(self.length_temper_min_weight)
+            and math.isfinite(self.length_temper_max_weight)
+            and 0.0 < self.length_temper_min_weight <= self.length_temper_max_weight
+        ):
+            raise ValueError(
+                "loss NB length-tempering bounds must be finite, positive, and ordered."
+            )
+
     def positive_mean_from_params(
         self,
         *,
@@ -865,11 +933,11 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
         Active loss:
 
-            loss = mean_replica(
-                replica_nb_weight * NB_NLL
-                + replica_raw_pcc_weight * (1 - PCC)
-                + replica_nb_vst_pcc_weight * (1 - PCC_NB_VST)
-            ) + gamma_reg_weight * mean(log_gamma^2)
+            pair_loss = replica_nb_weight * mean_replica(NB_NLL)
+                      + replica_raw_pcc_weight * mean_valid_replica(1 - PCC)
+                      + replica_nb_vst_pcc_weight
+                        * mean_valid_replica(1 - PCC_NB_VST)
+                      + gamma_reg_weight * mean_position(log_gamma^2)
 
     Every data-fit term uses the raw replicas. The arithmetic-mean consensus is
     retained only for diagnostics and never enters the optimized objective.
@@ -935,8 +1003,8 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         ):
             raise ValueError("At least one of the four loss coefficients must be positive.")
         self.min_pcc_target_var = float(getattr(loss_cfg, "min_pcc_target_var", 1.0e-6))
-        self.pcc_alpha_min = float(getattr(loss_cfg, "pcc_alpha_min", 1.0e-5))
-        self.pcc_alpha_max = float(getattr(loss_cfg, "pcc_alpha_max", 20.0))
+        if not math.isfinite(self.min_pcc_target_var) or self.min_pcc_target_var < 0.0:
+            raise ValueError("loss.min_pcc_target_var must be finite and non-negative.")
         self.pcc_detach_alpha = bool(getattr(loss_cfg, "pcc_detach_alpha", True))
         self.eps = float(getattr(loss_cfg, "eps", 1.0e-8))
         # Predicted-value floor for PCC only: predictions below this count are
@@ -1034,8 +1102,12 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
     # ============================================================
 
     def _forward_batch(self, batch) -> dict[str, Any]:
-        if len(batch) < 9:
-            raise ValueError(f"Expected at least 9 batch fields, got {len(batch)}.")
+        if len(batch) < 14:
+            raise ValueError(
+                "The current collate schema requires quality metadata, a local "
+                "transcript-group tensor, and mandatory replica tensors; got "
+                f"{len(batch)} batch fields."
+            )
         (
             dataset_ids,
             ids,
@@ -1046,42 +1118,24 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             codon_ids,
             css,
             sample_weights,
-        ) = batch[:9]
-
-        # New batches always carry the raw dataset rank and its positive
-        # rank-derived quality weight. Keep the shape check so old collated
-        # batches remain readable when inspecting historical artifacts.
-        has_quality_metadata = (
-            len(batch) >= 11
-            and torch.is_tensor(batch[9])
-            and torch.is_tensor(batch[10])
-            and batch[9].ndim == 1
-            and batch[10].ndim == 1
-        )
-        if has_quality_metadata:
-            dataset_quality_ranks = batch[9]
-            dataset_quality_weights = batch[10]
-            remaining_values = batch[11:]
-        else:
-            dataset_quality_ranks = torch.full_like(
-                sample_weights, float("nan"), dtype=torch.float32
-            )
-            dataset_quality_weights = torch.ones_like(
-                sample_weights, dtype=torch.float32
-            )
-            remaining_values = batch[9:]
-
-        transcript_group_index = None
-        if (
-            remaining_values
-            and torch.is_tensor(remaining_values[0])
-            and remaining_values[0].ndim == 1
-            and not remaining_values[0].is_floating_point()
+            dataset_quality_ranks,
+            dataset_quality_weights,
+            transcript_group_index,
+        ) = batch[:12]
+        if not (
+            torch.is_tensor(dataset_quality_ranks)
+            and dataset_quality_ranks.ndim == 1
+            and torch.is_tensor(dataset_quality_weights)
+            and dataset_quality_weights.ndim == 1
+            and torch.is_tensor(transcript_group_index)
+            and transcript_group_index.ndim == 1
+            and not transcript_group_index.is_floating_point()
         ):
-            transcript_group_index = remaining_values[0]
-            optional_values = remaining_values[1:]
-        else:
-            optional_values = remaining_values
+            raise ValueError(
+                "Invalid batch metadata: expected one-dimensional dataset ranks, "
+                "dataset quality weights, and integer transcript group indices."
+            )
+        optional_values = batch[12:]
 
         dataset_bias_sequence_features = None
         if len(optional_values) == 2:
@@ -1123,7 +1177,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "sample_weights": sample_weights,
             "dataset_quality_ranks": dataset_quality_ranks,
             "dataset_quality_weights": dataset_quality_weights,
-            "transcript_group_index": transcript_group_index,
             "mu": mu,
             "log_sigma": log_sigma,
             "extras": extras,
@@ -1153,48 +1206,22 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         of those dataset means, so each represented dataset has one equal outer
         vote. This reduction is fixed and has no configuration selector.
         """
-        values = values.reshape(-1)
-        ids = dataset_ids.reshape(-1).to(device=values.device)
-        w = (
-            sample_weights.reshape(-1)
-            .to(device=values.device, dtype=values.dtype)
-            .clamp_min(0.0)
+        return reduce_dataset_balanced_weighted_mean(
+            values=values,
+            dataset_ids=dataset_ids,
+            sample_weights=sample_weights,
         )
-        if values.numel() != ids.numel() or values.numel() != w.numel():
-            raise ValueError(
-                "values, dataset_ids, and sample_weights must contain the same "
-                f"number of samples; got {values.numel()}, {ids.numel()}, and "
-                f"{w.numel()}."
-            )
-        if values.numel() == 0:
-            return values.sum() * 0.0
-
-        unique_ids, inverse = torch.unique(ids, return_inverse=True)
-        # unique_ids is sorted/deduped, so its element count is the number of
-        # dataset buckets. Reading .numel() avoids the per-call .item() GPU sync
-        # (this helper runs ~12x per step).
-        K = unique_ids.numel()
-
-        w_sums = torch.zeros(
-            K, device=values.device, dtype=values.dtype
-        ).scatter_add_(0, inverse, w)
-        wv_sums = torch.zeros_like(w_sums).scatter_add_(0, inverse, values * w)
-        per_ds_mean = wv_sums / w_sums.clamp_min(self.eps)
-
-        return per_ds_mean.mean()
 
     def _pcc_alpha(
         self,
         log_alpha: torch.Tensor,
         target_shape: torch.Size | tuple[int, ...],
     ) -> torch.Tensor:
-        alpha = torch.exp(_broadcast_profile_param(log_alpha, target_shape))
-        alpha = torch.nan_to_num(
-            alpha,
-            nan=self.pcc_alpha_min,
-            posinf=self.pcc_alpha_max,
-            neginf=self.pcc_alpha_min,
+        bounded_log_alpha = self.loss_fn._log_alpha_from_model_output(
+            log_sigma=log_alpha,
+            target_shape=target_shape,
         )
+        alpha = torch.exp(bounded_log_alpha)
         if self.pcc_detach_alpha:
             alpha = alpha.detach()
         return alpha
@@ -1228,10 +1255,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             mask_f = mask.to(dtype=v.dtype)
             return (v * mask_f).sum() / mask_f.sum().clamp_min(1.0)
 
-        def valid_sample_mean(v: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-            valid_f = valid.to(dtype=v.dtype)
-            return (v * valid_f).sum() / valid_f.sum().clamp_min(1.0)
-
         alpha_diag = torch.ones_like(mu)
         if transform == "raw":
             x_pcc = mu
@@ -1252,11 +1275,10 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 f"got {transform!r}."
             )
 
-        pcc_out = masked_weighted_pcc(
+        pcc_out = masked_pcc(
             x=x_pcc,
             y=y_pcc,
             mask=mask,
-            weights=None,
             min_target_var=self.min_pcc_target_var,
             eps=self.eps,
         )
@@ -1266,14 +1288,10 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             1.0 - pcc_out["pcc_per_sample"],
             torch.zeros_like(pcc_out["pcc_per_sample"]),
         )
-        valid_f = valid.to(dtype=mu.dtype)
-        valid_count = valid_f.sum().clamp_min(1.0)
         return {
             "loss_per_sample": loss_per_sample,
             "pcc_per_sample": pcc_out["pcc_per_sample"],
             "valid": valid,
-            "pcc_value": (pcc_out["pcc_per_sample"] * valid_f).sum() / valid_count,
-            "loss_mean": valid_sample_mean(loss_per_sample, valid),
             "valid_fraction": pcc_out["valid_fraction"],
             "target_var_mean": pcc_out["target_var_mean"],
             "alpha_mean": masked_position_mean(alpha_diag),
@@ -1512,8 +1530,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                     "loss_per_sample": zero_sample,
                     "pcc_per_sample": zero_sample,
                     "valid": torch.zeros(B, device=flat_mu.device, dtype=torch.bool),
-                    "pcc_value": zero_scalar,
-                    "loss_mean": zero_scalar,
                     "valid_fraction": zero_scalar,
                     "target_var_mean": zero_scalar,
                     "alpha_mean": zero_scalar,
@@ -1523,14 +1539,15 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
             flat_diag = self._pcc_loss_per_sample(flat_out, transform=transform)
             active_valid = flat_diag["valid"].to(device=target_reps.device) & flat_rep_mask
-            sample_valid = active_valid.reshape(B, R).any(dim=1)
+            active_valid_by_sample = active_valid.reshape(B, R)
+            sample_valid = active_valid_by_sample.any(dim=1)
             return {
                 **flat_diag,
                 "loss_per_sample": self._average_over_valid_replicas(
-                    flat_diag["loss_per_sample"], rep_mask
+                    flat_diag["loss_per_sample"], active_valid_by_sample
                 ),
                 "pcc_per_sample": self._average_over_valid_replicas(
-                    flat_diag["pcc_per_sample"], rep_mask
+                    flat_diag["pcc_per_sample"], active_valid_by_sample
                 ),
                 "valid": sample_valid,
                 "valid_fraction": sample_valid.to(dtype=target_reps.dtype).mean(),
@@ -1683,11 +1700,24 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         replica_pcc_loss = pcc_loss
         pcc_weight_sum = self.replica_raw_pcc_weight + self.replica_nb_vst_pcc_weight
         if pcc_weight_sum > 0.0:
-            replica_pcc_per_sample = (
-                self.replica_raw_pcc_weight * raw_pcc_diag["pcc_per_sample"]
-                + self.replica_nb_vst_pcc_weight
-                * nb_vst_pcc_diag["pcc_per_sample"]
-            ) / pcc_weight_sum
+            raw_active_weight = (
+                raw_pcc_diag["valid"].to(dtype=nll_per_sample.dtype)
+                * self.replica_raw_pcc_weight
+            )
+            nb_vst_active_weight = (
+                nb_vst_pcc_diag["valid"].to(dtype=nll_per_sample.dtype)
+                * self.replica_nb_vst_pcc_weight
+            )
+            active_pcc_weight = raw_active_weight + nb_vst_active_weight
+            replica_pcc_per_sample = torch.where(
+                active_pcc_weight > 0.0,
+                (
+                    raw_active_weight * raw_pcc_diag["pcc_per_sample"]
+                    + nb_vst_active_weight * nb_vst_pcc_diag["pcc_per_sample"]
+                )
+                / active_pcc_weight.clamp_min(self.eps),
+                torch.zeros_like(nll_per_sample),
+            )
         else:
             replica_pcc_per_sample = nll_per_sample.new_zeros(nll_per_sample.shape)
         replica_pcc_value = aggregate_active(replica_pcc_per_sample)
@@ -2054,10 +2084,11 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             batch_size=batch_size,
             sync_dist=sync_dist,
         )
-        # `*_mu_pcc` is retained as the unweighted compatibility alias used
-        # by checkpoint monitoring.  `*_mu_pcc_weighted` is reduced across
-        # batches using sum(sample_weight), making it the exact weighted mean
-        # over the epoch rather than a mean of batch-level weighted means.
+        # `*_mu_pcc` is retained as the unweighted compatibility alias used by
+        # checkpoint monitoring. `*_mu_pcc_weighted` is the batch-local
+        # reliability-weighted, dataset-balanced diagnostic. Like the optimized
+        # loss, Lightning averages these already-reduced batch scalars at epoch
+        # level; it is not presented as a materialized whole-epoch reduction.
         self.log(
             f"{stage}_mu_pcc",
             metrics["mu_pcc_unweighted"],
@@ -2076,30 +2107,17 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             batch_size=batch_size,
             sync_dist=sync_dist,
         )
-        sample_weights = out.get("sample_weights")
-        if sample_weights is None:
-            weighted_batch_size = metrics["mu_pcc_weighted"].new_tensor(float(batch_size))
-        else:
-            weighted_batch_size = (
-                sample_weights.detach()
-                .to(
-                    device=metrics["mu_pcc_weighted"].device,
-                    dtype=metrics["mu_pcc_weighted"].dtype,
-                )
-                .clamp_min(0.0)
-                .sum()
-                .clamp_min(self.eps)
-            )
         self.log(
             f"{stage}_mu_pcc_weighted",
             metrics["mu_pcc_weighted"],
             on_step=False,
             on_epoch=True,
             prog_bar=False,
-            batch_size=weighted_batch_size,
+            batch_size=batch_size,
             sync_dist=sync_dist,
         )
 
+        scalar_logs: dict[str, torch.Tensor] = {}
         for name in self.SCALAR_METRICS:
             value = metrics.get(name)
             if not torch.is_tensor(value) or value.ndim != 0:
@@ -2116,15 +2134,15 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 if metric_path is not None
                 else f"{stage}_{name}"
             )
-            self.log(
-                log_name,
-                value,
-                on_step=False,
-                on_epoch=True,
-                prog_bar=False,
-                batch_size=batch_size,
-                sync_dist=sync_dist,
-            )
+            scalar_logs[log_name] = value
+        self.log_dict(
+            scalar_logs,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=False,
+            batch_size=batch_size,
+            sync_dist=sync_dist,
+        )
 
         log_train_per_dataset = bool(
             getattr(self.config.metrics, "log_train_per_dataset_metrics", False)
@@ -2150,7 +2168,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "pcc_raw_loss": metrics["pcc_raw_loss_per_sample"],
             "pcc_nb_vst_loss": metrics["pcc_nb_vst_loss_per_sample"],
             "mu_pcc": metrics["mu_pcc_per_sample"],
-            "mu_pcc_unweighted": metrics["mu_pcc_per_sample"],
             "L_bio_pcc": metrics["L_bio_pcc_per_sample"],
         }
         sample_weights = out.get("sample_weights")
@@ -2160,7 +2177,13 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             sample_weights = sample_weights.detach().to(
                 device=metrics["mu_pcc_per_sample"].device,
                 dtype=metrics["mu_pcc_per_sample"].dtype,
-            ).clamp_min(0.0)
+            )
+        if not bool(torch.isfinite(sample_weights).all()) or bool(
+            (sample_weights <= 0.0).any()
+        ):
+            raise ValueError(
+                "Logged transcript reliability weights must be finite and strictly positive."
+            )
 
         extras = out["extras"]
         gamma = extras.get("gamma", torch.ones_like(extras["L_bio"])).float()
@@ -2169,33 +2192,22 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             dataset_name = self._dataset_name(int(dataset_id_tensor.item()))
             sample_mask = dataset_ids == dataset_id_tensor
             dataset_sample_count = int(sample_mask.sum().item())
-
-            for metric_name, values in per_sample.items():
-                self.log(
-                    f"{stage}_{metric_name}/{dataset_name}",
-                    values[sample_mask].mean(),
-                    on_step=False,
-                    on_epoch=True,
-                    prog_bar=False,
-                    # Lightning weights epoch reductions by batch_size. Use the
-                    # number of samples from this dataset, not the full mixed
-                    # batch, so this is the true per-dataset sample mean.
-                    batch_size=dataset_sample_count,
-                    sync_dist=sync_dist,
-                )
-
             dataset_weights = sample_weights[sample_mask]
             weighted_pcc = (metrics["mu_pcc_per_sample"][sample_mask] * dataset_weights).sum()
-            weighted_pcc = weighted_pcc / dataset_weights.sum().clamp_min(self.eps)
-            self.log(
-                f"{stage}_mu_pcc_weighted/{dataset_name}",
-                weighted_pcc,
+            weighted_pcc = weighted_pcc / dataset_weights.sum()
+            dataset_logs = {
+                f"{stage}_{metric_name}/{dataset_name}": values[sample_mask].mean()
+                for metric_name, values in per_sample.items()
+            }
+            dataset_logs[f"{stage}_mu_pcc_weighted/{dataset_name}"] = weighted_pcc
+            self.log_dict(
+                dataset_logs,
                 on_step=False,
                 on_epoch=True,
                 prog_bar=False,
-                # Weight this epoch reduction by the sum of transcript
-                # weights, so it is exact across mixed batches.
-                batch_size=dataset_weights.sum().clamp_min(self.eps),
+                # Lightning weights epoch reductions by batch_size. Use this
+                # dataset's physical pair count, not the full mixed batch.
+                batch_size=dataset_sample_count,
                 sync_dist=sync_dist,
             )
 
@@ -2451,42 +2463,77 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
     def _record_train_batch_structure(self, batch) -> None:
         if not self._grouped_batch_logging_enabled:
             return
-        dataset_ids = batch[0]
-        transcript_ids = [str(value) for value in batch[1]]
-        if torch.is_tensor(dataset_ids):
-            dataset_id_values = dataset_ids.detach().reshape(-1).cpu().tolist()
-        else:
-            dataset_id_values = list(dataset_ids)
-        if len(dataset_id_values) != len(transcript_ids):
-            raise RuntimeError(
-                "Batch dataset IDs and transcript IDs have different row counts."
-            )
-
-        rows_by_transcript: dict[str, int] = {}
-        datasets_by_transcript: dict[str, set[int]] = {}
-        for transcript_id, dataset_id in zip(
-            transcript_ids,
-            dataset_id_values,
-            strict=True,
+        dataset_ids = torch.as_tensor(batch[0]).detach().reshape(-1).to(dtype=torch.long)
+        sample_weights = torch.as_tensor(batch[8]).detach().reshape(-1).float()
+        group_ids = batch[11]
+        if not (
+            torch.is_tensor(group_ids)
+            and group_ids.ndim == 1
+            and not group_ids.is_floating_point()
         ):
-            rows_by_transcript[transcript_id] = (
-                rows_by_transcript.get(transcript_id, 0) + 1
+            raise ValueError(
+                "Batch field 11 must contain one integer transcript group ID per row."
             )
-            datasets_by_transcript.setdefault(transcript_id, set()).add(
-                int(dataset_id)
+        group_ids = group_ids.detach().reshape(-1).to(
+            device=dataset_ids.device,
+            dtype=torch.long,
+        )
+        sample_weights = sample_weights.to(device=dataset_ids.device)
+        if not (
+            dataset_ids.numel() == group_ids.numel() == sample_weights.numel()
+        ):
+            raise RuntimeError(
+                "Batch dataset IDs, transcript groups, and weights have different row counts."
+            )
+        if not bool(torch.isfinite(sample_weights).all()) or bool(
+            (sample_weights <= 0.0).any()
+        ):
+            raise ValueError(
+                "Batch transcript reliability weights must be finite and strictly positive."
             )
 
-        datasets_per_transcript = tuple(
-            len(datasets_by_transcript[transcript_id])
-            for transcript_id in rows_by_transcript
+        unique_groups, inverse_groups = torch.unique(
+            group_ids,
+            sorted=False,
+            return_inverse=True,
         )
-        group_count = len(rows_by_transcript)
+        group_count = int(unique_groups.numel())
+        group_weight_sums = torch.zeros(
+            group_count,
+            device=sample_weights.device,
+            dtype=torch.float32,
+        )
+        group_weight_sums.index_add_(0, inverse_groups, sample_weights)
+
+        # Exactly one row is expected for each transcript--dataset pair. Count
+        # unique (local group, dataset) combinations and verify that invariant.
+        group_dataset_pairs = torch.stack((inverse_groups, dataset_ids), dim=1)
+        unique_group_dataset_pairs = torch.unique(group_dataset_pairs, dim=0)
+        datasets_per_transcript_t = torch.bincount(
+            unique_group_dataset_pairs[:, 0],
+            minlength=group_count,
+        )
+        rows_per_transcript_t = torch.bincount(
+            inverse_groups,
+            minlength=group_count,
+        )
+        if not torch.equal(datasets_per_transcript_t, rows_per_transcript_t):
+            raise RuntimeError(
+                "A grouped microbatch contains a duplicate transcript--dataset pair."
+            )
+        _, rows_per_dataset_t = torch.unique(dataset_ids, return_counts=True)
         self._train_batch_structure_records.append(
             {
-                "pair_row_count": len(transcript_ids),
+                "pair_row_count": int(dataset_ids.numel()),
                 "unique_transcript_count": group_count,
-                "distinct_dataset_count": len(set(map(int, dataset_id_values))),
-                "datasets_per_transcript": datasets_per_transcript,
+                "distinct_dataset_count": int(rows_per_dataset_t.numel()),
+                "datasets_per_transcript": tuple(
+                    map(int, datasets_per_transcript_t.cpu().tolist())
+                ),
+                "rows_per_dataset": tuple(map(int, rows_per_dataset_t.cpu().tolist())),
+                "transcript_weight_sums": tuple(
+                    map(float, group_weight_sums.cpu().tolist())
+                ),
             }
         )
 
@@ -2528,10 +2575,20 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             for record in records
             for value in record["datasets_per_transcript"]
         ]
+        rows_per_dataset = [
+            float(value)
+            for record in records
+            for value in record["rows_per_dataset"]
+        ]
+        transcript_weight_sums = [
+            float(value)
+            for record in records
+            for value in record["transcript_weight_sums"]
+        ]
 
-        def summary(values: list[float]) -> tuple[float, float, float, float]:
+        def summary(values: list[float]) -> tuple[float, float, float, float, float]:
             if not values:
-                return 0.0, 0.0, 0.0, 0.0
+                return 0.0, 0.0, 0.0, 0.0, 0.0
             ordered = sorted(values)
             count = len(ordered)
             midpoint = count // 2
@@ -2539,18 +2596,28 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 median = ordered[midpoint]
             else:
                 median = 0.5 * (ordered[midpoint - 1] + ordered[midpoint])
+            mean = float(sum(ordered) / count)
+            variance = float(sum((value - mean) ** 2 for value in ordered) / count)
+            cv = math.sqrt(variance) / mean if mean > 0.0 else 0.0
             return (
-                float(sum(ordered) / count),
+                mean,
                 float(median),
                 float(ordered[0]),
                 float(ordered[-1]),
+                float(cv),
             )
 
-        pair_mean, _, pair_min, pair_max = summary(pair_rows)
-        unique_mean, unique_median, unique_min, unique_max = summary(
+        pair_mean, _, pair_min, pair_max, _ = summary(pair_rows)
+        unique_mean, unique_median, unique_min, unique_max, unique_cv = summary(
             unique_transcripts
         )
-        ds_mean, ds_median, ds_min, ds_max = summary(datasets_per_transcript)
+        ds_mean, ds_median, ds_min, ds_max, _ = summary(datasets_per_transcript)
+        rows_ds_mean, rows_ds_median, rows_ds_min, rows_ds_max, _ = summary(
+            rows_per_dataset
+        )
+        weight_sum_mean, _, weight_sum_min, weight_sum_max, weight_sum_cv = summary(
+            transcript_weight_sums
+        )
         plan = self._grouped_optimizer_batch_plan
         estimated_total_steps = float(self.trainer.estimated_stepping_batches)
         metrics = {
@@ -2561,10 +2628,19 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "train_batch/unique_transcripts_median": unique_median,
             "train_batch/unique_transcripts_min": unique_min,
             "train_batch/unique_transcripts_max": unique_max,
+            "train_batch/unique_transcripts_cv": unique_cv,
             "train_batch/datasets_per_transcript_mean": ds_mean,
             "train_batch/datasets_per_transcript_median": ds_median,
             "train_batch/datasets_per_transcript_min": ds_min,
             "train_batch/datasets_per_transcript_max": ds_max,
+            "train_batch/rows_per_dataset_mean": rows_ds_mean,
+            "train_batch/rows_per_dataset_median": rows_ds_median,
+            "train_batch/rows_per_dataset_min": rows_ds_min,
+            "train_batch/rows_per_dataset_max": rows_ds_max,
+            "train_batch/transcript_weight_sum_mean": weight_sum_mean,
+            "train_batch/transcript_weight_sum_min": weight_sum_min,
+            "train_batch/transcript_weight_sum_max": weight_sum_max,
+            "train_batch/transcript_weight_sum_cv": weight_sum_cv,
             "train_batch/accumulation_factor": float(
                 plan.get("resolved_accumulate_grad_batches", 1)
             ),
@@ -2573,6 +2649,9 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             ),
             "train_batch/estimated_pair_rows_per_optimizer_step": float(
                 plan.get("estimated_pair_rows_per_optimizer_step", 0.0)
+            ),
+            "train_batch/estimated_global_pair_rows_per_optimizer_step": float(
+                plan.get("estimated_global_pair_rows_per_optimizer_step", 0.0)
             ),
             "train_batch/estimated_optimizer_steps_per_epoch": float(
                 plan.get("estimated_optimizer_steps_per_epoch", 0)
@@ -2593,31 +2672,32 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "train_batch/physical_pair_microbatch_size": float(
                 plan.get("physical_pair_microbatch_size", 0)
             ),
-            "train/microbatches_per_epoch": float(
+            "train_batch/per_dataset_pair_microbatch_size": float(
+                plan.get("per_dataset_pair_microbatch_size", 0)
+            ),
+            "train_batch/selected_dataset_count": float(
+                plan.get("selected_dataset_count", 0)
+            ),
+            "train_batch/microbatches_per_epoch": float(
                 plan.get("microbatches_per_epoch_per_rank", len(records))
             ),
-            "train/optimizer_steps_per_epoch": float(
-                plan.get("estimated_optimizer_steps_per_epoch", 0)
-            ),
-            "train/estimated_total_optimizer_steps": estimated_total_steps,
-            "train/accumulate_grad_batches": float(
-                plan.get("resolved_accumulate_grad_batches", 1)
-            ),
-            "train/optimizer_step_expectation_ratio": float(
+            "train_batch/estimated_total_optimizer_steps": estimated_total_steps,
+            "train_batch/optimizer_step_expectation_ratio": float(
                 plan.get("optimizer_step_expectation_ratio", 0.0)
             ),
         }
         # Every rank has the same all-gathered summaries. Lightning writes from
         # rank zero, so sync_dist=False avoids counting the gathered data twice.
-        for name, value in metrics.items():
-            self.log(
-                name,
-                torch.tensor(value, device=self.device, dtype=torch.float32),
-                on_step=False,
-                on_epoch=True,
-                prog_bar=False,
-                sync_dist=False,
-            )
+        self.log_dict(
+            {
+                name: torch.tensor(value, device=self.device, dtype=torch.float32)
+                for name, value in metrics.items()
+            },
+            on_step=False,
+            on_epoch=True,
+            prog_bar=False,
+            sync_dist=False,
+        )
 
         # TODO: if variable group sizes make microbatch-mean accumulation too
         # approximate, add a separate exact group-weighted manual accumulation
@@ -2631,12 +2711,32 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         return metrics["loss"]
 
     def on_before_optimizer_step(self, optimizer):
-        # Zero out any non-finite gradient from a degenerate batch so a single
-        # bad step cannot poison the weights (runs after gradient clipping).
-        params = [p for p in self.parameters() if p.grad is not None]
-        if any(not torch.isfinite(p.grad).all() for p in params):
-            for p in params:
-                p.grad.zero_()
+        del optimizer
+        named_gradients = [
+            (name, parameter.grad)
+            for name, parameter in self.named_parameters()
+            if parameter.grad is not None
+        ]
+        if not named_gradients:
+            return
+        finite_flags = torch.stack(
+            [torch.isfinite(gradient).all() for _, gradient in named_gradients]
+        ).detach().cpu().tolist()
+        nonfinite = [
+            name
+            for (name, _), is_finite in zip(
+                named_gradients,
+                finite_flags,
+                strict=True,
+            )
+            if not is_finite
+        ]
+        if nonfinite:
+            raise FloatingPointError(
+                "Non-finite gradients detected before the optimizer step. "
+                "Refusing to silently discard the complete accumulated update; "
+                f"first affected parameters: {nonfinite[:10]}."
+            )
 
     def validation_step(self, batch, batch_idx):
         out = self._forward_batch(batch)

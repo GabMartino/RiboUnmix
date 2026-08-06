@@ -15,9 +15,9 @@ def transcript_group_indices_from_ids(
     """Assign deterministic, microbatch-local integer IDs to transcripts.
 
     The first distinct transcript receives group zero, the next unseen
-    transcript group one, and so on.  The same sorted transcript-ID list is
-    passed to gamma centering, so loss grouping and gamma grouping share one
-    source of truth without doing string grouping in the training step.
+    transcript group one, and so on. The tensor is consumed by structural
+    batch diagnostics; the fixed dataset-balanced loss does not group by
+    transcript. Gamma centering receives the same sorted transcript-ID rows.
     """
     group_by_transcript: dict[str, int] = {}
     group_indices: list[int] = []
@@ -117,7 +117,6 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         transcripts_ids: list,
         data: dict | None = None,
         lengths: np.ndarray | None = None,
-        allowed_dataset_names_by_transcript: Mapping[str, Sequence[str]] | None = None,
         precompute_features: bool = True,
         precompute_ribo: bool = True,
         additional_sequence_features: Mapping[str, Mapping] | None = None,
@@ -174,15 +173,6 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             )
         # Replica cache keyed by (transcript_id, dataset_name) -> [n_replicas, L].
         self._ribo_replicas_cache: dict[tuple[str, str], np.ndarray] = {}
-        self.allowed_dataset_names_by_transcript = (
-            {
-                str(tid): set(map(str, dataset_names))
-                for tid, dataset_names in allowed_dataset_names_by_transcript.items()
-            }
-            if allowed_dataset_names_by_transcript is not None
-            else None
-        )
-
         # Global transcript id -> global sequence-table index.
         self.global_idx_by_tid = {
             str(tid): i
@@ -228,17 +218,10 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         for tid in self.transcripts_ids:
             available_map = self.data_records["ribo_profiles"][tid]
             available_names = list(available_map.keys())
-            if self.allowed_dataset_names_by_transcript is not None:
-                allowed = self.allowed_dataset_names_by_transcript.get(str(tid))
-                if allowed is not None:
-                    available_names = [
-                        name for name in available_names if str(name) in allowed
-                    ]
 
             if len(available_names) == 0:
                 raise RuntimeError(
-                    f"Transcript {tid} has no available ribo profiles after "
-                    "applying allowed dataset filtering."
+                    f"Transcript {tid} has no available ribo profiles."
                 )
 
             missing_dataset_names = [
@@ -774,14 +757,13 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
                 "Transcript sample weight must be finite for "
                 f"transcript={transcript_id}, dataset={dataset_name}; got {value}."
             )
-        if value < 0.0:
+        if value <= 0.0:
             raise ValueError(
-                "Transcript sample weight must be non-negative for "
+                "Transcript sample weight must be strictly positive for "
                 f"transcript={transcript_id}, dataset={dataset_name}; got {value}."
             )
 
-        # Zero is retained only for historical weighted parquets.  Positive
-        # median-normalized weights, including values above one, are preserved.
+        # Median-normalized weights, including values above one, are preserved.
         self._sample_weight_cache[key] = value
         return value
 

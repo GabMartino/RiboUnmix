@@ -36,7 +36,6 @@ class RiboQueuingModel(nn.Module):
         eps: float = 1.0e-8,
         selected_dataset_names: Sequence[str] | None = None,
         selected_dataset_ids: Sequence[int] | None = None,
-        selected_dataset_quality_weights: Sequence[float] | None = None,
         reference_dataset_names: Sequence[str] | None = None,
         reference_dataset_ids: Sequence[int] | None = None,
         reference_dataset_quality_weights: Sequence[float] | None = None,
@@ -46,9 +45,6 @@ class RiboQueuingModel(nn.Module):
         self.eps = float(eps)
         self.selected_dataset_names = tuple(str(x) for x in (selected_dataset_names or ()))
         self.selected_dataset_ids = tuple(int(x) for x in (selected_dataset_ids or ()))
-        self.selected_dataset_quality_weights = tuple(
-            float(x) for x in (selected_dataset_quality_weights or ())
-        )
 
         # Scale gauge is always the mean gauge S = mean_valid(target).
         self.init_gamma = float(model_configs.get("init_gamma", 1.0))
@@ -118,12 +114,6 @@ class RiboQueuingModel(nn.Module):
         reference_dataset_quality_weights: Sequence[float] | None,
     ) -> None:
         cfg = dict(model_configs.get("gamma_centering", {}))
-        centering_enabled = bool(cfg.get("enabled", False))
-        if centering_enabled and "mode" not in cfg:
-            raise ValueError(
-                "gamma_centering.mode is required when gamma centering is enabled. "
-                "Choose 'fixed_reference' or 'batch_grouped' explicitly."
-            )
         configured_mode = str(cfg.get("mode", "disabled")).lower()
         valid_modes = {"batch_grouped", "fixed_reference", "disabled"}
         if configured_mode not in valid_modes:
@@ -132,23 +122,14 @@ class RiboQueuingModel(nn.Module):
                 "'batch_grouped', or 'disabled'."
             )
         mode = configured_mode
-        if not centering_enabled:
-            mode = "disabled"
 
         reference_cfg = dict(cfg.get("reference", {}) or {})
-        weighting = str(
-            reference_cfg.get("weighting", cfg.get("weighting", "equal"))
-        ).lower()
+        weighting = str(reference_cfg.get("weighting", "equal")).lower()
         if weighting not in {"equal", "quality_rank"}:
             raise ValueError(
                 "gamma_centering weighting must be 'equal' or 'quality_rank'."
             )
-        quality_rank_power = float(
-            reference_cfg.get(
-                "quality_rank_power",
-                cfg.get("quality_rank_power", 1.0),
-            )
-        )
+        quality_rank_power = float(reference_cfg.get("quality_rank_power", 1.0))
         if not math.isfinite(quality_rank_power) or quality_rank_power < 0.0:
             raise ValueError(
                 "gamma_centering.quality_rank_power must be finite and nonnegative."
@@ -230,9 +211,6 @@ class RiboQueuingModel(nn.Module):
         self.gamma_reference_minimum_datasets = minimum_datasets
         self.gamma_reference_dataset_names = names
         self.gamma_reference_manifest_hash = manifest_hash
-        self.gamma_reference_source = str(
-            reference_cfg.get("source", "selected_experiment_datasets")
-        )
         self.register_buffer(
             "gamma_reference_dataset_ids",
             torch.as_tensor(ids, dtype=torch.long),
@@ -265,7 +243,6 @@ class RiboQueuingModel(nn.Module):
             "gamma_centering_mode": self.gamma_centering_mode,
             "gamma_reference_dataset_names": list(self.gamma_reference_dataset_names),
             "gamma_reference_manifest_hash": self.gamma_reference_manifest_hash,
-            "gamma_reference_source": self.gamma_reference_source,
             "gamma_centering_weighting": self.gamma_centering_weighting,
             "gamma_centering_quality_rank_power": self.gamma_centering_quality_rank_power,
             "gamma_reference_chunk_size": self.gamma_reference_chunk_size,
@@ -295,9 +272,6 @@ class RiboQueuingModel(nn.Module):
                 "gamma_reference_manifest_hash",
                 self.gamma_reference_manifest_hash,
             )
-        )
-        self.gamma_reference_source = str(
-            state.get("gamma_reference_source", self.gamma_reference_source)
         )
         self.gamma_centering_weighting = str(
             state.get("gamma_centering_weighting", self.gamma_centering_weighting)
@@ -729,59 +703,6 @@ class RiboQueuingModel(nn.Module):
                 chunk_count,
                 T,
             )
-            if not self.training:
-                # Reuse is safe only when the already-computed requested value
-                # is numerically identical to the synthetic reference value.
-                # Otherwise retain the synthetic value, preserving strict
-                # requested-partner independence over speculative optimization.
-                replacement_rows = []
-                reuse_flags = []
-                grouped_indices = list(grouped_rows.values())
-                for transcript_index, row_indices in enumerate(grouped_indices):
-                    replacement_datasets = []
-                    reuse_datasets = []
-                    row_index_tensor = torch.as_tensor(
-                        row_indices,
-                        device=device,
-                        dtype=torch.long,
-                    )
-                    group_dataset_ids = requested_ids.index_select(
-                        0, row_index_tensor
-                    )
-                    for chunk_index, reference_id in enumerate(ids_chunk):
-                        matching = row_index_tensor[
-                            group_dataset_ids == reference_id
-                        ]
-                        synthetic_value = raw_reference[
-                            transcript_index,
-                            chunk_index,
-                        ]
-                        if matching.numel() > 0:
-                            requested_value = log_gamma_raw.index_select(
-                                0, matching
-                            ).mean(dim=0)
-                            safe_to_reuse = torch.equal(
-                                requested_value.detach(),
-                                synthetic_value.detach(),
-                            )
-                        else:
-                            requested_value = synthetic_value
-                            safe_to_reuse = False
-                        replacement_datasets.append(requested_value)
-                        reuse_datasets.append(safe_to_reuse)
-                    replacement_rows.append(torch.stack(replacement_datasets, dim=0))
-                    reuse_flags.append(reuse_datasets)
-                replacement = torch.stack(replacement_rows, dim=0)
-                reuse_mask = torch.as_tensor(
-                    reuse_flags,
-                    device=device,
-                    dtype=torch.bool,
-                ).unsqueeze(-1)
-                raw_reference = torch.where(
-                    reuse_mask,
-                    replacement,
-                    raw_reference,
-                )
             weighted_sum = weighted_sum + (
                 raw_reference * weights_chunk.reshape(1, chunk_count, 1)
             ).sum(dim=1)
@@ -803,13 +724,13 @@ class RiboQueuingModel(nn.Module):
             requested_ids.reshape(-1, 1) == reference_ids.reshape(1, -1)
         ).any(dim=1)
         normalized_reference_weights = reference_weights / weight_sum.clamp_min(self.eps)
-        requested_weights = torch.zeros(B, device=device, dtype=dtype)
-        for ref_index in range(reference_count):
-            requested_weights = torch.where(
-                requested_ids == reference_ids[ref_index],
-                normalized_reference_weights[ref_index],
-                requested_weights,
-            )
+        requested_weights = (
+            (
+                requested_ids.reshape(-1, 1)
+                == reference_ids.reshape(1, -1)
+            ).to(dtype=dtype)
+            * normalized_reference_weights.reshape(1, -1)
+        ).sum(dim=1)
 
         return {
             "log_gamma": log_gamma,

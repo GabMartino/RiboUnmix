@@ -31,10 +31,9 @@ extract from raw_datasets only ["id", "transcript_id", "ribo"]
 
 
 - sequence:
-  - css_split.json: 
+  - css_split.json (legacy artifact; the active multidataset train/validation split does not read it):
     - training_set: ["ENST00000355849.10", "ENST00000361794.7",
     - validation_set: ["ENST00000355849.10", "ENST00000361794.7",
 - raw_full_dataset_replicas
 
 - raw_datasets:
-  - 
