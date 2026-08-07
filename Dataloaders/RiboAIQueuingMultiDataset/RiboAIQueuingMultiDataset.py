@@ -11,13 +11,16 @@ from torch.utils.data import Dataset
 
 def transcript_group_indices_from_ids(
     transcript_ids: Sequence[str],
+    expected_pair_rows_by_transcript: Mapping[str, int] | None = None,
 ) -> torch.LongTensor:
     """Assign deterministic, microbatch-local integer IDs to transcripts.
 
     The first distinct transcript receives group zero, the next unseen
-    transcript group one, and so on. The tensor is consumed by structural
-    batch diagnostics; the fixed dataset-balanced loss does not group by
-    transcript. Gamma centering receives the same sorted transcript-ID rows.
+    transcript group one, and so on. The tensor is consumed directly by the
+    vectorized sample-loss reducer. Gamma centering receives the same sorted
+    transcript-ID rows, so the two mechanisms cannot disagree about row
+    identity. The debug assertion below verifies the one-to-one mapping once
+    in collate rather than regrouping Python strings in every training step.
     """
     group_by_transcript: dict[str, int] = {}
     group_indices: list[int] = []
@@ -32,17 +35,31 @@ def transcript_group_indices_from_ids(
     result = torch.tensor(group_indices, dtype=torch.long)
     if __debug__:
         transcript_by_group: dict[int, str] = {}
+        observed_rows_by_transcript: dict[str, int] = defaultdict(int)
         for transcript_id, group_index in zip(
             map(str, transcript_ids),
             group_indices,
             strict=True,
         ):
+            observed_rows_by_transcript[transcript_id] += 1
             previous = transcript_by_group.setdefault(group_index, transcript_id)
             if previous != transcript_id:
                 raise AssertionError(
                     "One transcript_group_index was assigned to different "
                     f"transcripts: {previous!r} and {transcript_id!r}."
                 )
+        if expected_pair_rows_by_transcript is not None:
+            for transcript_id, observed_rows in observed_rows_by_transcript.items():
+                expected_rows = int(
+                    expected_pair_rows_by_transcript.get(transcript_id, 0)
+                )
+                if observed_rows != expected_rows:
+                    raise RuntimeError(
+                        "Incomplete transcript group reached collate: "
+                        f"transcript={transcript_id}, observed_pair_rows="
+                        f"{observed_rows}, expected_pair_rows={expected_rows}. "
+                        "Transcript-balanced reduction requires atomic groups."
+                    )
     return result
 
 
@@ -967,7 +984,8 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             dtype=torch.float32,
         )
         transcript_group_indices_sorted = transcript_group_indices_from_ids(
-            ids_sorted
+            ids_sorted,
+            expected_pair_rows_by_transcript=self.num_datasets_by_transcript,
         )
 
         seq_pad = pad_sequence(

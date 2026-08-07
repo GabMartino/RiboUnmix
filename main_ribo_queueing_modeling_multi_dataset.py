@@ -33,7 +33,10 @@ from Dataloaders.RiboAIQueuingMultiDataset.RiboAIQueuingDatamoduleMultiDataset i
     resolve_grouped_optimizer_batch_plan,
 )
 from Models.RiboQueuingModel import RiboQueuingModel
-from Models.RiboQueuingModelLighningModule import RiboQueuingModelLightningModule
+from Models.RiboQueuingModelLighningModule import (
+    RiboQueuingModelLightningModule,
+    resolve_sample_reduction_mode,
+)
 from Utils.checkpoints import find_checkpoint
 
 
@@ -215,11 +218,6 @@ def format_run_tag_value(value: Any) -> str:
     )
 
 
-def make_dataset_balance_run_tag() -> str:
-    """Tag the fixed transcript-weighted, dataset-balanced reduction."""
-    return "DBLossOn"
-
-
 def make_dataset_selection_run_tag(cfg: DictConfig) -> str:
     """Identify the actual dataset subset in every run artifact path."""
     datasets = sorted(normalize_dataset_list(cfg_get(cfg, "experiment.dataset", [])))
@@ -237,15 +235,16 @@ def make_dataset_selection_run_tag(cfg: DictConfig) -> str:
 def make_loss_run_tag(cfg: DictConfig) -> str:
     nb_weight = format_run_tag_value(cfg_get(cfg, "loss.replica_nb_weight"))
     raw_weight = format_run_tag_value(
-        cfg_get(cfg, "loss.replica_raw_pcc_weight")
+        cfg_get(cfg, "loss.consensus_raw_pcc_weight")
     )
     vst_weight = format_run_tag_value(
-        cfg_get(cfg, "loss.replica_nb_vst_pcc_weight")
+        cfg_get(cfg, "loss.consensus_nb_vst_pcc_weight")
     )
     gamma_weight = format_run_tag_value(cfg_get(cfg, "loss.gamma_reg_weight"))
+    reduction = format_run_tag_value(resolve_sample_reduction_mode(cfg.loss))
     return (
-        f"Loss-rNB{nb_weight}-rPCC{raw_weight}"
-        f"-rVSTPCC{vst_weight}-Gamma{gamma_weight}"
+        f"Loss-rNB{nb_weight}-cPCC{raw_weight}"
+        f"-cVSTPCC{vst_weight}-Gamma{gamma_weight}-Reduce{reduction}"
     )
 
 
@@ -383,7 +382,6 @@ def make_run_tag(cfg: DictConfig) -> str:
     parts = [
         "queueNB",
         make_dataset_selection_run_tag(cfg),
-        make_dataset_balance_run_tag(),
         make_loss_run_tag(cfg),
     ]
 
@@ -1518,6 +1516,9 @@ def make_datamodule(
             "data.train_sampling_strategy",
             "transcript_grouped_multidataset_pairs",
         ),
+        minimum_positive_datasets_per_transcript=int(
+            cfg_get(cfg, "data.minimum_positive_datasets_per_transcript", 2)
+        ),
         pin_memory=cfg_bool(cfg, "data.pin_memory", True),
         prefetch_factor=cfg_get(cfg, "data.prefetch_factor", 4),
         multiprocessing_context=cfg_get(
@@ -1657,7 +1658,19 @@ def print_grouped_optimizer_batch_plan(
     print("\n=== Group-aware optimizer batch plan ===")
     rows = (
         ("selected datasets", str(len(selected_datasets))),
-        ("eligible transcript groups", str(statistics.eligible_transcript_groups)),
+        ("transcripts considered", str(statistics.transcripts_considered)),
+        ("positive-support K=0", str(statistics.transcripts_with_positive_k0)),
+        ("positive-support K=1", str(statistics.transcripts_with_positive_k1)),
+        (
+            "positive-support K>=2",
+            str(statistics.transcripts_with_positive_k2_or_more),
+        ),
+        ("transcripts admitted", str(statistics.transcripts_admitted)),
+        (
+            "transcripts excluded for support",
+            str(statistics.transcripts_excluded_for_insufficient_support),
+        ),
+        ("admitted positive pair rows", str(statistics.positive_pair_rows)),
         (
             "per-dataset pair capacity",
             str(statistics.per_dataset_pair_capacity),
@@ -1754,7 +1767,7 @@ def save_grouped_optimizer_batch_manifest(
     config_name="config_riboai_queuing_multidataset",
 )
 def main(cfg: DictConfig) -> None:
-    fixed_loss_reduction = "dataset_balanced_transcript_weighted"
+    sample_reduction = resolve_sample_reduction_mode(cfg.loss)
     seed = int(cfg.experiment.seed)
 
     pl.seed_everything(seed, workers=True)
@@ -1849,7 +1862,37 @@ def main(cfg: DictConfig) -> None:
         (paths_results / "loss_reduction_manifest.json").write_text(
             json.dumps(
                 {
-                    "fixed_loss_reduction": fixed_loss_reduction,
+                    "sample_reduction": sample_reduction,
+                    "available_sample_reductions": [
+                        "global_weighted",
+                        "dataset_balanced",
+                        "transcript_balanced",
+                    ],
+                    "dataset_quality_rank_in_loss": False,
+                    "pair_objective": {
+                        "replica_nb": {
+                            "target": "raw_replicas",
+                            "within_pair_reduction": "arithmetic_mean",
+                            "weight": float(cfg.loss.replica_nb_weight),
+                        },
+                        "raw_pcc": {
+                            "target": "arithmetic_replica_consensus",
+                            "within_pair_reduction": "once_per_pair",
+                            "weight": float(cfg.loss.consensus_raw_pcc_weight),
+                        },
+                        "nb_vst_pcc": {
+                            "target": "arithmetic_replica_consensus",
+                            "within_pair_reduction": "once_per_pair",
+                            "weight": float(
+                                cfg.loss.consensus_nb_vst_pcc_weight
+                            ),
+                        },
+                        "gamma_regularization_weight": float(
+                            cfg.loss.gamma_reg_weight
+                        ),
+                    },
+                    "checkpoint_monitor": "val_loss",
+                    "val_loss_reduction": sample_reduction,
                     "train_sampling_strategy": str(
                         cfg_get(cfg, "data.train_sampling_strategy", "unknown")
                     ),
@@ -1949,6 +1992,31 @@ def main(cfg: DictConfig) -> None:
         lit_model.configure_grouped_optimizer_batch_logging(
             plan={
                 **grouped_optimizer_plan.to_dict(),
+                "batch_support_statistics": {
+                    "transcripts_considered": (
+                        grouped_batch_statistics.transcripts_considered
+                    ),
+                    "transcripts_with_positive_k0": (
+                        grouped_batch_statistics.transcripts_with_positive_k0
+                    ),
+                    "transcripts_with_positive_k1": (
+                        grouped_batch_statistics.transcripts_with_positive_k1
+                    ),
+                    "transcripts_with_positive_k2_or_more": (
+                        grouped_batch_statistics.transcripts_with_positive_k2_or_more
+                    ),
+                    "transcripts_admitted": (
+                        grouped_batch_statistics.transcripts_admitted
+                    ),
+                    "transcripts_excluded_for_insufficient_support": (
+                        grouped_batch_statistics.transcripts_excluded_for_insufficient_support
+                    ),
+                    "positive_pair_rows": grouped_batch_statistics.positive_pair_rows,
+                    "group_size_min": grouped_batch_statistics.minimum_group_size,
+                    "group_size_median": grouped_batch_statistics.median_group_size,
+                    "group_size_mean": grouped_batch_statistics.mean_group_size,
+                    "group_size_max": grouped_batch_statistics.maximum_group_size,
+                },
             },
             enabled=cfg_bool(
                 cfg,

@@ -27,7 +27,10 @@ class RiboQueuingModel(nn.Module):
                      load.
         gamma      = exp(centered_log_score), so it is strictly positive on
                      valid positions and neutral scores give 1,
-    Gamma-score centering is a multiplicative reference/gauge constraint only.
+    Gamma uses two joint log-space gauges: the configured weighted reference
+    datasets have zero weighted log mean at every position, and every active
+    dataset-transcript profile has zero positional log mean. Thus gamma has
+    geometric mean one along both identifiable axes without altering mu.
     """
 
     def __init__(
@@ -122,6 +125,17 @@ class RiboQueuingModel(nn.Module):
                 "'batch_grouped', or 'disabled'."
             )
         mode = configured_mode
+        dataset_constant_scale_gauge = str(
+            cfg.get("dataset_constant_scale_gauge", "geometric_mean_one")
+        ).lower()
+        if dataset_constant_scale_gauge not in {
+            "geometric_mean_one",
+            "disabled",
+        }:
+            raise ValueError(
+                "gamma_centering.dataset_constant_scale_gauge must be "
+                "'geometric_mean_one' or 'disabled'."
+            )
 
         reference_cfg = dict(cfg.get("reference", {}) or {})
         weighting = str(reference_cfg.get("weighting", "equal")).lower()
@@ -205,6 +219,7 @@ class RiboQueuingModel(nn.Module):
 
         self.gamma_centering_mode = mode
         self.gamma_cross_dataset_centering_enabled = mode != "disabled"
+        self.gamma_dataset_constant_scale_gauge = dataset_constant_scale_gauge
         self.gamma_centering_weighting = weighting
         self.gamma_centering_quality_rank_power = quality_rank_power
         self.gamma_reference_chunk_size = chunk_size
@@ -239,8 +254,11 @@ class RiboQueuingModel(nn.Module):
 
     def get_extra_state(self) -> dict:
         return {
-            "version": 1,
+            "version": 2,
             "gamma_centering_mode": self.gamma_centering_mode,
+            "gamma_dataset_constant_scale_gauge": (
+                self.gamma_dataset_constant_scale_gauge
+            ),
             "gamma_reference_dataset_names": list(self.gamma_reference_dataset_names),
             "gamma_reference_manifest_hash": self.gamma_reference_manifest_hash,
             "gamma_centering_weighting": self.gamma_centering_weighting,
@@ -259,6 +277,12 @@ class RiboQueuingModel(nn.Module):
         )
         self.gamma_cross_dataset_centering_enabled = (
             self.gamma_centering_mode != "disabled"
+        )
+        self.gamma_dataset_constant_scale_gauge = str(
+            state.get(
+                "gamma_dataset_constant_scale_gauge",
+                self.gamma_dataset_constant_scale_gauge,
+            )
         )
         self.gamma_reference_dataset_names = tuple(
             str(x)
@@ -354,19 +378,27 @@ class RiboQueuingModel(nn.Module):
         id_datasets: torch.Tensor,
         dataset_quality_weights: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        """Exactly center log-gamma across distinct datasets.
+        """Apply joint cross-dataset and positional log-gamma gauges.
 
-        For every transcript-position cell, duplicate observations are first
-        averaged within dataset. Dataset means then receive either equal raw
-        weight one or a configured positive dataset-quality weight. Positions
-        represented by fewer than two datasets are left unchanged.
+        For raw scores ``a[d,t,i]`` this computes
+
+        ``g = a - c[t,i] - m[d,t] + a_bar[t]``
+
+        where ``c`` is the configured weighted mean across distinct datasets,
+        ``m`` is the valid-position mean for one dataset-transcript pair, and
+        ``a_bar`` is the same dataset-weighted mean of ``m``. This makes both
+        the weighted cross-dataset log mean and each pair's positional log mean
+        zero. Fewer than two distinct datasets retain the documented raw-score
+        fallback. Dataset quality weights are used only for this gauge.
         """
         B, T = log_gamma_raw.shape
         dtype = log_gamma_raw.dtype
         device = log_gamma_raw.device
         mask_b = mask_b.bool()
-        mask_f = mask_b.to(dtype=dtype)
-        zeros = torch.zeros_like(log_gamma_raw)
+        accum_dtype = torch.float32
+        mask_f = mask_b.to(dtype=accum_dtype)
+        raw_f = log_gamma_raw.to(dtype=accum_dtype)
+        zeros = torch.zeros(B, T, device=device, dtype=accum_dtype)
         false = torch.zeros_like(mask_b)
         dataset_ids = id_datasets.reshape(-1).to(device=device, dtype=torch.long)
         sample_id_list = self._normalize_sample_ids(sample_ids, B)
@@ -380,7 +412,7 @@ class RiboQueuingModel(nn.Module):
                     "dataset_quality_weights in the batch."
                 )
             raw_dataset_weights = dataset_quality_weights.reshape(-1).to(
-                device=device, dtype=dtype
+                device=device, dtype=accum_dtype
             )
             if raw_dataset_weights.numel() != B:
                 raise ValueError(
@@ -395,7 +427,7 @@ class RiboQueuingModel(nn.Module):
                 self.gamma_centering_quality_rank_power
             )
         else:
-            raw_dataset_weights = torch.ones(B, device=device, dtype=dtype)
+            raw_dataset_weights = torch.ones(B, device=device, dtype=accum_dtype)
         if sample_id_list is None:
             candidate = false
         else:
@@ -417,13 +449,15 @@ class RiboQueuingModel(nn.Module):
             or B <= 1
         ):
             return {
-                "log_gamma": log_gamma_raw * mask_f,
+                "log_gamma": raw_f * mask_f,
                 "gamma_center": zeros,
+                "dataset_constant_log_shift": zeros,
                 "weights": zeros,
                 "applied": false,
                 "num_distinct_datasets": zeros,
                 "total_weight": zeros,
                 "constraint_error": zeros,
+                "positional_constraint_error": zeros,
                 "eligible": candidate,
             }
 
@@ -440,8 +474,8 @@ class RiboQueuingModel(nn.Module):
         cell_index = group_index * num_datasets + dataset_index
         cell_group = torch.arange(num_cells, device=device, dtype=torch.long) // num_datasets
 
-        candidate_f = candidate.to(dtype=dtype)
-        log_safe = torch.where(candidate, log_gamma_raw, zeros)
+        candidate_f = candidate.to(dtype=accum_dtype)
+        log_safe = torch.where(candidate, raw_f, zeros)
 
         def _scatter_sum(src: torch.Tensor, index: torch.Tensor, size: int) -> torch.Tensor:
             return torch.zeros(size, T, device=device, dtype=src.dtype).index_add(
@@ -453,7 +487,7 @@ class RiboQueuingModel(nn.Module):
             log_safe, cell_index, num_cells
         ) / count_cell.clamp_min(1.0)
         cell_active = count_cell > 0
-        active_f = cell_active.to(dtype=dtype)
+        active_f = cell_active.to(dtype=accum_dtype)
         num_distinct_group = _scatter_sum(active_f, cell_group, num_groups)
         # Average duplicate samples within each dataset before weighting the
         # distinct dataset means. Replicas therefore never multiply a
@@ -488,16 +522,75 @@ class RiboQueuingModel(nn.Module):
         sample_weights = torch.where(
             candidate & apply_sample, sample_weights, torch.zeros_like(sample_weights)
         )
-        ce_contrib = sample_weights * (log_safe - center_sample)
-        constraint_error_group = _scatter_sum(ce_contrib, group_index, num_groups).abs()
-        constraint_error = torch.where(
-            applied, constraint_error_group.index_select(0, group_index), zeros
+
+        # Dataset-level positional means and their group-weighted mean use
+        # float32 accumulation even when the forward runs in bf16/fp16.
+        cell_position_count = active_f.sum(dim=1).clamp_min(1.0)
+        positional_mean_cell = (mean_cell * active_f).sum(dim=1) / cell_position_count
+        row_active = candidate.any(dim=1).to(dtype=accum_dtype)
+        row_count_cell = torch.zeros(
+            num_cells, device=device, dtype=accum_dtype
+        ).index_add(0, cell_index, row_active)
+        cell_weight = torch.zeros(
+            num_cells, device=device, dtype=accum_dtype
+        ).index_add(
+            0,
+            cell_index,
+            raw_dataset_weights * row_active,
+        ) / row_count_cell.clamp_min(1.0)
+        cell_weight = cell_weight * cell_active.any(dim=1).to(dtype=accum_dtype)
+        total_weight_scalar = torch.zeros(
+            num_groups, device=device, dtype=accum_dtype
+        ).index_add(0, cell_group, cell_weight)
+        weighted_positional_mean = torch.zeros(
+            num_groups, device=device, dtype=accum_dtype
+        ).index_add(0, cell_group, cell_weight * positional_mean_cell)
+        a_bar_group = weighted_positional_mean / total_weight_scalar.clamp_min(self.eps)
+
+        valid_len = candidate_f.sum(dim=1).clamp_min(1.0)
+        requested_positional_mean = (log_safe * candidate_f).sum(dim=1) / valid_len
+        a_bar_sample = a_bar_group.index_select(0, group_index)
+        positional_shift = (
+            requested_positional_mean - a_bar_sample
+            if self.gamma_dataset_constant_scale_gauge == "geometric_mean_one"
+            else torch.zeros_like(requested_positional_mean)
         )
-        log_gamma = (log_gamma_raw - log_center) * mask_f
+        positional_shift_2d = positional_shift.reshape(-1, 1).expand(B, T)
+        log_gamma = torch.where(
+            applied,
+            raw_f - center_sample - positional_shift_2d,
+            raw_f,
+        ) * mask_f
+
+        # Diagnostics are evaluated from the final constrained scores rather
+        # than inferred from algebra, making numerical residuals observable.
+        final_cell = _scatter_sum(
+            log_gamma * candidate_f,
+            cell_index,
+            num_cells,
+        ) / count_cell.clamp_min(1.0)
+        cross_residual_group = _scatter_sum(
+            final_cell * raw_weight_cell,
+            cell_group,
+            num_groups,
+        ) / total_weight_group.clamp_min(self.eps)
+        constraint_error = torch.where(
+            applied,
+            cross_residual_group.abs().index_select(0, group_index),
+            zeros,
+        )
+        positional_residual = (
+            (log_gamma * candidate_f).sum(dim=1) / valid_len
+        ).abs().reshape(-1, 1).expand(B, T)
 
         return {
             "log_gamma": log_gamma,
             "gamma_center": log_center * mask_f,
+            "dataset_constant_log_shift": torch.where(
+                applied,
+                positional_shift_2d,
+                zeros,
+            ) * mask_f,
             "weights": sample_weights * mask_f,
             "applied": applied & mask_b,
             "num_distinct_datasets": num_distinct * mask_f,
@@ -507,6 +600,11 @@ class RiboQueuingModel(nn.Module):
                 zeros,
             ) * mask_f,
             "constraint_error": constraint_error * mask_f,
+            "positional_constraint_error": torch.where(
+                applied,
+                positional_residual,
+                zeros,
+            ) * mask_f,
             "eligible": candidate,
         }
 
@@ -562,13 +660,15 @@ class RiboQueuingModel(nn.Module):
         device = log_gamma_raw.device
         dtype = log_gamma_raw.dtype
         mask_b = mask_b.bool()
-        mask_f = mask_b.to(dtype=dtype)
-        zeros = torch.zeros_like(log_gamma_raw)
+        accum_dtype = torch.float32
+        mask_f = mask_b.to(dtype=accum_dtype)
+        raw_requested_f = log_gamma_raw.to(dtype=accum_dtype)
+        zeros = torch.zeros(B, T, device=device, dtype=accum_dtype)
         false = torch.zeros_like(mask_b)
         reference_ids = self.gamma_reference_dataset_ids.to(device=device)
         reference_weights = self.gamma_reference_weights.to(
             device=device,
-            dtype=dtype,
+            dtype=accum_dtype,
         )
         reference_count = int(reference_ids.numel())
 
@@ -577,13 +677,15 @@ class RiboQueuingModel(nn.Module):
             or reference_count < self.gamma_reference_minimum_datasets
         ):
             return {
-                "log_gamma": log_gamma_raw * mask_f,
+                "log_gamma": raw_requested_f * mask_f,
                 "gamma_center": zeros,
+                "dataset_constant_log_shift": zeros,
                 "weights": zeros,
                 "applied": false,
                 "num_distinct_datasets": zeros,
                 "total_weight": zeros,
                 "constraint_error": zeros,
+                "positional_constraint_error": zeros,
                 "eligible": mask_b & torch.isfinite(log_gamma_raw),
                 "reference_count": torch.full(
                     (B,),
@@ -663,7 +765,12 @@ class RiboQueuingModel(nn.Module):
             num_transcripts,
             T,
             device=device,
-            dtype=dtype,
+            dtype=accum_dtype,
+        )
+        weighted_positional_mean_sum = torch.zeros(
+            num_transcripts,
+            device=device,
+            dtype=accum_dtype,
         )
         weight_sum = reference_weights.sum()
         chunk_size = min(self.gamma_reference_chunk_size, reference_count)
@@ -695,7 +802,7 @@ class RiboQueuingModel(nn.Module):
                 embedding_center_ids=self.gamma_selected_dataset_ids,
             )["gamma_raw"]
             raw_reference = (
-                raw_reference.to(device=device, dtype=dtype)
+                raw_reference.to(device=device, dtype=accum_dtype)
                 + float(self.gamma_log_init)
             )
             raw_reference = raw_reference.reshape(
@@ -706,19 +813,55 @@ class RiboQueuingModel(nn.Module):
             weighted_sum = weighted_sum + (
                 raw_reference * weights_chunk.reshape(1, chunk_count, 1)
             ).sum(dim=1)
+            reference_mask = canonical_mask.to(dtype=accum_dtype).unsqueeze(1)
+            reference_valid_len = reference_mask.sum(dim=2).clamp_min(1.0)
+            reference_positional_mean = (
+                raw_reference * reference_mask
+            ).sum(dim=2) / reference_valid_len
+            weighted_positional_mean_sum = weighted_positional_mean_sum + (
+                reference_positional_mean * weights_chunk.reshape(1, chunk_count)
+            ).sum(dim=1)
 
         center_by_transcript = weighted_sum / weight_sum.clamp_min(self.eps)
+        a_bar_by_transcript = (
+            weighted_positional_mean_sum / weight_sum.clamp_min(self.eps)
+        )
         center = center_by_transcript.index_select(0, group_index_by_row)
         applied = mask_b & torch.isfinite(log_gamma_raw)
         log_center = torch.where(applied, center, zeros)
-        log_gamma = (log_gamma_raw - log_center) * mask_f
+        requested_valid_len = mask_f.sum(dim=1).clamp_min(1.0)
+        requested_positional_mean = (
+            torch.where(applied, raw_requested_f, zeros) * mask_f
+        ).sum(dim=1) / requested_valid_len
+        a_bar = a_bar_by_transcript.index_select(0, group_index_by_row)
+        positional_shift = (
+            requested_positional_mean - a_bar
+            if self.gamma_dataset_constant_scale_gauge == "geometric_mean_one"
+            else torch.zeros_like(requested_positional_mean)
+        )
+        positional_shift_2d = positional_shift.reshape(-1, 1).expand(B, T)
+        log_gamma = torch.where(
+            applied,
+            raw_requested_f - center - positional_shift_2d,
+            zeros,
+        ) * mask_f
 
         # The weighted residual is computed without retaining all reference
         # scores: sum w(q-c) = sum(wq) - c*sum(w).
+        constraint_numerator = weighted_sum - center_by_transcript * weight_sum
+        if self.gamma_dataset_constant_scale_gauge == "geometric_mean_one":
+            constraint_numerator = (
+                constraint_numerator
+                - weighted_positional_mean_sum.reshape(-1, 1)
+                + a_bar_by_transcript.reshape(-1, 1) * weight_sum
+            )
         constraint_by_transcript = (
-            weighted_sum - center_by_transcript * weight_sum
-        ).abs() / weight_sum.clamp_min(self.eps)
+            constraint_numerator.abs() / weight_sum.clamp_min(self.eps)
+        )
         constraint = constraint_by_transcript.index_select(0, group_index_by_row)
+        positional_constraint = (
+            (log_gamma * mask_f).sum(dim=1) / requested_valid_len
+        ).abs().reshape(-1, 1).expand(B, T)
 
         requested_in_reference = (
             requested_ids.reshape(-1, 1) == reference_ids.reshape(1, -1)
@@ -728,13 +871,14 @@ class RiboQueuingModel(nn.Module):
             (
                 requested_ids.reshape(-1, 1)
                 == reference_ids.reshape(1, -1)
-            ).to(dtype=dtype)
+            ).to(dtype=accum_dtype)
             * normalized_reference_weights.reshape(1, -1)
         ).sum(dim=1)
 
         return {
             "log_gamma": log_gamma,
             "gamma_center": log_center * mask_f,
+            "dataset_constant_log_shift": positional_shift_2d * mask_f,
             "weights": requested_weights.reshape(-1, 1).expand(B, T) * mask_f,
             "applied": applied,
             "num_distinct_datasets": torch.full_like(
@@ -744,6 +888,7 @@ class RiboQueuingModel(nn.Module):
             * mask_f,
             "total_weight": weight_sum.expand_as(log_gamma_raw) * mask_f,
             "constraint_error": constraint * mask_f,
+            "positional_constraint_error": positional_constraint * mask_f,
             "eligible": applied,
             "reference_count": torch.full(
                 (B,),
@@ -990,6 +1135,14 @@ class RiboQueuingModel(nn.Module):
                 gamma_cross_dataset_log_center,
                 torch.zeros_like(gamma_cross_dataset_log_center),
             ),
+            "gamma_dataset_constant_log_shift": torch.where(
+                mask_b,
+                centered.get(
+                    "dataset_constant_log_shift",
+                    torch.zeros_like(log_gamma),
+                ),
+                torch.zeros_like(log_gamma),
+            ),
             "gamma_cross_dataset_center_group_size": gamma_cross_dataset_center_group_size,
             "gamma_cross_dataset_center_applied": gamma_cross_dataset_center_applied,
             "gamma_centering_reliability": torch.where(
@@ -1019,7 +1172,18 @@ class RiboQueuingModel(nn.Module):
                 centered["constraint_error"],
                 torch.zeros_like(centered["constraint_error"]),
             ),
+            "gamma_positional_gauge_constraint_error": torch.where(
+                mask_b,
+                centered.get(
+                    "positional_constraint_error",
+                    torch.zeros_like(log_gamma),
+                ),
+                torch.zeros_like(log_gamma),
+            ),
             "gamma_centering_mode": self.gamma_centering_mode,
+            "gamma_dataset_constant_scale_gauge": (
+                self.gamma_dataset_constant_scale_gauge
+            ),
             "gamma_reference_dataset_count": centered.get(
                 "reference_count",
                 torch.zeros(B, device=device, dtype=dtype),

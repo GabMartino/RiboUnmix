@@ -51,6 +51,13 @@ class GroupedBatchStatistics:
     selected_dataset_ids: tuple[int, ...] = ()
     per_dataset_pair_capacity: int = 0
     dataset_pair_rows_per_microbatch: tuple[tuple[int, ...], ...] = ()
+    transcripts_considered: int = 0
+    transcripts_with_positive_k0: int = 0
+    transcripts_with_positive_k1: int = 0
+    transcripts_with_positive_k2_or_more: int = 0
+    transcripts_admitted: int = 0
+    transcripts_excluded_for_insufficient_support: int = 0
+    positive_pair_rows: int = 0
 
     @property
     def median_pair_rows_per_microbatch(self) -> float:
@@ -330,8 +337,10 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
         [(t, d) for d in D(t)]
 
     as an atomic unit. Groups are packed into batches without splitting them.
-    If require_multidataset is true, transcripts with fewer than two available
-    dataset observations are skipped.
+    ``minimum_distinct_datasets`` is applied before physical packing. Therefore
+    excluded transcript groups consume no microbatch capacity and are absent
+    from the automatic gradient-accumulation preview. ``require_multidataset``
+    remains as a compatibility alias for old callers.
     """
 
     def __init__(
@@ -340,12 +349,14 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
         *,
         flat_transcript_ids: Sequence[str] | np.ndarray,
         flat_dataset_ids: Sequence[int] | np.ndarray,
+        considered_transcript_ids: Sequence[str] | np.ndarray | None = None,
         lengths,
         batch_size: int,
         seed: int = 42,
         drop_last: bool = False,
         sort_by_length: bool = True,
         require_multidataset: bool = True,
+        minimum_distinct_datasets: int | None = None,
         shuffle_batches: bool = True,
         num_replicas: int = 1,
         rank: int = 0,
@@ -366,6 +377,9 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
         self.drop_last = bool(drop_last)
         self.sort_by_length = bool(sort_by_length)
         self.require_multidataset = bool(require_multidataset)
+        if minimum_distinct_datasets is None:
+            minimum_distinct_datasets = 2 if self.require_multidataset else 1
+        self.minimum_distinct_datasets = int(minimum_distinct_datasets)
         self.shuffle_batches = bool(shuffle_batches)
         self.num_replicas = max(int(num_replicas), 1)
         self.rank = int(rank) % self.num_replicas
@@ -374,6 +388,12 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
 
         if self.batch_size <= 0:
             raise ValueError("batch_size must be positive.")
+        if self.minimum_distinct_datasets < 1:
+            raise ValueError("minimum_distinct_datasets must be at least one.")
+        if self.require_multidataset and self.minimum_distinct_datasets < 2:
+            raise ValueError(
+                "require_multidataset=True requires minimum_distinct_datasets >= 2."
+            )
         if len(self.flat_transcript_ids) != len(self.flat_dataset_ids):
             raise ValueError("flat_transcript_ids and flat_dataset_ids must have same length.")
         if len(self.flat_transcript_ids) != len(self.lengths):
@@ -395,11 +415,23 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
         grouped: dict[str, list[int]] = defaultdict(list)
         for idx, tid in enumerate(self.flat_transcript_ids):
             grouped[str(tid)].append(int(idx))
+        considered_ids = (
+            set(grouped)
+            if considered_transcript_ids is None
+            else {str(tid) for tid in considered_transcript_ids}
+        )
+        missing_considered = sorted(set(grouped) - considered_ids)
+        if missing_considered:
+            raise ValueError(
+                "Flat pair rows contain transcripts absent from "
+                f"considered_transcript_ids: {missing_considered[:10]}."
+            )
 
         groups: list[np.ndarray] = []
         group_transcript_ids: list[str] = []
         group_dataset_counts: list[int] = []
         group_lengths: list[int] = []
+        all_positive_dataset_counts: list[int] = []
         for tid in sorted(grouped):
             indices = np.asarray(grouped[tid], dtype=np.int64)
             dataset_count = len(np.unique(self.flat_dataset_ids[indices]))
@@ -409,7 +441,8 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
                     f"transcript {tid!r} has {len(indices)} rows across "
                     f"{dataset_count} distinct datasets."
                 )
-            if self.require_multidataset and dataset_count < 2:
+            all_positive_dataset_counts.append(int(dataset_count))
+            if dataset_count < self.minimum_distinct_datasets:
                 continue
             groups.append(indices)
             group_transcript_ids.append(str(tid))
@@ -430,6 +463,15 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
         self.group_full_pair_counts = np.asarray(
             [len(group) for group in self.groups], dtype=np.int64
         )
+        support = np.asarray(all_positive_dataset_counts, dtype=np.int64)
+        self.transcripts_considered = int(len(considered_ids))
+        self.transcripts_with_positive_k0 = int(len(considered_ids - set(grouped)))
+        self.transcripts_with_positive_k1 = int(np.sum(support == 1))
+        self.transcripts_with_positive_k2_or_more = int(np.sum(support >= 2))
+        self.transcripts_excluded_for_insufficient_support = int(
+            self.transcripts_considered - len(self.groups)
+        )
+        self.positive_pair_rows = int(self.group_full_pair_counts.sum())
 
     def _sample_group_indices(
         self,
@@ -561,6 +603,17 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
             selected_dataset_ids=self.selected_dataset_ids,
             per_dataset_pair_capacity=self.batch_size,
             dataset_pair_rows_per_microbatch=dataset_pair_rows,
+            transcripts_considered=self.transcripts_considered,
+            transcripts_with_positive_k0=self.transcripts_with_positive_k0,
+            transcripts_with_positive_k1=self.transcripts_with_positive_k1,
+            transcripts_with_positive_k2_or_more=(
+                self.transcripts_with_positive_k2_or_more
+            ),
+            transcripts_admitted=len(self.groups),
+            transcripts_excluded_for_insufficient_support=(
+                self.transcripts_excluded_for_insufficient_support
+            ),
+            positive_pair_rows=self.positive_pair_rows,
         )
         return batches, statistics
 
@@ -616,6 +669,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         predict_num_workers: int = 0,
         seed: int = 42,
         train_sampling_strategy: Optional[str] = None,
+        minimum_positive_datasets_per_transcript: int = 2,
         pin_memory: bool = True,
         prefetch_factor: Optional[int] = 4,
         multiprocessing_context: Optional[str] = "spawn",
@@ -641,6 +695,13 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         self.seed = int(seed)
 
         self.train_sampling_strategy = train_sampling_strategy
+        self.minimum_positive_datasets_per_transcript = int(
+            minimum_positive_datasets_per_transcript
+        )
+        if self.minimum_positive_datasets_per_transcript < 1:
+            raise ValueError(
+                "minimum_positive_datasets_per_transcript must be at least one."
+            )
 
         self.pin_memory = bool(pin_memory)
         self.prefetch_factor = prefetch_factor
@@ -696,6 +757,14 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             raise ValueError(
                 "Only transcript-grouped sampling is supported; choose one of "
                 f"{sorted(supported)}, got {strategy!r}."
+            )
+        minimum_support = self.minimum_positive_datasets_per_transcript
+        if strategy == "transcript_grouped_multidataset_pairs" and minimum_support < 2:
+            raise ValueError(
+                "data.minimum_positive_datasets_per_transcript must be at least "
+                "two for transcript_grouped_multidataset_pairs. Use "
+                "transcript_grouped_pairs with a value of one for explicitly "
+                "singleton-compatible training."
             )
         return strategy
 
@@ -785,6 +854,18 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
                 raise KeyError(f"'id' column missing in {path}")
             if "ribo" not in df.columns:
                 raise KeyError(f"'ribo' column missing in {path}")
+
+            duplicate_ids = df.loc[
+                df["id"].astype(str).duplicated(keep=False), "id"
+            ].astype(str)
+            if not duplicate_ids.empty:
+                duplicate_id = str(duplicate_ids.iloc[0])
+                duplicate_count = int((duplicate_ids == duplicate_id).sum())
+                raise ValueError(
+                    "Duplicate transcript-dataset rows are not allowed: "
+                    f"dataset={os.path.basename(path).split('.')[0]}, "
+                    f"transcript={duplicate_id}, rows={duplicate_count}."
+                )
 
             df = df.set_index("id")
             df.index = df.index.astype(str)
@@ -890,15 +971,69 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             },
         }
 
-        def _stack_replicas(cell) -> np.ndarray:
+        def _eligible_consensus_profile(
+            cell: Any,
+            *,
+            dataset_name: str,
+            transcript_id: str,
+        ) -> np.ndarray:
+            """Validate the positive consensus profile before group construction."""
+            profile = np.asarray(cell, dtype=np.float32)
+            prefix = f"dataset={dataset_name}, transcript={transcript_id}"
+            if profile.ndim != 1:
+                raise ValueError(
+                    f"Ineligible consensus profile ({prefix}): expected one "
+                    f"dimension, got shape={profile.shape}."
+                )
+            if profile.size == 0:
+                raise ValueError(
+                    f"Ineligible consensus profile ({prefix}): profile is empty."
+                )
+            if not np.all(np.isfinite(profile)):
+                raise ValueError(
+                    f"Ineligible consensus profile ({prefix}): contains non-finite counts."
+                )
+            if np.any(profile < 0.0):
+                raise ValueError(
+                    f"Ineligible consensus profile ({prefix}): contains negative counts."
+                )
+            total_reads = float(profile.sum(dtype=np.float64))
+            coverage = float(np.count_nonzero(profile > 0.0) / profile.size)
+            if total_reads <= 0.0 or coverage <= 0.0:
+                raise ValueError(
+                    f"Ineligible consensus profile ({prefix}): total_reads="
+                    f"{total_reads:g}, coverage={coverage:g}; retained training "
+                    "rows must have strictly positive reads and coverage."
+                )
+            return np.ascontiguousarray(profile)
+
+        def _stack_replicas(
+            cell: Any,
+            *,
+            dataset_name: str,
+            transcript_id: str,
+        ) -> np.ndarray:
             """Stack a per-transcript replica cell into a [n_replicas, L] array."""
             reps = [np.asarray(rep, dtype=np.float32) for rep in cell]
+            prefix = f"dataset={dataset_name}, transcript={transcript_id}"
             if len(reps) == 0:
-                raise ValueError("Encountered a transcript with zero replicas.")
+                raise ValueError(f"Encountered zero replicas for {prefix}.")
+            invalid_dimensions = [rep.shape for rep in reps if rep.ndim != 1]
+            if invalid_dimensions:
+                raise ValueError(
+                    f"Replica profiles must be one-dimensional for {prefix}; "
+                    f"invalid shapes={invalid_dimensions[:5]}."
+                )
+            if any(rep.size == 0 for rep in reps):
+                raise ValueError(f"Encountered an empty replica profile for {prefix}.")
+            if any(not np.all(np.isfinite(rep)) for rep in reps):
+                raise ValueError(f"Replica profiles contain non-finite counts for {prefix}.")
+            if any(np.any(rep < 0.0) for rep in reps):
+                raise ValueError(f"Replica profiles contain negative counts for {prefix}.")
             rep_lengths = {rep.shape[0] for rep in reps}
             if len(rep_lengths) != 1:
                 raise ValueError(
-                    f"Replica length mismatch within a transcript: {sorted(rep_lengths)}."
+                    f"Replica length mismatch for {prefix}: {sorted(rep_lengths)}."
                 )
             return np.ascontiguousarray(np.stack(reps, axis=0))
 
@@ -907,11 +1042,27 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             has_weight = "weight" in df.columns
             ids = df.index.astype(str)
             weight_values = df["weight"].values if has_weight else None
+            consensus_values = df["ribo"].values
             replica_values = df[RIBO_REPLICAS_COLUMN].values
             for i, t_id in enumerate(ids):
                 if t_id not in valid_ids:
                     continue
-                reps = _stack_replicas(replica_values[i])  # [R, L], CDS-aligned
+                consensus = _eligible_consensus_profile(
+                    consensus_values[i],
+                    dataset_name=dataset_name,
+                    transcript_id=str(t_id),
+                )
+                reps = _stack_replicas(
+                    replica_values[i],
+                    dataset_name=dataset_name,
+                    transcript_id=str(t_id),
+                )  # [R, L], CDS-aligned
+                if reps.shape[1] != consensus.shape[0]:
+                    raise ValueError(
+                        "Consensus/replica length mismatch for "
+                        f"dataset={dataset_name}, transcript={t_id}: "
+                        f"consensus={consensus.shape[0]}, replicas={reps.shape[1]}."
+                    )
                 shared_data["ribo_replicas"][t_id][dataset_name] = reps
                 # Consensus is retained for PCC and diagnostics. The NB count
                 # likelihood is always evaluated on the raw replica profiles.
@@ -983,6 +1134,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             dataset_obj=self.train_dataset_obj,
             flat_transcript_ids=self.train_flat_transcript_ids,
             flat_dataset_ids=self.train_flat_dataset_ids,
+            considered_transcript_ids=self.split[0],
             split_name="train",
         )
         self.val_dataset_obj = RiboAIQueuingDatasetMultiDataset(
@@ -1007,6 +1159,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             dataset_obj=self.val_dataset_obj,
             flat_transcript_ids=val_flat_transcript_ids,
             flat_dataset_ids=val_flat_dataset_ids,
+            considered_transcript_ids=self.split[1],
             split_name="validation",
         )
 
@@ -1016,11 +1169,22 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         dataset_obj,
         flat_transcript_ids: np.ndarray,
         flat_dataset_ids: np.ndarray,
+        considered_transcript_ids: Sequence[str] | np.ndarray,
         split_name: str,
     ) -> None:
         print(f"\n=== {split_name.capitalize()} flat-pair summary ===")
-        print(f"flat transcript-dataset pairs: {len(dataset_obj)}")
-        print(f"unique transcripts: {len(np.unique(flat_transcript_ids))}")
+        considered = int(len(set(map(str, considered_transcript_ids))))
+        unique_positive_transcripts = int(len(np.unique(flat_transcript_ids)))
+        minimum_support = (
+            self.minimum_positive_datasets_per_transcript
+            if split_name == "train"
+            and self._resolve_train_sampling_strategy()
+            == "transcript_grouped_multidataset_pairs"
+            else 1
+        )
+        print(f"positive transcript-dataset pairs: {len(dataset_obj)}")
+        print(f"transcripts considered: {considered}")
+        print(f"unique positive transcripts: {unique_positive_transcripts}")
 
         counts_by_ds = defaultdict(int)
         for ds in flat_dataset_ids:
@@ -1031,15 +1195,37 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             ds_name = getattr(dataset_obj, "idx_to_dataset", {}).get(ds_id, str(ds_id))
             print(f"  {ds_name:35s} id={ds_id:3d} pairs={n}")
 
-        k_by_t = defaultdict(int)
-        for tid in flat_transcript_ids:
-            k_by_t[str(tid)] += 1
+        datasets_by_t: dict[str, set[int]] = defaultdict(set)
+        for tid, dataset_id in zip(
+            flat_transcript_ids,
+            flat_dataset_ids,
+            strict=True,
+        ):
+            datasets_by_t[str(tid)].add(int(dataset_id))
 
-        k_values = np.asarray(list(k_by_t.values()), dtype=np.int64)
+        k_values = np.asarray(
+            [len(dataset_ids) for dataset_ids in datasets_by_t.values()],
+            dtype=np.int64,
+        )
         unique_k, k_counts = np.unique(k_values, return_counts=True)
-        print("transcripts by number of available datasets:")
+        k0 = int(max(considered - len(k_values), 0))
+        k1 = int(np.sum(k_values == 1))
+        k2_or_more = int(np.sum(k_values >= 2))
+        admitted = int(np.sum(k_values >= minimum_support))
+        excluded = int(considered - admitted)
+        admitted_pairs = int(
+            np.sum(k_values[k_values >= minimum_support], dtype=np.int64)
+        )
+        print("transcripts by number of positive eligible datasets:")
+        print(f"  K=0: {k0}")
+        print(f"  K=1: {k1}")
+        print(f"  K>=2: {k2_or_more}")
         for k, n in zip(unique_k, k_counts):
             print(f"  k={int(k):2d}: transcripts={int(n)}")
+        print(f"minimum support for this loader: {minimum_support}")
+        print(f"transcripts admitted: {admitted}")
+        print(f"transcripts excluded for insufficient support: {excluded}")
+        print(f"admitted positive pair rows: {admitted_pairs}")
 
         sample_weights = getattr(dataset_obj, "flat_sample_weights", None)
         if sample_weights is not None:
@@ -1100,6 +1286,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         return TranscriptGroupedMultiDatasetBatchSampler(
             flat_transcript_ids=self.train_flat_transcript_ids,
             flat_dataset_ids=self.train_flat_dataset_ids,
+            considered_transcript_ids=self.split[0],
             lengths=self.train_lengths,
             batch_size=self.batch_size,
             seed=self.seed if iteration_seed is None else int(iteration_seed),
@@ -1107,6 +1294,11 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             sort_by_length=True,
             require_multidataset=(
                 strategy == "transcript_grouped_multidataset_pairs"
+            ),
+            minimum_distinct_datasets=(
+                self.minimum_positive_datasets_per_transcript
+                if strategy == "transcript_grouped_multidataset_pairs"
+                else 1
             ),
             num_replicas=max(int(num_replicas), 1),
             rank=int(rank),
@@ -1167,12 +1359,14 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         batch_sampler = TranscriptGroupedMultiDatasetBatchSampler(
             flat_transcript_ids=self.val_flat_transcript_ids,
             flat_dataset_ids=self.val_flat_dataset_ids,
+            considered_transcript_ids=self.split[1],
             lengths=self.val_lengths,
             batch_size=self.batch_size,
             seed=self.seed,
             drop_last=False,
             sort_by_length=True,
             require_multidataset=False,
+            minimum_distinct_datasets=1,
             shuffle_batches=False,
             num_replicas=num_replicas,
             rank=rank,
@@ -1197,12 +1391,14 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         batch_sampler = TranscriptGroupedMultiDatasetBatchSampler(
             flat_transcript_ids=self.val_flat_transcript_ids,
             flat_dataset_ids=self.val_flat_dataset_ids,
+            considered_transcript_ids=self.split[1],
             lengths=self.val_lengths,
             batch_size=self.batch_size,
             drop_last=False,
             seed=self.seed,
             sort_by_length=True,
             require_multidataset=False,
+            minimum_distinct_datasets=1,
             shuffle_batches=False,
             num_replicas=num_replicas,
             rank=rank,
