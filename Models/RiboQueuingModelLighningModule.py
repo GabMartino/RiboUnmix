@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-import csv
-import json
 import math
 from pathlib import Path
 from typing import Any
 
 import lightning as pl
 import matplotlib
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 
@@ -304,572 +304,6 @@ def masked_pcc(
     }
 
 
-class ResidualDiagnosticsAccumulator:
-    def __init__(
-        self,
-        *,
-        dataset_id_to_name: dict[int, str],
-        eps: float = 1.0e-8,
-        eps_count: float = 1.0e-3,
-        zero_threshold: float = 0.0,
-        low_count_threshold: float = 1.0,
-        tail_thresholds: tuple[float, ...] = (2.0, 3.0, 5.0),
-        topk_fractions: tuple[float, ...] = (0.01, 0.05, 0.10),
-        quantile_max_values: int = 1_000_000,
-    ) -> None:
-        self.dataset_id_to_name = dict(dataset_id_to_name)
-        self.eps = float(eps)
-        self.eps_count = float(eps_count)
-        self.zero_threshold = float(zero_threshold)
-        self.low_count_threshold = float(low_count_threshold)
-        self.tail_thresholds = tuple(float(x) for x in tail_thresholds)
-        self.topk_fractions = tuple(float(x) for x in topk_fractions)
-        self.quantile_max_values = max(1, int(quantile_max_values))
-        self.reset()
-
-    def reset(self) -> None:
-        self.position_chunks: list[dict[str, torch.Tensor]] = []
-        self.sample_rows: list[dict[str, float | int | str]] = []
-        self.dataset_rows: list[dict[str, float | int | str]] = []
-
-    def _dataset_name(self, dataset_id: int) -> str:
-        return self.dataset_id_to_name.get(int(dataset_id), str(int(dataset_id)))
-
-    def _quantile_values(self, x: torch.Tensor) -> torch.Tensor:
-        """Return a bounded, deterministic view used only for diagnostics.
-
-        ``torch.quantile`` rejects tensors above an internal element-count
-        limit. Large validation sets can cross that limit when all positions
-        from many datasets are concatenated. Sampling evenly across the
-        flattened tensor keeps the diagnostic reproducible and prevents both
-        that failure and an unnecessarily expensive full-data sort.
-
-        This does not affect losses, model outputs, or gradients: residual
-        diagnostics are accumulated under ``torch.no_grad()`` on CPU.
-        """
-        values = x.detach().float().reshape(-1)
-        if values.numel() <= self.quantile_max_values:
-            return values
-
-        # Midpoints of equally sized intervals cover the complete validation
-        # tensor without allocating a full randperm of a potentially huge N.
-        sample_positions = torch.arange(
-            self.quantile_max_values,
-            device=values.device,
-            dtype=torch.float64,
-        )
-        indices = torch.floor(
-            (sample_positions + 0.5)
-            * (float(values.numel()) / float(self.quantile_max_values))
-        ).to(dtype=torch.long)
-        return values.index_select(0, indices.clamp_max(values.numel() - 1))
-
-    def _safe_quantiles(
-        self,
-        x: torch.Tensor,
-        q: float | list[float] | tuple[float, ...] | torch.Tensor,
-    ) -> torch.Tensor:
-        if x.numel() == 0:
-            if torch.is_tensor(q) and q.ndim > 0:
-                return torch.zeros_like(q, dtype=torch.float32)
-            if isinstance(q, (list, tuple)):
-                return torch.zeros(len(q), dtype=torch.float32)
-            return x.new_tensor(0.0, dtype=torch.float32)
-        values = self._quantile_values(x)
-        q_tensor = torch.as_tensor(q, dtype=torch.float32, device=values.device)
-        return torch.quantile(values, q_tensor)
-
-    def _safe_quantile(self, x: torch.Tensor, q: float) -> torch.Tensor:
-        return self._safe_quantiles(x, float(q))
-
-    @staticmethod
-    def _mean_or_zero(x: torch.Tensor) -> torch.Tensor:
-        if x.numel() == 0:
-            return torch.tensor(0.0)
-        return x.float().mean()
-
-    def _corr_or_zero(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        valid = torch.isfinite(x) & torch.isfinite(y)
-        if int(valid.sum().item()) < 2:
-            return x.new_tensor(0.0)
-        x = x[valid].float()
-        y = y[valid].float()
-        x_centered = x - x.mean()
-        y_centered = y - y.mean()
-        denom = torch.sqrt(
-            x_centered.pow(2).sum() * y_centered.pow(2).sum()
-        ).clamp_min(self.eps)
-        return (x_centered * y_centered).sum() / denom
-
-    def _nb_zero_probability(self, mu: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
-        alpha = alpha.clamp_min(self.eps)
-        r = (1.0 / alpha).clamp_max(1.0e8)
-        return torch.exp(r * (torch.log(r.clamp_min(self.eps)) - torch.log((r + mu).clamp_min(self.eps))))
-
-    def update(self, out: dict[str, Any]) -> None:
-        with torch.no_grad():
-            target = out["target"].detach().float().cpu()
-            mu = out["mu"].detach().float().cpu()
-            log_alpha = out["log_sigma"].detach().float().cpu()
-            mask = out["mask"].detach().bool().cpu() & torch.isfinite(target)
-            dataset_ids = out["dataset_ids"].detach().long().cpu()
-            lengths = out["lengths"].detach().long().cpu()
-            transcript_ids = out.get("ids", None)
-            sample_weights = out.get("sample_weights", None)
-            if torch.is_tensor(sample_weights):
-                sample_weights_cpu = sample_weights.detach().float().cpu().reshape(-1)
-            else:
-                sample_weights_cpu = None
-            extras = out["extras"]
-            L_bio = extras["L_bio"].detach().float().cpu()
-            J = extras["J"].detach().float().cpu().reshape(-1)
-            scale_dt = extras["scale_dt"].detach().float().cpu().reshape(-1)
-
-            alpha = torch.exp(_broadcast_profile_param(log_alpha, mu.shape)).clamp(
-                min=1.0e-8,
-                max=1.0e8,
-            )
-            variance = (mu + alpha * mu.pow(2)).clamp_min(self.eps)
-            nb_std = (target - mu) / torch.sqrt(variance + self.eps)
-            additive = target - mu
-            log_residual = torch.log(target.clamp_min(0.0) + self.eps_count) - torch.log(
-                mu.clamp_min(0.0) + self.eps_count
-            )
-            relative = additive / (mu + self.eps_count)
-
-            B, T = target.shape
-            pos = torch.arange(T).reshape(1, T).expand(B, T)
-            rel_pos = pos.float() / (lengths.reshape(-1, 1).float() - 1.0).clamp_min(1.0)
-            dataset_pos = dataset_ids.reshape(-1, 1).expand(B, T)
-            length_pos = lengths.reshape(-1, 1).expand(B, T)
-            J_pos = J.reshape(-1, 1).expand(B, T)
-            S_pos = scale_dt.reshape(-1, 1).expand(B, T)
-
-            valid = mask
-            if bool(valid.any()):
-                self.position_chunks.append(
-                    {
-                        "dataset_id": dataset_pos[valid],
-                        "pos": pos[valid],
-                        "length": length_pos[valid],
-                        "rel_pos": rel_pos[valid],
-                        "target": target[valid],
-                        "mu": mu[valid],
-                        "alpha": alpha[valid],
-                        "nb_std": nb_std[valid],
-                        "additive": additive[valid],
-                        "log_residual": log_residual[valid],
-                        "relative": relative[valid],
-                        "L_bio": L_bio[valid],
-                        "J": J_pos[valid],
-                        "S": S_pos[valid],
-                    }
-                )
-
-            for sample_idx in range(B):
-                m = mask[sample_idx]
-                if not bool(m.any()):
-                    continue
-                dataset_id = int(dataset_ids[sample_idx].item())
-                y_i = target[sample_idx][m]
-                mu_i = mu[sample_idx][m]
-                alpha_i = alpha[sample_idx][m]
-                nb_i = nb_std[sample_idx][m].abs()
-                nb_signed_i = nb_std[sample_idx][m]
-                additive_i = additive[sample_idx][m]
-                log_i = log_residual[sample_idx][m]
-                abs_sum = nb_i.sum().clamp_min(self.eps)
-                y_nonneg = y_i.clamp_min(0.0)
-                mu_nonneg = mu_i.clamp_min(0.0)
-                target_mean = y_i.mean()
-                mu_mean = mu_i.mean()
-                read_depth = y_i.sum()
-                mu_depth = mu_i.sum()
-                log1p_y = torch.log1p(y_nonneg)
-                log1p_mu = torch.log1p(mu_nonneg)
-                alpha_i = alpha_i.clamp_min(self.eps)
-                r = (1.0 / alpha_i).clamp_max(1.0e8)
-                nb_log_prob = (
-                    torch.lgamma(y_nonneg + r)
-                    - torch.lgamma(r)
-                    - torch.lgamma(y_nonneg + 1.0)
-                    + r
-                    * (
-                        torch.log(r.clamp_min(self.eps))
-                        - torch.log((r + mu_nonneg).clamp_min(self.eps))
-                    )
-                    + y_nonneg
-                    * (
-                        torch.log(mu_nonneg.clamp_min(self.eps))
-                        - torch.log((r + mu_nonneg).clamp_min(self.eps))
-                    )
-                )
-
-                if isinstance(transcript_ids, (list, tuple)):
-                    transcript_id = str(transcript_ids[sample_idx])
-                elif torch.is_tensor(transcript_ids):
-                    transcript_id = str(transcript_ids.detach().cpu().reshape(-1)[sample_idx].item())
-                elif transcript_ids is None:
-                    transcript_id = str(sample_idx)
-                else:
-                    try:
-                        transcript_id = str(transcript_ids[sample_idx])
-                    except Exception:
-                        transcript_id = str(sample_idx)
-
-                row: dict[str, float | int | str] = {
-                    "dataset_id": dataset_id,
-                    "dataset_name": self._dataset_name(dataset_id),
-                    "transcript_id": transcript_id,
-                    "valid_len": int(m.sum().item()),
-                    "sample_weight": (
-                        float(sample_weights_cpu[sample_idx].item())
-                        if sample_weights_cpu is not None and sample_idx < sample_weights_cpu.numel()
-                        else 1.0
-                    ),
-                    "read_depth": float(read_depth.item()),
-                    "mu_depth": float(mu_depth.item()),
-                    "target_mean": float(target_mean.item()),
-                    "mu_mean": float(mu_mean.item()),
-                    "mean_ratio": float((mu_mean / target_mean.clamp_min(self.eps)).item()),
-                    "coverage_fraction": float((y_i > self.zero_threshold).float().mean().item()),
-                    "low_count_fraction": float((y_i <= self.low_count_threshold).float().mean().item()),
-                    "target_var": float(y_i.var(unbiased=False).item()),
-                    "mu_var": float(mu_i.var(unbiased=False).item()),
-                    "target_max": float(y_i.max().item()),
-                    "mu_max": float(mu_i.max().item()),
-                    "nb_nll_mean": float((-nb_log_prob).mean().item()),
-                    "nb_std_mean": float(nb_signed_i.mean().item()),
-                    "nb_std_abs_mean": float(nb_i.mean().item()),
-                    "nb_std_q95_abs": float(self._safe_quantile(nb_i, 0.95).item()),
-                    "mean_additive_residual": float(additive_i.mean().item()),
-                    "mean_abs_additive_residual": float(additive_i.abs().mean().item()),
-                    "mean_log_residual": float(log_i.mean().item()),
-                    "mean_abs_log_residual": float(log_i.abs().mean().item()),
-                    "profile_log1p_mse": float((log1p_mu - log1p_y).pow(2).mean().item()),
-                    "profile_pcc": float(self._corr_or_zero(mu_i, y_i).item()),
-                    "log1p_profile_pcc": float(self._corr_or_zero(log1p_mu, log1p_y).item()),
-                    "J": float(J[sample_idx].item()) if sample_idx < J.numel() else 0.0,
-                    "scale_dt": float(scale_dt[sample_idx].item()) if sample_idx < scale_dt.numel() else 0.0,
-                }
-                for thr in (3.0, 5.0):
-                    tail = nb_i > thr
-                    row[f"tail_fraction_gt_{thr:g}"] = float(tail.float().mean().item())
-                    row[f"tail_mass_gt_{thr:g}"] = float((nb_i[tail].sum() / abs_sum).item()) if bool(tail.any()) else 0.0
-                for frac in self.topk_fractions:
-                    k = max(1, int(math.ceil(float(frac) * nb_i.numel())))
-                    row[f"top_{int(frac * 100):g}pct_abs_mass"] = float((torch.topk(nb_i, k).values.sum() / abs_sum).item())
-
-                for frac in (0.10, 0.05, 0.01):
-                    k = max(1, int(math.ceil(float(frac) * y_i.numel())))
-                    target_top = torch.topk(y_i, k).indices
-                    mu_top = torch.topk(mu_i, k).indices
-                    row[f"peak_mu_over_y_top_{int(frac * 100):g}"] = float(
-                        (mu_i[target_top] / (y_i[target_top] + self.eps_count)).mean().item()
-                    )
-                    row[f"peak_log_residual_top_{int(frac * 100):g}"] = float(
-                        log_i[target_top].mean().item()
-                    )
-                    overlap = len(set(target_top.tolist()) & set(mu_top.tolist()))
-                    row[f"top{int(frac * 100):g}_overlap"] = float(overlap / k)
-                self.sample_rows.append(row)
-
-    def _concat_positions(self) -> dict[str, torch.Tensor]:
-        if not self.position_chunks:
-            return {}
-        keys = self.position_chunks[0].keys()
-        return {key: torch.cat([chunk[key] for chunk in self.position_chunks]) for key in keys}
-
-    def _summarize_positions(self, data: dict[str, torch.Tensor], mask: torch.Tensor, prefix: str) -> dict[str, torch.Tensor]:
-        out: dict[str, torch.Tensor] = {}
-        if not bool(mask.any()):
-            return out
-        nb = data["nb_std"][mask].float()
-        abs_nb = nb.abs()
-        additive = data["additive"][mask].float()
-        log_res = data["log_residual"][mask].float()
-        mu = data["mu"][mask].float()
-        target = data["target"][mask].float()
-        alpha = data["alpha"][mask].float()
-        L_bio = data["L_bio"][mask].float()
-        J = data["J"][mask].float()
-        centered = nb - nb.mean()
-        std = nb.std(unbiased=False).clamp_min(self.eps)
-
-        out[f"{prefix}/nb_std_mean"] = nb.mean()
-        out[f"{prefix}/nb_std_std"] = nb.std(unbiased=False)
-        out[f"{prefix}/nb_std_abs_mean"] = abs_nb.mean()
-        out[f"{prefix}/nb_std_median"] = nb.median()
-        out[f"{prefix}/nb_std_q90_abs"] = self._safe_quantile(abs_nb, 0.90)
-        out[f"{prefix}/nb_std_q95_abs"] = self._safe_quantile(abs_nb, 0.95)
-        out[f"{prefix}/nb_std_q99_abs"] = self._safe_quantile(abs_nb, 0.99)
-        for thr in self.tail_thresholds:
-            out[f"{prefix}/fraction_abs_std_gt_{thr:g}"] = (abs_nb > thr).float().mean()
-        out[f"{prefix}/skewness"] = (centered.pow(3).mean() / std.pow(3)).nan_to_num()
-        out[f"{prefix}/kurtosis"] = (centered.pow(4).mean() / std.pow(4)).nan_to_num()
-
-        abs_sum = abs_nb.sum().clamp_min(self.eps)
-        for thr in (3.0, 5.0):
-            tail = abs_nb > thr
-            out[f"{prefix}/tail_fraction_abs_gt_{thr:g}"] = tail.float().mean()
-            out[f"{prefix}/tail_mass_abs_gt_{thr:g}"] = abs_nb[tail].sum() / abs_sum if bool(tail.any()) else nb.new_tensor(0.0)
-        for frac in (0.01, 0.05):
-            k = max(1, int(math.ceil(frac * abs_nb.numel())))
-            out[f"{prefix}/top_{int(frac * 100):g}pct_abs_mass"] = torch.topk(abs_nb, k).values.sum() / abs_sum
-
-        low_mu_cut = self._safe_quantile(mu, 0.10)
-        high_mu_cut = self._safe_quantile(mu, 0.90)
-        low_mu = mu <= low_mu_cut
-        high_mu = mu >= high_mu_cut
-        out[f"{prefix}/low_mu_additive_bias"] = self._mean_or_zero(additive[low_mu])
-        out[f"{prefix}/high_mu_log_bias"] = self._mean_or_zero(log_res[high_mu])
-
-        zero = target <= self.zero_threshold
-        low_count = target <= self.low_count_threshold
-        p0 = self._nb_zero_probability(mu, alpha)
-        out[f"{prefix}/zero_fraction"] = zero.float().mean()
-        out[f"{prefix}/low_count_fraction"] = low_count.float().mean()
-        out[f"{prefix}/zero_mean_mu"] = self._mean_or_zero(mu[zero])
-        out[f"{prefix}/zero_median_mu"] = mu[zero].median() if bool(zero.any()) else mu.new_tensor(0.0)
-        out[f"{prefix}/zero_q95_mu"] = self._safe_quantile(mu[zero], 0.95)
-        out[f"{prefix}/zero_mean_alpha"] = self._mean_or_zero(alpha[zero])
-        out[f"{prefix}/zero_mean_nb_p0"] = self._mean_or_zero(p0[zero])
-        out[f"{prefix}/zero_fraction_mu_gt_1"] = (mu[zero] > 1.0).float().mean() if bool(zero.any()) else mu.new_tensor(0.0)
-        out[f"{prefix}/zero_fraction_mu_gt_5"] = (mu[zero] > 5.0).float().mean() if bool(zero.any()) else mu.new_tensor(0.0)
-
-        out[f"{prefix}/alpha_mean"] = alpha.mean()
-        out[f"{prefix}/L_bio_mean"] = L_bio.mean()
-        out[f"{prefix}/L_bio_max"] = L_bio.max()
-        out[f"{prefix}/J_mean"] = J.mean()
-        out[f"{prefix}/mean_ratio"] = mu.mean() / target.mean().clamp_min(self.eps)
-        return out
-
-    def _mu_bin_metrics(self, data: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        out: dict[str, torch.Tensor] = {}
-        if not data:
-            return out
-        mu = data["mu"].float()
-        additive = data["additive"].float()
-        log_res = data["log_residual"].float()
-        nb = data["nb_std"].float()
-        quantiles = [0.0, 0.10, 0.25, 0.50, 0.75, 0.90, 0.99, 1.0]
-        edges = self._safe_quantiles(mu, quantiles)
-        names = ["q0_q10", "q10_q25", "q25_q50", "q50_q75", "q75_q90", "q90_q99", "q99_q100"]
-        for i, name in enumerate(names):
-            if i == 0:
-                m = (mu >= edges[i]) & (mu <= edges[i + 1])
-            else:
-                m = (mu > edges[i]) & (mu <= edges[i + 1])
-            prefix = f"residual/mu_bin/{name}"
-            out[f"{prefix}/mean_additive_residual"] = self._mean_or_zero(additive[m])
-            out[f"{prefix}/median_additive_residual"] = additive[m].median() if bool(m.any()) else mu.new_tensor(0.0)
-            out[f"{prefix}/mean_log_residual"] = self._mean_or_zero(log_res[m])
-            out[f"{prefix}/median_log_residual"] = log_res[m].median() if bool(m.any()) else mu.new_tensor(0.0)
-            out[f"{prefix}/nb_std_residual_mean"] = self._mean_or_zero(nb[m])
-            out[f"{prefix}/nb_std_residual_abs_mean"] = self._mean_or_zero(nb[m].abs())
-        return out
-
-    def _basic_bin_summary(
-        self,
-        data: dict[str, torch.Tensor],
-        mask: torch.Tensor,
-        prefix: str,
-    ) -> dict[str, torch.Tensor]:
-        if not bool(mask.any()):
-            z = data["mu"].new_tensor(0.0)
-            return {
-                f"{prefix}/nb_std_mean": z,
-                f"{prefix}/nb_std_abs_mean": z,
-                f"{prefix}/frac_abs_std_gt_3": z,
-                f"{prefix}/mean_additive_residual": z,
-                f"{prefix}/mean_log_residual": z,
-                f"{prefix}/mean_mu": z,
-                f"{prefix}/mean_target": z,
-            }
-        nb = data["nb_std"][mask].float()
-        return {
-            f"{prefix}/nb_std_mean": nb.mean(),
-            f"{prefix}/nb_std_abs_mean": nb.abs().mean(),
-            f"{prefix}/frac_abs_std_gt_3": (nb.abs() > 3.0).float().mean(),
-            f"{prefix}/mean_additive_residual": data["additive"][mask].float().mean(),
-            f"{prefix}/mean_log_residual": data["log_residual"][mask].float().mean(),
-            f"{prefix}/mean_mu": data["mu"][mask].float().mean(),
-            f"{prefix}/mean_target": data["target"][mask].float().mean(),
-        }
-
-    def _quantile_stratification_metrics(
-        self,
-        data: dict[str, torch.Tensor],
-        key: str,
-        prefix: str,
-    ) -> dict[str, torch.Tensor]:
-        out: dict[str, torch.Tensor] = {}
-        values = data[key].float()
-        if values.numel() == 0:
-            return out
-        quantiles = [0.0, 0.10, 0.25, 0.50, 0.75, 0.90, 0.99, 1.0]
-        edges = self._safe_quantiles(values, quantiles)
-        names = ["q0_q10", "q10_q25", "q25_q50", "q50_q75", "q75_q90", "q90_q99", "q99_q100"]
-        for i, name in enumerate(names):
-            if i == 0:
-                mask = (values >= edges[i]) & (values <= edges[i + 1])
-            else:
-                mask = (values > edges[i]) & (values <= edges[i + 1])
-            out.update(self._basic_bin_summary(data, mask, f"{prefix}/{name}"))
-        return out
-
-    def _stratification_metrics(self, data: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        out: dict[str, torch.Tensor] = {}
-        if not data:
-            return out
-
-        length = data["length"].float()
-        out.update(self._basic_bin_summary(data, length < 500.0, "residual/length_bin/short"))
-        out.update(
-            self._basic_bin_summary(
-                data,
-                (length >= 500.0) & (length < 1500.0),
-                "residual/length_bin/medium",
-            )
-        )
-        out.update(self._basic_bin_summary(data, length >= 1500.0, "residual/length_bin/long"))
-
-        pos = data["pos"].float()
-        rel_pos = data["rel_pos"].float()
-        out.update(self._basic_bin_summary(data, pos < 50.0, "residual/position_bin/start"))
-        out.update(self._basic_bin_summary(data, rel_pos < 0.25, "residual/position_bin/early"))
-        out.update(
-            self._basic_bin_summary(
-                data,
-                (rel_pos >= 0.25) & (rel_pos < 0.75),
-                "residual/position_bin/middle",
-            )
-        )
-        out.update(self._basic_bin_summary(data, rel_pos >= 0.75, "residual/position_bin/late"))
-        out.update(
-            self._basic_bin_summary(
-                data,
-                pos >= (length - 50.0).clamp_min(0.0),
-                "residual/position_bin/stop",
-            )
-        )
-
-        out.update(self._quantile_stratification_metrics(data, "target", "residual/target_quantile"))
-        out.update(self._quantile_stratification_metrics(data, "L_bio", "residual/L_bio_quantile"))
-        return out
-
-    def _dataset_csv_rows(self, data: dict[str, torch.Tensor]) -> list[dict[str, Any]]:
-        rows: list[dict[str, Any]] = []
-        if not data:
-            return rows
-        sample_by_dataset: dict[int, list[dict[str, float | int | str]]] = {}
-        for row in self.sample_rows:
-            sample_by_dataset.setdefault(int(row["dataset_id"]), []).append(row)
-
-        for dataset_id_tensor in torch.unique(data["dataset_id"]):
-            dataset_id = int(dataset_id_tensor.item())
-            mask = data["dataset_id"] == dataset_id
-            summary = self._summarize_positions(data, mask, f"residual/{self._dataset_name(dataset_id)}")
-            samples = sample_by_dataset.get(dataset_id, [])
-
-            def avg_sample(key: str) -> float:
-                vals = [float(r[key]) for r in samples if key in r]
-                return float(sum(vals) / len(vals)) if vals else 0.0
-
-            rows.append(
-                {
-                    "dataset_name": self._dataset_name(dataset_id),
-                    "n_samples": len(samples),
-                    "n_positions": int(mask.sum().item()),
-                    "mean_ratio": float(summary.get(f"residual/{self._dataset_name(dataset_id)}/mean_ratio", torch.tensor(0.0)).item()),
-                    "nb_std_mean": float(summary.get(f"residual/{self._dataset_name(dataset_id)}/nb_std_mean", torch.tensor(0.0)).item()),
-                    "nb_std_std": float(summary.get(f"residual/{self._dataset_name(dataset_id)}/nb_std_std", torch.tensor(0.0)).item()),
-                    "frac_abs_std_gt_3": float(summary.get(f"residual/{self._dataset_name(dataset_id)}/fraction_abs_std_gt_3", torch.tensor(0.0)).item()),
-                    "frac_abs_std_gt_5": float(summary.get(f"residual/{self._dataset_name(dataset_id)}/fraction_abs_std_gt_5", torch.tensor(0.0)).item()),
-                    "tail_mass_gt_3": float(summary.get(f"residual/{self._dataset_name(dataset_id)}/tail_mass_abs_gt_3", torch.tensor(0.0)).item()),
-                    "tail_mass_gt_5": float(summary.get(f"residual/{self._dataset_name(dataset_id)}/tail_mass_abs_gt_5", torch.tensor(0.0)).item()),
-                    "low_mu_additive_bias": float(summary.get(f"residual/{self._dataset_name(dataset_id)}/low_mu_additive_bias", torch.tensor(0.0)).item()),
-                    "high_mu_log_bias": float(summary.get(f"residual/{self._dataset_name(dataset_id)}/high_mu_log_bias", torch.tensor(0.0)).item()),
-                    "zero_fraction": float(summary.get(f"residual/{self._dataset_name(dataset_id)}/zero_fraction", torch.tensor(0.0)).item()),
-                    "zero_mean_mu": float(summary.get(f"residual/{self._dataset_name(dataset_id)}/zero_mean_mu", torch.tensor(0.0)).item()),
-                    "peak_mu_over_y_top1": avg_sample("peak_mu_over_y_top_1"),
-                    "top1_overlap": avg_sample("top1_overlap"),
-                    "alpha_mean": float(summary.get(f"residual/{self._dataset_name(dataset_id)}/alpha_mean", torch.tensor(0.0)).item()),
-                }
-            )
-        return rows
-
-    def compute(self) -> tuple[dict[str, torch.Tensor], list[dict[str, Any]], dict[str, Any]]:
-        data = self._concat_positions()
-        if not data:
-            return {}, [], {}
-        all_mask = torch.ones_like(data["mu"], dtype=torch.bool)
-        metrics = self._summarize_positions(data, all_mask, "residual")
-        metrics.update(self._mu_bin_metrics(data))
-        metrics.update(self._stratification_metrics(data))
-
-        for dataset_id_tensor in torch.unique(data["dataset_id"]):
-            dataset_id = int(dataset_id_tensor.item())
-            dataset_name = self._dataset_name(dataset_id)
-            metrics.update(
-                self._summarize_positions(
-                    data,
-                    data["dataset_id"] == dataset_id,
-                    f"residual/{dataset_name}",
-                )
-            )
-
-        rows = self._dataset_csv_rows(data)
-        report = self._decision_report(metrics)
-        return metrics, rows, report
-
-    def _decision_report(self, metrics: dict[str, torch.Tensor]) -> dict[str, Any]:
-        nb_std = float(metrics.get("residual/nb_std_std", torch.tensor(0.0)).item())
-        frac3 = float(metrics.get("residual/fraction_abs_std_gt_3", torch.tensor(0.0)).item())
-        tail_mass3 = float(metrics.get("residual/tail_mass_abs_gt_3", torch.tensor(0.0)).item())
-        low_mu_bias = float(metrics.get("residual/low_mu_additive_bias", torch.tensor(0.0)).item())
-        high_mu_log_bias = float(metrics.get("residual/high_mu_log_bias", torch.tensor(0.0)).item())
-        zero_mu = float(metrics.get("residual/zero_mean_mu", torch.tensor(0.0)).item())
-        zero_p0 = float(metrics.get("residual/zero_mean_nb_p0", torch.tensor(1.0)).item())
-        recommendations = []
-        if 0.75 <= nb_std <= 1.25 and frac3 < 0.02:
-            recommendations.append("NB calibration looks broadly adequate.")
-        if low_mu_bias > 0.1:
-            recommendations.append("Positive low-mu additive bias suggests additive background/floor.")
-        if abs(high_mu_log_bias) > 0.25:
-            recommendations.append("High-mu log residual bias suggests gamma/L_bio or additive-bias adjustment.")
-        if frac3 < 0.05 and tail_mass3 > 0.25:
-            recommendations.append("Sparse residual tail concentration suggests outlier/contamination diagnostics.")
-        if zero_mu > 1.0 and zero_p0 < 0.25:
-            recommendations.append("Zeros with high mu and low NB p0 suggest dropout/censoring.")
-        return {
-            "nb_std_std": nb_std,
-            "frac_abs_std_gt_3": frac3,
-            "tail_mass_abs_gt_3": tail_mass3,
-            "low_mu_additive_bias": low_mu_bias,
-            "high_mu_log_bias": high_mu_log_bias,
-            "zero_mean_mu": zero_mu,
-            "zero_mean_nb_p0": zero_p0,
-            "recommendations": recommendations,
-        }
-
-    @staticmethod
-    def export_csv(rows: list[dict[str, Any]], path: str | Path) -> None:
-        if not rows:
-            return
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fieldnames: list[str] = []
-        for row in rows:
-            for key in row:
-                if str(key) not in fieldnames:
-                    fieldnames.append(str(key))
-        with path.open("w", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(rows)
-
-
 class NegativeBinomialProfileLoss(nn.Module):
     """
     Negative Binomial profile NLL.
@@ -1150,45 +584,207 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         self.pcc_prediction_floor = float(
             getattr(loss_cfg, "pcc_prediction_floor", 0.0)
         )
-        residual_cfg = getattr(self.config, "residual_diagnostics", None)
-
-        def residual_cfg_get(name: str, default: Any) -> Any:
-            if residual_cfg is None:
-                return default
-            return getattr(residual_cfg, name, default)
-
-        self.residual_diag_enabled = bool(residual_cfg_get("enabled", True))
-        self.residual_diag_run_on_validation = bool(
-            residual_cfg_get("run_on_validation", True)
+        metrics_cfg = getattr(self.config, "metrics", None)
+        self.log_validation_transcript_mu_pcc_distribution = bool(
+            getattr(
+                metrics_cfg,
+                "log_validation_transcript_mu_pcc_distribution",
+                True,
+            )
         )
-        self.residual_diag_export_csv = bool(residual_cfg_get("export_csv", True))
-        self.residual_diag_export_sample_csv = bool(
-            residual_cfg_get("export_sample_csv", True)
-        )
-        self.residual_diag_export_dir = str(
-            residual_cfg_get("export_dir", "residual_diagnostics")
-        )
-        self.residual_diag = ResidualDiagnosticsAccumulator(
-            dataset_id_to_name=self.dataset_id_to_name,
-            eps=float(residual_cfg_get("eps", self.eps)),
-            eps_count=float(residual_cfg_get("eps_count", 1.0e-3)),
-            zero_threshold=float(residual_cfg_get("zero_threshold", 0.0)),
-            low_count_threshold=float(residual_cfg_get("low_count_threshold", 1.0)),
-            tail_thresholds=tuple(
-                float(x)
-                for x in residual_cfg_get("residual_tail_thresholds", [2.0, 3.0, 5.0])
-            ),
-            topk_fractions=tuple(
-                float(x)
-                for x in residual_cfg_get("topk_fractions", [0.01, 0.05, 0.10])
-            ),
-            quantile_max_values=int(
-                residual_cfg_get("quantile_max_values", 1_000_000)
-            ),
-        )
+        self._validation_transcript_mu_pcc: dict[str, float] = {}
         self._grouped_batch_logging_enabled = False
         self._grouped_optimizer_batch_plan: dict[str, Any] = {}
         self._train_batch_structure_records: list[dict[str, Any]] = []
+        self._synthetic_ground_truth = self._load_synthetic_ground_truth()
+        self._synthetic_ground_truth_epoch: dict[str, dict[str, list[float]]] = {}
+
+    @staticmethod
+    def _resolve_optional_path(raw_path: Any) -> Path:
+        path = Path(str(raw_path)).expanduser()
+        if path.is_absolute() or path.exists():
+            return path
+        return Path(__file__).resolve().parents[1] / path
+
+    @staticmethod
+    def _normalize_reference_profile(value: Any, *, label: str) -> np.ndarray:
+        array = np.asarray(value, dtype=np.float64).reshape(-1)
+        if array.size == 0 or not np.isfinite(array).all():
+            raise ValueError(f"{label} must be a non-empty finite profile.")
+        if bool((array < 0.0).any()):
+            raise ValueError(f"{label} contains a negative value.")
+        mean = float(array.mean())
+        if not math.isfinite(mean) or mean <= 0.0:
+            raise ValueError(f"{label} must have a positive mean.")
+        return (array / mean).astype(np.float32)
+
+    def _load_synthetic_ground_truth(self) -> dict[str, dict[str, np.ndarray]] | None:
+        """Load optional synthetic references for validation-only diagnostics."""
+        cfg = getattr(self.config, "synthetic_ground_truth", None)
+        if cfg is None or not bool(getattr(cfg, "enabled", False)):
+            return None
+
+        latent_path = self._resolve_optional_path(getattr(cfg, "latent_path"))
+        observed_path = self._resolve_optional_path(getattr(cfg, "observed_path"))
+        if not latent_path.is_file():
+            raise FileNotFoundError(f"Synthetic latent ground truth not found: {latent_path}")
+        if not observed_path.is_file():
+            raise FileNotFoundError(f"Synthetic observed ground truth not found: {observed_path}")
+
+        latent_frame = pd.read_parquet(latent_path, columns=["transcript_id", "rib_profile"])
+        latent: dict[str, np.ndarray] = {}
+        for row in latent_frame.itertuples(index=False):
+            transcript_id = str(row.transcript_id)
+            if transcript_id in latent:
+                raise ValueError(f"Duplicate synthetic latent transcript ID: {transcript_id}")
+            latent[transcript_id] = self._normalize_reference_profile(
+                row.rib_profile,
+                label=f"latent profile {transcript_id}",
+            )
+
+        observed_frame = pd.read_parquet(observed_path, columns=["id", "ribo"])
+        observed: dict[str, np.ndarray] = {}
+        drop_terminal = bool(getattr(cfg, "drop_terminal_position", True))
+        for row in observed_frame.itertuples(index=False):
+            transcript_id = str(row.id)
+            truth = latent.get(transcript_id)
+            if truth is None:
+                continue
+            profile = np.asarray(row.ribo, dtype=np.float64).reshape(-1)
+            expected_length = int(truth.size)
+            if drop_terminal and profile.size == expected_length + 1:
+                profile = profile[:-1]
+            elif profile.size != expected_length:
+                raise ValueError(
+                    f"Observed profile length mismatch for {transcript_id}: "
+                    f"observed={profile.size}, latent={expected_length}."
+                )
+            if transcript_id in observed:
+                raise ValueError(f"Duplicate synthetic observed transcript ID: {transcript_id}")
+            observed[transcript_id] = self._normalize_reference_profile(
+                profile,
+                label=f"observed profile {transcript_id}",
+            )
+
+        if not latent:
+            raise ValueError(f"No profiles found in synthetic latent reference: {latent_path}")
+        if not observed:
+            raise ValueError(
+                "No transcript IDs overlap between synthetic latent and observed references."
+            )
+        print(
+            "[synthetic ground truth] "
+            f"latent={len(latent):,} observed_overlap={len(observed):,}"
+        )
+        return {"latent": latent, "observed": observed}
+
+    @staticmethod
+    def _reference_profile_metrics(
+        prediction: np.ndarray,
+        reference: np.ndarray,
+        valid_mask: np.ndarray,
+    ) -> tuple[float, float] | None:
+        length = min(prediction.size, reference.size, valid_mask.size)
+        if length < 2:
+            return None
+        valid = valid_mask[:length] & np.isfinite(prediction[:length])
+        if int(valid.sum()) < 2:
+            return None
+        pred = prediction[:length][valid].astype(np.float64)
+        ref = reference[:length][valid].astype(np.float64)
+        pred_mean = float(pred.mean())
+        ref_mean = float(ref.mean())
+        if pred_mean <= 0.0 or ref_mean <= 0.0:
+            return None
+        pred = pred / pred_mean
+        ref = ref / ref_mean
+        mse = float(np.mean((pred - ref) ** 2))
+        pred_centered = pred - pred.mean()
+        ref_centered = ref - ref.mean()
+        denominator = float(
+            np.sqrt(np.sum(pred_centered**2) * np.sum(ref_centered**2))
+        )
+        pcc = (
+            float(np.sum(pred_centered * ref_centered) / denominator)
+            if denominator > 0.0
+            else float("nan")
+        )
+        return mse, pcc
+
+    def _record_synthetic_ground_truth_metrics(self, out: dict[str, Any]) -> None:
+        if self._synthetic_ground_truth is None:
+            return
+        ids = self._transcript_ids_as_strings(out["ids"], out["mask"].shape[0])
+        predictions = out["extras"]["L_bio"].detach().float().cpu().numpy()
+        masks = out["mask"].detach().bool().cpu().numpy()
+        references = self._synthetic_ground_truth
+        for index, transcript_id in enumerate(ids):
+            row = self._synthetic_ground_truth_epoch.setdefault(
+                transcript_id,
+                {"latent_mse": [], "latent_pcc": [], "observed_mse": [], "observed_pcc": []},
+            )
+            latent_metrics = self._reference_profile_metrics(
+                predictions[index],
+                references["latent"].get(transcript_id, np.empty(0, dtype=np.float32)),
+                masks[index],
+            )
+            if latent_metrics is not None:
+                row["latent_mse"].append(latent_metrics[0])
+                row["latent_pcc"].append(latent_metrics[1])
+            observed_profile = references["observed"].get(transcript_id)
+            if observed_profile is not None:
+                observed_metrics = self._reference_profile_metrics(
+                    predictions[index],
+                    observed_profile,
+                    masks[index],
+                )
+                if observed_metrics is not None:
+                    row["observed_mse"].append(observed_metrics[0])
+                    row["observed_pcc"].append(observed_metrics[1])
+
+    def _log_synthetic_ground_truth_metrics(self) -> None:
+        if self._synthetic_ground_truth is None or not self._synthetic_ground_truth_epoch:
+            return
+        metric_names = ("latent_mse", "latent_pcc", "observed_mse", "observed_pcc")
+        local_pairs: list[float] = []
+        for metric_name in metric_names:
+            per_transcript = [
+                float(np.mean(values[metric_name]))
+                for values in self._synthetic_ground_truth_epoch.values()
+                if values[metric_name]
+            ]
+            local_pairs.extend(
+                [float(np.sum(per_transcript)), float(len(per_transcript))]
+            )
+        local_pairs.append(float(len(self._synthetic_ground_truth_epoch)))
+        totals = torch.tensor(
+            local_pairs,
+            device=self.device,
+            dtype=torch.float64,
+        )
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(totals, op=torch.distributed.ReduceOp.SUM)
+        for index, metric_name in enumerate(metric_names):
+            metric_sum = totals[2 * index]
+            metric_count = totals[2 * index + 1]
+            if float(metric_count.item()) <= 0.0:
+                continue
+            self.log(
+                f"val/synthetic_ground_truth/{metric_name}",
+                (metric_sum / metric_count).float(),
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                sync_dist=False,
+            )
+        self.log(
+            "val/synthetic_ground_truth/transcripts",
+            totals[-1].float(),
+            on_step=False,
+            on_epoch=True,
+            prog_bar=False,
+            sync_dist=False,
+        )
 
     def configure_grouped_optimizer_batch_logging(
         self,
@@ -1981,12 +1577,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         # Retain an unweighted pair-micro diagnostic alongside the configured
         # reliability-weighted sample reduction.
         mu_pcc_unweighted = raw_mu_pcc_per_sample.mean()
-        mu_pcc_weighted = self._aggregate_per_sample(
-            raw_mu_pcc_per_sample,
-            dataset_ids,
-            sample_weights=sample_weights,
-            transcript_group_ids=transcript_group_ids,
-        )
+        likelihood_mu_pcc_unweighted = likelihood_mu_pcc_per_sample.mean()
 
         metrics: dict[str, torch.Tensor] = {
             "loss": loss,
@@ -2037,7 +1628,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             # The legacy name remains an unweighted compatibility alias.
             "mu_pcc": mu_pcc_unweighted,
             "mu_pcc_unweighted": mu_pcc_unweighted,
-            "mu_pcc_weighted": mu_pcc_weighted,
             "mu_pcc_per_sample": raw_mu_pcc_per_sample,
             "L_bio_pcc": self._aggregate_per_sample(
                 L_bio_pcc_per_sample,
@@ -2061,12 +1651,9 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 (sample_lengths >= 500.0) & (sample_lengths < 1500.0)
             ),
             "nb_length_weight_long": length_weight_bin_mean(sample_lengths >= 1500.0),
-            "likelihood_mu_pcc": self._aggregate_per_sample(
-                likelihood_mu_pcc_per_sample,
-                dataset_ids,
-                sample_weights,
-                transcript_group_ids,
-            ),
+            "likelihood_mu_pcc": likelihood_mu_pcc_unweighted,
+            "likelihood_mu_pcc_unweighted": likelihood_mu_pcc_unweighted,
+            "likelihood_mu_pcc_per_sample": likelihood_mu_pcc_per_sample,
             "log1p_mse": self._aggregate_per_sample(
                 log1p_mse_per_sample,
                 dataset_ids,
@@ -2196,6 +1783,8 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         "consensus_pcc_value",
         "replica_nll",
         "replica_count_mean",
+        "likelihood_mu_pcc",
+        "likelihood_mu_pcc_unweighted",
         "log1p_mse",
         "mean_ratio",
         "J_mean",
@@ -2356,11 +1945,10 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             )
         if stage == "val":
             self._log_validation_batch_structure(out)
-        # `*_mu_pcc` is retained as the unweighted compatibility alias used by
-        # checkpoint monitoring. `*_mu_pcc_weighted` uses the selected sample
-        # reducer. Like the optimized
-        # loss, Lightning averages these already-reduced batch scalars at epoch
-        # level; it is not presented as a materialized whole-epoch reduction.
+        # All metrics carrying the ``mu_pcc`` name are unweighted arithmetic
+        # means over physical transcript-dataset pairs. The legacy alias is
+        # retained for checkpoint monitoring, and the explicit suffix prevents
+        # confusion with reliability-weighted objective diagnostics.
         self.log(
             f"{stage}_mu_pcc",
             metrics["mu_pcc_unweighted"],
@@ -2379,16 +1967,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             batch_size=batch_size,
             sync_dist=sync_dist,
         )
-        self.log(
-            f"{stage}_mu_pcc_weighted",
-            metrics["mu_pcc_weighted"],
-            on_step=False,
-            on_epoch=True,
-            prog_bar=False,
-            batch_size=batch_size,
-            sync_dist=sync_dist,
-        )
-
         scalar_logs: dict[str, torch.Tensor] = {}
         for name in self.SCALAR_METRICS:
             value = metrics.get(name)
@@ -2443,23 +2021,13 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "pcc_raw_loss": metrics["pcc_raw_loss_per_sample"],
             "pcc_nb_vst_loss": metrics["pcc_nb_vst_loss_per_sample"],
             "mu_pcc": metrics["mu_pcc_per_sample"],
+            "mu_pcc_unweighted": metrics["mu_pcc_per_sample"],
+            "likelihood_mu_pcc": metrics["likelihood_mu_pcc_per_sample"],
+            "likelihood_mu_pcc_unweighted": (
+                metrics["likelihood_mu_pcc_per_sample"]
+            ),
             "L_bio_pcc": metrics["L_bio_pcc_per_sample"],
         }
-        sample_weights = out.get("sample_weights")
-        if sample_weights is None:
-            sample_weights = torch.ones_like(metrics["mu_pcc_per_sample"])
-        else:
-            sample_weights = sample_weights.detach().to(
-                device=metrics["mu_pcc_per_sample"].device,
-                dtype=metrics["mu_pcc_per_sample"].dtype,
-            )
-        if not bool(torch.isfinite(sample_weights).all()) or bool(
-            (sample_weights <= 0.0).any()
-        ):
-            raise ValueError(
-                "Logged transcript reliability weights must be finite and strictly positive."
-            )
-
         extras = out["extras"]
         gamma = extras.get("gamma", torch.ones_like(extras["L_bio"])).float()
 
@@ -2467,14 +2035,10 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             dataset_name = self._dataset_name(int(dataset_id_tensor.item()))
             sample_mask = dataset_ids == dataset_id_tensor
             dataset_sample_count = int(sample_mask.sum().item())
-            dataset_weights = sample_weights[sample_mask]
-            weighted_pcc = (metrics["mu_pcc_per_sample"][sample_mask] * dataset_weights).sum()
-            weighted_pcc = weighted_pcc / dataset_weights.sum()
             dataset_logs = {
                 f"{stage}_{metric_name}/{dataset_name}": values[sample_mask].mean()
                 for metric_name, values in per_sample.items()
             }
-            dataset_logs[f"{stage}_mu_pcc_weighted/{dataset_name}"] = weighted_pcc
             self.log_dict(
                 dataset_logs,
                 on_step=False,
@@ -2504,70 +2068,212 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
     # Profile plots
     # ============================================================
 
+    @staticmethod
+    def _transcript_ids_as_strings(ids: Any, expected_count: int) -> list[str]:
+        if torch.is_tensor(ids):
+            values = ids.detach().cpu().reshape(-1).tolist()
+        elif isinstance(ids, (list, tuple)):
+            values = list(ids)
+        else:
+            try:
+                values = list(ids)
+            except TypeError as exc:
+                raise TypeError(
+                    "Validation transcript IDs must be a tensor or sequence."
+                ) from exc
+        if len(values) != int(expected_count):
+            raise ValueError(
+                "Validation transcript ID count does not match per-pair PCC "
+                f"count: ids={len(values)}, pcc={expected_count}."
+            )
+        return [str(value) for value in values]
+
+    def _record_validation_transcript_mu_pcc(
+        self,
+        out: dict[str, Any],
+        metrics: dict[str, torch.Tensor],
+    ) -> None:
+        """Accumulate compact, unweighted validation PCC data on CPU.
+
+        Complete validation transcript groups are reduced immediately to the
+        equal arithmetic mean of their dataset-pair PCC values. Only one CPU
+        float per transcript is retained; no profile tensor or autograd graph
+        survives the validation step.
+        """
+        if not self.log_validation_transcript_mu_pcc_distribution:
+            return
+
+        pair_pcc = metrics["mu_pcc_per_sample"].detach().float().cpu().reshape(-1)
+        group_ids = (
+            out["transcript_group_index"].detach().long().cpu().reshape(-1)
+        )
+        transcript_ids = self._transcript_ids_as_strings(
+            out["ids"],
+            expected_count=pair_pcc.numel(),
+        )
+        if group_ids.numel() != pair_pcc.numel():
+            raise ValueError(
+                "Validation transcript group count does not match per-pair PCC count."
+            )
+        if not bool(torch.isfinite(pair_pcc).all()):
+            raise ValueError("Validation per-pair mu PCC values must be finite.")
+
+        unique_groups, inverse = torch.unique(
+            group_ids,
+            sorted=False,
+            return_inverse=True,
+        )
+        group_sums = torch.zeros(unique_groups.numel(), dtype=torch.float32)
+        group_counts = torch.zeros(unique_groups.numel(), dtype=torch.float32)
+        group_sums.index_add_(0, inverse, pair_pcc)
+        group_counts.index_add_(0, inverse, torch.ones_like(pair_pcc))
+        group_means = group_sums / group_counts.clamp_min(1.0)
+
+        for group_position in range(unique_groups.numel()):
+            row_indices = torch.nonzero(
+                inverse == group_position,
+                as_tuple=False,
+            ).reshape(-1)
+            group_transcript_ids = {
+                transcript_ids[int(row_index)]
+                for row_index in row_indices.tolist()
+            }
+            if len(group_transcript_ids) != 1:
+                raise RuntimeError(
+                    "One validation transcript_group_index maps to multiple "
+                    f"transcript IDs: {sorted(group_transcript_ids)}."
+                )
+            transcript_id = next(iter(group_transcript_ids))
+            pcc = float(group_means[group_position].item())
+            if transcript_id in self._validation_transcript_mu_pcc:
+                if not math.isclose(
+                    self._validation_transcript_mu_pcc[transcript_id],
+                    pcc,
+                    rel_tol=0.0,
+                    abs_tol=1.0e-6,
+                ):
+                    raise RuntimeError(
+                        "A validation transcript was split across physical "
+                        f"batches with different PCC means: {transcript_id!r}."
+                    )
+                continue
+            self._validation_transcript_mu_pcc[transcript_id] = pcc
+
+    def _collect_validation_transcript_mu_pcc(
+        self,
+    ) -> tuple[list[str], torch.Tensor]:
+        """Gather DDP shards and return one equal-dataset PCC per transcript."""
+        local = self._validation_transcript_mu_pcc
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            gathered: list[dict[str, float] | None] = [
+                None
+            ] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(gathered, local)
+        else:
+            gathered = [local]
+
+        merged: dict[str, float] = {}
+        for rank_values in gathered:
+            if rank_values is None:
+                continue
+            for transcript_id, pcc in rank_values.items():
+                transcript_id = str(transcript_id)
+                pcc = float(pcc)
+                if transcript_id in merged:
+                    # DDP pads the global plan by at most world_size-1 complete
+                    # batches. Deduplicate those identical transcript groups.
+                    if not math.isclose(
+                        merged[transcript_id],
+                        pcc,
+                        rel_tol=0.0,
+                        abs_tol=1.0e-6,
+                    ):
+                        raise RuntimeError(
+                            "DDP validation shards disagree for transcript="
+                            f"{transcript_id!r}."
+                        )
+                    continue
+                merged[transcript_id] = pcc
+
+        transcript_ids = sorted(merged)
+        transcript_pcc = torch.tensor(
+            [merged[transcript_id] for transcript_id in transcript_ids],
+            dtype=torch.float32,
+        )
+        return transcript_ids, transcript_pcc
+
+    def _log_validation_transcript_mu_pcc_distribution(self) -> None:
+        if not self.log_validation_transcript_mu_pcc_distribution:
+            return
+        transcript_ids, values = self._collect_validation_transcript_mu_pcc()
+        if not transcript_ids:
+            return
+
+        values = values.float()
+        quantiles = torch.quantile(
+            values,
+            torch.tensor([0.05, 0.25, 0.50, 0.75, 0.95]),
+        )
+        summary = {
+            "val_mu_pcc_unweighted_by_transcript": values.mean(),
+            "val/mu_pcc_unweighted_by_transcript/count": values.new_tensor(
+                float(values.numel())
+            ),
+            "val/mu_pcc_unweighted_by_transcript/mean": values.mean(),
+            "val/mu_pcc_unweighted_by_transcript/std": values.std(unbiased=False),
+            "val/mu_pcc_unweighted_by_transcript/min": values.amin(),
+            "val/mu_pcc_unweighted_by_transcript/q05": quantiles[0],
+            "val/mu_pcc_unweighted_by_transcript/q25": quantiles[1],
+            "val/mu_pcc_unweighted_by_transcript/median": quantiles[2],
+            "val/mu_pcc_unweighted_by_transcript/q75": quantiles[3],
+            "val/mu_pcc_unweighted_by_transcript/q95": quantiles[4],
+            "val/mu_pcc_unweighted_by_transcript/max": values.amax(),
+        }
+        self.log_dict(
+            {
+                name: value.to(device=self.device)
+                for name, value in summary.items()
+            },
+            on_step=False,
+            on_epoch=True,
+            prog_bar=False,
+            batch_size=int(values.numel()),
+            # Every rank has the same all-gathered transcript distribution.
+            sync_dist=False,
+        )
+
+        trainer = getattr(self, "trainer", None)
+        is_global_zero = trainer is None or getattr(trainer, "is_global_zero", True)
+        sanity_checking = trainer is not None and bool(
+            getattr(trainer, "sanity_checking", False)
+        )
+        experiment = (
+            getattr(self.logger, "experiment", None)
+            if self.logger is not None
+            else None
+        )
+        if (
+            is_global_zero
+            and not sanity_checking
+            and experiment is not None
+            and hasattr(experiment, "add_histogram")
+        ):
+            experiment.add_histogram(
+                "val/mu_pcc_unweighted_by_transcript/distribution",
+                values,
+                global_step=self.global_step,
+            )
+
     def on_validation_epoch_start(self) -> None:
         self._val_profile_plot_logged_this_epoch = False
-        if self.residual_diag_enabled and self.residual_diag_run_on_validation:
-            self.residual_diag.reset()
-
-    @staticmethod
-    def _metrics_to_device(
-        metrics: dict[str, torch.Tensor],
-        device: torch.device,
-    ) -> dict[str, torch.Tensor]:
-        """Move CPU-computed scalar diagnostics to the DDP reduction device."""
-        moved: dict[str, torch.Tensor] = {}
-        for name, value in metrics.items():
-            if not torch.is_tensor(value):
-                value = torch.as_tensor(value)
-            if value.numel() != 1:
-                raise ValueError(
-                    f"Logged residual metric {name!r} must be scalar, got "
-                    f"shape {tuple(value.shape)}."
-                )
-            moved[name] = value.detach().reshape(()).to(device=device)
-        return moved
+        self._validation_transcript_mu_pcc = {}
+        self._synthetic_ground_truth_epoch = {}
 
     def on_validation_epoch_end(self) -> None:
-        if not (self.residual_diag_enabled and self.residual_diag_run_on_validation):
-            return
-        metrics, rows, report = self.residual_diag.compute()
-        if metrics:
-            sync_dist = bool(getattr(self.config.trainer, "sync_dist_logs", False))
-            # ResidualDiagnosticsAccumulator intentionally works on CPU to keep
-            # full validation profiles off GPU memory. NCCL cannot all-reduce
-            # CPU tensors, so return only the final scalar summaries to the
-            # Lightning device before distributed logging.
-            metrics = self._metrics_to_device(metrics, self.device)
-            self.log_dict(
-                metrics,
-                on_step=False,
-                on_epoch=True,
-                prog_bar=False,
-                sync_dist=sync_dist,
-            )
-        if self.residual_diag_export_csv and rows:
-            log_dir = None
-            if self.logger is not None:
-                log_dir = getattr(self.logger, "log_dir", None)
-            base_dir = Path(log_dir) if log_dir else Path(".")
-            export_dir = base_dir / self.residual_diag_export_dir
-            epoch = int(getattr(self, "current_epoch", 0))
-            if not hasattr(self, "trainer") or getattr(self.trainer, "is_global_zero", True):
-                self.residual_diag.export_csv(
-                    rows,
-                    export_dir / f"residual_diagnostics_by_dataset_epoch_{epoch}.csv",
-                )
-                if self.residual_diag_export_sample_csv and self.residual_diag.sample_rows:
-                    self.residual_diag.export_csv(
-                        self.residual_diag.sample_rows,
-                        export_dir / f"residual_diagnostics_by_sample_epoch_{epoch}.csv",
-                    )
-                if report:
-                    export_dir.mkdir(parents=True, exist_ok=True)
-                    (export_dir / f"residual_diagnostics_report_epoch_{epoch}.json").write_text(
-                        json.dumps(report, indent=2, sort_keys=True)
-                    )
-        self.residual_diag.reset()
+        self._log_validation_transcript_mu_pcc_distribution()
+        self._log_synthetic_ground_truth_metrics()
+        self._validation_transcript_mu_pcc = {}
+        self._synthetic_ground_truth_epoch = {}
 
     def _likelihood_positive_mean(self, out: dict[str, Any]) -> torch.Tensor:
         with torch.no_grad():
@@ -3080,8 +2786,8 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         out = self._forward_batch(batch)
         metrics = self._compute_loss_and_metrics(out)
         self._log_stage(stage="val", out=out, metrics=metrics)
-        if self.residual_diag_enabled and self.residual_diag_run_on_validation:
-            self.residual_diag.update(out)
+        self._record_synthetic_ground_truth_metrics(out)
+        self._record_validation_transcript_mu_pcc(out, metrics)
         self._plot_profile_example(out, batch_idx=batch_idx)
         return metrics["loss"]
 

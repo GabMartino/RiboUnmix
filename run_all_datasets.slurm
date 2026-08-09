@@ -104,10 +104,6 @@ TRAIN_SAMPLING_STRATEGY="${TRAIN_SAMPLING_STRATEGY:-transcript_grouped_multidata
 NUM_WORKERS="${NUM_WORKERS:-1}"
 PREDICT_NUM_WORKERS="${PREDICT_NUM_WORKERS:-0}"
 DATA_WORKER_CONTEXT="${DATA_WORKER_CONTEXT:-spawn}"
-# Residual diagnostics retain every validation position and are therefore
-# disabled for training by default. Set RESIDUAL_DIAGNOSTICS_ENABLED=true for
-# a dedicated diagnostic run (the quantile guard remains active then).
-RESIDUAL_DIAGNOSTICS_ENABLED="${RESIDUAL_DIAGNOSTICS_ENABLED:-false}"
 # Optional-sequence-feature ablation. Submit, for example:
 #   sbatch --export=ALL,FEATURE_PRESET=baseline run_all_datasets.slurm
 # Supported: baseline, biological, dataset_bias, both, exo_bio, gmp_bio,
@@ -309,7 +305,6 @@ COMMAND=(
     "data.num_workers=${NUM_WORKERS}"
     "data.predict_num_workers=${PREDICT_NUM_WORKERS}"
     "data.multiprocessing_context=${DATA_WORKER_CONTEXT}"
-    "residual_diagnostics.enabled=${RESIDUAL_DIAGNOSTICS_ENABLED}"
     "${FEATURE_OVERRIDES[@]}"
     "paths.checkpoints=${CKPT_DIR}"
     "paths.logs=${LOG_DIR}"

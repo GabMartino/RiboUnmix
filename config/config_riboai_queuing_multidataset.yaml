@@ -42,7 +42,7 @@ data:
   # Per-dataset pair-row quota on each GPU. With D selected datasets, one
   # physical microbatch contains at most batch_size * D pair rows. For the
   # current two-dataset multidataset sampler, every eligible transcript has one
-  # row in each dataset, so 16 means 16 transcripts and 32 pair rows per rank.
+  # row in each dataset, so 8 means 8 transcripts and 16 pair rows per rank.
   # Atomic packing can underfill some dataset quotas when support differs.
   batch_size: 8
   num_workers: 4
@@ -94,7 +94,7 @@ training:
     # conflict; set this false to keep an explicit Trainer value instead.
     auto_accumulate_grad_batches: true
     # Median represents a typical full batch without letting the final partial
-    # epoch batch inflate the active ceil(32 / ~16) accumulation estimate.
+    # epoch batch inflate the active ceil(32 / ~8) accumulation estimate.
     accumulation_statistic: median  # median | mean | p25 | minimum
     # Safety ceiling for the automatically resolved accumulation factor. It is
     # not a batch-size multiplier unless the target requires that many
@@ -282,40 +282,6 @@ loss:
   # model must still push mu down at zeros to benefit.
   pcc_prediction_floor: 0.0
 
-residual_diagnostics:
-  # These summaries are expensive validation-only diagnostics and are not
-  # used by the objective, checkpoint monitor, PCC, or gamma centering. Keep
-  # them off for production/ablation training; enable explicitly for a
-  # dedicated diagnostic run.
-  enabled: false
-  run_on_validation: true
-
-  # Quantiles are diagnostic-only. PyTorch rejects torch.quantile inputs above
-  # an internal size limit, so very large validation sets use this many
-  # deterministic, evenly spaced positions. Other diagnostic means/fractions
-  # still use every valid position; training and validation losses are unchanged.
-  quantile_max_values: 1000000
-
-  eps: 1.0e-8
-  eps_count: 1.0e-3
-
-  zero_threshold: 0.0
-  low_count_threshold: 1.0
-
-  export_csv: false
-  export_sample_csv: false
-  export_dir: residual_diagnostics
-
-  topk_fractions:
-    - 0.01
-    - 0.05
-    - 0.10
-
-  residual_tail_thresholds:
-    - 2.0
-    - 3.0
-    - 5.0
-
 optim:
   lr_biological: 5.0e-4
   lr_rest: 1.0e-3
@@ -349,5 +315,9 @@ callbacks:
 
 metrics:
   log_train_per_dataset_metrics: false
+  # Accumulate only one CPU float per validation transcript, then log summary
+  # quantiles and one TensorBoard histogram of its equal-dataset mean PCC. This
+  # reuses the existing forward pass and complete transcript groups.
+  log_validation_transcript_mu_pcc_distribution: true
   log_example_plot: true
   example_plot_max_datasets: 2
