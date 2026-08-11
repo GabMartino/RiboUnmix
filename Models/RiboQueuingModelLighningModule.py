@@ -578,6 +578,55 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         self.eps = float(getattr(loss_cfg, "eps", 1.0e-8))
         self.sample_reduction = resolve_sample_reduction_mode(loss_cfg)
         self.hparams["sample_reduction"] = self.sample_reduction
+        execution_cfg = getattr(
+            getattr(self.config, "training", None),
+            "execution_microbatching",
+            None,
+        )
+        self.execution_microbatching_enabled = bool(
+            getattr(execution_cfg, "enabled", False)
+        )
+        execution_clip_value = getattr(execution_cfg, "gradient_clip_val", None)
+        if execution_clip_value is None:
+            execution_clip_value = getattr(
+                getattr(self.config, "trainer", None),
+                "gradient_clip_val",
+                0.0,
+            )
+        if execution_clip_value is None:
+            execution_clip_value = 0.0
+        self.execution_gradient_clip_val = float(execution_clip_value)
+        if (
+            not math.isfinite(self.execution_gradient_clip_val)
+            or self.execution_gradient_clip_val < 0.0
+        ):
+            raise ValueError(
+                "Execution gradient clipping must be finite and non-negative."
+            )
+        self.execution_gradient_clip_algorithm = str(
+            getattr(
+                execution_cfg,
+                "gradient_clip_algorithm",
+                getattr(
+                    getattr(self.config, "trainer", None),
+                    "gradient_clip_algorithm",
+                    "norm",
+                ),
+            )
+        )
+        if self.execution_microbatching_enabled and self.sample_reduction != "transcript_balanced":
+            raise ValueError(
+                "Complete-group execution microbatching currently requires "
+                "loss.sample_reduction=transcript_balanced so chunk gradients can "
+                "reconstruct the logical-batch objective exactly."
+            )
+        # Execution chunks are backwarded immediately and therefore require
+        # manual optimization. They remain invisible to logical-batch and
+        # optimizer-step semantics.
+        self.automatic_optimization = not self.execution_microbatching_enabled
+        self._execution_logical_batches_since_step = 0
+        self._execution_optimizer_steps = 0
+        self._execution_has_pending_gradients = False
         # Predicted-value floor for PCC only: predictions below this count are
         # treated as 0 ("undetected") when computing correlation. Honest (uses
         # only the prediction, never the target); 0.0 disables.
@@ -743,7 +792,17 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                     row["observed_pcc"].append(observed_metrics[1])
 
     def _log_synthetic_ground_truth_metrics(self) -> None:
-        if self._synthetic_ground_truth is None or not self._synthetic_ground_truth_epoch:
+        # Every DDP rank must execute the same collective sequence.  A rank can
+        # legitimately have no locally valid reference rows (for example when
+        # its validation shard contains no overlapping synthetic transcript),
+        # so do not return based on the local epoch dictionary.
+        if self._synthetic_ground_truth is None:
+            return
+        # These are optional diagnostics, not part of the optimized objective.
+        # Do not introduce a second, manually ordered collective stream beside
+        # Lightning's epoch metric reductions under DDP. Run them on a single
+        # process instead; distributed training remains collective-safe.
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
             return
         metric_names = ("latent_mse", "latent_pcc", "observed_mse", "observed_pcc")
         local_pairs: list[float] = []
@@ -868,7 +927,13 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 "Invalid batch metadata: expected one-dimensional dataset ranks, "
                 "dataset quality weights, and integer transcript group indices."
             )
-        optional_values = batch[12:]
+        optional_values = list(batch[12:])
+        execution_microbatch_metadata = None
+        if optional_values and (
+            optional_values[-1] is None
+            or isinstance(optional_values[-1], dict)
+        ):
+            execution_microbatch_metadata = optional_values.pop()
 
         dataset_bias_sequence_features = None
         if len(optional_values) == 2:
@@ -894,6 +959,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             mask=mask,
             target=target,
             sample_ids=ids,
+            transcript_group_index=transcript_group_index,
             dataset_bias_sequence_features=dataset_bias_sequence_features,
             dataset_quality_weights=dataset_quality_weights,
         )
@@ -917,6 +983,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         }
         out["replica_profiles"] = replica_profiles
         out["replica_mask"] = replica_mask
+        out["execution_microbatch_metadata"] = execution_microbatch_metadata
         return out
 
     def forward_batch(self, batch) -> dict[str, Any]:
@@ -2012,7 +2079,6 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
     ) -> None:
         dataset_ids = out["dataset_ids"].detach().to(device=out["target"].device)
         unique_dataset_ids = torch.unique(dataset_ids)
-        sync_dist = bool(getattr(self.config.trainer, "sync_dist_logs", False))
 
         per_sample = {
             "loss": metrics["loss_per_sample"],
@@ -2047,7 +2113,13 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 # Lightning weights epoch reductions by batch_size. Use this
                 # dataset's physical pair count, not the full mixed batch.
                 batch_size=dataset_sample_count,
-                sync_dist=sync_dist,
+                # Dataset IDs represented in a batch are data-dependent. Two
+                # DDP ranks can therefore produce different metric-key sets;
+                # synchronizing these dynamic keys would make ranks enter
+                # different NCCL collectives. These diagnostics remain
+                # rank-local; the fixed-key aggregate metrics above are still
+                # synchronized.
+                sync_dist=False,
             )
 
             position_mask = sample_mask.reshape(-1, 1) & out["mask"].bool()
@@ -2061,7 +2133,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                     # This metric is a mean over valid positions, so weight its
                     # epoch reduction by the number of contributing positions.
                     batch_size=int(position_mask.sum().item()),
-                    sync_dist=sync_dist,
+                    sync_dist=False,
                 )
 
     # ============================================================
@@ -2165,10 +2237,10 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         """Gather DDP shards and return one equal-dataset PCC per transcript."""
         local = self._validation_transcript_mu_pcc
         if torch.distributed.is_available() and torch.distributed.is_initialized():
-            gathered: list[dict[str, float] | None] = [
-                None
-            ] * torch.distributed.get_world_size()
-            torch.distributed.all_gather_object(gathered, local)
+            # Epoch-end object collectives can race with Lightning's pending
+            # reductions. Keep this diagnostic local in DDP; it is not used for
+            # optimization or checkpoint selection.
+            gathered: list[dict[str, float] | None] = [local]
         else:
             gathered = [local]
 
@@ -2272,6 +2344,18 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
     def on_validation_epoch_end(self) -> None:
         self._log_validation_transcript_mu_pcc_distribution()
         self._log_synthetic_ground_truth_metrics()
+        if (
+            self.execution_microbatching_enabled
+            and not bool(getattr(self.trainer, "sanity_checking", False))
+        ):
+            monitor = str(self.config.optim.scheduler.monitor)
+            monitored_value = self.trainer.callback_metrics.get(monitor)
+            if monitored_value is None:
+                raise RuntimeError(
+                    "Manual execution microbatching could not find scheduler "
+                    f"monitor {monitor!r} at validation epoch end."
+                )
+            self.lr_schedulers().step(float(monitored_value.detach().cpu().item()))
         self._validation_transcript_mu_pcc = {}
         self._synthetic_ground_truth_epoch = {}
 
@@ -2431,6 +2515,10 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             )
         )
         actual = int(self.trainer.accumulate_grad_batches)
+        if self.execution_microbatching_enabled:
+            # Logical accumulation is performed manually; Lightning must see
+            # one because its batches are execution chunks, not logical batches.
+            expected = 1
         if actual != expected:
             raise RuntimeError(
                 "Trainer accumulation changed after grouped batch planning: "
@@ -2440,6 +2528,15 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
     def on_train_epoch_start(self) -> None:
         self._train_batch_structure_records = []
+        if self.execution_microbatching_enabled:
+            if (
+                self._execution_logical_batches_since_step != 0
+                or self._execution_has_pending_gradients
+            ):
+                raise RuntimeError(
+                    "A pending execution-microbatch optimizer window leaked across epochs."
+                )
+            self.optimizers().zero_grad()
 
     def _record_train_batch_structure(self, batch) -> None:
         if not self._grouped_batch_logging_enabled:
@@ -2553,18 +2650,29 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             and torch.distributed.is_initialized()
         ):
             return list(records)
-        gathered: list[list[dict[str, Any]] | None] = [
-            None for _ in range(torch.distributed.get_world_size())
-        ]
-        torch.distributed.all_gather_object(gathered, list(records))
-        return [
-            record
-            for rank_records in gathered
-            if rank_records is not None
-            for record in rank_records
-        ]
+        # Batch-structure output is diagnostic-only. Avoid a manual object
+        # collective at epoch end, where it can be ordered differently from
+        # Lightning's metric reductions on different ranks.
+        return list(records)
 
     def on_train_epoch_end(self) -> None:
+        if (
+            self.execution_microbatching_enabled
+            and self._execution_has_pending_gradients
+            and self._execution_logical_batches_since_step == 0
+        ):
+            raise RuntimeError(
+                "Training stopped in the middle of a logical batch. Execution "
+                "microbatching refuses to apply a partial logical-batch gradient."
+            )
+        if (
+            self.execution_microbatching_enabled
+            and self._execution_logical_batches_since_step > 0
+        ):
+            # Match Lightning's usual fixed-factor final accumulation window:
+            # gradients retain the configured 1/A scaling even when the last
+            # epoch window contains fewer than A logical batches.
+            self._execution_optimizer_step()
         if not self._grouped_batch_logging_enabled:
             return
         records = self._gather_batch_structure_records(
@@ -2743,16 +2851,101 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             sync_dist=False,
         )
 
-        # TODO: if variable group sizes make microbatch-mean accumulation too
-        # approximate, add a separate exact group-weighted manual accumulation
-        # ablation. Do not change the active loss reduction in this feature.
+    def _logical_accumulation_factor(self) -> int:
+        return max(
+            int(
+                self._grouped_optimizer_batch_plan.get(
+                    "resolved_accumulate_grad_batches",
+                    1,
+                )
+            ),
+            1,
+        )
+
+    def _execution_optimizer_step(self) -> None:
+        """Apply one optimizer step after complete logical-batch gradients."""
+        optimizer = self.optimizers()
+        clip_value = self.execution_gradient_clip_val
+        if clip_value > 0.0:
+            self.clip_gradients(
+                optimizer,
+                gradient_clip_val=clip_value,
+                gradient_clip_algorithm=self.execution_gradient_clip_algorithm,
+            )
+        optimizer.step()
+        optimizer.zero_grad()
+        self._execution_logical_batches_since_step = 0
+        self._execution_optimizer_steps += 1
+        self._execution_has_pending_gradients = False
+
+    @staticmethod
+    def _execution_metadata(batch) -> dict[str, int] | None:
+        if not batch:
+            return None
+        value = batch[-1]
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            return None
+        required = {
+            "logical_batch_index",
+            "execution_chunk_index",
+            "execution_chunk_count",
+            "logical_group_count",
+            "execution_group_count",
+            "logical_pair_count",
+        }
+        missing = required.difference(value)
+        if missing:
+            raise ValueError(
+                "Execution microbatch metadata is missing fields "
+                f"{sorted(missing)}."
+            )
+        return {name: int(value[name]) for name in required}
 
     def training_step(self, batch, batch_idx):
         self._record_train_batch_structure(batch)
         out = self._forward_batch(batch)
         metrics = self._compute_loss_and_metrics(out)
         self._log_stage(stage="train", out=out, metrics=metrics)
-        return metrics["loss"]
+        if not self.execution_microbatching_enabled:
+            return metrics["loss"]
+
+        metadata = self._execution_metadata(batch)
+        if metadata is None:
+            raise RuntimeError(
+                "Execution microbatching is enabled, but the training sampler did "
+                "not attach logical-batch metadata."
+            )
+        logical_groups = metadata["logical_group_count"]
+        execution_groups = metadata["execution_group_count"]
+        if logical_groups <= 0 or not (1 <= execution_groups <= logical_groups):
+            raise ValueError(
+                "Invalid execution/logical transcript-group counts: "
+                f"execution={execution_groups}, logical={logical_groups}."
+            )
+
+        # The chunk loss is an equal mean over its complete transcript groups.
+        # Multiplying by G_chunk/G_logical makes the sum of chunk gradients
+        # exactly equal to the original transcript-balanced logical-batch loss.
+        logical_accumulation = self._logical_accumulation_factor()
+        gradient_loss = metrics["loss"] * (
+            float(execution_groups)
+            / float(logical_groups)
+            / float(logical_accumulation)
+        )
+        self.manual_backward(gradient_loss)
+        self._execution_has_pending_gradients = True
+
+        is_last_chunk = (
+            metadata["execution_chunk_index"]
+            == metadata["execution_chunk_count"] - 1
+        )
+        if is_last_chunk:
+            self._execution_logical_batches_since_step += 1
+            if self._execution_logical_batches_since_step >= logical_accumulation:
+                self._execution_optimizer_step()
+        return metrics["loss"].detach()
 
     def on_before_optimizer_step(self, optimizer):
         del optimizer
@@ -2786,9 +2979,13 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         out = self._forward_batch(batch)
         metrics = self._compute_loss_and_metrics(out)
         self._log_stage(stage="val", out=out, metrics=metrics)
-        self._record_synthetic_ground_truth_metrics(out)
-        self._record_validation_transcript_mu_pcc(out, metrics)
-        self._plot_profile_example(out, batch_idx=batch_idx)
+        # Sanity validation exists only to catch a broken forward/loss path.
+        # Avoid expensive CPU diagnostics and Matplotlib work that will be
+        # repeated during the first real validation epoch.
+        if not bool(getattr(self.trainer, "sanity_checking", False)):
+            self._record_synthetic_ground_truth_metrics(out)
+            self._record_validation_transcript_mu_pcc(out, metrics)
+            self._plot_profile_example(out, batch_idx=batch_idx)
         return metrics["loss"]
 
     @staticmethod

@@ -7,6 +7,7 @@ import math
 
 import torch
 import torch.nn as nn
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 from Models.RiboQueuingModel.DatasetBiasSubmodel import DatasetBiasSubmodel
 from Models.RiboQueuingModel.QueuingBiologicalModel import QueuingBiologicalModel
@@ -776,51 +777,100 @@ class RiboQueuingModel(nn.Module):
         chunk_size = min(self.gamma_reference_chunk_size, reference_count)
         requested_ids = id_datasets.reshape(-1).to(device=device, dtype=torch.long)
 
-        for start in range(0, reference_count, chunk_size):
-            stop = min(start + chunk_size, reference_count)
-            ids_chunk = reference_ids[start:stop]
-            weights_chunk = reference_weights[start:stop]
-            chunk_count = int(ids_chunk.numel())
-            synthetic_ids = ids_chunk.repeat(num_transcripts)
-            synthetic_mask = canonical_mask.repeat_interleave(chunk_count, dim=0)
-            synthetic_codons = canonical_codons.repeat_interleave(chunk_count, dim=0)
-            synthetic_position = canonical_position.repeat_interleave(
-                chunk_count, dim=0
+        # In evaluation mode, complete transcript groups already contain the
+        # raw score for every requested reference dataset. Reusing those values
+        # is exactly equivalent because dropout is disabled, and avoids a
+        # second dataset-bias BiGRU pass during sanity checking/validation.
+        # Training deliberately retains the original independent reference
+        # evaluation so its dropout semantics are unchanged.
+        reusable_reference_rows: list[list[int]] = []
+        can_reuse_requested_reference = not self.training
+        if can_reuse_requested_reference:
+            reference_id_list = [int(value) for value in reference_ids.tolist()]
+            for indices in grouped_rows.values():
+                row_by_dataset: dict[int, int] = {}
+                for row_index in indices:
+                    dataset_id = int(requested_ids[row_index].item())
+                    if dataset_id in row_by_dataset:
+                        can_reuse_requested_reference = False
+                        break
+                    row_by_dataset[dataset_id] = int(row_index)
+                if not can_reuse_requested_reference or any(
+                    dataset_id not in row_by_dataset
+                    for dataset_id in reference_id_list
+                ):
+                    can_reuse_requested_reference = False
+                    break
+                reusable_reference_rows.append(
+                    [row_by_dataset[dataset_id] for dataset_id in reference_id_list]
+                )
+
+        reference_mask = canonical_mask.to(dtype=accum_dtype).unsqueeze(1)
+        reference_valid_len = reference_mask.sum(dim=2).clamp_min(1.0)
+        if can_reuse_requested_reference:
+            row_matrix = torch.as_tensor(
+                reusable_reference_rows,
+                device=device,
+                dtype=torch.long,
             )
-            synthetic_optional = (
-                None
-                if canonical_optional is None
-                else canonical_optional.repeat_interleave(chunk_count, dim=0)
-            )
-            raw_reference = self.dataset_bias_model(
-                dataset_ids=synthetic_ids,
-                mask=synthetic_mask,
-                codon_ids=synthetic_codons,
-                position_features=synthetic_position,
-                sequence_features=synthetic_optional,
-                compute_log_sigma=False,
-                embedding_center_ids=self.gamma_selected_dataset_ids,
-            )["gamma_raw"]
-            raw_reference = (
-                raw_reference.to(device=device, dtype=accum_dtype)
-                + float(self.gamma_log_init)
-            )
-            raw_reference = raw_reference.reshape(
-                num_transcripts,
-                chunk_count,
-                T,
-            )
-            weighted_sum = weighted_sum + (
-                raw_reference * weights_chunk.reshape(1, chunk_count, 1)
+            raw_reference = raw_requested_f.index_select(
+                0,
+                row_matrix.reshape(-1),
+            ).reshape(num_transcripts, reference_count, T)
+            weighted_sum = (
+                raw_reference * reference_weights.reshape(1, reference_count, 1)
             ).sum(dim=1)
-            reference_mask = canonical_mask.to(dtype=accum_dtype).unsqueeze(1)
-            reference_valid_len = reference_mask.sum(dim=2).clamp_min(1.0)
             reference_positional_mean = (
                 raw_reference * reference_mask
             ).sum(dim=2) / reference_valid_len
-            weighted_positional_mean_sum = weighted_positional_mean_sum + (
-                reference_positional_mean * weights_chunk.reshape(1, chunk_count)
+            weighted_positional_mean_sum = (
+                reference_positional_mean
+                * reference_weights.reshape(1, reference_count)
             ).sum(dim=1)
+        else:
+            for start in range(0, reference_count, chunk_size):
+                stop = min(start + chunk_size, reference_count)
+                ids_chunk = reference_ids[start:stop]
+                weights_chunk = reference_weights[start:stop]
+                chunk_count = int(ids_chunk.numel())
+                synthetic_ids = ids_chunk.repeat(num_transcripts)
+                synthetic_mask = canonical_mask.repeat_interleave(chunk_count, dim=0)
+                synthetic_codons = canonical_codons.repeat_interleave(chunk_count, dim=0)
+                synthetic_position = canonical_position.repeat_interleave(
+                    chunk_count, dim=0
+                )
+                synthetic_optional = (
+                    None
+                    if canonical_optional is None
+                    else canonical_optional.repeat_interleave(chunk_count, dim=0)
+                )
+                raw_reference = self.dataset_bias_model(
+                    dataset_ids=synthetic_ids,
+                    mask=synthetic_mask,
+                    codon_ids=synthetic_codons,
+                    position_features=synthetic_position,
+                    sequence_features=synthetic_optional,
+                    compute_log_sigma=False,
+                    embedding_center_ids=self.gamma_selected_dataset_ids,
+                )["gamma_raw"]
+                raw_reference = (
+                    raw_reference.to(device=device, dtype=accum_dtype)
+                    + float(self.gamma_log_init)
+                )
+                raw_reference = raw_reference.reshape(
+                    num_transcripts,
+                    chunk_count,
+                    T,
+                )
+                weighted_sum = weighted_sum + (
+                    raw_reference * weights_chunk.reshape(1, chunk_count, 1)
+                ).sum(dim=1)
+                reference_positional_mean = (
+                    raw_reference * reference_mask
+                ).sum(dim=2) / reference_valid_len
+                weighted_positional_mean_sum = weighted_positional_mean_sum + (
+                    reference_positional_mean * weights_chunk.reshape(1, chunk_count)
+                ).sum(dim=1)
 
         center_by_transcript = weighted_sum / weight_sum.clamp_min(self.eps)
         a_bar_by_transcript = (
@@ -959,6 +1009,114 @@ class RiboQueuingModel(nn.Module):
     # Forward
     # ============================================================
 
+    @staticmethod
+    def _canonical_transcript_rows(
+        transcript_group_index: torch.Tensor,
+        *,
+        batch_size: int,
+    ) -> tuple[torch.Tensor, int]:
+        """Return the first pair row for every contiguous transcript group.
+
+        Collate assigns group IDs in first-occurrence order, starting from zero.
+        Keeping that order makes the unique packed biological batch and this
+        pair-to-transcript gather map agree without any string processing.
+        """
+        groups = transcript_group_index.reshape(-1).long()
+        if groups.numel() != int(batch_size):
+            raise ValueError(
+                "transcript_group_index must contain one entry per pair row; "
+                f"got {groups.numel()} entries for batch size {batch_size}."
+            )
+        if groups.numel() == 0 or bool(torch.any(groups < 0)):
+            raise ValueError("transcript_group_index must be nonempty and nonnegative.")
+        unique_groups = torch.unique(groups, sorted=True)
+        expected = torch.arange(
+            unique_groups.numel(),
+            device=groups.device,
+            dtype=groups.dtype,
+        )
+        if not torch.equal(unique_groups, expected):
+            raise ValueError(
+                "transcript_group_index must be contiguous from zero within each batch."
+            )
+        canonical_rows = torch.stack(
+            [
+                torch.nonzero(groups == group, as_tuple=False)[0, 0]
+                for group in unique_groups
+            ]
+        )
+        return canonical_rows, int(unique_groups.numel())
+
+    def _forward_biological_unique_transcripts(
+        self,
+        *,
+        x_packed,
+        mask_b: torch.Tensor,
+        transcript_group_index: torch.Tensor | None,
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        """Evaluate the shared branch once per transcript and gather to pairs.
+
+        Gathering a unique transcript output into all of its dataset rows keeps
+        the complete autograd graph. Consequently, gradients contributed by all
+        pair losses are summed at the gather operation before flowing through
+        the single biological evaluation.
+        """
+        batch_size, maximum_length = mask_b.shape
+        if transcript_group_index is None:
+            padded, _ = pad_packed_sequence(
+                x_packed,
+                batch_first=True,
+                total_length=maximum_length,
+            )
+            if padded.shape[0] != batch_size:
+                raise ValueError(
+                    "A pair-row biological packed batch must contain one sequence "
+                    f"per pair row; got {padded.shape[0]} for {batch_size} rows."
+                )
+            return self.biological_model(x_packed, mask_b), padded
+
+        groups = transcript_group_index.to(device=mask_b.device, dtype=torch.long)
+        canonical_rows, unique_count = self._canonical_transcript_rows(
+            groups,
+            batch_size=batch_size,
+        )
+        unique_mask = mask_b.index_select(0, canonical_rows)
+        unique_padded, _ = pad_packed_sequence(
+            x_packed,
+            batch_first=True,
+            total_length=maximum_length,
+        )
+        if unique_padded.shape[0] != unique_count:
+            raise ValueError(
+                "The packed biological batch must contain exactly one sequence "
+                "per transcript group; got "
+                f"{unique_padded.shape[0]} sequences for {unique_count} groups."
+            )
+
+        pair_padded = unique_padded.index_select(0, groups)
+        if self.training and float(self.biological_model.dropout) > 0.0:
+            # Preserve the former independent per-pair dropout masks for any
+            # nonbaseline configuration that enables biological dropout.
+            pair_lengths = mask_b.sum(dim=1).clamp_min(1).to("cpu")
+            pair_packed = pack_padded_sequence(
+                pair_padded,
+                pair_lengths,
+                batch_first=True,
+                enforce_sorted=False,
+            )
+            return self.biological_model(pair_packed, mask_b), pair_padded
+
+        biological_unique = self.biological_model(x_packed, unique_mask)
+        biological_pairs: dict[str, torch.Tensor] = {}
+        for name, value in biological_unique.items():
+            if name == "h_n":
+                # Hidden state is not consumed downstream. Retain a correctly
+                # gathered diagnostic form without changing recurrent compute.
+                biological_pairs[name] = value.index_select(1, groups)
+            else:
+                biological_pairs[name] = value.index_select(0, groups)
+        return biological_pairs, pair_padded
+
     def forward(
         self,
         x_packed,
@@ -967,18 +1125,25 @@ class RiboQueuingModel(nn.Module):
         mask: torch.Tensor,
         target: torch.Tensor,
         sample_ids: Sequence[str] | torch.Tensor | None = None,
+        transcript_group_index: torch.Tensor | None = None,
         dataset_bias_sequence_features: torch.Tensor | None = None,
         dataset_quality_weights: torch.Tensor | None = None,
     ):
         # --------------------------------------------------------
         # 1. Biological branch -> queue load
         # --------------------------------------------------------
-        bio = self.biological_model(x_packed, mask)
+        mask_b = mask.bool()
+        bio, biological_sequence_features = (
+            self._forward_biological_unique_transcripts(
+                x_packed=x_packed,
+                mask_b=mask_b,
+                transcript_group_index=transcript_group_index,
+            )
+        )
         L_bio = bio["L_bio"]
 
         dtype = L_bio.dtype
         device = L_bio.device
-        mask_b = mask.bool()
         B, _ = mask_b.shape
         mask_f = mask_b.to(dtype=dtype)
 
@@ -1024,11 +1189,6 @@ class RiboQueuingModel(nn.Module):
         )
         gamma_raw = torch.exp(log_gamma_raw)
         if self.gamma_centering_mode == "fixed_reference":
-            biological_sequence_features, _ = nn.utils.rnn.pad_packed_sequence(
-                x_packed,
-                batch_first=True,
-                total_length=mask_b.shape[1],
-            )
             centered = self._center_log_gamma_fixed_reference(
                 log_gamma_raw,
                 mask_b=mask_b,

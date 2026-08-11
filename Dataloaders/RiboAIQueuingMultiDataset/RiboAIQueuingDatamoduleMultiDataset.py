@@ -327,16 +327,19 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
     This is intended for losses that need matched transcript content across
     datasets, including cross-dataset gamma centering for shared transcripts.
 
-    ``batch_size`` is a per-dataset pair-row quota. Each emitted batch contains
-    at most ``batch_size`` rows from every represented dataset, while its total
-    number of rows may reach ``batch_size * number_of_datasets``.
+    ``batch_size`` is a per-dataset pair-row quota for the logical batch. A
+    logical batch contains at most ``batch_size`` rows from every represented
+    dataset, while its total number of rows may reach
+    ``batch_size * number_of_datasets``. Optional execution limits split that
+    logical batch only between complete transcript groups before DataLoader
+    collation; they never change logical membership.
 
     Each emitted batch contains flat pair indices. For a transcript t measured
     in datasets D(t), the sampler emits the group:
 
         [(t, d) for d in D(t)]
 
-    as an atomic unit. Groups are packed into batches without splitting them.
+    as an atomic unit. Groups are packed without splitting them.
     ``minimum_distinct_datasets`` is applied before physical packing. Therefore
     excluded transcript groups consume no microbatch capacity and are absent
     from the automatic gradient-accumulation preview. ``require_multidataset``
@@ -360,6 +363,9 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
         shuffle_batches: bool = True,
         num_replicas: int = 1,
         rank: int = 0,
+        execution_microbatch_max_transcript_groups: int | None = None,
+        execution_microbatch_max_pair_rows: int | None = None,
+        execution_microbatch_max_padded_codon_tokens: int | None = None,
     ):
         self.flat_transcript_ids = _as_numpy_str(flat_transcript_ids)
         self.flat_dataset_ids = _as_numpy_int(flat_dataset_ids)
@@ -383,6 +389,54 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
         self.shuffle_batches = bool(shuffle_batches)
         self.num_replicas = max(int(num_replicas), 1)
         self.rank = int(rank) % self.num_replicas
+        self.execution_microbatch_max_transcript_groups = (
+            None
+            if execution_microbatch_max_transcript_groups is None
+            else int(execution_microbatch_max_transcript_groups)
+        )
+        self.execution_microbatch_max_pair_rows = (
+            None
+            if execution_microbatch_max_pair_rows is None
+            else int(execution_microbatch_max_pair_rows)
+        )
+        self.execution_microbatch_max_padded_codon_tokens = (
+            None
+            if execution_microbatch_max_padded_codon_tokens is None
+            else int(execution_microbatch_max_padded_codon_tokens)
+        )
+        if (
+            self.execution_microbatch_max_transcript_groups is not None
+            and self.execution_microbatch_max_transcript_groups < 1
+        ):
+            raise ValueError(
+                "execution_microbatch_max_transcript_groups must be at least one."
+            )
+        if (
+            self.execution_microbatch_max_pair_rows is not None
+            and self.execution_microbatch_max_pair_rows < 1
+        ):
+            raise ValueError(
+                "execution_microbatch_max_pair_rows must be at least one."
+            )
+        if (
+            self.execution_microbatch_max_padded_codon_tokens is not None
+            and self.execution_microbatch_max_padded_codon_tokens < 1
+        ):
+            raise ValueError(
+                "execution_microbatch_max_padded_codon_tokens must be at least one."
+            )
+        if (
+            (
+                self.execution_microbatch_max_transcript_groups is not None
+                or self.execution_microbatch_max_pair_rows is not None
+                or self.execution_microbatch_max_padded_codon_tokens is not None
+            )
+            and self.num_replicas > 1
+        ):
+            raise ValueError(
+                "Execution microbatching is currently single-process only. Run one "
+                "independent experiment per GPU instead of DDP."
+            )
         self._iter_count = 0
         self.last_epoch_statistics: GroupedBatchStatistics | None = None
 
@@ -473,6 +527,102 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
         )
         self.positive_pair_rows = int(self.group_full_pair_counts.sum())
 
+    def _split_logical_batches_for_execution(self, packed):
+        """Split logical batches between complete transcript groups.
+
+        The original per-dataset packing remains the logical optimizer-batch
+        definition. The returned index payloads merely limit how many complete
+        transcript groups are materialized in one GPU forward pass.
+        """
+        maximum_groups = self.execution_microbatch_max_transcript_groups
+        maximum_pair_rows = self.execution_microbatch_max_pair_rows
+        maximum_padded_tokens = self.execution_microbatch_max_padded_codon_tokens
+        if (
+            maximum_groups is None
+            and maximum_pair_rows is None
+            and maximum_padded_tokens is None
+        ):
+            return [indices for indices, _, _ in packed]
+
+        execution_batches = []
+        for logical_batch_index, (indices, records, _) in enumerate(packed):
+            logical_group_count = len(records)
+            logical_pair_count = len(indices)
+            group_indices: list[list[int]] = []
+            offset = 0
+            for transcript_id, pair_count in records:
+                pair_count = int(pair_count)
+                group = list(indices[offset : offset + pair_count])
+                if len(group) != pair_count:
+                    raise RuntimeError(
+                        "Logical batch group boundaries are inconsistent for "
+                        f"transcript {transcript_id!r}."
+                    )
+                group_indices.append(group)
+                offset += pair_count
+            if offset != logical_pair_count:
+                raise RuntimeError(
+                    "Logical batch metadata does not cover every pair row."
+                )
+
+            chunks: list[list[list[int]]] = []
+            current_chunk: list[list[int]] = []
+            current_pair_rows = 0
+            current_max_length = 0
+            for group in group_indices:
+                group_max_length = int(
+                    self.lengths[np.asarray(group, dtype=np.int64)].max()
+                )
+                proposed_pair_rows = current_pair_rows + len(group)
+                proposed_max_length = max(current_max_length, group_max_length)
+                exceeds_group_limit = (
+                    maximum_groups is not None
+                    and len(current_chunk) >= maximum_groups
+                )
+                exceeds_pair_limit = (
+                    maximum_pair_rows is not None
+                    and bool(current_chunk)
+                    and current_pair_rows + len(group) > maximum_pair_rows
+                )
+                exceeds_token_limit = (
+                    maximum_padded_tokens is not None
+                    and bool(current_chunk)
+                    and proposed_pair_rows * proposed_max_length
+                    > maximum_padded_tokens
+                )
+                if current_chunk and (
+                    exceeds_group_limit
+                    or exceeds_pair_limit
+                    or exceeds_token_limit
+                ):
+                    chunks.append(current_chunk)
+                    current_chunk = []
+                    current_pair_rows = 0
+                    current_max_length = 0
+                current_chunk.append(group)
+                current_pair_rows += len(group)
+                current_max_length = max(current_max_length, group_max_length)
+            if current_chunk:
+                chunks.append(current_chunk)
+            chunk_count = len(chunks)
+            for chunk_index, chunk_groups in enumerate(chunks):
+                chunk_indices = [index for group in chunk_groups for index in group]
+                metadata = (
+                    int(logical_batch_index),
+                    int(chunk_index),
+                    int(chunk_count),
+                    int(logical_group_count),
+                    int(len(chunk_groups)),
+                    int(logical_pair_count),
+                )
+                execution_batches.append(
+                    [
+                        ("execution_microbatch_v1", int(index), *metadata)
+                        for index in chunk_indices
+                    ]
+                )
+        return execution_batches
+
     def _sample_group_indices(
         self,
         group_index: int,
@@ -561,11 +711,11 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
             packed = [packed[int(i)] for i in batch_order]
 
         packed = _shard_batches_padded(packed, self.num_replicas, self.rank)
-        batches = [indices for indices, _, _ in packed]
-        pair_rows = tuple(len(indices) for indices in batches)
+        logical_batches = [indices for indices, _, _ in packed]
+        pair_rows = tuple(len(indices) for indices in logical_batches)
         unique_transcripts = tuple(
             len(set(self.flat_transcript_ids[np.asarray(indices, dtype=np.int64)]))
-            for indices in batches
+            for indices in logical_batches
         )
         group_records = [
             record for _, records, _ in packed for record in records
@@ -586,7 +736,7 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
 
         statistics = GroupedBatchStatistics(
             iteration_index=int(iteration_index),
-            number_of_microbatches=len(batches),
+            number_of_microbatches=len(logical_batches),
             eligible_transcript_groups=len(self.groups),
             physical_pair_capacity=self.physical_pair_capacity,
             pair_rows_per_microbatch=pair_rows,
@@ -615,7 +765,8 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
             ),
             positive_pair_rows=self.positive_pair_rows,
         )
-        return batches, statistics
+        execution_batches = self._split_logical_batches_for_execution(packed)
+        return execution_batches, statistics
 
     def preview_epoch_batch_statistics(
         self,
@@ -633,9 +784,8 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
         yield from batches
 
     def __len__(self):
-        return self.preview_epoch_batch_statistics(
-            iteration_index=self._iter_count
-        ).number_of_microbatches
+        batches, _ = self._build_epoch_plan(iteration_index=self._iter_count)
+        return len(batches)
 
 
 # ============================================================
@@ -678,6 +828,9 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         dataset_quality_dataset_column: str = "dataset",
         dataset_quality_rank_column: str = "quality_rank",
         dataset_quality_strict: bool = True,
+        execution_microbatch_max_transcript_groups: int | None = None,
+        execution_microbatch_max_pair_rows: int | None = None,
+        execution_microbatch_max_padded_codon_tokens: int | None = None,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -721,6 +874,42 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         self.dataset_quality_dataset_column = str(dataset_quality_dataset_column)
         self.dataset_quality_rank_column = str(dataset_quality_rank_column)
         self.dataset_quality_strict = bool(dataset_quality_strict)
+        self.execution_microbatch_max_transcript_groups = (
+            None
+            if execution_microbatch_max_transcript_groups is None
+            else int(execution_microbatch_max_transcript_groups)
+        )
+        self.execution_microbatch_max_pair_rows = (
+            None
+            if execution_microbatch_max_pair_rows is None
+            else int(execution_microbatch_max_pair_rows)
+        )
+        self.execution_microbatch_max_padded_codon_tokens = (
+            None
+            if execution_microbatch_max_padded_codon_tokens is None
+            else int(execution_microbatch_max_padded_codon_tokens)
+        )
+        if (
+            self.execution_microbatch_max_transcript_groups is not None
+            and self.execution_microbatch_max_transcript_groups < 1
+        ):
+            raise ValueError(
+                "execution_microbatch_max_transcript_groups must be at least one."
+            )
+        if (
+            self.execution_microbatch_max_pair_rows is not None
+            and self.execution_microbatch_max_pair_rows < 1
+        ):
+            raise ValueError(
+                "execution_microbatch_max_pair_rows must be at least one."
+            )
+        if (
+            self.execution_microbatch_max_padded_codon_tokens is not None
+            and self.execution_microbatch_max_padded_codon_tokens < 1
+        ):
+            raise ValueError(
+                "execution_microbatch_max_padded_codon_tokens must be at least one."
+            )
 
         self.nt_enc = open_file(nt_encoding_path)
         self.c2aa_enc = open_file(codon_to_aa_encoding_path)
@@ -832,8 +1021,15 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
                 "Configured additional sequence feature columns are missing from "
                 f"{self.sequences_path}: {missing_sequence_features}."
             )
+        sequence_column = "codons" if "codons" in seq_available else "ref"
+        if sequence_column not in seq_available:
+            raise KeyError(
+                f"{self.sequences_path} contains neither 'codons' nor 'ref'."
+            )
         seq_columns = [
-            c for c in ("transcript_id", "ref", seq_css_col) if c in seq_available
+            c
+            for c in ("transcript_id", sequence_column, seq_css_col)
+            if c in seq_available
         ]
         seq_columns.extend(active_sequence_feature_names)
         seq_df = pd.read_parquet(self.sequences_path, columns=seq_columns or None)
@@ -843,20 +1039,29 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
 
         print("Length of the main sequence:", len(seq_df.index))
 
-        loaded_datasets = {}
+        dataset_specs: dict[str, tuple[str, bool]] = {}
         weighted_dataset_names = []
         union_index = pd.Index([], dtype=seq_df.index.dtype)
 
-        for path in tqdm(self.datasets_paths, desc="Loading ribo datasets"):
-            df = pd.read_parquet(path)
-
-            if "id" not in df.columns:
+        # First read only IDs. Full nested profiles are processed one dataset at
+        # a time below, preventing all expanded Pandas profile frames from
+        # coexisting at peak memory.
+        for path in tqdm(self.datasets_paths, desc="Indexing ribo datasets"):
+            available_columns = set(pq.read_schema(path).names)
+            if "id" not in available_columns:
                 raise KeyError(f"'id' column missing in {path}")
-            if "ribo" not in df.columns:
+            if "ribo" not in available_columns:
                 raise KeyError(f"'ribo' column missing in {path}")
+            if RIBO_REPLICAS_COLUMN not in available_columns:
+                raise KeyError(
+                    f"Required replica column {RIBO_REPLICAS_COLUMN!r} is missing "
+                    f"in {path}. Point dataset_config at replica-aware parquets."
+                )
 
-            duplicate_ids = df.loc[
-                df["id"].astype(str).duplicated(keep=False), "id"
+            id_frame = pd.read_parquet(path, columns=["id"])
+
+            duplicate_ids = id_frame.loc[
+                id_frame["id"].astype(str).duplicated(keep=False), "id"
             ].astype(str)
             if not duplicate_ids.empty:
                 duplicate_id = str(duplicate_ids.iloc[0])
@@ -867,29 +1072,20 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
                     f"transcript={duplicate_id}, rows={duplicate_count}."
                 )
 
-            df = df.set_index("id")
-            df.index = df.index.astype(str)
-
             dataset_name = os.path.basename(path).split(".")[0]
-            columns = ["ribo"]
-            if "weight" in df.columns:
-                columns.append("weight")
+            if dataset_name in dataset_specs:
+                raise ValueError(f"Duplicate active dataset name: {dataset_name!r}.")
+            has_weight = "weight" in available_columns
+            if has_weight:
                 weighted_dataset_names.append(dataset_name)
-
-            if RIBO_REPLICAS_COLUMN not in df.columns:
-                raise KeyError(
-                    f"Required replica column {RIBO_REPLICAS_COLUMN!r} is missing "
-                    f"in {path}. Point dataset_config at replica-aware parquets."
-                )
-            columns.append(RIBO_REPLICAS_COLUMN)
-
-            loaded_datasets[dataset_name] = df[columns]
-            union_index = union_index.union(df.index, sort=False)
+            dataset_specs[dataset_name] = (str(path), has_weight)
+            dataset_ids = pd.Index(id_frame["id"].astype(str))
+            union_index = union_index.union(dataset_ids, sort=False)
 
         if weighted_dataset_names:
-            if len(weighted_dataset_names) != len(loaded_datasets):
+            if len(weighted_dataset_names) != len(dataset_specs):
                 missing_weight_columns = sorted(
-                    set(loaded_datasets) - set(weighted_dataset_names)
+                    set(dataset_specs) - set(weighted_dataset_names)
                 )
                 raise ValueError(
                     "Do not mix weighted and unweighted datasets in one run. "
@@ -898,32 +1094,32 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
                 )
             print(
                 "Using transcript weights from "
-                f"{len(weighted_dataset_names)}/{len(loaded_datasets)} loaded datasets."
+                f"{len(weighted_dataset_names)}/{len(dataset_specs)} loaded datasets."
             )
         else:
             print("No transcript weight column found; using unit sample weights.")
 
-        dataset_quality_ranks = {name: float("nan") for name in loaded_datasets}
-        dataset_quality_weights = {name: 1.0 for name in loaded_datasets}
+        dataset_quality_ranks = {name: float("nan") for name in dataset_specs}
+        dataset_quality_weights = {name: 1.0 for name in dataset_specs}
         if self.dataset_quality_ranking_path:
             rank_lookup, quality_lookup = load_dataset_quality_ranking(
                 self.dataset_quality_ranking_path,
                 dataset_column=self.dataset_quality_dataset_column,
                 rank_column=self.dataset_quality_rank_column,
             )
-            missing_rankings = sorted(set(loaded_datasets) - set(rank_lookup))
+            missing_rankings = sorted(set(dataset_specs) - set(rank_lookup))
             if missing_rankings and self.dataset_quality_strict:
                 raise KeyError(
                     "The dataset-quality ranking is missing active datasets: "
                     f"{missing_rankings}."
                 )
-            for name in loaded_datasets:
+            for name in dataset_specs:
                 if name in rank_lookup:
                     dataset_quality_ranks[name] = rank_lookup[name]
                     dataset_quality_weights[name] = quality_lookup[name]
             print(
                 "Loaded dataset-quality metadata for "
-                f"{len(loaded_datasets) - len(missing_rankings)}/{len(loaded_datasets)} "
+                f"{len(dataset_specs) - len(missing_rankings)}/{len(dataset_specs)} "
                 f"active datasets from {self.dataset_quality_ranking_path}."
             )
             if missing_rankings:
@@ -939,7 +1135,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             )
 
         seq_df_union = seq_df.loc[valid_index]
-        ref_arrays = seq_df_union["ref"].values
+        sequence_arrays = seq_df_union[sequence_column].values
 
         css_col = (
             "conserved_stalling_sites"
@@ -952,11 +1148,17 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             )
 
         css = seq_df_union[css_col].values
-        lengths = np.asarray([len(x) for x in ref_arrays], dtype=np.int32)
+        lengths = np.asarray([len(x) for x in sequence_arrays], dtype=np.int32)
 
         shared_data = {
             "transcript_id": valid_index.values.astype(str),
-            "ref": ref_arrays,
+            # Keep the historical key for dataset compatibility, while the
+            # representation flag tells the compact converter whether each
+            # cell contains codon strings or nucleotide one-hots.
+            "ref": sequence_arrays,
+            "sequence_representation": (
+                "codon_tokens" if sequence_column == "codons" else "nucleotide_onehot"
+            ),
             "css": css,
             "ribo_profiles": defaultdict(dict),
             "ribo_replicas": defaultdict(dict),
@@ -964,7 +1166,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             "dataset_quality_ranks": dataset_quality_ranks,
             "dataset_quality_weights": dataset_quality_weights,
             "lengths": lengths,
-            "datasets_names": list(loaded_datasets.keys()),
+            "datasets_names": list(dataset_specs.keys()),
             "sequence_features": {
                 name: seq_df_union[name].values
                 for name in active_sequence_feature_names
@@ -1038,8 +1240,15 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             return np.ascontiguousarray(np.stack(reps, axis=0))
 
         valid_ids = set(valid_index.astype(str))
-        for dataset_name, df in loaded_datasets.items():
-            has_weight = "weight" in df.columns
+        for dataset_name, (path, has_weight) in tqdm(
+            dataset_specs.items(),
+            desc="Validating ribo profiles",
+        ):
+            read_columns = ["id", "ribo", RIBO_REPLICAS_COLUMN]
+            if has_weight:
+                read_columns.append("weight")
+            df = pd.read_parquet(path, columns=read_columns).set_index("id")
+            df.index = df.index.astype(str)
             ids = df.index.astype(str)
             weight_values = df["weight"].values if has_weight else None
             consensus_values = df["ribo"].values
@@ -1082,6 +1291,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
                             f"{sample_weight}."
                         )
                     shared_data["sample_weights"][t_id][dataset_name] = sample_weight
+            del ids, consensus_values, replica_values, weight_values, df
 
         if self.split is None:
             raise NotImplementedError(
@@ -1162,6 +1372,14 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             considered_transcript_ids=self.split[1],
             split_name="validation",
         )
+
+        # Both split datasets now own compact codon-ID and routed-feature
+        # caches for every transcript they can return. Release the much larger
+        # nested sequence cells before DataLoader worker creation; otherwise a
+        # spawn worker serializes data that can never be consulted.
+        if self.train_dataset_obj.precompute_features and self.val_dataset_obj.precompute_features:
+            shared_data["ref"] = ()
+            shared_data["sequence_features"] = {}
 
     def _print_flat_pair_summary(
         self,
@@ -1302,6 +1520,15 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             ),
             num_replicas=max(int(num_replicas), 1),
             rank=int(rank),
+            execution_microbatch_max_transcript_groups=(
+                self.execution_microbatch_max_transcript_groups
+            ),
+            execution_microbatch_max_pair_rows=(
+                self.execution_microbatch_max_pair_rows
+            ),
+            execution_microbatch_max_padded_codon_tokens=(
+                self.execution_microbatch_max_padded_codon_tokens
+            ),
         )
 
     def preview_train_grouped_batch_statistics(
@@ -1370,6 +1597,15 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             shuffle_batches=False,
             num_replicas=num_replicas,
             rank=rank,
+            execution_microbatch_max_transcript_groups=(
+                self.execution_microbatch_max_transcript_groups
+            ),
+            execution_microbatch_max_pair_rows=(
+                self.execution_microbatch_max_pair_rows
+            ),
+            execution_microbatch_max_padded_codon_tokens=(
+                self.execution_microbatch_max_padded_codon_tokens
+            ),
         )
 
         return DataLoader(
@@ -1402,6 +1638,15 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             shuffle_batches=False,
             num_replicas=num_replicas,
             rank=rank,
+            execution_microbatch_max_transcript_groups=(
+                self.execution_microbatch_max_transcript_groups
+            ),
+            execution_microbatch_max_pair_rows=(
+                self.execution_microbatch_max_pair_rows
+            ),
+            execution_microbatch_max_padded_codon_tokens=(
+                self.execution_microbatch_max_padded_codon_tokens
+            ),
         )
 
         return DataLoader(

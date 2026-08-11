@@ -86,7 +86,7 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         (
             real_idx_dataset,
             transcript_id,
-            encoded_sequence[T, F],
+            biological_extra_features[T, F_extra],
             codon_ids[T],
             ribo_profile[T],
             css,
@@ -95,13 +95,14 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             dataset_quality_weight,
             dataset_bias_features[T, F_bias],  # when F_bias > 0
             ribo_replicas[R, T],
+            execution_microbatch_metadata,     # dict or None
         )
 
     Collate returns:
         (
             ids_datasets_sorted,   # [B]
             ids_sorted,            # list[str]
-            seq_packed,            # PackedSequence
+            seq_packed,            # one dense biological sequence per transcript
             prof_pad,              # [B, T_max]
             lengths_sorted,        # [B]
             mask_pad,              # [B, T_max]
@@ -114,14 +115,15 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             bias_features_pad,     # [B, T_max, F_bias], optional
             replica_pad,           # [B, R_max, T_max]
             replica_mask,          # [B, R_max]
+            execution_microbatch_metadata, # dict or None
         )
 
     Speed-oriented details:
         1. Avoids string reconstruction of codons during feature extraction.
         2. Uses a triplet-index lookup table for codon IDs.
-        3. Precomputes sequence features/codon IDs by default.
+        3. Caches compact uint8 codon IDs, not dense base one-hots.
         4. Caches ribo profiles as contiguous float32 arrays.
-        5. Avoids unnecessary copy=True conversions in collate_fn.
+        5. Builds dense biological inputs once per transcript group in collate.
     """
 
     def __init__(
@@ -148,6 +150,17 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
 
         self.data_records = data
         self.lengths = np.asarray(lengths, dtype=np.int64)
+        self.sequence_representation = str(
+            self.data_records.get("sequence_representation", "nucleotide_onehot")
+        )
+        if self.sequence_representation not in {
+            "nucleotide_onehot",
+            "codon_tokens",
+        }:
+            raise ValueError(
+                "Unknown sequence representation: "
+                f"{self.sequence_representation!r}."
+            )
 
         self.codon_map = codon_encoding
         self.aa_map = aa_encoding
@@ -215,8 +228,13 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         # ------------------------------------------------------------
         self._build_encoding_lookup_tables()
 
-        # One cache slot per global transcript in shared_data.
-        self._feature_cache: list[np.ndarray | None] = [None] * len(self.data_records["ref"])
+        # Keep only compact codon IDs plus genuinely transcript-specific extra
+        # features. The former dense 97-float base representation consumed
+        # roughly 4 GiB for MANE and duplicated identical sequence rows across
+        # dataset observations during collate.
+        self._biological_extra_feature_cache: list[np.ndarray | None] = [
+            None
+        ] * len(self.data_records["ref"])
         self._codon_id_cache: list[np.ndarray | None] = [None] * len(self.data_records["ref"])
         self._dataset_bias_feature_cache: list[np.ndarray | None] = [
             None
@@ -338,13 +356,38 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         return self.total_length
 
     def __getitem__(self, index: int):
+        execution_metadata = None
+        if isinstance(index, (tuple, list)):
+            if len(index) != 8 or str(index[0]) != "execution_microbatch_v1":
+                raise ValueError(f"Invalid execution-microbatch dataset index: {index!r}")
+            (
+                _,
+                index,
+                logical_batch_index,
+                execution_chunk_index,
+                execution_chunk_count,
+                logical_group_count,
+                execution_group_count,
+                logical_pair_count,
+            ) = index
+            execution_metadata = {
+                "logical_batch_index": int(logical_batch_index),
+                "execution_chunk_index": int(execution_chunk_index),
+                "execution_chunk_count": int(execution_chunk_count),
+                "logical_group_count": int(logical_group_count),
+                "execution_group_count": int(execution_group_count),
+                "logical_pair_count": int(logical_pair_count),
+            }
+        index = int(index)
         local_idx = int(self.flat_local_indices[index])
         transcript_id = str(self.flat_transcript_ids[index])
         dataset_name = str(self.flat_dataset_names[index])
 
         global_idx = int(self.local_to_global_idx[local_idx])
 
-        encoded, codon_ids, dataset_bias_features = self._get_sequence_inputs(global_idx)
+        biological_extra_features, codon_ids, dataset_bias_features = (
+            self._get_sequence_inputs(global_idx)
+        )
         ribo = self._get_ribo_profile(transcript_id, dataset_name)
         replicas = self._get_ribo_replicas(transcript_id, dataset_name)
         css = self.data_records["css"][global_idx]
@@ -353,22 +396,28 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             dataset_name
         )
 
-        if len(ribo) != encoded.shape[0]:
+        sequence_length = int(codon_ids.shape[0])
+        if len(ribo) != sequence_length:
             raise ValueError(
                 f"Length mismatch for transcript_id={transcript_id}, dataset={dataset_name}: "
-                f"seq_len={encoded.shape[0]}, ribo_len={len(ribo)}, css_len={len(css)}"
+                f"seq_len={sequence_length}, ribo_len={len(ribo)}, css_len={len(css)}"
             )
 
-        if len(codon_ids) != encoded.shape[0]:
+        if biological_extra_features.shape != (
+            sequence_length,
+            self.biological_extra_dim,
+        ):
             raise ValueError(
-                f"Codon ID length mismatch for transcript_id={transcript_id}: "
-                f"seq_len={encoded.shape[0]}, codon_ids_len={len(codon_ids)}"
+                "Biological extra-feature shape mismatch for "
+                f"transcript_id={transcript_id}: got "
+                f"{biological_extra_features.shape}, expected "
+                f"({sequence_length}, {self.biological_extra_dim})."
             )
 
-        if replicas.shape[1] != encoded.shape[0]:
+        if replicas.shape[1] != sequence_length:
             raise ValueError(
                 f"Replica length mismatch for transcript_id={transcript_id}, "
-                f"dataset={dataset_name}: seq_len={encoded.shape[0]}, "
+                f"dataset={dataset_name}: seq_len={sequence_length}, "
                 f"replica_shape={replicas.shape}"
             )
 
@@ -377,7 +426,7 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         sample = (
             real_idx_dataset,
             transcript_id,
-            encoded,
+            biological_extra_features,
             codon_ids,
             ribo,
             css,
@@ -387,7 +436,7 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         )
         if self.dataset_bias_extra_dim > 0:
             sample = (*sample, dataset_bias_features)
-        return (*sample, replicas)
+        return (*sample, replicas, execution_metadata)
 
     def flat_pair_summary(self) -> dict:
         """
@@ -604,32 +653,63 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         self.codon_onehot_lut = np.eye(self.num_codons, dtype=np.float32)
         self.aa_onehot_lut = np.eye(self.n_aa, dtype=np.float32)
 
+        # A codon completely determines the original 97-dimensional base
+        # representation: 3 nucleotide one-hots, codon one-hot, and amino-acid
+        # one-hot. Materialize this tiny table once, then index it only for the
+        # unique transcripts present in the current collated batch.
+        base_feature_lut = np.empty(
+            (self.num_codons, 3 * self.nt_dim + self.num_codons + self.n_aa),
+            dtype=np.float32,
+        )
+        seen_ids: set[int] = set()
+        for raw_codon, raw_codon_id in self.codon_map.items():
+            codon = str(raw_codon)
+            codon_id = int(raw_codon_id)
+            if codon_id < 0 or codon_id >= self.num_codons:
+                raise ValueError(f"Codon ID out of range: {codon!r} -> {codon_id}.")
+            nucleotide_features = np.concatenate(
+                [
+                    np.asarray(self.nt_encoding[base], dtype=np.float32)
+                    for base in codon
+                ]
+            )
+            base_feature_lut[codon_id] = np.concatenate(
+                [
+                    nucleotide_features,
+                    self.codon_onehot_lut[codon_id],
+                    self.aa_onehot_lut[codon_idx_to_aa_idx[codon_id]],
+                ]
+            )
+            seen_ids.add(codon_id)
+        if seen_ids != set(range(self.num_codons)):
+            raise ValueError(
+                "Codon encoding must define every contiguous ID from 0 to "
+                f"{self.num_codons - 1}."
+            )
+        self.base_biological_feature_lut = np.ascontiguousarray(base_feature_lut)
+
     def _precompute_sequence_features(self) -> None:
         """
-        Precompute encoded features and codon IDs for the transcripts used by this split.
+        Precompute compact codon IDs and optional transcript-specific features.
 
-        This is usually faster than lazy per-worker caching, because with multiple
-        DataLoader workers each worker has its own dataset/cache copy.
+        The dense base one-hots are deliberately not cached. They are recovered
+        from ``base_biological_feature_lut`` for unique transcripts in collate.
         """
         for global_idx in np.unique(self.local_to_global_idx):
             global_idx = int(global_idx)
             ref = self.data_records["ref"][global_idx]
-            encoded, codon_ids = self._extract_features_and_codon_ids(ref)
+            codon_ids = self._sequence_cell_to_codon_ids(ref)
             bio_extra = self._additional_features_for_route(
                 global_idx=global_idx,
                 specs=self.biological_feature_specs,
-                sequence_length=encoded.shape[0],
+                sequence_length=codon_ids.shape[0],
             )
-            if bio_extra.shape[1] > 0:
-                encoded = np.ascontiguousarray(
-                    np.concatenate((encoded, bio_extra), axis=1), dtype=np.float32
-                )
             bias_extra = self._additional_features_for_route(
                 global_idx=global_idx,
                 specs=self.dataset_bias_feature_specs,
-                sequence_length=encoded.shape[0],
+                sequence_length=codon_ids.shape[0],
             )
-            self._feature_cache[global_idx] = encoded
+            self._biological_extra_feature_cache[global_idx] = bio_extra
             self._codon_id_cache[global_idx] = codon_ids
             self._dataset_bias_feature_cache[global_idx] = bias_extra
 
@@ -657,16 +737,16 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             dataset_name = str(self.flat_dataset_names[i])
             global_idx = int(self.flat_global_indices[i])
 
-            encoded = self._feature_cache[global_idx]
+            codon_ids = self._codon_id_cache[global_idx]
             ribo = self._ribo_cache.get((tid, dataset_name))
 
-            if encoded is None or ribo is None:
+            if codon_ids is None or ribo is None:
                 continue
 
-            if len(ribo) != encoded.shape[0]:
+            if len(ribo) != codon_ids.shape[0]:
                 mismatches.append(
                     f"  transcript_id={tid}, dataset={dataset_name}: "
-                    f"seq_len={encoded.shape[0]}, ribo_len={len(ribo)}"
+                    f"seq_len={codon_ids.shape[0]}, ribo_len={len(ribo)}"
                 )
 
         if mismatches:
@@ -678,32 +758,28 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
     def _get_sequence_inputs(
         self, global_idx: int
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        encoded = self._feature_cache[global_idx]
+        biological_extra = self._biological_extra_feature_cache[global_idx]
         codon_ids = self._codon_id_cache[global_idx]
         bias_features = self._dataset_bias_feature_cache[global_idx]
 
-        if encoded is None or codon_ids is None or bias_features is None:
+        if biological_extra is None or codon_ids is None or bias_features is None:
             ref = self.data_records["ref"][global_idx]
-            encoded, codon_ids = self._extract_features_and_codon_ids(ref)
-            bio_extra = self._additional_features_for_route(
+            codon_ids = self._sequence_cell_to_codon_ids(ref)
+            biological_extra = self._additional_features_for_route(
                 global_idx=global_idx,
                 specs=self.biological_feature_specs,
-                sequence_length=encoded.shape[0],
+                sequence_length=codon_ids.shape[0],
             )
-            if bio_extra.shape[1] > 0:
-                encoded = np.ascontiguousarray(
-                    np.concatenate((encoded, bio_extra), axis=1), dtype=np.float32
-                )
             bias_features = self._additional_features_for_route(
                 global_idx=global_idx,
                 specs=self.dataset_bias_feature_specs,
-                sequence_length=encoded.shape[0],
+                sequence_length=codon_ids.shape[0],
             )
-            self._feature_cache[global_idx] = encoded
+            self._biological_extra_feature_cache[global_idx] = biological_extra
             self._codon_id_cache[global_idx] = codon_ids
             self._dataset_bias_feature_cache[global_idx] = bias_features
 
-        return encoded, codon_ids, bias_features
+        return biological_extra, codon_ids, bias_features
 
     def _get_ribo_profile(self, transcript_id: str, dataset_name: str) -> np.ndarray:
         key = (str(transcript_id), str(dataset_name))
@@ -798,17 +874,24 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             )
         return rank, weight
 
-    def _extract_features_and_codon_ids(
-        self,
-        nucleotide_sequence_per_codon,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Builds sequence features and codon IDs.
+    def _sequence_cell_to_codon_ids(self, sequence_cell) -> np.ndarray:
+        if self.sequence_representation == "codon_tokens":
+            tokens = np.asarray(sequence_cell).reshape(-1)
+            try:
+                values = np.fromiter(
+                    (self.codon_map[str(token).upper()] for token in tokens),
+                    dtype=np.uint8,
+                    count=int(tokens.size),
+                )
+            except KeyError as exc:
+                raise ValueError(
+                    f"Sequence contains a codon absent from codon_encoding: {exc.args[0]!r}."
+                ) from exc
+            return np.ascontiguousarray(values, dtype=np.uint8)
+        return self._extract_codon_ids(sequence_cell)
 
-        Robust to both:
-            1. rectangular arrays with shape [T, 3, nt_dim]
-            2. object/ragged arrays where each codon is a list/array of 3 nt one-hots
-        """
+    def _extract_codon_ids(self, nucleotide_sequence_per_codon) -> np.ndarray:
+        """Convert the stored nucleotide one-hots to compact codon IDs."""
         # Fast path: works if the parquet cell is already rectangular.
         try:
             raw_nt_sequence = np.asarray(
@@ -855,11 +938,6 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
                 f"got {raw_nt_sequence.shape[2]}."
             )
 
-        T = raw_nt_sequence.shape[0]
-
-        # Flatten 3 nucleotide one-hots per codon into one vector per codon.
-        nt_sequence = raw_nt_sequence.reshape(T, -1)
-
         # Fast one-hot triplet -> codon id lookup.
         nt_idx = np.argmax(raw_nt_sequence, axis=-1).astype(np.int64, copy=False)
 
@@ -877,27 +955,19 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
                 f"First bad positions: {bad.tolist()}, triplets={bad_triplets}."
             )
 
-        codon_ids = np.ascontiguousarray(codon_ids.astype(np.int64, copy=False))
-        aa_ids = self.codon_idx_to_aa_idx[codon_ids]
+        return np.ascontiguousarray(codon_ids.astype(np.uint8, copy=False))
 
-        aa_onehot = self.aa_onehot_lut[aa_ids]
-        codon_onehot = self.codon_onehot_lut[codon_ids]
-
-        concatenated_sequence = np.concatenate(
-            [
-                nt_sequence.astype(np.float32, copy=False),
-                codon_onehot,
-                aa_onehot,
-            ],
-            axis=1,
-        )
-
-        concatenated_sequence = np.ascontiguousarray(
-            concatenated_sequence,
+    def _extract_features_and_codon_ids(
+        self,
+        nucleotide_sequence_per_codon,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Compatibility helper that reconstructs the former dense features."""
+        codon_ids = self._extract_codon_ids(nucleotide_sequence_per_codon)
+        encoded = np.ascontiguousarray(
+            self.base_biological_feature_lut[codon_ids],
             dtype=np.float32,
         )
-
-        return concatenated_sequence, codon_ids
+        return encoded, codon_ids
 
     # ============================================================
     # Collate
@@ -905,7 +975,7 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
 
     def collate_fn(self, batch):
         has_bias_features = self.dataset_bias_extra_dim > 0
-        expected_fields = 10 + int(has_bias_features)
+        expected_fields = 11 + int(has_bias_features)
         if any(len(sample) != expected_fields for sample in batch):
             raise ValueError(
                 "Every sample must contain the mandatory replica tensor; expected "
@@ -925,9 +995,23 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         ) = zip(*batch)
         bias_features = optional_values[0] if has_bias_features else None
         replicas = optional_values[int(has_bias_features)]
+        execution_metadata_values = optional_values[int(has_bias_features) + 1]
+        if all(value is None for value in execution_metadata_values):
+            execution_metadata = None
+        elif any(value is None for value in execution_metadata_values):
+            raise ValueError(
+                "An execution microbatch cannot mix indexed and ordinary samples."
+            )
+        else:
+            first_metadata = dict(execution_metadata_values[0])
+            if any(dict(value) != first_metadata for value in execution_metadata_values[1:]):
+                raise ValueError(
+                    "All rows in one execution microbatch must carry identical metadata."
+                )
+            execution_metadata = first_metadata
 
         lengths = torch.as_tensor(
-            [s.shape[0] for s in sequences],
+            [value.shape[0] for value in codon_ids],
             dtype=torch.long,
         )
 
@@ -941,9 +1025,7 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
 
         ids_sorted = [ids[i] for i in order_list]
 
-        # Arrays should already be contiguous and correctly typed from cache.
-        # np.asarray(..., dtype=...) avoids copies when already correct.
-        seq_sorted = [
+        biological_extra_sorted = [
             torch.from_numpy(np.asarray(sequences[i], dtype=np.float32))
             for i in order_list
         ]
@@ -986,12 +1068,6 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         transcript_group_indices_sorted = transcript_group_indices_from_ids(
             ids_sorted,
             expected_pair_rows_by_transcript=self.num_datasets_by_transcript,
-        )
-
-        seq_pad = pad_sequence(
-            seq_sorted,
-            batch_first=True,
-            padding_value=0.0,
         )
 
         prof_pad = pad_sequence(
@@ -1040,6 +1116,60 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
 
         codon_ids_pad = codon_ids_pad.masked_fill(~mask_pad, 0)
 
+        # The biological encoder is dataset-blind. Pack one canonical sequence
+        # per transcript group, while retaining pair-row codon IDs for the
+        # dataset-specific branch. Group IDs are contiguous and assigned by
+        # first occurrence, so canonical order remains length-sorted.
+        unique_group_count = int(transcript_group_indices_sorted.max().item()) + 1
+        canonical_pair_rows: list[int] = []
+        for group in range(unique_group_count):
+            rows = torch.nonzero(
+                transcript_group_indices_sorted == group,
+                as_tuple=False,
+            ).reshape(-1)
+            if rows.numel() == 0:
+                raise RuntimeError(f"Missing transcript group {group} in collate.")
+            canonical_pair_rows.append(int(rows[0].item()))
+
+        if __debug__:
+            for pair_row, group in enumerate(transcript_group_indices_sorted.tolist()):
+                canonical_row = canonical_pair_rows[int(group)]
+                if not torch.equal(
+                    codon_ids_sorted[pair_row],
+                    codon_ids_sorted[canonical_row],
+                ):
+                    raise RuntimeError(
+                        "Dataset rows for one transcript have different codon IDs."
+                    )
+
+        canonical_index = torch.as_tensor(canonical_pair_rows, dtype=torch.long)
+        unique_lengths = lengths_sorted.index_select(0, canonical_index)
+        unique_codon_ids_pad = pad_sequence(
+            [codon_ids_sorted[index] for index in canonical_pair_rows],
+            batch_first=True,
+            padding_value=0,
+        )
+        base_feature_lut = torch.from_numpy(self.base_biological_feature_lut)
+        unique_sequence_pad = base_feature_lut[unique_codon_ids_pad]
+        unique_mask = (
+            torch.arange(unique_sequence_pad.shape[1]).unsqueeze(0)
+            < unique_lengths.unsqueeze(1)
+        )
+        unique_sequence_pad = unique_sequence_pad.masked_fill(
+            ~unique_mask.unsqueeze(-1),
+            0.0,
+        )
+        if self.biological_extra_dim > 0:
+            unique_biological_extra_pad = pad_sequence(
+                [biological_extra_sorted[index] for index in canonical_pair_rows],
+                batch_first=True,
+                padding_value=0.0,
+            )
+            unique_sequence_pad = torch.cat(
+                (unique_sequence_pad, unique_biological_extra_pad),
+                dim=-1,
+            )
+
         Rmax = max(int(rep.shape[0]) for rep in replicas_sorted)
         replica_pad = torch.zeros(
             len(replicas_sorted),
@@ -1070,8 +1200,8 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             replica_mask[row_idx, :n_rep] = True
 
         seq_packed = pack_padded_sequence(
-            seq_pad,
-            lengths_sorted,
+            unique_sequence_pad,
+            unique_lengths,
             batch_first=True,
             enforce_sorted=True,
         )
@@ -1092,4 +1222,4 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         )
         if bias_features_pad is not None:
             collated = (*collated, bias_features_pad)
-        return (*collated, replica_pad, replica_mask)
+        return (*collated, replica_pad, replica_mask, execution_metadata)

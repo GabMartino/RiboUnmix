@@ -408,8 +408,17 @@ def shared_logger_version_from_environment() -> str | None:
     Return a deterministic logger version shared by all externally launched DDP
     ranks. With Slurm + srun every rank executes this script independently before
     Lightning has a Trainer/rank-zero guard, so TensorBoardLogger's auto version
-    discovery can race and create one version_* directory per rank.
+    discovery can race and create one version_* directory per rank. Local
+    torchrun uses ``RIBOAI_LOGGER_VERSION`` for the same purpose.
     """
+    # Local torchrun launches do not provide SLURM identifiers, but all ranks
+    # still need one deterministic TensorBoard version directory. The local
+    # launcher supplies this explicit value before falling back to Slurm's
+    # job/array identifiers.
+    explicit_version = os.environ.get("RIBOAI_LOGGER_VERSION")
+    if explicit_version:
+        return explicit_version
+
     slurm_job_id = os.environ.get("SLURM_JOB_ID")
     if slurm_job_id:
         array_task_id = os.environ.get("SLURM_ARRAY_TASK_ID")
@@ -1498,6 +1507,49 @@ def make_datamodule(
         feature_cfg = OmegaConf.to_container(feature_cfg, resolve=True)
     else:
         feature_cfg = dict(feature_cfg or {})
+    execution_enabled = cfg_bool(
+        cfg, "training.execution_microbatching.enabled", False
+    )
+    raw_execution_groups = cfg_get(
+        cfg,
+        "training.execution_microbatching.max_transcript_groups_per_forward",
+        None,
+    )
+    raw_execution_pairs = cfg_get(
+        cfg,
+        "training.execution_microbatching.max_pair_rows_per_forward",
+        None,
+    )
+    raw_execution_tokens = cfg_get(
+        cfg,
+        "training.execution_microbatching.max_padded_codon_tokens_per_forward",
+        None,
+    )
+    execution_groups = (
+        int(raw_execution_groups)
+        if execution_enabled and raw_execution_groups is not None
+        else None
+    )
+    execution_pairs = (
+        int(raw_execution_pairs)
+        if execution_enabled and raw_execution_pairs is not None
+        else None
+    )
+    execution_tokens = (
+        int(raw_execution_tokens)
+        if execution_enabled and raw_execution_tokens is not None
+        else None
+    )
+    if (
+        execution_enabled
+        and execution_groups is None
+        and execution_pairs is None
+        and execution_tokens is None
+    ):
+        raise ValueError(
+            "training.execution_microbatching.enabled=true requires at least one "
+            "execution-forward limit."
+        )
     return RiboAIQueuingDatamoduleMultiDataset(
         sequences_path=cfg.paths.sequences_path,
         datasets_paths=datasets_paths,
@@ -1537,6 +1589,9 @@ def make_datamodule(
         dataset_quality_strict=cfg_bool(
             cfg, "data.dataset_quality_ranking.strict", True
         ),
+        execution_microbatch_max_transcript_groups=execution_groups,
+        execution_microbatch_max_pair_rows=execution_pairs,
+        execution_microbatch_max_padded_codon_tokens=execution_tokens,
     )
 
 
@@ -1610,10 +1665,20 @@ def resolve_training_grouped_optimizer_batching(
         world_size=world_size,
         forced_accumulate_grad_batches=(None if auto else configured_accumulation),
     )
+    execution_microbatching = cfg_bool(
+        cfg,
+        "training.execution_microbatching.enabled",
+        False,
+    )
+    if execution_microbatching and world_size != 1:
+        raise ValueError(
+            "training.execution_microbatching is single-process only. Launch one "
+            "independent experiment per GPU with trainer.devices=[0]."
+        )
     OmegaConf.update(
         cfg,
         "trainer.accumulate_grad_batches",
-        int(plan.resolved_accumulate_grad_batches),
+        1 if execution_microbatching else int(plan.resolved_accumulate_grad_batches),
         merge=False,
         force_add=True,
     )
@@ -2100,6 +2165,9 @@ def main(cfg: DictConfig) -> None:
         "num_nodes": int(cfg_get(cfg, "trainer.num_nodes", 1)),
         "precision": cfg.trainer.precision,
         "max_epochs": int(cfg.trainer.max_epochs),
+        "num_sanity_val_steps": int(
+            cfg_get(cfg, "trainer.num_sanity_val_steps", 2)
+        ),
         "logger": tb_logger,
         "log_every_n_steps": int(cfg.trainer.log_every_n_steps),
         "accumulate_grad_batches": int(cfg_get(cfg, "trainer.accumulate_grad_batches", 1)),
@@ -2118,7 +2186,20 @@ def main(cfg: DictConfig) -> None:
     if n_devices > 1:
         trainer_kwargs["strategy"] = "ddp_find_unused_parameters_true"
 
-    trainer_kwargs["gradient_clip_val"] = cfg_get(cfg, "trainer.gradient_clip_val", 0.0)
+    execution_microbatching = cfg_bool(
+        cfg,
+        "training.execution_microbatching.enabled",
+        False,
+    )
+    if execution_microbatching:
+        trainer_kwargs["accumulate_grad_batches"] = 1
+    # Manual optimization performs clipping once per logical optimizer step.
+    # Lightning's automatic clipping must be disabled for execution chunks.
+    trainer_kwargs["gradient_clip_val"] = (
+        None
+        if execution_microbatching
+        else cfg_get(cfg, "trainer.gradient_clip_val", 0.0)
+    )
     trainer_kwargs["gradient_clip_algorithm"] = cfg_get(
         cfg, "trainer.gradient_clip_algorithm", "norm"
     )
