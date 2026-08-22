@@ -295,6 +295,7 @@ COMMAND=(
     experiment.train=true
     experiment.predict=true
     'trainer.devices=[0,1]'
+    training.execution_microbatching.enabled=false
     trainer.use_distributed_sampler=false
     trainer.sync_dist_logs=true
     "data.batch_size=${BATCH_SIZE}"

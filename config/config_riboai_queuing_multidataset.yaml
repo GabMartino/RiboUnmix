@@ -13,6 +13,13 @@ experiment:
   dataset: ["martinez_2019", "sharma_2021"]
   seed: 42
 
+prediction:
+  # Run validation prediction twice from independently selected checkpoints.
+  # Output filenames include best_val_loss or best_pcc explicitly.
+  checkpoint_variants:
+    - best_val_loss
+    - best_pcc
+
 split:
   master_dataset_universe: all
   # The active defaults.dataset_config mapping defines both the complete
@@ -40,7 +47,7 @@ paths:
 
 data:
   # Per-dataset pair-row quota on each GPU. With D selected datasets, one
-  # physical microbatch contains at most batch_size * D pair rows. For the
+  # logical grouped batch contains at most batch_size * D pair rows. For the
   # current two-dataset multidataset sampler, every eligible transcript has one
   # row in each dataset, so 8 means 8 transcripts and 16 pair rows per rank.
   # Atomic packing can underfill some dataset quotas when support differs.
@@ -81,6 +88,25 @@ data:
     strict: true
 
 training:
+  # Keep data.batch_size as the biological/logical batch definition, while
+  # materializing only a memory-safe subset of its complete transcript groups
+  # in each GPU forward. This is exact for transcript-balanced loss because
+  # each chunk loss is rescaled by its fraction of the logical groups.
+  # The current implementation is deliberately single-process; disable this
+  # block before launching DDP.
+  execution_microbatching:
+    enabled: true
+    # Manual optimization clips once after every execution chunk and every
+    # accumulated logical batch for the optimizer window have contributed.
+    gradient_clip_val: 1.0
+    gradient_clip_algorithm: norm
+    # These are forward-memory limits, not changes to data.batch_size or the
+    # target number of transcripts per optimizer update. A transcript group is
+    # never split; one oversized group is consequently allowed past a limit.
+    max_pair_rows_per_forward: 128
+    max_padded_codon_tokens_per_forward: 64000
+    max_transcript_groups_per_forward: null
+
   grouped_optimizer_batch:
     # This resolver is active for either supported transcript-grouped sampler.
     # A non-grouped future sampler would retain the explicit Trainer setting.
@@ -200,11 +226,18 @@ model:
 
     num_codons: 64
     codon_embeddings_size: 16
+    # Codon identity remains available, while direct nucleotide-position and
+    # amino-acid embeddings give gamma a compositional inductive bias matching
+    # the biological sequence representation. Lookup tables are built from the
+    # same configured encodings; no dense per-pair one-hot tensors are sent.
+    use_nucleotide_amino_acid_embeddings: true
+    nucleotide_embeddings_size: 4
+    amino_acid_embeddings_size: 8
 
     # Dedicated dataset-bias BiGRU. It is deliberately separate from the
     # biological BiGRU, so gamma remains a pure function of (sequence,
     # dataset_id) and L_bio and gamma stay separately interpretable.
-    context_gru_hidden_size: 128
+    context_gru_hidden_size: 256
     context_gru_num_layers: 2
     context_gru_dropout: 0.0
     # Dataset correction head for log-gamma residuals.
@@ -285,6 +318,9 @@ loss:
 optim:
   lr_biological: 5.0e-4
   lr_rest: 1.0e-3
+  # The NB2 log-alpha head uses lr_rest times this scale. Its input context is
+  # detached, so dispersion learns without shaping the shared bias encoder.
+  alpha_learning_rate_scale: 0.1
   weight_decay_bio: 1.0e-2
   weight_decay_rest: 1.0e-2
 
@@ -307,7 +343,10 @@ trainer:
   # Required for globally reduced validation/checkpoint metrics under DDP;
   # harmless for the default one-GPU run.
   sync_dist_logs: true
-  gradient_clip_val: 1.0
+  # Execution microbatching uses manual optimization and clips once at the
+  # logical optimizer-step boundary. Trainer-level clipping must stay disabled
+  # to avoid clipping partial execution chunks or clipping twice.
+  gradient_clip_val: null
   gradient_clip_algorithm: norm
 
 callbacks:

@@ -281,13 +281,22 @@ def masked_pcc(
     x_c = (x - x_mean) * mask_f
     y_c = (y - y_mean) * mask_f
 
-    cov = (w * x_c * y_c).sum(dim=1)
-    x_var = (w * x_c.pow(2)).sum(dim=1)
-    y_var = (w * y_c.pow(2)).sum(dim=1)
-    pcc = cov / torch.sqrt((x_var * y_var).clamp_min(0.0) + float(eps) * float(eps))
+    # Work with mask-normalized covariance and variances.  The historical
+    # ``sum_cov / sqrt(sum_x_var * sum_y_var + eps**2)`` expression leaves a
+    # singular derivative when the prediction is nearly flat: its denominator
+    # is then only ``eps`` even for a variable target.  Adding eps to each
+    # variance gives a finite, scale-consistent derivative while changing
+    # ordinary well-conditioned Pearson values only at numerical precision.
+    normalization = w_sum.squeeze(1).clamp_min(float(eps))
+    covariance = (w * x_c * y_c).sum(dim=1) / normalization
+    x_variance = (w * x_c.pow(2)).sum(dim=1) / normalization
+    y_variance = (w * y_c.pow(2)).sum(dim=1) / normalization
+    pcc = covariance / torch.sqrt(
+        (x_variance + float(eps)) * (y_variance + float(eps))
+    )
     pcc = torch.nan_to_num(pcc, nan=0.0, posinf=0.0, neginf=0.0)
 
-    target_var = y_var / w_sum.squeeze(1).clamp_min(float(eps))
+    target_var = y_variance
     valid = target_var > float(min_target_var)
     pcc = torch.where(valid, pcc, torch.zeros_like(pcc))
 
@@ -578,6 +587,19 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         self.eps = float(getattr(loss_cfg, "eps", 1.0e-8))
         self.sample_reduction = resolve_sample_reduction_mode(loss_cfg)
         self.hparams["sample_reduction"] = self.sample_reduction
+        self.alpha_learning_rate_scale = float(
+            getattr(self.config.optim, "alpha_learning_rate_scale", 0.1)
+        )
+        if (
+            not math.isfinite(self.alpha_learning_rate_scale)
+            or self.alpha_learning_rate_scale <= 0.0
+        ):
+            raise ValueError(
+                "optim.alpha_learning_rate_scale must be finite and strictly positive."
+            )
+        self.hparams["alpha_learning_rate_scale"] = (
+            self.alpha_learning_rate_scale
+        )
         execution_cfg = getattr(
             getattr(self.config, "training", None),
             "execution_microbatching",
@@ -674,10 +696,15 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             return None
 
         latent_path = self._resolve_optional_path(getattr(cfg, "latent_path"))
-        observed_path = self._resolve_optional_path(getattr(cfg, "observed_path"))
+        raw_observed_path = getattr(cfg, "observed_path", None)
+        observed_path = (
+            self._resolve_optional_path(raw_observed_path)
+            if raw_observed_path not in (None, "", "null", "None")
+            else None
+        )
         if not latent_path.is_file():
             raise FileNotFoundError(f"Synthetic latent ground truth not found: {latent_path}")
-        if not observed_path.is_file():
+        if observed_path is not None and not observed_path.is_file():
             raise FileNotFoundError(f"Synthetic observed ground truth not found: {observed_path}")
 
         latent_frame = pd.read_parquet(latent_path, columns=["transcript_id", "rib_profile"])
@@ -691,33 +718,34 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 label=f"latent profile {transcript_id}",
             )
 
-        observed_frame = pd.read_parquet(observed_path, columns=["id", "ribo"])
         observed: dict[str, np.ndarray] = {}
         drop_terminal = bool(getattr(cfg, "drop_terminal_position", True))
-        for row in observed_frame.itertuples(index=False):
-            transcript_id = str(row.id)
-            truth = latent.get(transcript_id)
-            if truth is None:
-                continue
-            profile = np.asarray(row.ribo, dtype=np.float64).reshape(-1)
-            expected_length = int(truth.size)
-            if drop_terminal and profile.size == expected_length + 1:
-                profile = profile[:-1]
-            elif profile.size != expected_length:
-                raise ValueError(
-                    f"Observed profile length mismatch for {transcript_id}: "
-                    f"observed={profile.size}, latent={expected_length}."
+        if observed_path is not None:
+            observed_frame = pd.read_parquet(observed_path, columns=["id", "ribo"])
+            for row in observed_frame.itertuples(index=False):
+                transcript_id = str(row.id)
+                truth = latent.get(transcript_id)
+                if truth is None:
+                    continue
+                profile = np.asarray(row.ribo, dtype=np.float64).reshape(-1)
+                expected_length = int(truth.size)
+                if drop_terminal and profile.size == expected_length + 1:
+                    profile = profile[:-1]
+                elif profile.size != expected_length:
+                    raise ValueError(
+                        f"Observed profile length mismatch for {transcript_id}: "
+                        f"observed={profile.size}, latent={expected_length}."
+                    )
+                if transcript_id in observed:
+                    raise ValueError(f"Duplicate synthetic observed transcript ID: {transcript_id}")
+                observed[transcript_id] = self._normalize_reference_profile(
+                    profile,
+                    label=f"observed profile {transcript_id}",
                 )
-            if transcript_id in observed:
-                raise ValueError(f"Duplicate synthetic observed transcript ID: {transcript_id}")
-            observed[transcript_id] = self._normalize_reference_profile(
-                profile,
-                label=f"observed profile {transcript_id}",
-            )
 
         if not latent:
             raise ValueError(f"No profiles found in synthetic latent reference: {latent_path}")
-        if not observed:
+        if observed_path is not None and not observed:
             raise ValueError(
                 "No transcript IDs overlap between synthetic latent and observed references."
             )
@@ -3133,20 +3161,43 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         return name.startswith("biological_model.")
 
     def configure_optimizers(self):
-        bio_lr = self.config.optim.lr_biological
-        rest_lr = self.config.optim.lr_rest
-        weight_decay_bio = self.config.optim.weight_decay_bio
-        weight_decay_rest = self.config.optim.weight_decay_rest
+        bio_lr = float(self.config.optim.lr_biological)
+        rest_lr = float(self.config.optim.lr_rest)
+        alpha_lr = rest_lr * self.alpha_learning_rate_scale
+        weight_decay_bio = float(self.config.optim.weight_decay_bio)
+        weight_decay_rest = float(self.config.optim.weight_decay_rest)
         bio_params = []
         rest_params = []
+        alpha_params = []
+
+        alpha_head = self.model.dataset_bias_model.log_sigma_head
+        alpha_parameter_ids = {
+            id(param) for param in alpha_head.parameters() if param.requires_grad
+        }
+        if not alpha_parameter_ids:
+            raise RuntimeError("The NB2 alpha head has no trainable parameters.")
 
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
                 continue
-            if self._is_biological_parameter_name(name):
+            if id(param) in alpha_parameter_ids:
+                alpha_params.append(param)
+            elif self._is_biological_parameter_name(name):
                 bio_params.append(param)
             else:
                 rest_params.append(param)
+
+        grouped_parameter_ids = [
+            id(param) for param in (*bio_params, *rest_params, *alpha_params)
+        ]
+        if len(grouped_parameter_ids) != len(set(grouped_parameter_ids)):
+            raise RuntimeError("A trainable parameter appears in multiple optimizer groups.")
+        if set(grouped_parameter_ids) != {
+            id(param) for param in self.model.parameters() if param.requires_grad
+        }:
+            raise RuntimeError("Optimizer parameter grouping omitted a trainable parameter.")
+        if {id(param) for param in alpha_params} != alpha_parameter_ids:
+            raise RuntimeError("Not all alpha-head parameters reached the alpha optimizer group.")
 
         param_groups = []
         if bio_params:
@@ -3167,18 +3218,36 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                     "name": "rest",
                 }
             )
+        if alpha_params:
+            param_groups.append(
+                {
+                    "params": alpha_params,
+                    "lr": alpha_lr,
+                    "weight_decay": weight_decay_rest,
+                    "name": "alpha",
+                }
+            )
         if not param_groups:
             raise RuntimeError("No trainable parameters found.")
 
         opt = torch.optim.AdamW(param_groups)
 
         scheduler_config = self.config.optim.scheduler
+        scheduler_min_lr = float(scheduler_config.min_lr)
+        scheduler_min_lrs = [
+            (
+                scheduler_min_lr * self.alpha_learning_rate_scale
+                if group["name"] == "alpha"
+                else scheduler_min_lr
+            )
+            for group in param_groups
+        ]
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             opt,
             mode=str(scheduler_config.mode),
             factor=float(scheduler_config.factor),
             patience=int(scheduler_config.patience),
-            min_lr=float(scheduler_config.min_lr),
+            min_lr=scheduler_min_lrs,
         )
 
         return {

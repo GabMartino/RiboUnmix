@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 import hashlib
 import json
 import math
@@ -11,6 +11,37 @@ from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 from Models.RiboQueuingModel.DatasetBiasSubmodel import DatasetBiasSubmodel
 from Models.RiboQueuingModel.QueuingBiologicalModel import QueuingBiologicalModel
+
+
+def build_bias_sequence_embedding_tables(
+    *,
+    nt_encoding: Mapping[str, Sequence[float]],
+    codon_to_aa_encoding: Mapping[str, str],
+    codon_encoding: Mapping[str, int],
+    aa_encoding: Mapping[str, int],
+) -> dict[str, object]:
+    """Build codon -> nucleotide/amino-acid token lookup tables."""
+    num_codons = len(codon_encoding)
+    nt_base_to_id = {
+        str(base).upper(): int(torch.as_tensor(value).argmax().item())
+        for base, value in nt_encoding.items()
+    }
+    num_nucleotides = len(nt_base_to_id)
+
+    codon_nucleotide_ids = [[0, 0, 0] for _ in range(num_codons)]
+    codon_amino_acid_ids = [0 for _ in range(num_codons)]
+    for codon, raw_id in codon_encoding.items():
+        codon = str(codon).upper().replace("U", "T")
+        codon_id = int(raw_id)
+        amino_acid_id = int(aa_encoding[str(codon_to_aa_encoding[codon])])
+        codon_nucleotide_ids[codon_id] = [nt_base_to_id[base] for base in codon]
+        codon_amino_acid_ids[codon_id] = amino_acid_id
+    return {
+        "num_nucleotides": num_nucleotides,
+        "num_amino_acids": len(aa_encoding),
+        "codon_nucleotide_ids": codon_nucleotide_ids,
+        "codon_amino_acid_ids": codon_amino_acid_ids,
+    }
 
 
 class RiboQueuingModel(nn.Module):
@@ -43,6 +74,10 @@ class RiboQueuingModel(nn.Module):
         reference_dataset_names: Sequence[str] | None = None,
         reference_dataset_ids: Sequence[int] | None = None,
         reference_dataset_quality_weights: Sequence[float] | None = None,
+        nt_encoding: Mapping[str, Sequence[float]] | None = None,
+        codon_to_aa_encoding: Mapping[str, str] | None = None,
+        codon_encoding: Mapping[str, int] | None = None,
+        aa_encoding: Mapping[str, int] | None = None,
     ):
         super().__init__()
 
@@ -99,6 +134,14 @@ class RiboQueuingModel(nn.Module):
 
         dataset_bias_params = dict(model_configs["dataset_bias_params"])
         dataset_bias_params["additional_sequence_feature_dim"] = dataset_bias_extra_dim
+        if bool(dataset_bias_params.get("use_nucleotide_amino_acid_embeddings", False)):
+            tables = build_bias_sequence_embedding_tables(
+                nt_encoding=nt_encoding,
+                codon_to_aa_encoding=codon_to_aa_encoding,
+                codon_encoding=codon_encoding,
+                aa_encoding=aa_encoding,
+            )
+            dataset_bias_params.update(tables)
         self.position_features = list(dataset_bias_params["position_features"])
         self.position_scale = float(dataset_bias_params.get("position_scale", 5000.0))
         self.position_edge_tau = float(dataset_bias_params.get("position_edge_tau", 30.0))

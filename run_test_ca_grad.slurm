@@ -16,6 +16,7 @@ source ~/venvs/queueing_riboai_venv/bin/activate
 
 srun python main_ribo_queueing_modeling_multi_dataset.py \
     trainer.devices=[0,1] \
+    training.execution_microbatching.enabled=false \
     data.batch_size=128 \
     data.num_workers=8 \
     experiment.dataset="['kutay_2021', 'grimson_2019', 'sako_2020']" \

@@ -98,6 +98,9 @@ class DatasetBiasSubmodel(nn.Module):
         self.position_dim = len(self.position_features)
 
         self.codon_embeddings_size = int(config_params["codon_embeddings_size"])
+        self.use_nucleotide_amino_acid_embeddings = bool(
+            config_params.get("use_nucleotide_amino_acid_embeddings", False)
+        )
         self.dataset_embeddings_size = int(config_params["dataset_embeddings_size"])
         self.num_datasets = int(config_params["num_datasets"])
         self.num_codons = int(config_params["num_codons"])
@@ -114,10 +117,38 @@ class DatasetBiasSubmodel(nn.Module):
             self.codon_embeddings_size,
         )
 
+        nucleotide_feature_dim = 0
+        amino_acid_feature_dim = 0
+        if self.use_nucleotide_amino_acid_embeddings:
+            nucleotide_embeddings_size = int(config_params["nucleotide_embeddings_size"])
+            amino_acid_embeddings_size = int(config_params["amino_acid_embeddings_size"])
+            num_nucleotides = int(config_params["num_nucleotides"])
+            num_amino_acids = int(config_params["num_amino_acids"])
+            codon_nucleotide_ids = torch.as_tensor(
+                config_params["codon_nucleotide_ids"], dtype=torch.long
+            )
+            codon_amino_acid_ids = torch.as_tensor(
+                config_params["codon_amino_acid_ids"], dtype=torch.long
+            )
+            self.nucleotide_embedding = nn.Embedding(
+                num_nucleotides,
+                nucleotide_embeddings_size,
+            )
+            self.amino_acid_embedding = nn.Embedding(
+                num_amino_acids,
+                amino_acid_embeddings_size,
+            )
+            self.register_buffer("codon_nucleotide_ids", codon_nucleotide_ids)
+            self.register_buffer("codon_amino_acid_ids", codon_amino_acid_ids)
+            nucleotide_feature_dim = 3 * nucleotide_embeddings_size
+            amino_acid_feature_dim = amino_acid_embeddings_size
+
         # This branch deliberately owns a GRU separate from the biological GRU,
         # preserving gamma as a function of only (sequence, dataset_id).
         encoder_in = (
             self.codon_embeddings_size
+            + nucleotide_feature_dim
+            + amino_acid_feature_dim
             + self.dataset_embeddings_size
             + self.additional_sequence_feature_dim
         )
@@ -186,6 +217,17 @@ class DatasetBiasSubmodel(nn.Module):
         codon_emb = codon_emb * mask_f.unsqueeze(-1)
 
         encoder_features = [dataset_emb, codon_emb]
+        if self.use_nucleotide_amino_acid_embeddings:
+            nucleotide_ids = self.codon_nucleotide_ids[codon_ids]
+            nucleotide_emb = self.nucleotide_embedding(nucleotide_ids).reshape(B, T, -1)
+            amino_acid_ids = self.codon_amino_acid_ids[codon_ids]
+            amino_acid_emb = self.amino_acid_embedding(amino_acid_ids)
+            encoder_features.extend(
+                [
+                    nucleotide_emb.to(dtype=dtype) * mask_f.unsqueeze(-1),
+                    amino_acid_emb.to(dtype=dtype) * mask_f.unsqueeze(-1),
+                ]
+            )
         if self.additional_sequence_feature_dim > 0:
             if sequence_features is None:
                 raise ValueError(
@@ -223,8 +265,11 @@ class DatasetBiasSubmodel(nn.Module):
         )
 
         if compute_log_sigma:
+            # Dispersion sees the exact same dataset-conditioned context values,
+            # but its NB2 gradients stop here. The alpha-specific head remains
+            # fully trainable; gamma keeps the attached `x` path above.
             log_sigma_out = self.log_sigma_head(
-                x=x,
+                x=x.detach(),
                 mask=mask_b,
             )
             log_sigma = log_sigma_out["log_sigma"]  # [B, T]

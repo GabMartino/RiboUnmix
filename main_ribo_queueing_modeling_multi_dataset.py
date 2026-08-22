@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Sequence
@@ -1231,6 +1232,77 @@ def choose_checkpoint(
     return None
 
 
+PREDICTION_CHECKPOINT_VARIANTS = ("best_val_loss", "best_pcc")
+
+
+def resolve_prediction_checkpoint_variants(cfg: DictConfig) -> tuple[str, ...]:
+    """Return the ordered, unique checkpoint variants requested for prediction."""
+    raw_variants = cfg_get(
+        cfg,
+        "prediction.checkpoint_variants",
+        list(PREDICTION_CHECKPOINT_VARIANTS),
+    )
+    if isinstance(raw_variants, str):
+        variants = (raw_variants,)
+    else:
+        variants = tuple(str(value) for value in raw_variants)
+    if not variants:
+        raise ValueError("prediction.checkpoint_variants must not be empty.")
+    unknown = sorted(set(variants).difference(PREDICTION_CHECKPOINT_VARIANTS))
+    if unknown:
+        raise ValueError(
+            "prediction.checkpoint_variants supports only "
+            f"{PREDICTION_CHECKPOINT_VARIANTS}, got {unknown}."
+        )
+    if len(set(variants)) != len(variants):
+        raise ValueError("prediction.checkpoint_variants must not contain duplicates.")
+    return variants
+
+
+def find_prediction_checkpoint(
+    checkpoint_root: str | Path,
+    variant: str,
+) -> str | None:
+    """Find one metric-specific checkpoint without mixing PCC and loss files."""
+    if variant not in PREDICTION_CHECKPOINT_VARIANTS:
+        raise ValueError(f"Unknown prediction checkpoint variant: {variant!r}.")
+
+    root = Path(checkpoint_root)
+    if not root.exists():
+        return None
+    candidates = [
+        path
+        for path in root.rglob("*.ckpt")
+        if path.is_file() and path.name != "last.ckpt"
+    ]
+    if variant == "best_pcc":
+        candidates = [path for path in candidates if path.name.startswith("pcc-")]
+        metric_name = "val_mu_pcc"
+        select = max
+    else:
+        candidates = [
+            path
+            for path in candidates
+            if not path.name.startswith("pcc-") and "val_loss" in path.name
+        ]
+        metric_name = "val_loss"
+        select = min
+    if not candidates:
+        return None
+
+    metric_pattern = re.compile(
+        rf"{re.escape(metric_name)}=([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)"
+    )
+    scored: list[tuple[float, Path]] = []
+    for path in candidates:
+        match = metric_pattern.search(path.name)
+        if match is not None:
+            scored.append((float(match.group(1)), path))
+    if scored:
+        return str(select(scored, key=lambda item: item[0])[1])
+    return str(max(candidates, key=lambda path: path.stat().st_mtime_ns))
+
+
 # ============================================================
 # Predictions
 # ============================================================
@@ -1956,7 +2028,13 @@ def main(cfg: DictConfig) -> None:
                             cfg.loss.gamma_reg_weight
                         ),
                     },
-                    "checkpoint_monitor": "val_loss",
+                    "checkpoint_monitors": {
+                        "best_val_loss": {"metric": "val_loss", "mode": "min"},
+                        "best_pcc": {"metric": "val_mu_pcc", "mode": "max"},
+                    },
+                    "prediction_checkpoint_variants": list(
+                        resolve_prediction_checkpoint_variants(cfg)
+                    ),
                     "val_loss_reduction": sample_reduction,
                     "train_sampling_strategy": str(
                         cfg_get(cfg, "data.train_sampling_strategy", "unknown")
@@ -2001,6 +2079,10 @@ def main(cfg: DictConfig) -> None:
         experiment_datasets=experiment_datasets,
         dataset_encoding=dataset_encoding,
     )
+    nt_encoding = open_file(cfg.paths.encodings.nt)
+    codon_encoding = open_file(cfg.paths.encodings.codon)
+    codon_to_aa_encoding = open_file(cfg.paths.encodings.codon_to_aa)
+    aa_encoding = open_file(cfg.paths.encodings.aa)
     torch_model = RiboQueuingModel(
         model_configs=cfg.model,
         eps=float(cfg.model.get("eps", 1e-8)),
@@ -2009,6 +2091,10 @@ def main(cfg: DictConfig) -> None:
         reference_dataset_names=gamma_reference_panel["reference_names"],
         reference_dataset_ids=gamma_reference_panel["reference_ids"],
         reference_dataset_quality_weights=gamma_reference_panel["reference_quality"],
+        nt_encoding=nt_encoding,
+        codon_to_aa_encoding=codon_to_aa_encoding,
+        codon_encoding=codon_encoding,
+        aa_encoding=aa_encoding,
     )
     print(
         "Gamma centering: "
@@ -2111,27 +2197,19 @@ def main(cfg: DictConfig) -> None:
     monitor = str(cfg.optim.scheduler.monitor)
     metric_mode = str(cfg.optim.scheduler.mode)
 
-    safe_monitor = sanitize_metric_name_for_filename(monitor)
-    filename = "{epoch}-{" + monitor + ":.4f}"
-
-    # If monitor contains "/", Lightning may create nested paths from filename.
-    # This fallback avoids that.
-    if "/" in monitor:
-        filename = "{epoch}-" + safe_monitor + "-{" + monitor + ":.4f}"
-
-    checkpoint_callback = ModelCheckpoint(
+    val_loss_checkpoint_callback = ModelCheckpoint(
         dirpath=str(ckpt_dir),
-        filename=filename,
+        filename="val-loss-{epoch}-{val_loss:.4f}",
         save_top_k=1,
         save_last=True,
         save_weights_only=True,
-        monitor=monitor,
-        mode=metric_mode,
+        monitor="val_loss",
+        mode="min",
     )
 
-    # Keep a second, independently selected checkpoint for the metric the
-    # current ablation is explicitly trying to improve. The likelihood-best
-    # checkpoint remains available for calibration/NLL comparisons.
+    # Keep a second, independently selected checkpoint. Validation loss follows
+    # the configured optimized objective; val_mu_pcc is the unweighted
+    # consensus-profile PCC diagnostic.
     pcc_checkpoint_callback = ModelCheckpoint(
         dirpath=str(ckpt_dir),
         filename="pcc-{epoch}-{val_mu_pcc:.4f}",
@@ -2172,7 +2250,7 @@ def main(cfg: DictConfig) -> None:
         "log_every_n_steps": int(cfg.trainer.log_every_n_steps),
         "accumulate_grad_batches": int(cfg_get(cfg, "trainer.accumulate_grad_batches", 1)),
         "callbacks": [
-            checkpoint_callback,
+            val_loss_checkpoint_callback,
             pcc_checkpoint_callback,
             early_stopping,
             lr_monitor,
@@ -2212,14 +2290,12 @@ def main(cfg: DictConfig) -> None:
 
     selected_ckpt = None
 
-    if from_checkpoint:
-        prefer = "latest" if do_train else "best"
-
+    if from_checkpoint and do_train:
         selected_ckpt = choose_checkpoint(
-            checkpoint_callback=checkpoint_callback,
+            checkpoint_callback=val_loss_checkpoint_callback,
             ckpt_dir=ckpt_dir,
             run_checkpoint_root=paths_checkpoints,
-            prefer=prefer,
+            prefer="latest",
         )
 
         if selected_ckpt is None:
@@ -2228,6 +2304,11 @@ def main(cfg: DictConfig) -> None:
             )
 
         print(f"Checkpoint selected from disk: {selected_ckpt}")
+    elif from_checkpoint:
+        print(
+            "Prediction-only checkpoint loading will resolve best_val_loss and "
+            "best_pcc independently."
+        )
 
     # ------------------------------------------------------------
     # Training on every non-validation ID, validating on the fixed common panel
@@ -2244,45 +2325,60 @@ def main(cfg: DictConfig) -> None:
     # ------------------------------------------------------------
     if do_predict:
         paths_results.mkdir(parents=True, exist_ok=True)
+        prediction_variants = resolve_prediction_checkpoint_variants(cfg)
+        callback_paths = {
+            "best_val_loss": val_loss_checkpoint_callback.best_model_path,
+            "best_pcc": pcc_checkpoint_callback.best_model_path,
+        }
+        prediction_manifest: dict[str, dict[str, Any]] = {}
 
-        ckpt_to_use = (
-            pcc_checkpoint_callback.best_model_path
-            or checkpoint_callback.best_model_path
-            or selected_ckpt
-        )
+        for variant in prediction_variants:
+            ckpt_to_use = callback_paths[variant] or find_prediction_checkpoint(
+                paths_checkpoints,
+                variant,
+            )
+            if ckpt_to_use is None:
+                raise FileNotFoundError(
+                    f"Prediction requested {variant!r}, but no matching checkpoint "
+                    f"was found below {paths_checkpoints}."
+                )
 
-        if ckpt_to_use is None:
-            ckpt_to_use = choose_checkpoint(
-                checkpoint_callback=checkpoint_callback,
-                ckpt_dir=ckpt_dir,
-                run_checkpoint_root=paths_checkpoints,
-                prefer="best",
+            print(f"Loading {variant} checkpoint for prediction: {ckpt_to_use}")
+            load_weights_only(lit_model=lit_model, ckpt_path=ckpt_to_use)
+            print(
+                "Predicting on the fixed common validation set with "
+                f"{variant}..."
+            )
+            main_predictions = trainer.predict(
+                model=lit_model,
+                datamodule=datamodule,
+                ckpt_path=None,
             )
 
-        if ckpt_to_use is not None:
-            print(f"Loading checkpoint weights for prediction: {ckpt_to_use}")
-            load_weights_only(lit_model=lit_model, ckpt_path=ckpt_to_use)
-        else:
-            print("No checkpoint found. Predicting with current model weights.")
+            out_file = paths_results / (
+                f"predictions_main_val_{variant}_{dataset_str}.parquet"
+            )
+            main_prediction_rows = save_predictions_for_trainer(
+                predictions=main_predictions,
+                out_file=out_file,
+                trainer=trainer,
+            )
+            prediction_manifest[variant] = {
+                "checkpoint_path": str(ckpt_to_use),
+                "output_path": str(out_file),
+                "prediction_rows": int(main_prediction_rows),
+            }
 
-        print("Predicting on the fixed common validation set...")
-        main_predictions = trainer.predict(
-            model=lit_model,
-            datamodule=datamodule,
-            ckpt_path=None,
-        )
+            if trainer.is_global_zero and main_prediction_rows > 0:
+                print(f"{variant} validation prediction complete: {out_file}")
+            elif trainer.is_global_zero:
+                print(f"No {variant} validation predictions were returned.")
 
-        out_file = paths_results / f"predictions_main_val_{dataset_str}.parquet"
-        main_prediction_rows = save_predictions_for_trainer(
-            predictions=main_predictions,
-            out_file=out_file,
-            trainer=trainer,
-        )
-
-        if trainer.is_global_zero and main_prediction_rows > 0:
-            print(f"Fixed validation prediction complete: {out_file}")
-        elif trainer.is_global_zero:
-            print("No fixed validation predictions were returned.")
+        if trainer.is_global_zero:
+            (paths_results / "prediction_checkpoint_manifest.json").write_text(
+                json.dumps(prediction_manifest, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
 
 
 if __name__ == "__main__":
