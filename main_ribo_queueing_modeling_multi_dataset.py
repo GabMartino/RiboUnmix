@@ -30,6 +30,7 @@ from Dataloaders.RiboAIQueuingMultiDataset.RiboAIQueuingDatamoduleMultiDataset i
     GroupedBatchStatistics,
     GroupedOptimizerBatchPlan,
     RiboAIQueuingDatamoduleMultiDataset,
+    filter_sequences_by_max_cds_codons,
     load_dataset_quality_ranking,
     resolve_grouped_optimizer_batch_plan,
 )
@@ -39,6 +40,14 @@ from Models.RiboQueuingModelLighningModule import (
     resolve_sample_reduction_mode,
 )
 from Utils.checkpoints import find_checkpoint
+from Utils.external_transcript_split import load_external_transcript_split
+from Utils.reliability_references import transcript_id_hash
+from Utils.stratified_transcript_split import (
+    assign_reliability_quantile_bins as shared_assign_reliability_quantile_bins,
+    css_bin as shared_css_bin,
+    css_count as shared_css_count,
+    sample_stratified_ids as shared_sample_stratified_ids,
+)
 
 
 # ============================================================
@@ -108,6 +117,17 @@ def cfg_bool(cfg: Any, path: str, default: bool = False) -> bool:
             return False
 
     return bool(value)
+
+
+def cfg_optional_positive_int(cfg: Any, path: str) -> int | None:
+    """Resolve an optional positive integer configuration value."""
+    value = cfg_get(cfg, path, None)
+    if value is None:
+        return None
+    resolved = int(value)
+    if resolved < 1:
+        raise ValueError(f"{path} must be null or at least one, got {value!r}.")
+    return resolved
 
 
 def open_file(path: str | Path) -> dict[str, Any]:
@@ -243,9 +263,15 @@ def make_loss_run_tag(cfg: DictConfig) -> str:
     )
     gamma_weight = format_run_tag_value(cfg_get(cfg, "loss.gamma_reg_weight"))
     reduction = format_run_tag_value(resolve_sample_reduction_mode(cfg.loss))
+    experiment_mode = format_run_tag_value(
+        cfg_get(cfg, "loss.experiment_mode", "mean_gradient_reweighted_nb")
+    )
+    alpha_mode = format_run_tag_value(cfg_get(cfg, "model.alpha_mode", "learned"))
+    beta = format_run_tag_value(cfg_get(cfg, "loss.nb_mean_gradient_beta", 0.0))
     return (
         f"Loss-rNB{nb_weight}-cPCC{raw_weight}"
         f"-cVSTPCC{vst_weight}-Gamma{gamma_weight}-Reduce{reduction}"
+        f"-NBMode{experiment_mode}-Alpha{alpha_mode}-Beta{beta}"
     )
 
 
@@ -254,6 +280,22 @@ def make_sampling_run_tag(cfg: DictConfig) -> str | None:
     if sampling in {"", "default", "None", "none"}:
         return None
     return f"Sampling_{format_run_tag_value(sampling)}"
+
+
+def make_numerical_eligibility_run_tag(cfg: DictConfig) -> str | None:
+    """Identify gamma support and sequence eligibility that change a run."""
+    parts: list[str] = []
+    raw_bound = cfg_get(
+        cfg,
+        "model.dataset_bias_params.raw_log_gamma_bound",
+        None,
+    )
+    if raw_bound is not None:
+        parts.append(f"GammaRawB{format_run_tag_value(raw_bound)}")
+    max_cds_codons = cfg_get(cfg, "data.max_cds_codons", None)
+    if max_cds_codons is not None:
+        parts.append(f"CDSMax{format_run_tag_value(max_cds_codons)}")
+    return "-".join(parts) if parts else None
 
 
 def make_gamma_centering_run_tag(cfg: DictConfig) -> str:
@@ -379,6 +421,33 @@ def make_sequence_features_run_tag(cfg: DictConfig) -> str:
     return f"FeatPreset{preset}_SeqFeat" + "_".join(parts)
 
 
+# Linux limits a single path component to 255 bytes, and the run tag is used
+# verbatim as one directory name under checkpoints/, logs/ and results/.
+RUN_TAG_MAX_COMPONENT_BYTES = 255
+
+
+def abbreviate_run_tag(
+    tag: str, *, max_bytes: int = RUN_TAG_MAX_COMPONENT_BYTES
+) -> str:
+    """Keep a run tag usable as a single filesystem path component.
+
+    Single-dataset runs inline the dataset name instead of hashing a subset, so
+    a descriptive name such as ``artificial_bias_gc_fraction_gt_0p7`` pushes the
+    tag past the component limit and every artifact directory fails to be
+    created. Truncating with a digest of the full tag keeps the readable head
+    while remaining unique per configuration. Tags within the limit are returned
+    unchanged, so existing artifact paths are untouched.
+    """
+    encoded = tag.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return tag
+    suffix = f"_h{hashlib.md5(encoded).hexdigest()[:8]}"
+    keep = max_bytes - len(suffix)
+    if keep <= 0:
+        raise ValueError(f"max_bytes={max_bytes} is too small for a run tag.")
+    return encoded[:keep].decode("utf-8", "ignore") + suffix
+
+
 def make_run_tag(cfg: DictConfig) -> str:
     parts = [
         "queueNB",
@@ -390,10 +459,14 @@ def make_run_tag(cfg: DictConfig) -> str:
     if sampling_tag is not None:
         parts.append(sampling_tag)
 
+    numerical_eligibility_tag = make_numerical_eligibility_run_tag(cfg)
+    if numerical_eligibility_tag is not None:
+        parts.append(numerical_eligibility_tag)
+
     parts.append(make_gamma_centering_run_tag(cfg))
     parts.append(make_sequence_features_run_tag(cfg))
 
-    return "_".join(parts)
+    return abbreviate_run_tag("_".join(parts))
 
 
 def dataset_name_from_path(path: str | Path) -> str:
@@ -446,81 +519,19 @@ def env_global_rank() -> int:
 # ============================================================
 
 def css_count(x: Any) -> int:
-    """
-    Robust CSS counter.
-
-    Handles:
-        - list/array of CSS positions
-        - boolean masks
-        - None / NaN
-        - stringified lists
-    """
-    if x is None:
-        return 0
-
-    if isinstance(x, float) and np.isnan(x):
-        return 0
-
-    if isinstance(x, str):
-        s = x.strip()
-
-        if s in {"", "[]", "nan", "None", "null"}:
-            return 0
-
-        try:
-            parsed = json.loads(s)
-            return css_count(parsed)
-        except Exception:
-            s = s.strip("[]()")
-            if not s:
-                return 0
-            return len([v for v in s.split(",") if v.strip()])
-
-    arr = np.asarray(x)
-
-    if arr.ndim == 0:
-        try:
-            if pd.isna(arr.item()):
-                return 0
-        except Exception:
-            pass
-
-        try:
-            return int(bool(arr.item()))
-        except Exception:
-            return 0
-
-    if arr.dtype == bool:
-        return int(arr.sum())
-
-    count = 0
-
-    for v in arr.reshape(-1):
-        try:
-            if pd.isna(v):
-                continue
-        except Exception:
-            pass
-
-        count += 1
-
-    return int(count)
+    """Compatibility wrapper around the shared split-stratification helper."""
+    return shared_css_count(x)
 
 
 def css_bin(n_css: int) -> str:
-    if n_css <= 0:
-        return "css_0"
-    if n_css == 1:
-        return "css_1"
-    if n_css <= 3:
-        return "css_2_3"
-    return "css_4_plus"
+    return shared_css_bin(n_css)
 
 
 def build_transcript_metadata(
     *,
     sequences_path: str | Path,
     datasets_paths: Sequence[str | Path],
+    max_cds_codons: int | None = None,
 ) -> dict[str, dict[str, Any]]:
     """
     Build transcript-level metadata from:
@@ -537,21 +548,57 @@ def build_transcript_metadata(
     Important:
         The supplied datasets_paths define the split universe.
     """
-    # Only the CSS column (keyed by transcript_id) is read from the sequence
-    # parquet here; the large unused sequence/structure columns are skipped.
+    # Ordinarily only the CSS column is needed. When a maximum CDS length is
+    # configured, read the compact codon-token sequence as well so eligibility
+    # is resolved before validation sampling rather than after a split is made.
     _seq_available = set(pq.read_schema(sequences_path).names)
     _seq_css_col = (
         "conserved_stalling_sites"
         if "conserved_stalling_sites" in _seq_available
         else "css"
     )
-    _seq_columns = [c for c in ("transcript_id", _seq_css_col) if c in _seq_available]
+    sequence_column: str | None = None
+    if max_cds_codons is not None:
+        sequence_column = "codons" if "codons" in _seq_available else "ref"
+        if sequence_column not in _seq_available:
+            raise KeyError(
+                f"{sequences_path} contains neither 'codons' nor 'ref', so "
+                "data.max_cds_codons cannot be enforced."
+            )
+    _seq_columns = list(
+        dict.fromkeys(
+            c
+            for c in ("transcript_id", _seq_css_col, sequence_column)
+            if c is not None and c in _seq_available
+        )
+    )
     seq_df = pd.read_parquet(sequences_path, columns=_seq_columns or None)
 
     if "transcript_id" in seq_df.columns:
         seq_df = seq_df.set_index("transcript_id")
 
     seq_df.index = seq_df.index.astype(str)
+
+    length_by_transcript: dict[str, int] = {}
+    if sequence_column is not None:
+        seq_df, length_filter = filter_sequences_by_max_cds_codons(
+            seq_df,
+            sequence_column=sequence_column,
+            max_cds_codons=max_cds_codons,
+        )
+        length_by_transcript = {
+            str(transcript_id): int(len(sequence))
+            for transcript_id, sequence in seq_df[sequence_column].items()
+        }
+        print(
+            "[split] CDS-length eligibility: "
+            f"max={int(max_cds_codons):,} codons, "
+            f"removed={length_filter['removed_transcripts']:,}/"
+            f"{length_filter['input_transcripts']:,}, "
+            "longest retained="
+            f"{length_filter['longest_retained_cds_codons']:,} codons."
+        )
+        seq_df = seq_df.drop(columns=[sequence_column])
 
     css_col = "conserved_stalling_sites" if "conserved_stalling_sites" in seq_df.columns else "css"
 
@@ -593,6 +640,7 @@ def build_transcript_metadata(
             "transcript_id": tid,
             "datasets": datasets,
             "availability": availability,
+            "cds_codon_length": length_by_transcript.get(tid),
             "css_count": int(n_css),
             "css_bin": css_bin(int(n_css)),
             "has_css": int(n_css) > 0,
@@ -696,19 +744,10 @@ def assign_reliability_quantile_bins(
     *,
     number_of_bins: int,
 ) -> dict[str, int]:
-    """Assign deterministic rank-quantile bins spanning low to high reliability."""
-    number_of_bins = int(number_of_bins)
-    if number_of_bins < 2:
-        raise ValueError("split.validation_weight_bins must be at least 2.")
-    if not scores:
-        return {}
-
-    ordered = sorted(scores, key=lambda tid: (float(scores[tid]), str(tid)))
-    effective_bins = min(number_of_bins, len(ordered))
-    return {
-        tid: min((rank * effective_bins) // len(ordered), effective_bins - 1)
-        for rank, tid in enumerate(ordered)
-    }
+    """Compatibility wrapper around the shared rank-quantile implementation."""
+    return shared_assign_reliability_quantile_bins(
+        scores, number_of_bins=number_of_bins
+    )
 
 
 def sample_stratified_validation_ids(
@@ -718,55 +757,13 @@ def sample_stratified_validation_ids(
     target_count: int,
     rng: np.random.Generator,
 ) -> list[str]:
-    """Sample an exact-sized validation set proportionally across strata."""
-    candidates = sorted(set(map(str, candidate_ids)))
-    target_count = int(target_count)
-    if target_count <= 0:
-        return []
-    if target_count >= len(candidates):
-        raise ValueError(
-            "The main validation target must be smaller than the number of "
-            f"eligible common transcripts; target={target_count}, "
-            f"eligible={len(candidates)}."
-        )
-
-    strata: dict[str, list[str]] = defaultdict(list)
-    for tid in candidates:
-        if tid not in stratum_by_transcript:
-            raise KeyError(f"Missing validation stratum for transcript {tid}.")
-        strata[str(stratum_by_transcript[tid])].append(tid)
-
-    total = len(candidates)
-    ideal = {
-        bin_id: target_count * len(ids) / total
-        for bin_id, ids in strata.items()
-    }
-    quotas = {bin_id: int(np.floor(value)) for bin_id, value in ideal.items()}
-    remaining = target_count - sum(quotas.values())
-    remainder_order = sorted(
-        strata,
-        key=lambda bin_id: (-(ideal[bin_id] - quotas[bin_id]), bin_id),
+    """Compatibility wrapper around the shared proportional stratum sampler."""
+    return shared_sample_stratified_ids(
+        candidate_ids=candidate_ids,
+        stratum_by_transcript=stratum_by_transcript,
+        target_count=target_count,
+        rng=rng,
     )
-    for bin_id in remainder_order:
-        if remaining <= 0:
-            break
-        if quotas[bin_id] < len(strata[bin_id]):
-            quotas[bin_id] += 1
-            remaining -= 1
-    if remaining != 0:
-        raise RuntimeError(f"Could not allocate {remaining} validation transcripts.")
-
-    selected: list[str] = []
-    for bin_id in sorted(strata):
-        ids = np.asarray(sorted(strata[bin_id]), dtype=object)
-        permutation = rng.permutation(len(ids))
-        selected.extend(map(str, ids[permutation[: quotas[bin_id]]]))
-
-    if len(selected) != target_count:
-        raise RuntimeError(
-            f"Validation sampling selected {len(selected)} IDs, expected {target_count}."
-        )
-    return sorted(selected)
 
 
 def print_split_summary(
@@ -836,6 +833,7 @@ def fixed_common_validation_split(
     validation_frac: float = 0.10,
     random_seed: int = 42,
     validation_weight_bins: int = 10,
+    max_cds_codons: int | None = None,
 ) -> tuple[list[str], list[str], dict[str, dict[str, Any]]]:
     """Build one fixed common validation panel and use all other IDs for training.
 
@@ -862,6 +860,7 @@ def fixed_common_validation_split(
     metadata = build_transcript_metadata(
         sequences_path=sequences_path,
         datasets_paths=split_universe_dataset_paths,
+        max_cds_codons=max_cds_codons,
     )
 
     all_ids = sorted(metadata.keys())
@@ -968,6 +967,7 @@ def save_split_manifest(
     metadata: dict[str, dict[str, Any]],
     seed: int,
     validation_frac: float,
+    max_cds_codons: int | None = None,
 ) -> None:
     """Save the fixed validation panel and master-universe provenance."""
     out_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1021,6 +1021,15 @@ def save_split_manifest(
         "split_dataset_source": split_dataset_source,
         "split_dataset_paths": list(map(str, split_dataset_paths or [])),
         "training_dataset_paths": list(map(str, training_dataset_paths or [])),
+        "sequence_eligibility": {
+            "max_cds_codons": (
+                None if max_cds_codons is None else int(max_cds_codons)
+            ),
+            "rule": (
+                "retain the complete transcript when CDS codon length is at "
+                "most max_cds_codons; never truncate"
+            ),
+        },
         "validation_selection": {
             "strategy": "fixed_master_common_weight_css_stratified",
             "reference_datasets": list(map(str, split_universe_datasets)),
@@ -1573,6 +1582,7 @@ def make_datamodule(
     train_fold: list[str],
     val_fold: list[str],
     seed: int,
+    predict_fold: list[str] | None = None,
 ) -> RiboAIQueuingDatamoduleMultiDataset:
     feature_cfg = cfg_get(cfg, "model.additional_sequence_features", {})
     if OmegaConf.is_config(feature_cfg):
@@ -1626,7 +1636,11 @@ def make_datamodule(
         sequences_path=cfg.paths.sequences_path,
         datasets_paths=datasets_paths,
         batch_size=int(cfg.data.batch_size),
-        split=(train_fold, val_fold),
+        split=(
+            (train_fold, val_fold)
+            if predict_fold is None
+            else (train_fold, val_fold, predict_fold)
+        ),
         num_workers=int(cfg.data.num_workers),
         predict_num_workers=int(cfg_get(cfg, "data.predict_num_workers", 0)),
         seed=seed,
@@ -1643,6 +1657,7 @@ def make_datamodule(
         minimum_positive_datasets_per_transcript=int(
             cfg_get(cfg, "data.minimum_positive_datasets_per_transcript", 2)
         ),
+        max_cds_codons=cfg_optional_positive_int(cfg, "data.max_cds_codons"),
         pin_memory=cfg_bool(cfg, "data.pin_memory", True),
         prefetch_factor=cfg_get(cfg, "data.prefetch_factor", 4),
         multiprocessing_context=cfg_get(
@@ -1660,6 +1675,9 @@ def make_datamodule(
         ),
         dataset_quality_strict=cfg_bool(
             cfg, "data.dataset_quality_ranking.strict", True
+        ),
+        reliability_reference_manifest_path=cfg_get(
+            cfg, "data.reliability_reference_manifest", None
         ),
         execution_microbatch_max_transcript_groups=execution_groups,
         execution_microbatch_max_pair_rows=execution_pairs,
@@ -1923,11 +1941,32 @@ def main(cfg: DictConfig) -> None:
     # ------------------------------------------------------------
     experiment_datasets = get_datasets(cfg)
     split_dataset_mapping = dict(cfg.dataset_config.dataset_path)
-    split_dataset_source_label = "active dataset_config"
-    split_universe_datasets = get_split_universe_datasets(
-        cfg,
-        experiment_datasets,
+    external_split_manifest = cfg_get(cfg, "split.external_manifest", None)
+    external_split_manifest = (
+        None
+        if external_split_manifest is None or not str(external_split_manifest).strip()
+        else str(external_split_manifest)
     )
+    external_panel_name = cfg_get(cfg, "split.external_panel_name", None)
+    if external_split_manifest is not None:
+        if external_panel_name is None or not str(external_panel_name).strip():
+            raise ValueError(
+                "split.external_panel_name is required when "
+                "split.external_manifest is set."
+            )
+        external_panel_name = str(external_panel_name)
+        # The external manifest already fixed the cross-panel transcript
+        # universe. Avoid rebuilding the legacy all-dataset common split.
+        split_universe_datasets = list(experiment_datasets)
+        split_dataset_source_label = (
+            f"external manifest panel {external_panel_name}"
+        )
+    else:
+        split_dataset_source_label = "active dataset_config"
+        split_universe_datasets = get_split_universe_datasets(
+            cfg,
+            experiment_datasets,
+        )
 
     experiment_dataset_paths = dataset_paths_for(
         mapping=dict(cfg.dataset_config.dataset_path),
@@ -1968,17 +2007,41 @@ def main(cfg: DictConfig) -> None:
     # ------------------------------------------------------------
     validation_frac = float(cfg_get(cfg, "split.validation_frac", 0.10))
     validation_weight_bins = int(cfg_get(cfg, "split.validation_weight_bins", 10))
-    print("\n=== Fixed split configuration ===")
-    print(f"validation fraction of common candidates: {validation_frac}")
-    print(f"validation reliability bins:              {validation_weight_bins}")
-
-    train_fold, validation_fold, split_metadata = fixed_common_validation_split(
-        sequences_path=cfg.paths.sequences_path,
-        split_universe_dataset_paths=split_universe_dataset_paths,
-        validation_frac=validation_frac,
-        random_seed=seed,
-        validation_weight_bins=validation_weight_bins,
-    )
+    max_cds_codons = cfg_optional_positive_int(cfg, "data.max_cds_codons")
+    external_split_payload: dict[str, Any] | None = None
+    if external_split_manifest is not None:
+        print("\n=== External transcript split configuration ===")
+        print(f"manifest:                 {external_split_manifest}")
+        print(f"panel:                    {external_panel_name}")
+        print(f"maximum eligible CDS:     {max_cds_codons}")
+        (
+            train_fold,
+            validation_fold,
+            test_fold,
+            external_split_payload,
+        ) = load_external_transcript_split(
+            external_split_manifest,
+            panel_name=str(external_panel_name),
+            experiment_datasets=experiment_datasets,
+        )
+        split_metadata = None
+        print(f"training transcripts:     {len(train_fold):,}")
+        print(f"common validation IDs:    {len(validation_fold):,}")
+        print(f"common test IDs:          {len(test_fold):,}")
+    else:
+        print("\n=== Fixed split configuration ===")
+        print(f"validation fraction of common candidates: {validation_frac}")
+        print(f"validation reliability bins:              {validation_weight_bins}")
+        print(f"maximum eligible CDS codons:              {max_cds_codons}")
+        train_fold, validation_fold, split_metadata = fixed_common_validation_split(
+            sequences_path=cfg.paths.sequences_path,
+            split_universe_dataset_paths=split_universe_dataset_paths,
+            validation_frac=validation_frac,
+            random_seed=seed,
+            validation_weight_bins=validation_weight_bins,
+            max_cds_codons=max_cds_codons,
+        )
+        test_fold = []
     if len(validation_fold) == 0:
         raise RuntimeError("Validation split is empty.")
 
@@ -1999,6 +2062,18 @@ def main(cfg: DictConfig) -> None:
         (paths_results / "loss_reduction_manifest.json").write_text(
             json.dumps(
                 {
+                    "experiment_mode": str(
+                        cfg_get(
+                            cfg,
+                            "loss.experiment_mode",
+                            "mean_gradient_reweighted_nb",
+                        )
+                    ),
+                    "alpha_mode": str(cfg_get(cfg, "model.alpha_mode", "learned")),
+                    "fixed_alpha": float(cfg_get(cfg, "model.fixed_alpha", 0.1)),
+                    "nb_mean_gradient_beta": float(
+                        cfg_get(cfg, "loss.nb_mean_gradient_beta", 0.0)
+                    ),
                     "sample_reduction": sample_reduction,
                     "available_sample_reductions": [
                         "global_weighted",
@@ -2030,7 +2105,20 @@ def main(cfg: DictConfig) -> None:
                     },
                     "checkpoint_monitors": {
                         "best_val_loss": {"metric": "val_loss", "mode": "min"},
-                        "best_pcc": {"metric": "val_mu_pcc", "mode": "max"},
+                        **(
+                            {
+                                "best_pcc": {
+                                    "metric": "val_mu_pcc",
+                                    "mode": "max",
+                                }
+                            }
+                            if cfg_bool(
+                                cfg,
+                                "callbacks.save_best_pcc_checkpoint",
+                                True,
+                            )
+                            else {}
+                        ),
                     },
                     "prediction_checkpoint_variants": list(
                         resolve_prediction_checkpoint_variants(cfg)
@@ -2050,20 +2138,61 @@ def main(cfg: DictConfig) -> None:
     # script before the Lightning Trainer exists, so use the environment rank
     # guard rather than trainer.is_global_zero.
     if env_global_rank() == 0:
-        save_split_manifest(
-            out_file=paths_results / f"split_manifest_experiment_{dataset_str}_universe_{split_universe_str}.json",
-            experiment_datasets=experiment_datasets,
-            split_universe_datasets=split_universe_datasets,
-            split_dataset_source=split_dataset_source_label,
-            split_dataset_paths=split_universe_dataset_paths,
-            training_dataset_paths=experiment_dataset_paths,
-            validation_weight_bins=validation_weight_bins,
-            train_ids=train_fold,
-            validation_ids=validation_fold,
-            metadata=split_metadata,
-            seed=seed,
-            validation_frac=validation_frac,
-        )
+        if external_split_manifest is not None:
+            source_bytes = Path(external_split_manifest).read_bytes()
+            panel_support_statistics = dict(
+                (external_split_payload or {}).get(
+                    "panel_support_statistics", {}
+                )
+            ).get(str(external_panel_name), {})
+            external_run_manifest = {
+                "split_strategy": "external_common_validation_and_test",
+                "source_manifest": str(Path(external_split_manifest).resolve()),
+                "source_manifest_sha256": hashlib.sha256(source_bytes).hexdigest(),
+                "panel_name": str(external_panel_name),
+                "experiment_datasets": list(map(str, experiment_datasets)),
+                "training_dataset_paths": list(map(str, experiment_dataset_paths)),
+                "seed": seed,
+                "maximum_cds_codons": max_cds_codons,
+                "minimum_positive_datasets_per_training_transcript": int(
+                    cfg_get(cfg, "data.minimum_positive_datasets_per_transcript", 2)
+                ),
+                "train_ids": list(map(str, train_fold)),
+                "validation_ids": list(map(str, validation_fold)),
+                "test_ids": list(map(str, test_fold)),
+                "fold_id_hashes": {
+                    "train": transcript_id_hash(train_fold),
+                    "validation": transcript_id_hash(validation_fold),
+                    "test": transcript_id_hash(test_fold),
+                },
+                "fold_sizes": {
+                    "train": len(train_fold),
+                    "validation": len(validation_fold),
+                    "test": len(test_fold),
+                },
+                "panel_support_statistics": panel_support_statistics,
+                "heldout_train_overlap": 0,
+            }
+            (paths_results / "split_manifest.json").write_text(
+                json.dumps(external_run_manifest, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+        else:
+            save_split_manifest(
+                out_file=paths_results / f"split_manifest_experiment_{dataset_str}_universe_{split_universe_str}.json",
+                experiment_datasets=experiment_datasets,
+                split_universe_datasets=split_universe_datasets,
+                split_dataset_source=split_dataset_source_label,
+                split_dataset_paths=split_universe_dataset_paths,
+                training_dataset_paths=experiment_dataset_paths,
+                validation_weight_bins=validation_weight_bins,
+                train_ids=train_fold,
+                validation_ids=validation_fold,
+                metadata=split_metadata,
+                seed=seed,
+                validation_frac=validation_frac,
+                max_cds_codons=max_cds_codons,
+            )
 
     dataset_encoding = open_file(cfg.paths.encodings.datasets)
     missing_dataset_encodings = [
@@ -2102,6 +2231,50 @@ def main(cfg: DictConfig) -> None:
         f"reference_count={torch_model.gamma_reference_dataset_ids.numel()}, "
         f"manifest={torch_model.gamma_reference_manifest_hash[:12]}"
     )
+    if env_global_rank() == 0:
+        gamma_raw_weights = (
+            torch_model.gamma_reference_weights.detach().cpu().to(torch.float64)
+        )
+        gamma_pi = gamma_raw_weights / gamma_raw_weights.sum()
+        gamma_manifest = {
+            "centering_mode": str(torch_model.gamma_centering_mode),
+            "dataset_constant_scale_gauge": str(
+                torch_model.gamma_dataset_constant_scale_gauge
+            ),
+            "selected_dataset_names": list(
+                map(str, gamma_reference_panel["selected_names"])
+            ),
+            "selected_dataset_ids": list(
+                map(int, gamma_reference_panel["selected_ids"])
+            ),
+            "reference_dataset_names": list(
+                map(str, gamma_reference_panel["reference_names"])
+            ),
+            "reference_dataset_ids": list(
+                map(int, gamma_reference_panel["reference_ids"])
+            ),
+            "reference_raw_weights": [
+                float(value) for value in gamma_raw_weights.tolist()
+            ],
+            "reference_pi": [float(value) for value in gamma_pi.tolist()],
+            "weighting": str(torch_model.gamma_centering_weighting),
+            "quality_rank_power": float(
+                torch_model.gamma_centering_quality_rank_power
+            ),
+            "reference_manifest_hash": str(
+                torch_model.gamma_reference_manifest_hash
+            ),
+            "pi_is_gamma_reference_only": True,
+            "w_dt_source": (
+                str(cfg_get(cfg, "data.reliability_reference_manifest", None))
+                if cfg_get(cfg, "data.reliability_reference_manifest", None)
+                else "input_parquet_weight"
+            ),
+        }
+        (paths_results / "gamma_reference_manifest.json").write_text(
+            json.dumps(gamma_manifest, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
 
     lit_model = RiboQueuingModelLightningModule(
         torch_model,
@@ -2119,6 +2292,7 @@ def main(cfg: DictConfig) -> None:
         train_fold=train_fold,
         val_fold=validation_fold,
         seed=seed,
+        predict_fold=(test_fold if test_fold else None),
     )
 
     grouped_batch_statistics, grouped_optimizer_plan = (
@@ -2128,6 +2302,17 @@ def main(cfg: DictConfig) -> None:
         )
     )
     if grouped_batch_statistics is not None and grouped_optimizer_plan is not None:
+        if (
+            external_split_manifest is not None
+            and grouped_batch_statistics.transcripts_excluded_for_insufficient_support
+            != 0
+        ):
+            raise RuntimeError(
+                "External panel manifest violated its training-support contract: "
+                f"{grouped_batch_statistics.transcripts_excluded_for_insufficient_support} "
+                "provided training transcripts have fewer than the configured "
+                "number of usable selected datasets."
+            )
         print_grouped_optimizer_batch_plan(
             selected_datasets=experiment_datasets,
             statistics=grouped_batch_statistics,
@@ -2210,14 +2395,23 @@ def main(cfg: DictConfig) -> None:
     # Keep a second, independently selected checkpoint. Validation loss follows
     # the configured optimized objective; val_mu_pcc is the unweighted
     # consensus-profile PCC diagnostic.
-    pcc_checkpoint_callback = ModelCheckpoint(
-        dirpath=str(ckpt_dir),
-        filename="pcc-{epoch}-{val_mu_pcc:.4f}",
-        save_top_k=1,
-        save_last=False,
-        save_weights_only=True,
-        monitor="val_mu_pcc",
-        mode="max",
+    save_best_pcc_checkpoint = cfg_bool(
+        cfg,
+        "callbacks.save_best_pcc_checkpoint",
+        True,
+    )
+    pcc_checkpoint_callback = (
+        ModelCheckpoint(
+            dirpath=str(ckpt_dir),
+            filename="pcc-{epoch}-{val_mu_pcc:.4f}",
+            save_top_k=1,
+            save_last=False,
+            save_weights_only=True,
+            monitor="val_mu_pcc",
+            mode="max",
+        )
+        if save_best_pcc_checkpoint
+        else None
     )
 
     early_stopping = EarlyStopping(
@@ -2250,10 +2444,14 @@ def main(cfg: DictConfig) -> None:
         "log_every_n_steps": int(cfg.trainer.log_every_n_steps),
         "accumulate_grad_batches": int(cfg_get(cfg, "trainer.accumulate_grad_batches", 1)),
         "callbacks": [
-            val_loss_checkpoint_callback,
-            pcc_checkpoint_callback,
-            early_stopping,
-            lr_monitor,
+            callback
+            for callback in (
+                val_loss_checkpoint_callback,
+                pcc_checkpoint_callback,
+                early_stopping,
+                lr_monitor,
+            )
+            if callback is not None
         ],
         "use_distributed_sampler": cfg_bool(
             cfg,
@@ -2325,10 +2523,16 @@ def main(cfg: DictConfig) -> None:
     # ------------------------------------------------------------
     if do_predict:
         paths_results.mkdir(parents=True, exist_ok=True)
+        prediction_split_name = "test" if test_fold else "val"
+        prediction_split_ids = test_fold if test_fold else validation_fold
         prediction_variants = resolve_prediction_checkpoint_variants(cfg)
         callback_paths = {
             "best_val_loss": val_loss_checkpoint_callback.best_model_path,
-            "best_pcc": pcc_checkpoint_callback.best_model_path,
+            "best_pcc": (
+                pcc_checkpoint_callback.best_model_path
+                if pcc_checkpoint_callback is not None
+                else ""
+            ),
         }
         prediction_manifest: dict[str, dict[str, Any]] = {}
 
@@ -2346,7 +2550,7 @@ def main(cfg: DictConfig) -> None:
             print(f"Loading {variant} checkpoint for prediction: {ckpt_to_use}")
             load_weights_only(lit_model=lit_model, ckpt_path=ckpt_to_use)
             print(
-                "Predicting on the fixed common validation set with "
+                f"Predicting on the fixed common {prediction_split_name} set with "
                 f"{variant}..."
             )
             main_predictions = trainer.predict(
@@ -2356,7 +2560,7 @@ def main(cfg: DictConfig) -> None:
             )
 
             out_file = paths_results / (
-                f"predictions_main_val_{variant}_{dataset_str}.parquet"
+                f"predictions_main_{prediction_split_name}_{variant}_{dataset_str}.parquet"
             )
             main_prediction_rows = save_predictions_for_trainer(
                 predictions=main_predictions,
@@ -2367,12 +2571,20 @@ def main(cfg: DictConfig) -> None:
                 "checkpoint_path": str(ckpt_to_use),
                 "output_path": str(out_file),
                 "prediction_rows": int(main_prediction_rows),
+                "split_name": prediction_split_name,
+                "transcript_count": int(len(prediction_split_ids)),
+                "transcript_id_hash": transcript_id_hash(prediction_split_ids),
             }
 
             if trainer.is_global_zero and main_prediction_rows > 0:
-                print(f"{variant} validation prediction complete: {out_file}")
+                print(
+                    f"{variant} {prediction_split_name} prediction complete: "
+                    f"{out_file}"
+                )
             elif trainer.is_global_zero:
-                print(f"No {variant} validation predictions were returned.")
+                print(
+                    f"No {variant} {prediction_split_name} predictions were returned."
+                )
 
         if trainer.is_global_zero:
             (paths_results / "prediction_checkpoint_manifest.json").write_text(

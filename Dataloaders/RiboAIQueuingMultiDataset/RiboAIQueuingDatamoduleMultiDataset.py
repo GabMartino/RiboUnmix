@@ -24,9 +24,84 @@ from tqdm import tqdm
 from Dataloaders.RiboAIQueuingMultiDataset.RiboAIQueuingMultiDataset import (
     RiboAIQueuingDatasetMultiDataset,
 )
+from Utils.reliability_references import (
+    apply_dataset_reliability_reference,
+    load_reliability_reference_manifest,
+    materialize_observed_pair_statistics,
+)
 
 
 RIBO_REPLICAS_COLUMN = "ribo_cds_replicas"
+
+
+def filter_sequences_by_max_cds_codons(
+    sequence_frame: pd.DataFrame,
+    *,
+    sequence_column: str,
+    max_cds_codons: int | None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Apply one transcript-level CDS-length eligibility rule.
+
+    The complete transcript is removed when it exceeds the configured limit;
+    sequences are never truncated because that would invalidate start/stop
+    alignment, 3-prime synthetic biases, and transcript-wide gamma gauges.
+    """
+    if max_cds_codons is None:
+        return sequence_frame, {
+            "max_cds_codons": None,
+            "input_transcripts": int(len(sequence_frame)),
+            "retained_transcripts": int(len(sequence_frame)),
+            "removed_transcripts": 0,
+            "longest_input_cds_codons": None,
+            "longest_retained_cds_codons": None,
+            "removed_transcript_ids": (),
+        }
+
+    maximum = int(max_cds_codons)
+    if maximum < 1:
+        raise ValueError("data.max_cds_codons must be null or at least one.")
+    if sequence_column not in sequence_frame.columns:
+        raise KeyError(
+            f"Cannot enforce data.max_cds_codons: sequence column "
+            f"{sequence_column!r} is missing."
+        )
+
+    lengths: list[int] = []
+    for transcript_id, sequence in sequence_frame[sequence_column].items():
+        try:
+            length = int(len(sequence))
+        except TypeError as exc:
+            raise ValueError(
+                "Cannot determine CDS codon length for transcript "
+                f"{transcript_id!r}."
+            ) from exc
+        if length < 1:
+            raise ValueError(
+                f"Transcript {transcript_id!r} has an empty CDS sequence."
+            )
+        lengths.append(length)
+
+    length_array = np.asarray(lengths, dtype=np.int64)
+    eligible = length_array <= maximum
+    removed_ids = tuple(
+        map(str, sequence_frame.index.to_numpy()[~eligible].tolist())
+    )
+    filtered = sequence_frame.loc[eligible].copy()
+    if filtered.empty:
+        raise ValueError(
+            "data.max_cds_codons removed every sequence: "
+            f"limit={maximum}, input={len(sequence_frame)}."
+        )
+
+    return filtered, {
+        "max_cds_codons": maximum,
+        "input_transcripts": int(len(sequence_frame)),
+        "retained_transcripts": int(eligible.sum()),
+        "removed_transcripts": int((~eligible).sum()),
+        "longest_input_cds_codons": int(length_array.max()),
+        "longest_retained_cds_codons": int(length_array[eligible].max()),
+        "removed_transcript_ids": removed_ids,
+    }
 
 
 @dataclass(frozen=True)
@@ -820,6 +895,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         seed: int = 42,
         train_sampling_strategy: Optional[str] = None,
         minimum_positive_datasets_per_transcript: int = 2,
+        max_cds_codons: int | None = None,
         pin_memory: bool = True,
         prefetch_factor: Optional[int] = 4,
         multiprocessing_context: Optional[str] = "spawn",
@@ -828,6 +904,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         dataset_quality_dataset_column: str = "dataset",
         dataset_quality_rank_column: str = "quality_rank",
         dataset_quality_strict: bool = True,
+        reliability_reference_manifest_path: Optional[str] = None,
         execution_microbatch_max_transcript_groups: int | None = None,
         execution_microbatch_max_pair_rows: int | None = None,
         execution_microbatch_max_padded_codon_tokens: int | None = None,
@@ -855,6 +932,11 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             raise ValueError(
                 "minimum_positive_datasets_per_transcript must be at least one."
             )
+        self.max_cds_codons = (
+            None if max_cds_codons is None else int(max_cds_codons)
+        )
+        if self.max_cds_codons is not None and self.max_cds_codons < 1:
+            raise ValueError("data.max_cds_codons must be null or at least one.")
 
         self.pin_memory = bool(pin_memory)
         self.prefetch_factor = prefetch_factor
@@ -874,6 +956,23 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         self.dataset_quality_dataset_column = str(dataset_quality_dataset_column)
         self.dataset_quality_rank_column = str(dataset_quality_rank_column)
         self.dataset_quality_strict = bool(dataset_quality_strict)
+        self.reliability_reference_manifest_path = (
+            None
+            if reliability_reference_manifest_path is None
+            else str(reliability_reference_manifest_path)
+        )
+        self.reliability_reference_manifest = (
+            None
+            if self.reliability_reference_manifest_path is None
+            else load_reliability_reference_manifest(
+                self.reliability_reference_manifest_path
+            )
+        )
+        self.frozen_reliability_references = (
+            {}
+            if self.reliability_reference_manifest is None
+            else dict(self.reliability_reference_manifest["datasets"])
+        )
         self.execution_microbatch_max_transcript_groups = (
             None
             if execution_microbatch_max_transcript_groups is None
@@ -919,14 +1018,19 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
 
         self.train_dataset_obj = None
         self.val_dataset_obj = None
+        self.predict_dataset_obj = None
 
         self.train_lengths = None
         self.val_lengths = None
+        self.predict_lengths = None
 
         self.train_flat_dataset_ids = None
         self.train_flat_transcript_ids = None
         self.val_flat_dataset_ids = None
         self.val_flat_transcript_ids = None
+        self.predict_flat_dataset_ids = None
+        self.predict_flat_transcript_ids = None
+        self.predict_split_ids = None
 
         self._has_loaded_data = False
 
@@ -1037,9 +1141,24 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             seq_df = seq_df.set_index("transcript_id")
         seq_df.index = seq_df.index.astype(str)
 
+        seq_df, length_filter = filter_sequences_by_max_cds_codons(
+            seq_df,
+            sequence_column=sequence_column,
+            max_cds_codons=self.max_cds_codons,
+        )
+        if self.max_cds_codons is not None:
+            print(
+                "CDS-length eligibility: "
+                f"max={self.max_cds_codons:,} codons, "
+                f"removed={length_filter['removed_transcripts']:,}/"
+                f"{length_filter['input_transcripts']:,}, "
+                "longest retained="
+                f"{length_filter['longest_retained_cds_codons']:,} codons."
+            )
+
         print("Length of the main sequence:", len(seq_df.index))
 
-        dataset_specs: dict[str, tuple[str, bool]] = {}
+        dataset_specs: dict[str, tuple[str, bool, frozenset[str]]] = {}
         weighted_dataset_names = []
         union_index = pd.Index([], dtype=seq_df.index.dtype)
 
@@ -1076,9 +1195,35 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             if dataset_name in dataset_specs:
                 raise ValueError(f"Duplicate active dataset name: {dataset_name!r}.")
             has_weight = "weight" in available_columns
+            if self.reliability_reference_manifest is not None:
+                # A weighted artifact's retained rows and stored weight define
+                # the production eligibility contract. Pair-local density and
+                # coverage can be either materialized by the current
+                # preprocessor or derived exactly from the already-required
+                # consensus ``ribo`` profile for older artifacts.
+                missing_reliability_columns = {"weight"}.difference(
+                    available_columns
+                )
+                if missing_reliability_columns:
+                    raise KeyError(
+                        "Split-aware reliability weighting requires a weighted "
+                        "artifact; dataset "
+                        f"{dataset_name!r} is missing "
+                        f"{sorted(missing_reliability_columns)}."
+                    )
+                if dataset_name not in self.frozen_reliability_references:
+                    raise KeyError(
+                        "Frozen reliability-reference manifest "
+                        f"{self.reliability_reference_manifest_path} has no entry "
+                        f"for active dataset {dataset_name!r}."
+                    )
             if has_weight:
                 weighted_dataset_names.append(dataset_name)
-            dataset_specs[dataset_name] = (str(path), has_weight)
+            dataset_specs[dataset_name] = (
+                str(path),
+                has_weight,
+                frozenset(available_columns),
+            )
             dataset_ids = pd.Index(id_frame["id"].astype(str))
             union_index = union_index.union(dataset_ids, sort=False)
 
@@ -1098,6 +1243,20 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             )
         else:
             print("No transcript weight column found; using unit sample weights.")
+
+        if self.reliability_reference_manifest is not None:
+            unused_references = sorted(
+                set(self.frozen_reliability_references) - set(dataset_specs)
+            )
+            print(
+                "Applying training-only frozen reliability references from "
+                f"{self.reliability_reference_manifest_path}."
+            )
+            if unused_references:
+                print(
+                    "Ignoring frozen references for inactive datasets: "
+                    f"{unused_references}"
+                )
 
         dataset_quality_ranks = {name: float("nan") for name in dataset_specs}
         dataset_quality_weights = {name: 1.0 for name in dataset_specs}
@@ -1240,17 +1399,35 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             return np.ascontiguousarray(np.stack(reps, axis=0))
 
         valid_ids = set(valid_index.astype(str))
-        for dataset_name, (path, has_weight) in tqdm(
+        for dataset_name, (path, has_weight, available_columns) in tqdm(
             dataset_specs.items(),
             desc="Validating ribo profiles",
         ):
             read_columns = ["id", "ribo", RIBO_REPLICAS_COLUMN]
             if has_weight:
                 read_columns.append("weight")
-            df = pd.read_parquet(path, columns=read_columns).set_index("id")
+            if self.reliability_reference_manifest is not None:
+                read_columns.extend(
+                    column
+                    for column in ("read_density", "coverage")
+                    if column in available_columns
+                )
+            raw_df = pd.read_parquet(path, columns=read_columns)
+            if self.reliability_reference_manifest is not None:
+                raw_df = materialize_observed_pair_statistics(
+                    raw_df,
+                    dataset_name=dataset_name,
+                )
+                weight_values = apply_dataset_reliability_reference(
+                    raw_df,
+                    dataset_name=dataset_name,
+                    reference=self.frozen_reliability_references[dataset_name],
+                )
+            else:
+                weight_values = raw_df["weight"].values if has_weight else None
+            df = raw_df.set_index("id")
             df.index = df.index.astype(str)
             ids = df.index.astype(str)
-            weight_values = df["weight"].values if has_weight else None
             consensus_values = df["ribo"].values
             replica_values = df[RIBO_REPLICAS_COLUMN].values
             for i, t_id in enumerate(ids):
@@ -1291,7 +1468,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
                             f"{sample_weight}."
                         )
                     shared_data["sample_weights"][t_id][dataset_name] = sample_weight
-            del ids, consensus_values, replica_values, weight_values, df
+            del ids, consensus_values, replica_values, weight_values, df, raw_df
 
         if self.split is None:
             raise NotImplementedError(
@@ -1303,20 +1480,53 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         all_ids = np.asarray(shared_data["transcript_id"]).astype(str)
         train_id_set = set(map(str, self.split[0]))
         val_id_set = set(map(str, self.split[1]))
+        if train_id_set.intersection(val_id_set):
+            overlap = sorted(train_id_set.intersection(val_id_set))[:5]
+            raise ValueError(
+                f"Training and validation transcript IDs overlap: {overlap}."
+            )
+        has_distinct_prediction_split = len(self.split) >= 3 and self.split[2] is not None
+        prediction_id_set = (
+            set(map(str, self.split[2]))
+            if has_distinct_prediction_split
+            else val_id_set
+        )
+        if has_distinct_prediction_split:
+            heldout_overlap = train_id_set.intersection(prediction_id_set)
+            validation_overlap = val_id_set.intersection(prediction_id_set)
+            if heldout_overlap or validation_overlap:
+                raise ValueError(
+                    "A distinct prediction/test split must be disjoint from train "
+                    "and validation; overlaps: "
+                    f"train={sorted(heldout_overlap)[:5]}, "
+                    f"validation={sorted(validation_overlap)[:5]}."
+                )
 
         train_indices = [i for i, tid in enumerate(all_ids) if tid in train_id_set]
         val_indices = [i for i, tid in enumerate(all_ids) if tid in val_id_set]
+        prediction_indices = [
+            i for i, tid in enumerate(all_ids) if tid in prediction_id_set
+        ]
 
         train_ids = all_ids[train_indices].tolist()
         val_ids = all_ids[val_indices].tolist()
+        prediction_ids = all_ids[prediction_indices].tolist()
 
         if len(train_ids) == 0:
             raise RuntimeError("Training split is empty after intersecting with available transcripts.")
         if len(val_ids) == 0:
             raise RuntimeError("Validation split is empty after intersecting with available transcripts.")
+        if len(prediction_ids) == 0:
+            raise RuntimeError(
+                "Prediction split is empty after intersecting with available transcripts."
+            )
 
         print(f"Train transcripts: {len(train_ids)}")
         print(f"Validation transcripts: {len(val_ids)}")
+        print(
+            f"{'Test' if has_distinct_prediction_split else 'Prediction'} "
+            f"transcripts: {len(prediction_ids)}"
+        )
 
         strategy = self._resolve_train_sampling_strategy()
         print("dataset pair mode: deterministic flat pairs")
@@ -1373,11 +1583,49 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             split_name="validation",
         )
 
+        if has_distinct_prediction_split:
+            self.predict_dataset_obj = RiboAIQueuingDatasetMultiDataset(
+                data=shared_data,
+                lengths=shared_data["lengths"],
+                nt_encoding=self.nt_enc,
+                codon_to_aa_encoding=self.c2aa_enc,
+                codon_encoding=self.c_enc,
+                aa_encoding=self.aa_enc,
+                datasets_encoding=self.datasets_enc,
+                transcripts_ids=prediction_ids,
+                additional_sequence_features=self.additional_sequence_features,
+            )
+            self.predict_lengths = self._get_flat_lengths(self.predict_dataset_obj)
+            self.predict_flat_dataset_ids = self._get_flat_dataset_ids(
+                self.predict_dataset_obj
+            )
+            self.predict_flat_transcript_ids = self._get_flat_transcript_ids(
+                self.predict_dataset_obj
+            )
+            self.predict_split_ids = list(map(str, self.split[2]))
+            self._print_flat_pair_summary(
+                dataset_obj=self.predict_dataset_obj,
+                flat_transcript_ids=self.predict_flat_transcript_ids,
+                flat_dataset_ids=self.predict_flat_dataset_ids,
+                considered_transcript_ids=self.predict_split_ids,
+                split_name="test",
+            )
+        else:
+            self.predict_dataset_obj = self.val_dataset_obj
+            self.predict_lengths = self.val_lengths
+            self.predict_flat_dataset_ids = self.val_flat_dataset_ids
+            self.predict_flat_transcript_ids = self.val_flat_transcript_ids
+            self.predict_split_ids = list(map(str, self.split[1]))
+
         # Both split datasets now own compact codon-ID and routed-feature
         # caches for every transcript they can return. Release the much larger
         # nested sequence cells before DataLoader worker creation; otherwise a
         # spawn worker serializes data that can never be consulted.
-        if self.train_dataset_obj.precompute_features and self.val_dataset_obj.precompute_features:
+        if (
+            self.train_dataset_obj.precompute_features
+            and self.val_dataset_obj.precompute_features
+            and self.predict_dataset_obj.precompute_features
+        ):
             shared_data["ref"] = ()
             shared_data["sequence_features"] = {}
 
@@ -1616,19 +1864,23 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         )
 
     def predict_dataloader(self):
-        if self.val_dataset_obj is None:
+        if self.predict_dataset_obj is None:
             raise RuntimeError("setup() must be called before predict_dataloader().")
 
-        if self.val_flat_transcript_ids is None or self.val_flat_dataset_ids is None:
+        if (
+            self.predict_flat_transcript_ids is None
+            or self.predict_flat_dataset_ids is None
+            or self.predict_split_ids is None
+        ):
             raise RuntimeError("Prediction dataloader requires deterministic flat metadata.")
 
         num_replicas, rank = self._dist_info()
 
         batch_sampler = TranscriptGroupedMultiDatasetBatchSampler(
-            flat_transcript_ids=self.val_flat_transcript_ids,
-            flat_dataset_ids=self.val_flat_dataset_ids,
-            considered_transcript_ids=self.split[1],
-            lengths=self.val_lengths,
+            flat_transcript_ids=self.predict_flat_transcript_ids,
+            flat_dataset_ids=self.predict_flat_dataset_ids,
+            considered_transcript_ids=self.predict_split_ids,
+            lengths=self.predict_lengths,
             batch_size=self.batch_size,
             drop_last=False,
             seed=self.seed,
@@ -1650,8 +1902,8 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         )
 
         return DataLoader(
-            self.val_dataset_obj,
+            self.predict_dataset_obj,
             batch_sampler=batch_sampler,
-            collate_fn=self.val_dataset_obj.collate_fn,
+            collate_fn=self.predict_dataset_obj.collate_fn,
             **self._dataloader_kwargs(num_workers=self.predict_num_workers),
         )

@@ -347,6 +347,9 @@ class NegativeBinomialProfileLoss(nn.Module):
         eps: float = 1.0e-8,
         log_alpha_min: float = -5.0,
         log_alpha_max: float = 3.0,
+        experiment_mode: str = "mean_gradient_reweighted_nb",
+        nb_mean_gradient_beta: float = 0.5,
+        nb_mean_gradient_max_weight: float | None = None,
         sequence_reduction: str = "mean",
         length_temper_gamma: float = 0.85,
         length_temper_ref: float = 1000.0,
@@ -358,6 +361,13 @@ class NegativeBinomialProfileLoss(nn.Module):
         self.eps = float(eps)
         self.log_alpha_min = float(log_alpha_min)
         self.log_alpha_max = float(log_alpha_max)
+        self.experiment_mode = str(experiment_mode).lower()
+        self.nb_mean_gradient_beta = float(nb_mean_gradient_beta)
+        self.nb_mean_gradient_max_weight = (
+            None
+            if nb_mean_gradient_max_weight is None
+            else float(nb_mean_gradient_max_weight)
+        )
         self.sequence_reduction = sequence_reduction
         self.length_temper_gamma = float(length_temper_gamma)
         self.length_temper_ref = float(length_temper_ref)
@@ -373,6 +383,40 @@ class NegativeBinomialProfileLoss(nn.Module):
         ):
             raise ValueError(
                 "loss.nb_log_alpha_min/max must be finite and min must be <= max."
+            )
+        if (
+            not math.isfinite(self.nb_mean_gradient_beta)
+            or not 0.0 <= self.nb_mean_gradient_beta <= 1.0
+        ):
+            raise ValueError("loss.nb_mean_gradient_beta must be finite and in [0, 1].")
+        valid_experiment_modes = {
+            "standard_nb",
+            "mean_gradient_reweighted_nb",
+            "decoupled_nb_mean_gradient",
+            "fixed_alpha",
+        }
+        if self.experiment_mode not in valid_experiment_modes:
+            raise ValueError(
+                "loss.experiment_mode must be one of "
+                f"{sorted(valid_experiment_modes)}, got {self.experiment_mode!r}."
+            )
+        if self.experiment_mode == "standard_nb" and self.nb_mean_gradient_beta != 0.0:
+            raise ValueError("standard_nb requires loss.nb_mean_gradient_beta=0.0.")
+        if (
+            self.experiment_mode == "decoupled_nb_mean_gradient"
+            and self.nb_mean_gradient_beta != 1.0
+        ):
+            raise ValueError(
+                "decoupled_nb_mean_gradient requires loss.nb_mean_gradient_beta=1.0."
+            )
+        if self.experiment_mode == "fixed_alpha" and self.nb_mean_gradient_beta != 0.0:
+            raise ValueError("fixed_alpha requires loss.nb_mean_gradient_beta=0.0.")
+        if self.nb_mean_gradient_max_weight is not None and (
+            not math.isfinite(self.nb_mean_gradient_max_weight)
+            or self.nb_mean_gradient_max_weight < 1.0
+        ):
+            raise ValueError(
+                "loss.nb_mean_gradient_max_weight must be null or finite and >= 1."
             )
         if self.sequence_reduction not in {"mean", "sum", "length_tempered"}:
             raise ValueError(
@@ -429,7 +473,26 @@ class NegativeBinomialProfileLoss(nn.Module):
         y_true: torch.Tensor,
         mask: torch.Tensor,
         return_per_sample: bool = False,
-    ) -> torch.Tensor:
+        apply_mean_gradient_reweighting: bool = True,
+        return_details: bool = False,
+    ) -> torch.Tensor | dict[str, torch.Tensor]:
+        """Evaluate raw NB2 and the configured optimization surrogate.
+
+        The ordinary NB2 likelihood remains
+
+            ell = lgamma(r) - lgamma(y+r) + lgamma(y+1)
+                  - r log(r) - y log(mu) + (r+y) log(r+mu),
+
+        where ``r = 1 / alpha``.  For optimization only, the caller may use
+
+            stopgrad((1 + alpha * mu) ** beta) * ell.
+
+        ``decoupled_nb_mean_gradient`` constructs two numerically related but
+        gradient-disjoint terms: weighted NB2(mu, stopgrad(alpha)) trains the
+        mean/gamma branches, while NB2(stopgrad(mu), alpha) trains only the
+        alpha head. The raw NB2 likelihood remains the validation objective.
+        Every position tensor passes through the identical sequence reduction.
+        """
         with torch.amp.autocast(device_type=mu_phys.device.type, enabled=False):
             finite_mask = mask.bool() & torch.isfinite(y_true)
             y = torch.nan_to_num(
@@ -447,22 +510,91 @@ class NegativeBinomialProfileLoss(nn.Module):
                 log_sigma=log_sigma.to(torch.float32),
                 target_shape=y.shape,
             )
-            r = torch.exp(-log_alpha).clamp_min(self.eps)
+            def nb2_nll(
+                mean: torch.Tensor,
+                log_dispersion: torch.Tensor,
+            ) -> torch.Tensor:
+                size = torch.exp(-log_dispersion).clamp_min(self.eps)
+                return (
+                    torch.lgamma(size)
+                    - torch.lgamma(y + size)
+                    + torch.lgamma(y + 1.0)
+                    - size * torch.log(size.clamp_min(self.eps))
+                    - y * torch.log(mean.clamp_min(self.eps))
+                    + (size + y)
+                    * torch.log((size + mean).clamp_min(self.eps))
+                )
 
-            nll = (
-                torch.lgamma(r)
-                - torch.lgamma(y + r)
-                + torch.lgamma(y + 1.0)
-                - r * torch.log(r.clamp_min(self.eps))
-                - y * torch.log(mu.clamp_min(self.eps))
-                + (r + y) * torch.log((r + mu).clamp_min(self.eps))
-            )
+            nll = nb2_nll(mu, log_alpha)
 
             nll = torch.nan_to_num(nll, nan=0.0, posinf=1.0e8, neginf=1.0e8)
 
-            nll = torch.where(finite_mask, nll, torch.zeros_like(nll))
-            loss_per_sample = reduce_sequence_nll(
-                nll,
+            raw_nll = torch.where(finite_mask, nll, torch.zeros_like(nll))
+
+            if self.nb_mean_gradient_beta == 0.0:
+                mean_gradient_weight = torch.ones_like(mu).detach()
+            else:
+                # softplus(log(alpha) + log(mu)) is a stable evaluation of
+                # log(1 + alpha * mu). The weight is deliberately detached;
+                # alpha remains attached inside ``raw_nll`` above.
+                log_alpha_mu = log_alpha + torch.log(mu.clamp_min(self.eps))
+                log_weight = self.nb_mean_gradient_beta * torch.nn.functional.softplus(
+                    log_alpha_mu
+                )
+                if self.nb_mean_gradient_max_weight is not None:
+                    log_weight = log_weight.clamp_max(
+                        math.log(self.nb_mean_gradient_max_weight)
+                    )
+                mean_gradient_weight = torch.exp(log_weight).detach()
+                if not bool(torch.isfinite(mean_gradient_weight).all()):
+                    raise FloatingPointError(
+                        "Non-finite NB mean-gradient weight. Reduce "
+                        "loss.nb_mean_gradient_beta or configure a finite "
+                        "loss.nb_mean_gradient_max_weight."
+                    )
+
+            if self.experiment_mode == "decoupled_nb_mean_gradient":
+                mean_branch_nll = nb2_nll(mu, log_alpha.detach())
+                alpha_branch_nll = nb2_nll(mu.detach(), log_alpha)
+                mean_branch_nll = torch.nan_to_num(
+                    mean_branch_nll,
+                    nan=0.0,
+                    posinf=1.0e8,
+                    neginf=1.0e8,
+                )
+                alpha_branch_nll = torch.nan_to_num(
+                    alpha_branch_nll,
+                    nan=0.0,
+                    posinf=1.0e8,
+                    neginf=1.0e8,
+                )
+                mean_branch_nll = torch.where(
+                    finite_mask,
+                    mean_gradient_weight * mean_branch_nll,
+                    torch.zeros_like(mean_branch_nll),
+                )
+                alpha_branch_nll = torch.where(
+                    finite_mask,
+                    alpha_branch_nll,
+                    torch.zeros_like(alpha_branch_nll),
+                )
+                optimization_nll = mean_branch_nll + alpha_branch_nll
+            elif self.experiment_mode == "mean_gradient_reweighted_nb":
+                mean_branch_nll = mean_gradient_weight * raw_nll
+                alpha_branch_nll = torch.zeros_like(raw_nll)
+                optimization_nll = mean_branch_nll
+            else:
+                mean_branch_nll = raw_nll
+                alpha_branch_nll = torch.zeros_like(raw_nll)
+                optimization_nll = raw_nll
+
+            if not bool(torch.isfinite(optimization_nll).all()):
+                raise FloatingPointError(
+                    "Non-finite NB2 optimization surrogate."
+                )
+
+            raw_loss_per_sample = reduce_sequence_nll(
+                raw_nll,
                 finite_mask,
                 self.sequence_reduction,
                 gamma=self.length_temper_gamma,
@@ -471,8 +603,79 @@ class NegativeBinomialProfileLoss(nn.Module):
                 max_weight=self.length_temper_max_weight,
                 eps=self.eps,
             )
+            mean_branch_loss_per_sample = reduce_sequence_nll(
+                mean_branch_nll,
+                finite_mask,
+                self.sequence_reduction,
+                gamma=self.length_temper_gamma,
+                length_ref=self.length_temper_ref,
+                min_weight=self.length_temper_min_weight,
+                max_weight=self.length_temper_max_weight,
+                eps=self.eps,
+            )
+            alpha_branch_loss_per_sample = reduce_sequence_nll(
+                alpha_branch_nll,
+                finite_mask,
+                self.sequence_reduction,
+                gamma=self.length_temper_gamma,
+                length_ref=self.length_temper_ref,
+                min_weight=self.length_temper_min_weight,
+                max_weight=self.length_temper_max_weight,
+                eps=self.eps,
+            )
+            optimization_loss_per_sample = reduce_sequence_nll(
+                optimization_nll,
+                finite_mask,
+                self.sequence_reduction,
+                gamma=self.length_temper_gamma,
+                length_ref=self.length_temper_ref,
+                min_weight=self.length_temper_min_weight,
+                max_weight=self.length_temper_max_weight,
+                eps=self.eps,
+            )
+            loss_per_sample = (
+                optimization_loss_per_sample
+                if apply_mean_gradient_reweighting
+                else raw_loss_per_sample
+            )
             loss_per_sample = loss_per_sample.to(torch.float32)
+            raw_loss_per_sample = raw_loss_per_sample.to(torch.float32)
+            mean_branch_loss_per_sample = mean_branch_loss_per_sample.to(torch.float32)
+            alpha_branch_loss_per_sample = alpha_branch_loss_per_sample.to(torch.float32)
+            optimization_loss_per_sample = optimization_loss_per_sample.to(torch.float32)
 
+            valid_weights = mean_gradient_weight[finite_mask]
+            if valid_weights.numel() == 0:
+                weight_summary = mean_gradient_weight.new_ones(5)
+            else:
+                quantiles = torch.quantile(
+                    valid_weights.float(),
+                    valid_weights.new_tensor([0.5, 0.9, 0.99]).float(),
+                )
+                weight_summary = torch.stack(
+                    (
+                        valid_weights.float().mean(),
+                        quantiles[0],
+                        quantiles[1],
+                        quantiles[2],
+                        valid_weights.float().amax(),
+                    )
+                ).detach()
+
+        if return_details:
+            return {
+                "loss_per_sample": loss_per_sample,
+                "raw_nll_per_sample": raw_loss_per_sample,
+                "mean_reweighted_nll_per_sample": mean_branch_loss_per_sample,
+                "alpha_nll_per_sample": alpha_branch_loss_per_sample,
+                "optimization_surrogate_per_sample": optimization_loss_per_sample,
+                "mean_gradient_weight": mean_gradient_weight,
+                "mean_gradient_weight_mean": weight_summary[0],
+                "mean_gradient_weight_median": weight_summary[1],
+                "mean_gradient_weight_p90": weight_summary[2],
+                "mean_gradient_weight_p99": weight_summary[3],
+                "mean_gradient_weight_max": weight_summary[4],
+            }
         if return_per_sample:
             return loss_per_sample
 
@@ -524,6 +727,26 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         self.model = torch_model
         self.config = config
         self.loss_fn = self._build_loss()
+        self.experiment_mode = str(self.loss_fn.experiment_mode)
+        self.nb_mean_gradient_beta = float(
+            self.loss_fn.nb_mean_gradient_beta
+        )
+        self.alpha_mode = str(getattr(self.model, "alpha_mode", "learned"))
+        expected_alpha_mode = (
+            "fixed" if self.experiment_mode == "fixed_alpha" else "learned"
+        )
+        if self.alpha_mode != expected_alpha_mode:
+            raise ValueError(
+                f"loss.experiment_mode={self.experiment_mode!r} requires "
+                f"model.alpha_mode={expected_alpha_mode!r}, got {self.alpha_mode!r}."
+            )
+        self.hparams["experiment_mode"] = self.experiment_mode
+        self.hparams["alpha_mode"] = self.alpha_mode
+        self.hparams["fixed_alpha"] = float(getattr(self.model, "fixed_alpha", 0.1))
+        self.hparams["nb_mean_gradient_beta"] = self.nb_mean_gradient_beta
+        self.hparams["nb_mean_gradient_max_weight"] = (
+            self.loss_fn.nb_mean_gradient_max_weight
+        )
 
         self.dataset_id_to_name = {int(v): str(k) for k, v in dataset_encoding.items()}
         self._val_profile_plot_logged_this_epoch = False
@@ -910,6 +1133,15 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             eps=loss_cfg.eps,
             log_alpha_min=float(loss_cfg_get("nb_log_alpha_min", -5.0)),
             log_alpha_max=float(loss_cfg_get("nb_log_alpha_max", 3.0)),
+            experiment_mode=str(
+                loss_cfg_get("experiment_mode", "mean_gradient_reweighted_nb")
+            ),
+            nb_mean_gradient_beta=float(
+                loss_cfg_get("nb_mean_gradient_beta", 0.5)
+            ),
+            nb_mean_gradient_max_weight=loss_cfg_get(
+                "nb_mean_gradient_max_weight", None
+            ),
             sequence_reduction=sequence_reduction,
             length_temper_gamma=length_temper_gamma,
             length_temper_ref=length_temper_ref,
@@ -1289,6 +1521,8 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
     def _compute_replica_loss_terms(
         self,
         out: dict[str, Any],
+        *,
+        optimize_with_reweighted_nb: bool,
     ) -> dict[str, Any]:
         replica_profiles = out.get("replica_profiles")
         replica_mask = out.get("replica_mask")
@@ -1370,26 +1604,89 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
         zero_flat = flat_mu.new_zeros(B * R)
         if self.replica_nb_weight > 0.0:
-            nll_flat = self.loss_fn(
+            nb_details = self.loss_fn(
                 mu_phys=flat_mu,
                 log_sigma=flat_log_sigma,
                 y_true=flat_target,
                 mask=flat_mask,
                 return_per_sample=True,
+                apply_mean_gradient_reweighting=optimize_with_reweighted_nb,
+                return_details=True,
             )
+            nll_flat = nb_details["loss_per_sample"]
+            raw_nll_flat = nb_details["raw_nll_per_sample"]
+            reweighted_nll_flat = nb_details[
+                "mean_reweighted_nll_per_sample"
+            ]
+            alpha_nll_flat = nb_details["alpha_nll_per_sample"]
+            optimization_surrogate_flat = nb_details[
+                "optimization_surrogate_per_sample"
+            ]
         else:
             # A zero coefficient disables the NB-NLL branch completely.
             nll_flat = zero_flat
+            raw_nll_flat = zero_flat
+            reweighted_nll_flat = zero_flat
+            alpha_nll_flat = zero_flat
+            optimization_surrogate_flat = zero_flat
+            one = flat_mu.new_tensor(1.0)
+            nb_details = {
+                "mean_gradient_weight_mean": one,
+                "mean_gradient_weight_median": one,
+                "mean_gradient_weight_p90": one,
+                "mean_gradient_weight_p99": one,
+                "mean_gradient_weight_max": one,
+            }
         nll_per_sample = self._average_over_valid_replicas(nll_flat, rep_mask)
+        raw_nll_per_sample = self._average_over_valid_replicas(
+            raw_nll_flat,
+            rep_mask,
+        )
+        reweighted_nll_per_sample = self._average_over_valid_replicas(
+            reweighted_nll_flat,
+            rep_mask,
+        )
+        alpha_nll_per_sample = self._average_over_valid_replicas(
+            alpha_nll_flat,
+            rep_mask,
+        )
+        optimization_surrogate_per_sample = self._average_over_valid_replicas(
+            optimization_surrogate_flat,
+            rep_mask,
+        )
         replica_counts = rep_mask.to(dtype=target_reps.dtype).sum(dim=1)
         return {
             "nll_per_sample": nll_per_sample,
+            "raw_nll_per_sample": raw_nll_per_sample,
+            "mean_reweighted_nll_per_sample": reweighted_nll_per_sample,
+            "alpha_nll_per_sample": alpha_nll_per_sample,
+            "optimization_surrogate_per_sample": optimization_surrogate_per_sample,
             "metrics": {
                 "replica_count_mean": replica_counts.mean(),
+                "nb_mean_gradient_weight_mean": nb_details[
+                    "mean_gradient_weight_mean"
+                ],
+                "nb_mean_gradient_weight_median": nb_details[
+                    "mean_gradient_weight_median"
+                ],
+                "nb_mean_gradient_weight_p90": nb_details[
+                    "mean_gradient_weight_p90"
+                ],
+                "nb_mean_gradient_weight_p99": nb_details[
+                    "mean_gradient_weight_p99"
+                ],
+                "nb_mean_gradient_weight_max": nb_details[
+                    "mean_gradient_weight_max"
+                ],
             },
         }
 
-    def _compute_loss_and_metrics(self, out: dict[str, Any]) -> dict[str, torch.Tensor]:
+    def _compute_loss_and_metrics(
+        self,
+        out: dict[str, Any],
+        *,
+        optimize_with_reweighted_nb: bool,
+    ) -> dict[str, torch.Tensor]:
         dataset_ids = out["dataset_ids"]
         sample_weights = out["sample_weights"]
         transcript_group_ids = out["transcript_group_index"]
@@ -1397,11 +1694,22 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         target = torch.nan_to_num(out["target"].float(), nan=0.0, posinf=0.0, neginf=0.0)
 
         consensus_terms = self._compute_consensus_loss_terms(out, target, mask)
-        replica_terms = self._compute_replica_loss_terms(out)
+        replica_terms = self._compute_replica_loss_terms(
+            out,
+            optimize_with_reweighted_nb=optimize_with_reweighted_nb,
+        )
 
         # NB2 retains raw-replica supervision. Shape-oriented PCC is evaluated
         # once per pair against the arithmetic replica consensus.
         nll_per_sample = replica_terms["nll_per_sample"]
+        raw_nll_per_sample = replica_terms["raw_nll_per_sample"]
+        reweighted_nll_per_sample = replica_terms[
+            "mean_reweighted_nll_per_sample"
+        ]
+        alpha_nll_per_sample = replica_terms["alpha_nll_per_sample"]
+        optimization_surrogate_per_sample = replica_terms[
+            "optimization_surrogate_per_sample"
+        ]
         raw_pcc_diag = consensus_terms["raw_pcc_diag"]
         nb_vst_pcc_diag = consensus_terms["nb_vst_pcc_diag"]
         pcc_raw_loss_per_sample = raw_pcc_diag["loss_per_sample"]
@@ -1473,6 +1781,30 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
         nll = self._aggregate_per_sample(
             nll_per_sample,
+            dataset_ids,
+            sample_weights,
+            transcript_group_ids,
+        )
+        nb_nll_raw = self._aggregate_per_sample(
+            raw_nll_per_sample,
+            dataset_ids,
+            sample_weights,
+            transcript_group_ids,
+        )
+        nb_nll_mean_reweighted = self._aggregate_per_sample(
+            reweighted_nll_per_sample,
+            dataset_ids,
+            sample_weights,
+            transcript_group_ids,
+        )
+        nb_nll_alpha_branch = self._aggregate_per_sample(
+            alpha_nll_per_sample,
+            dataset_ids,
+            sample_weights,
+            transcript_group_ids,
+        )
+        optimization_surrogate = self._aggregate_per_sample(
+            optimization_surrogate_per_sample,
             dataset_ids,
             sample_weights,
             transcript_group_ids,
@@ -1682,6 +2014,17 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "loss_transcript_balanced": loss_by_mode["transcript_balanced"],
             "nll": nll,
             "nll_per_sample": nll_per_sample,
+            "nb_nll_raw": nb_nll_raw,
+            "nb_nll_raw_per_sample": raw_nll_per_sample,
+            "nb_nll_mean_reweighted": nb_nll_mean_reweighted,
+            "nb_nll_mean_reweighted_per_sample": reweighted_nll_per_sample,
+            "nb_nll_alpha_branch": nb_nll_alpha_branch,
+            "nb_nll_alpha_branch_per_sample": alpha_nll_per_sample,
+            "optimization_surrogate": optimization_surrogate,
+            "optimization_surrogate_per_sample": optimization_surrogate_per_sample,
+            "nb_mean_gradient_beta": target.new_tensor(
+                self.nb_mean_gradient_beta
+            ),
             "pcc_loss": pcc_loss,
             "pcc_loss_per_sample": pcc_loss_per_sample,
             "consensus_pcc_loss": consensus_pcc_loss,
@@ -1771,6 +2114,10 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "gamma_mean": global_pos_mean(
                 extras.get("gamma", torch.ones_like(extras["L_bio"]))
             ),
+            "gamma_raw_bound_active_fraction": extras.get(
+                "gamma_raw_bound_active_fraction",
+                torch.zeros_like(extras["scale_dt"]),
+            ).float().mean(),
             "gamma_raw_mean": global_pos_mean(gamma_raw_diag),
             "gamma_raw_geometric_mean": torch.exp(global_pos_mean(log_gamma_raw_diag)),
             "gamma_centered_mean": global_pos_mean(gamma_diag),
@@ -1870,6 +2217,12 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
     # different arguments.
     SCALAR_METRICS = (
         "nll",
+        "nb_mean_gradient_beta",
+        "nb_mean_gradient_weight_mean",
+        "nb_mean_gradient_weight_median",
+        "nb_mean_gradient_weight_p90",
+        "nb_mean_gradient_weight_p99",
+        "nb_mean_gradient_weight_max",
         "pcc_loss",
         "pcc_value",
         "pcc_valid_fraction",
@@ -1888,6 +2241,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         "rho_max",
         "gamma_reg",
         "gamma_mean",
+        "gamma_raw_bound_active_fraction",
         "gamma_centering_applied_fraction",
         "gamma_distinct_dataset_count_mean",
         "gamma_centering_constraint_error",
@@ -2036,6 +2390,24 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 on_epoch=True,
                 prog_bar=False,
                 batch_size=reduction_epoch_weights[mode],
+                sync_dist=sync_dist,
+            )
+        # These two values use the configured sample reduction. Weighting the
+        # epoch aggregation by that reduction's outer bucket count avoids a
+        # mean-of-microbatch-means artifact when batch composition varies.
+        for metric_name in (
+            "nb_nll_raw",
+            "nb_nll_mean_reweighted",
+            "nb_nll_alpha_branch",
+            "optimization_surrogate",
+        ):
+            self.log(
+                f"{stage}_{metric_name}",
+                metrics[metric_name],
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=reduction_epoch_weights[self.sample_reduction],
                 sync_dist=sync_dist,
             )
         if stage == "val":
@@ -2934,7 +3306,10 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         self._record_train_batch_structure(batch)
         out = self._forward_batch(batch)
-        metrics = self._compute_loss_and_metrics(out)
+        metrics = self._compute_loss_and_metrics(
+            out,
+            optimize_with_reweighted_nb=True,
+        )
         self._log_stage(stage="train", out=out, metrics=metrics)
         if not self.execution_microbatching_enabled:
             return metrics["loss"]
@@ -3005,7 +3380,13 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         out = self._forward_batch(batch)
-        metrics = self._compute_loss_and_metrics(out)
+        # Validation and checkpoint ``val_loss`` retain the ordinary NB2
+        # likelihood. Mean-gradient reweighting is an optimization device, not
+        # a replacement probabilistic likelihood.
+        metrics = self._compute_loss_and_metrics(
+            out,
+            optimize_with_reweighted_nb=False,
+        )
         self._log_stage(stage="val", out=out, metrics=metrics)
         # Sanity validation exists only to catch a broken forward/loss path.
         # Avoid expensive CPU diagnostics and Matplotlib work that will be
@@ -3174,8 +3555,13 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         alpha_parameter_ids = {
             id(param) for param in alpha_head.parameters() if param.requires_grad
         }
-        if not alpha_parameter_ids:
+        learned_alpha = str(getattr(self.model, "alpha_mode", "learned")) == "learned"
+        if learned_alpha and not alpha_parameter_ids:
             raise RuntimeError("The NB2 alpha head has no trainable parameters.")
+        if not learned_alpha and alpha_parameter_ids:
+            raise RuntimeError(
+                "Fixed-alpha mode requires every alpha-head parameter to be frozen."
+            )
 
         for name, param in self.model.named_parameters():
             if not param.requires_grad:

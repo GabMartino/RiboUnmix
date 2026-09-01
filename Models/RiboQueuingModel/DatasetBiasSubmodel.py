@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -107,6 +109,20 @@ class DatasetBiasSubmodel(nn.Module):
         self.additional_sequence_feature_dim = int(
             config_params.get("additional_sequence_feature_dim", 0)
         )
+        raw_log_gamma_bound = config_params.get("raw_log_gamma_bound")
+        self.raw_log_gamma_bound = (
+            None
+            if raw_log_gamma_bound is None
+            else float(raw_log_gamma_bound)
+        )
+        if self.raw_log_gamma_bound is not None and (
+            not math.isfinite(self.raw_log_gamma_bound)
+            or self.raw_log_gamma_bound <= 0.0
+        ):
+            raise ValueError(
+                "dataset_bias_params.raw_log_gamma_bound must be null or a "
+                "finite, strictly positive number."
+            )
         self.dataset_embedding = nn.Embedding(
             self.num_datasets,
             self.dataset_embeddings_size,
@@ -262,6 +278,23 @@ class DatasetBiasSubmodel(nn.Module):
         out = self.observation_bias_head(
             x=x,
             mask=mask_b,
+        )
+        raw_log_gamma = out["gamma_raw"]
+        if self.raw_log_gamma_bound is None:
+            bounded_log_gamma = raw_log_gamma
+            bound_active = torch.zeros_like(mask_b)
+        else:
+            bound = float(self.raw_log_gamma_bound)
+            bounded_log_gamma = raw_log_gamma.clamp(min=-bound, max=bound)
+            bound_active = mask_b & (raw_log_gamma.abs() > bound)
+        out["gamma_raw"] = torch.where(
+            mask_b,
+            bounded_log_gamma,
+            torch.zeros_like(bounded_log_gamma),
+        )
+        out["gamma_raw_bound_active_fraction"] = (
+            bound_active.to(dtype=dtype).sum(dim=1)
+            / mask_f.sum(dim=1).clamp_min(1.0)
         )
 
         if compute_log_sigma:

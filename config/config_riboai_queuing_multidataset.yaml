@@ -22,6 +22,11 @@ prediction:
 
 split:
   master_dataset_universe: all
+  # Optional experiment-orchestrator manifest. When set, the entrypoint uses
+  # its panel-specific training IDs and common validation/test IDs verbatim.
+  # external_panel_name identifies which panel is being trained.
+  external_manifest: null
+  external_panel_name: null
   # The active defaults.dataset_config mapping defines both the complete
   # transcript universe and the fixed common-transcript validation panel.
   # Validation candidates must have one retained positive-weight row in EVERY
@@ -68,6 +73,14 @@ data:
   # Count distinct positive, eligible dataset observations, not physical rows.
   # This check runs before microbatch packing and accumulation planning.
   minimum_positive_datasets_per_transcript: 2
+
+  # Optional frozen SNR/coverage references fitted on explicit training IDs.
+  # The datamodule recomputes w_dt from pair-local read density and coverage at
+  # load time. Current artifacts materialize those columns; for compatible
+  # older weighted artifacts they are derived exactly from the observed ribo
+  # consensus. Held-out rows are transformed but never participate in fitting
+  # tau_d or the within-dataset normalization median.
+  reliability_reference_manifest: null
 
   pin_memory: true
   prefetch_factor: 2
@@ -176,6 +189,8 @@ model:
   # sum(mu) = sum(target). Makes zero-suppression mass-neutral (mass leaves the
   # zeros and lands on the peaks). gamma/L_bio stay per-position interpretable.
   mass_conservation: true
+  alpha_mode: learned
+  fixed_alpha: 0.1
   # Geometric anchoring of dataset-specific gamma. This removes a multiplicative
   # reference ambiguity when enough same-transcript datasets are present.
   gamma_centering:
@@ -253,6 +268,7 @@ model:
       init_log_sigma: 0.2
 
 loss:
+  experiment_mode: mean_gradient_reweighted_nb
   # The observation likelihood is fixed to NB2. There is no loss-mode or PCC
   # enable selector: each explicit coefficient below controls exactly one term.
   # A term whose coefficient is zero is skipped instead of being computed.
@@ -282,6 +298,17 @@ loss:
   # alpha<=~2.7. Lower it further to push zeros harder, at some cost to peak
   # tail calibration.
   nb_log_alpha_max: 1.0
+  # Detached mean-gradient correction for the optimized training NB2 term:
+  #   w = stopgrad((1 + alpha * mu) ** beta)
+  #   optimized_NLL = w * raw_NB2_NLL
+  # beta=0 reproduces ordinary NB2 training; beta=1 approximately cancels the
+  # 1/(1+alpha*mu) attenuation of the log-mu gradient. Validation and
+  # checkpoint val_loss always retain the ordinary unweighted NB2 likelihood.
+  # Ablation values: 0.0, 0.25, 0.5, 0.75, 1.0.
+  nb_mean_gradient_beta: 0.5
+  # Optional safety cap for extreme applications. null leaves the correction
+  # mathematically unclipped; non-finite weights raise instead of being hidden.
+  nb_mean_gradient_max_weight: null
   # Negative-binomial valid-position reduction inside each sequence:
   #   mean = average NLL over sequence length before aggregation
   #   sum  = sum NLL over sequence length, then aggregate across batch/datasets
@@ -351,6 +378,7 @@ trainer:
 
 callbacks:
   early_stopping_patience: 20
+  save_best_pcc_checkpoint: true
 
 metrics:
   log_train_per_dataset_metrics: false

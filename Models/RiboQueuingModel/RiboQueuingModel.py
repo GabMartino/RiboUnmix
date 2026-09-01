@@ -101,6 +101,13 @@ class RiboQueuingModel(nn.Module):
         # mass pushed off zeros is redistributed to the peaks automatically.
         self.mass_conservation = bool(model_configs.get("mass_conservation", True))
 
+        self.alpha_mode = str(model_configs.get("alpha_mode", "learned")).lower()
+        if self.alpha_mode not in {"learned", "fixed"}:
+            raise ValueError("model.alpha_mode must be 'learned' or 'fixed'.")
+        self.fixed_alpha = float(model_configs.get("fixed_alpha", 0.1))
+        if not math.isfinite(self.fixed_alpha) or self.fixed_alpha <= 0.0:
+            raise ValueError("model.fixed_alpha must be finite and strictly positive.")
+
         feature_config = model_configs.get("additional_sequence_features", {}) or {}
         biological_extra_dim = 0
         dataset_bias_extra_dim = 0
@@ -147,6 +154,15 @@ class RiboQueuingModel(nn.Module):
         self.position_edge_tau = float(dataset_bias_params.get("position_edge_tau", 30.0))
 
         self.dataset_bias_model = DatasetBiasSubmodel(config_params=dataset_bias_params)
+        if self.alpha_mode == "fixed":
+            # Keep the architecture/checkpoint schema unchanged, but make the
+            # diagnostic oracle bypass the alpha head and optimizer entirely.
+            self.dataset_bias_model.log_sigma_head.requires_grad_(False)
+        self.register_buffer(
+            "fixed_log_alpha",
+            torch.tensor(math.log(self.fixed_alpha), dtype=torch.float32),
+            persistent=False,
+        )
 
     # ============================================================
     # Cross-dataset gamma centering
@@ -298,7 +314,10 @@ class RiboQueuingModel(nn.Module):
 
     def get_extra_state(self) -> dict:
         return {
-            "version": 2,
+            "version": 4,
+            "alpha_mode": self.alpha_mode,
+            "fixed_alpha": self.fixed_alpha,
+            "raw_log_gamma_bound": self.dataset_bias_model.raw_log_gamma_bound,
             "gamma_centering_mode": self.gamma_centering_mode,
             "gamma_dataset_constant_scale_gauge": (
                 self.gamma_dataset_constant_scale_gauge
@@ -316,6 +335,26 @@ class RiboQueuingModel(nn.Module):
     def set_extra_state(self, state: dict | None) -> None:
         if not state:
             return
+        self.alpha_mode = str(state.get("alpha_mode", self.alpha_mode))
+        self.fixed_alpha = float(state.get("fixed_alpha", self.fixed_alpha))
+        self.fixed_log_alpha.fill_(math.log(self.fixed_alpha))
+        raw_log_gamma_bound = state.get(
+            "raw_log_gamma_bound",
+            self.dataset_bias_model.raw_log_gamma_bound,
+        )
+        self.dataset_bias_model.raw_log_gamma_bound = (
+            None
+            if raw_log_gamma_bound is None
+            else float(raw_log_gamma_bound)
+        )
+        if self.dataset_bias_model.raw_log_gamma_bound is not None and (
+            not math.isfinite(self.dataset_bias_model.raw_log_gamma_bound)
+            or self.dataset_bias_model.raw_log_gamma_bound <= 0.0
+        ):
+            raise ValueError(
+                "Checkpoint raw_log_gamma_bound must be null or finite and "
+                "strictly positive."
+            )
         self.gamma_centering_mode = str(
             state.get("gamma_centering_mode", self.gamma_centering_mode)
         )
@@ -1214,9 +1253,22 @@ class RiboQueuingModel(nn.Module):
                 if self.gamma_centering_mode == "fixed_reference"
                 else None
             ),
+            compute_log_sigma=self.alpha_mode == "learned",
         )
         gamma_log_residual = bias["gamma_raw"].to(dtype=dtype, device=device) * mask_f
-        log_sigma = bias["log_sigma"].to(dtype=dtype)
+        gamma_raw_bound_active_fraction = bias.get(
+            "gamma_raw_bound_active_fraction",
+            torch.zeros(B, device=device, dtype=dtype),
+        ).to(dtype=dtype, device=device)
+        if self.alpha_mode == "learned":
+            log_sigma = bias["log_sigma"].to(dtype=dtype)
+        else:
+            # The synthetic oracle uses the known generative NB2 dispersion.
+            # Invalid padded positions retain the historical zero sentinel;
+            # every valid position is exactly log(fixed_alpha).
+            log_sigma = self.fixed_log_alpha.to(device=device).expand(
+                L_bio.shape
+            )
         log_sigma = torch.where(mask_b, log_sigma, torch.zeros_like(log_sigma))
 
         # --------------------------------------------------------
@@ -1331,6 +1383,7 @@ class RiboQueuingModel(nn.Module):
                 log_gamma_raw,
                 torch.zeros_like(log_gamma_raw),
             ),
+            "gamma_raw_bound_active_fraction": gamma_raw_bound_active_fraction,
             "gamma_raw": gamma_raw,
             "log_gamma_raw": log_gamma_raw,
             "gamma_cross_dataset_log_center": torch.where(
