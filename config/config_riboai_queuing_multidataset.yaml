@@ -19,6 +19,10 @@ prediction:
   checkpoint_variants:
     - best_val_loss
     - best_pcc
+  # Experiment orchestrators may request one sequence-only inference row for
+  # every held-out transcript, even when a tiny selected dataset subset has no
+  # measured profile for that sequence. Ordinary runs retain observed pairs.
+  sequence_only_shared_profile: false
 
 split:
   master_dataset_universe: all
@@ -74,12 +78,12 @@ data:
   # This check runs before microbatch packing and accumulation planning.
   minimum_positive_datasets_per_transcript: 2
 
-  # Optional frozen SNR/coverage references fitted on explicit training IDs.
-  # The datamodule recomputes w_dt from pair-local read density and coverage at
-  # load time. Current artifacts materialize those columns; for compatible
-  # older weighted artifacts they are derived exactly from the observed ribo
-  # consensus. Held-out rows are transformed but never participate in fitting
-  # tau_d or the within-dataset normalization median.
+  # Null uses the exact positive `weight` values stored in the configured
+  # weighted artifacts. Historical compact artifacts may contain physical
+  # weight==0 exclusion rows; the datamodule removes those before support,
+  # split, and group construction, so only strictly positive w_dt reaches the
+  # loss. A manifest opts into frozen SNR/coverage references fitted on
+  # explicit training IDs and requires the corresponding audit columns.
   reliability_reference_manifest: null
 
   pin_memory: true
@@ -268,7 +272,9 @@ model:
       init_log_sigma: 0.2
 
 loss:
-  experiment_mode: mean_gradient_reweighted_nb
+  # Classical NB2 maximum-likelihood objective. No detached multiplicative
+  # mean-gradient correction is applied to the per-position NB2 NLL.
+  experiment_mode: standard_nb
   # The observation likelihood is fixed to NB2. There is no loss-mode or PCC
   # enable selector: each explicit coefficient below controls exactly one term.
   # A term whose coefficient is zero is skipped instead of being computed.
@@ -305,7 +311,7 @@ loss:
   # 1/(1+alpha*mu) attenuation of the log-mu gradient. Validation and
   # checkpoint val_loss always retain the ordinary unweighted NB2 likelihood.
   # Ablation values: 0.0, 0.25, 0.5, 0.75, 1.0.
-  nb_mean_gradient_beta: 0.5
+  nb_mean_gradient_beta: 0.0
   # Optional safety cap for extreme applications. null leaves the correction
   # mathematically unclipped; non-finite weights raise instead of being hidden.
   nb_mean_gradient_max_weight: null

@@ -1478,6 +1478,73 @@ def predictions_to_parquet(
     return len(df_predictions)
 
 
+def export_sequence_only_shared_profiles(
+    *,
+    prediction_path: Path,
+    output_path: Path,
+    expected_transcript_ids: Sequence[str],
+    run_id: str,
+    dataset_count: int | None,
+    subset_identifier: str | None,
+    mean_one_tolerance: float = 1.0e-4,
+) -> int:
+    """Export exactly one directly predicted L_t vector per held-out sequence."""
+    frame = pd.read_parquet(
+        prediction_path,
+        columns=["transcript_id", "length", "mask", "L_bio"],
+    )
+    frame["transcript_id"] = frame["transcript_id"].astype(str)
+    expected = list(map(str, expected_transcript_ids))
+    if len(expected) != len(set(expected)):
+        raise ValueError("Sequence-only prediction IDs contain duplicates.")
+    observed = frame["transcript_id"].tolist()
+    if len(observed) != len(set(observed)):
+        raise ValueError(
+            "Sequence-only shared-profile prediction must contain exactly one "
+            "row per transcript."
+        )
+    if set(observed) != set(expected):
+        raise ValueError(
+            "Sequence-only shared-profile transcript mismatch: "
+            f"missing={sorted(set(expected) - set(observed))[:10]}, "
+            f"extra={sorted(set(observed) - set(expected))[:10]}."
+        )
+    indexed = frame.set_index("transcript_id")
+    rows: list[dict[str, Any]] = []
+    for transcript_id in expected:
+        row = indexed.loc[transcript_id]
+        values = np.asarray(row["L_bio"], dtype=np.float64)
+        mask = np.asarray(row["mask"], dtype=bool)
+        length = int(row["length"])
+        if values.ndim != 1 or mask.ndim != 1 or values.shape != mask.shape:
+            raise ValueError(f"Invalid L_t/mask shape for {transcript_id}.")
+        if length != int(mask.sum()) or length <= 0:
+            raise ValueError(f"Invalid length/mask for {transcript_id}.")
+        valid = values[mask]
+        if not np.isfinite(valid).all() or np.any(valid <= 0.0):
+            raise ValueError(f"Non-finite or non-positive L_t for {transcript_id}.")
+        mean = float(valid.mean())
+        if abs(mean - 1.0) > float(mean_one_tolerance):
+            raise ValueError(
+                f"L_t is not mean-one for {transcript_id}: mean={mean:.8g}."
+            )
+        rows.append(
+            {
+                "transcript_id": transcript_id,
+                "transcript_length": length,
+                "L_t": values.astype(np.float32),
+                "valid_position_mask": mask,
+                "run_id": str(run_id),
+                "N": dataset_count,
+                "subset_identifier": subset_identifier,
+                "L_mean": mean,
+            }
+        )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_parquet(output_path, engine="pyarrow", index=False)
+    return len(rows)
+
+
 def flatten_prediction_batches(predictions: Any) -> list[dict[str, Any]]:
     """Flatten Lightning prediction outputs from single-process or DDP strategies."""
     flat: list[dict[str, Any]] = []
@@ -1678,6 +1745,9 @@ def make_datamodule(
         ),
         reliability_reference_manifest_path=cfg_get(
             cfg, "data.reliability_reference_manifest", None
+        ),
+        sequence_only_shared_profile_prediction=cfg_bool(
+            cfg, "prediction.sequence_only_shared_profile", False
         ),
         execution_microbatch_max_transcript_groups=execution_groups,
         execution_microbatch_max_pair_rows=execution_pairs,
@@ -2567,13 +2637,47 @@ def main(cfg: DictConfig) -> None:
                 out_file=out_file,
                 trainer=trainer,
             )
+            shared_profile_path: Path | None = None
+            if (
+                trainer.is_global_zero
+                and cfg_bool(cfg, "prediction.sequence_only_shared_profile", False)
+            ):
+                shared_profile_path = paths_results / (
+                    "common_test_L_profiles.parquet"
+                    if variant == "best_val_loss"
+                    else f"common_test_L_profiles_{variant}.parquet"
+                )
+                raw_dataset_count = cfg_get(cfg, "orchestrator.N", None)
+                export_sequence_only_shared_profiles(
+                    prediction_path=out_file,
+                    output_path=shared_profile_path,
+                    expected_transcript_ids=prediction_split_ids,
+                    run_id=str(cfg_get(cfg, "orchestrator.run_id", cfg.name)),
+                    dataset_count=(
+                        None
+                        if raw_dataset_count is None
+                        else int(raw_dataset_count)
+                    ),
+                    subset_identifier=cfg_get(
+                        cfg, "orchestrator.subset_identifier", None
+                    ),
+                )
             prediction_manifest[variant] = {
                 "checkpoint_path": str(ckpt_to_use),
                 "output_path": str(out_file),
+                "shared_profile_output_path": (
+                    str(shared_profile_path)
+                    if shared_profile_path is not None
+                    else None
+                ),
                 "prediction_rows": int(main_prediction_rows),
                 "split_name": prediction_split_name,
                 "transcript_count": int(len(prediction_split_ids)),
                 "transcript_id_hash": transcript_id_hash(prediction_split_ids),
+                "sequence_only_shared_profile_prediction": cfg_bool(
+                    cfg, "prediction.sequence_only_shared_profile", False
+                ),
+                "observation_dependent_dummy_outputs_are_scientific": False,
             }
 
             if trainer.is_global_zero and main_prediction_rows > 0:

@@ -27,7 +27,6 @@ from Dataloaders.RiboAIQueuingMultiDataset.RiboAIQueuingMultiDataset import (
 from Utils.reliability_references import (
     apply_dataset_reliability_reference,
     load_reliability_reference_manifest,
-    materialize_observed_pair_statistics,
 )
 
 
@@ -905,6 +904,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         dataset_quality_rank_column: str = "quality_rank",
         dataset_quality_strict: bool = True,
         reliability_reference_manifest_path: Optional[str] = None,
+        sequence_only_shared_profile_prediction: bool = False,
         execution_microbatch_max_transcript_groups: int | None = None,
         execution_microbatch_max_pair_rows: int | None = None,
         execution_microbatch_max_padded_codon_tokens: int | None = None,
@@ -972,6 +972,9 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             {}
             if self.reliability_reference_manifest is None
             else dict(self.reliability_reference_manifest["datasets"])
+        )
+        self.sequence_only_shared_profile_prediction = bool(
+            sequence_only_shared_profile_prediction
         )
         self.execution_microbatch_max_transcript_groups = (
             None
@@ -1158,8 +1161,9 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
 
         print("Length of the main sequence:", len(seq_df.index))
 
-        dataset_specs: dict[str, tuple[str, bool, frozenset[str]]] = {}
+        dataset_specs: dict[str, tuple[str, bool]] = {}
         weighted_dataset_names = []
+        zero_weight_exclusion_counts: dict[str, int] = {}
         union_index = pd.Index([], dtype=seq_df.index.dtype)
 
         # First read only IDs. Full nested profiles are processed one dataset at
@@ -1177,7 +1181,10 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
                     f"in {path}. Point dataset_config at replica-aware parquets."
                 )
 
-            id_frame = pd.read_parquet(path, columns=["id"])
+            has_weight = "weight" in available_columns
+            id_frame = pd.read_parquet(
+                path, columns=["id", "weight"] if has_weight else ["id"]
+            )
 
             duplicate_ids = id_frame.loc[
                 id_frame["id"].astype(str).duplicated(keep=False), "id"
@@ -1194,22 +1201,43 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             dataset_name = os.path.basename(path).split(".")[0]
             if dataset_name in dataset_specs:
                 raise ValueError(f"Duplicate active dataset name: {dataset_name!r}.")
-            has_weight = "weight" in available_columns
-            if self.reliability_reference_manifest is not None:
-                # A weighted artifact's retained rows and stored weight define
-                # the production eligibility contract. Pair-local density and
-                # coverage can be either materialized by the current
-                # preprocessor or derived exactly from the already-required
-                # consensus ``ribo`` profile for older artifacts.
-                missing_reliability_columns = {"weight"}.difference(
-                    available_columns
+            if has_weight:
+                stored_weights = pd.to_numeric(
+                    id_frame["weight"], errors="coerce"
+                ).to_numpy(dtype=np.float64)
+                invalid_weights = ~np.isfinite(stored_weights) | (
+                    stored_weights < 0.0
                 )
+                if bool(invalid_weights.any()):
+                    invalid_index = int(np.flatnonzero(invalid_weights)[0])
+                    raise ValueError(
+                        "Stored transcript weight must be finite and non-negative: "
+                        f"dataset={dataset_name}, "
+                        f"transcript={id_frame.iloc[invalid_index]['id']}, "
+                        f"weight={stored_weights[invalid_index]}."
+                    )
+                positive_weight_mask = stored_weights > 0.0
+                zero_weight_exclusion_counts[dataset_name] = int(
+                    np.count_nonzero(stored_weights == 0.0)
+                )
+                # Historical compact weighted artifacts kept some physical
+                # rows with weight zero.  They are explicit exclusions, not
+                # observations with zero influence, so omit them from the
+                # logical transcript universe before split/group handling.
+                id_frame = id_frame.loc[positive_weight_mask].reset_index(drop=True)
+            if self.reliability_reference_manifest is not None:
+                missing_reliability_columns = {
+                    "read_density",
+                    "coverage",
+                    "weight",
+                }.difference(available_columns)
                 if missing_reliability_columns:
                     raise KeyError(
-                        "Split-aware reliability weighting requires a weighted "
-                        "artifact; dataset "
+                        "Split-aware reliability weighting requires the filtered "
+                        "production weighted artifact columns; dataset "
                         f"{dataset_name!r} is missing "
-                        f"{sorted(missing_reliability_columns)}."
+                        f"{sorted(missing_reliability_columns)} in {path}. Raw "
+                        "profile artifacts are not accepted."
                     )
                 if dataset_name not in self.frozen_reliability_references:
                     raise KeyError(
@@ -1219,11 +1247,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
                     )
             if has_weight:
                 weighted_dataset_names.append(dataset_name)
-            dataset_specs[dataset_name] = (
-                str(path),
-                has_weight,
-                frozenset(available_columns),
-            )
+            dataset_specs[dataset_name] = (str(path), has_weight)
             dataset_ids = pd.Index(id_frame["id"].astype(str))
             union_index = union_index.union(dataset_ids, sort=False)
 
@@ -1241,6 +1265,16 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
                 "Using transcript weights from "
                 f"{len(weighted_dataset_names)}/{len(dataset_specs)} loaded datasets."
             )
+            zero_weight_exclusions = int(sum(zero_weight_exclusion_counts.values()))
+            if zero_weight_exclusions:
+                affected_datasets = int(
+                    sum(count > 0 for count in zero_weight_exclusion_counts.values())
+                )
+                print(
+                    "Excluded historical zero-weight rows before constructing "
+                    f"support/groups: {zero_weight_exclusions:,} rows across "
+                    f"{affected_datasets} datasets."
+                )
         else:
             print("No transcript weight column found; using unit sample weights.")
 
@@ -1287,7 +1321,24 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
                     f"data.dataset_quality_ranking.strict=false: {missing_rankings}"
                 )
 
-        valid_index = seq_df.index.intersection(union_index, sort=False)
+        observed_valid_index = seq_df.index.intersection(union_index, sort=False)
+        has_requested_test_split = (
+            self.split is not None
+            and len(self.split) >= 3
+            and self.split[2] is not None
+        )
+        if self.sequence_only_shared_profile_prediction and has_requested_test_split:
+            requested_prediction_ids = set(map(str, self.split[2]))
+            missing_sequences = sorted(requested_prediction_ids - set(seq_df.index))
+            if missing_sequences:
+                raise KeyError(
+                    "Sequence-only shared-profile prediction requested transcript "
+                    f"IDs missing from the sequence table: {missing_sequences[:10]}."
+                )
+            retained_ids = set(observed_valid_index.astype(str)) | requested_prediction_ids
+            valid_index = seq_df.index[seq_df.index.isin(retained_ids)]
+        else:
+            valid_index = observed_valid_index
         if len(valid_index) == 0:
             raise RuntimeError(
                 "No transcript IDs overlap between sequence table and ribo datasets."
@@ -1399,7 +1450,8 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             return np.ascontiguousarray(np.stack(reps, axis=0))
 
         valid_ids = set(valid_index.astype(str))
-        for dataset_name, (path, has_weight, available_columns) in tqdm(
+        zero_information_exclusion_counts: dict[str, int] = {}
+        for dataset_name, (path, has_weight) in tqdm(
             dataset_specs.items(),
             desc="Validating ribo profiles",
         ):
@@ -1407,17 +1459,47 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             if has_weight:
                 read_columns.append("weight")
             if self.reliability_reference_manifest is not None:
-                read_columns.extend(
-                    column
-                    for column in ("read_density", "coverage")
-                    if column in available_columns
-                )
+                read_columns.extend(["read_density", "coverage"])
             raw_df = pd.read_parquet(path, columns=read_columns)
-            if self.reliability_reference_manifest is not None:
-                raw_df = materialize_observed_pair_statistics(
-                    raw_df,
-                    dataset_name=dataset_name,
+            if has_weight:
+                stored_weights = pd.to_numeric(
+                    raw_df["weight"], errors="coerce"
+                ).to_numpy(dtype=np.float64)
+                invalid_weights = ~np.isfinite(stored_weights) | (
+                    stored_weights < 0.0
                 )
+                if bool(invalid_weights.any()):
+                    invalid_index = int(np.flatnonzero(invalid_weights)[0])
+                    raise ValueError(
+                        "Stored transcript weight must be finite and non-negative: "
+                        f"dataset={dataset_name}, "
+                        f"transcript={raw_df.iloc[invalid_index]['id']}, "
+                        f"weight={stored_weights[invalid_index]}."
+                    )
+                raw_df = raw_df.loc[stored_weights > 0.0].reset_index(drop=True)
+                usable_profiles = np.ones(len(raw_df), dtype=bool)
+                for profile_index, (transcript_id, profile_cell) in enumerate(
+                    zip(raw_df["id"], raw_df["ribo"], strict=True)
+                ):
+                    profile = np.asarray(profile_cell, dtype=np.float32)
+                    if (
+                        profile.ndim != 1
+                        or profile.size == 0
+                        or not np.all(np.isfinite(profile))
+                        or np.any(profile < 0.0)
+                    ):
+                        raise ValueError(
+                            "Malformed positive-weight consensus profile: "
+                            f"dataset={dataset_name}, transcript={transcript_id}."
+                        )
+                    usable_profiles[profile_index] = bool(
+                        profile.sum(dtype=np.float64) > 0.0
+                    )
+                zero_information_exclusion_counts[dataset_name] = int(
+                    np.count_nonzero(~usable_profiles)
+                )
+                raw_df = raw_df.loc[usable_profiles].reset_index(drop=True)
+            if self.reliability_reference_manifest is not None:
                 weight_values = apply_dataset_reliability_reference(
                     raw_df,
                     dataset_name=dataset_name,
@@ -1449,10 +1531,17 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
                         f"dataset={dataset_name}, transcript={t_id}: "
                         f"consensus={consensus.shape[0]}, replicas={reps.shape[1]}."
                     )
+                replica_consensus = reps.mean(axis=0)
+                if float(replica_consensus.sum(dtype=np.float64)) <= 0.0:
+                    raise ValueError(
+                        "Positive stored consensus disagrees with zero-information "
+                        "raw replicas for "
+                        f"dataset={dataset_name}, transcript={t_id}."
+                    )
                 shared_data["ribo_replicas"][t_id][dataset_name] = reps
                 # Consensus is retained for PCC and diagnostics. The NB count
                 # likelihood is always evaluated on the raw replica profiles.
-                shared_data["ribo_profiles"][t_id][dataset_name] = reps.mean(axis=0)
+                shared_data["ribo_profiles"][t_id][dataset_name] = replica_consensus
                 if has_weight:
                     sample_weight = float(weight_values[i])
                     if not np.isfinite(sample_weight):
@@ -1469,6 +1558,19 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
                         )
                     shared_data["sample_weights"][t_id][dataset_name] = sample_weight
             del ids, consensus_values, replica_values, weight_values, df, raw_df
+
+        zero_information_exclusions = int(
+            sum(zero_information_exclusion_counts.values())
+        )
+        if zero_information_exclusions:
+            affected_datasets = int(
+                sum(count > 0 for count in zero_information_exclusion_counts.values())
+            )
+            print(
+                "Excluded legacy positive-weight zero-information rows before "
+                f"constructing support/groups: {zero_information_exclusions:,} "
+                f"rows across {affected_datasets} datasets."
+            )
 
         if self.split is None:
             raise NotImplementedError(
@@ -1584,8 +1686,41 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         )
 
         if has_distinct_prediction_split:
+            prediction_data = shared_data
+            if self.sequence_only_shared_profile_prediction:
+                # L_t is produced exclusively by the shared sequence branch.  A
+                # common Experiment-8 test sequence therefore does not need an
+                # observed profile in every tiny dataset subset.  One explicit
+                # dummy pair per sequence supplies the existing collate/forward
+                # interface; its observation-dependent mu/gamma/alpha outputs
+                # are not exported as scientific Experiment-8 quantities.
+                dummy_dataset_name = next(iter(dataset_specs))
+                global_index_by_id = {
+                    str(transcript_id): index
+                    for index, transcript_id in enumerate(shared_data["transcript_id"])
+                }
+                dummy_profiles: defaultdict[str, dict[str, np.ndarray]] = defaultdict(dict)
+                dummy_replicas: defaultdict[str, dict[str, np.ndarray]] = defaultdict(dict)
+                dummy_weights: defaultdict[str, dict[str, float]] = defaultdict(dict)
+                for transcript_id in prediction_ids:
+                    sequence_length = int(
+                        shared_data["lengths"][global_index_by_id[str(transcript_id)]]
+                    )
+                    profile = np.ones(sequence_length, dtype=np.float32)
+                    dummy_profiles[str(transcript_id)][dummy_dataset_name] = profile
+                    dummy_replicas[str(transcript_id)][dummy_dataset_name] = profile[None, :]
+                    dummy_weights[str(transcript_id)][dummy_dataset_name] = 1.0
+                prediction_data = dict(shared_data)
+                prediction_data["ribo_profiles"] = dummy_profiles
+                prediction_data["ribo_replicas"] = dummy_replicas
+                prediction_data["sample_weights"] = dummy_weights
+                prediction_data["datasets_names"] = [dummy_dataset_name]
+                print(
+                    "Sequence-only shared-profile prediction: one dummy interface "
+                    f"row per held-out sequence using dataset identity {dummy_dataset_name!r}."
+                )
             self.predict_dataset_obj = RiboAIQueuingDatasetMultiDataset(
-                data=shared_data,
+                data=prediction_data,
                 lengths=shared_data["lengths"],
                 nt_encoding=self.nt_enc,
                 codon_to_aa_encoding=self.c2aa_enc,
@@ -1603,6 +1738,9 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
                 self.predict_dataset_obj
             )
             self.predict_split_ids = list(map(str, self.split[2]))
+            self.predict_is_sequence_only_shared_profile = bool(
+                self.sequence_only_shared_profile_prediction
+            )
             self._print_flat_pair_summary(
                 dataset_obj=self.predict_dataset_obj,
                 flat_transcript_ids=self.predict_flat_transcript_ids,
