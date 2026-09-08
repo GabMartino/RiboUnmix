@@ -708,7 +708,16 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
         self,
         rng: np.random.Generator,
     ) -> list[tuple[int, int, np.ndarray]]:
-        group_order = rng.permutation(len(self.groups))
+        # Lightning resolves ``num_training_batches`` once from ``__len__``.
+        # The former random permutation changed which equal-length transcript
+        # groups were packed together and therefore changed the number of
+        # execution chunks between epochs. A later, longer plan was then
+        # truncated at Lightning's original length, sometimes inside a logical
+        # batch. Keep physical packing deterministic and randomize only the
+        # complete packed batches below. This preserves every transcript group
+        # and the logical objective while making the epoch length invariant.
+        del rng
+        group_order = np.arange(len(self.groups), dtype=np.int64)
 
         selected = []
         for group_idx in group_order:
@@ -718,7 +727,7 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
             selected.append((length, group_idx, indices))
 
         if self.sort_by_length:
-            selected.sort(key=lambda item: item[0], reverse=True)
+            selected.sort(key=lambda item: (-item[0], item[1]))
 
         return selected
 

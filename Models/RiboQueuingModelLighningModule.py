@@ -11,6 +11,8 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
+from Utils.transcript_batch_metadata import ValidatedTranscriptMetadata
+
 matplotlib.use("Agg")
 
 from matplotlib import pyplot as plt
@@ -1195,6 +1197,12 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         ):
             execution_microbatch_metadata = optional_values.pop()
 
+        transcript_metadata = None
+        if optional_values and isinstance(
+            optional_values[-1], ValidatedTranscriptMetadata
+        ):
+            transcript_metadata = optional_values.pop()
+
         dataset_bias_sequence_features = None
         if len(optional_values) == 2:
             replica_profiles, replica_mask = optional_values
@@ -1212,6 +1220,13 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 f"got {tuple(replica_profiles.shape)} and {tuple(replica_mask.shape)}."
             )
 
+        # Historical/manual batches without CPU validation retain the model's
+        # ordinary input checks and do not receive a trusted-metadata flag.
+        metadata_kwargs = (
+            {"validated_transcript_metadata": transcript_metadata}
+            if transcript_metadata is not None
+            else {}
+        )
         mu, log_sigma, extras = self.model(
             x_packed=seq_packed,
             codon_ids=codon_ids,
@@ -1222,6 +1237,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             transcript_group_index=transcript_group_index,
             dataset_bias_sequence_features=dataset_bias_sequence_features,
             dataset_quality_weights=dataset_quality_weights,
+            **metadata_kwargs,
         )
 
         out = {
@@ -3265,6 +3281,10 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
     def _execution_optimizer_step(self) -> None:
         """Apply one optimizer step after complete logical-batch gradients."""
         optimizer = self.optimizers()
+        # Norm clipping uses one coefficient for all parameters. A single NaN
+        # would otherwise contaminate every branch before the optimizer hook
+        # can identify the original affected parameters.
+        self._raise_if_nonfinite_gradients("before gradient clipping")
         clip_value = self.execution_gradient_clip_val
         if clip_value > 0.0:
             self.clip_gradients(
@@ -3306,6 +3326,16 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         self._record_train_batch_structure(batch)
         out = self._forward_batch(batch)
+        # Keep only small metadata tensors, never the forward graph. Materialize
+        # their values on the host only if a numerical failure occurs.
+        self._gradient_batch_context = {
+            "epoch": self.current_epoch,
+            "batch_idx": batch_idx,
+            "ids": out["ids"],
+            "dataset_ids": out["dataset_ids"].detach(),
+            "lengths": out["lengths"].detach(),
+            "execution": out["execution_microbatch_metadata"],
+        }
         metrics = self._compute_loss_and_metrics(
             out,
             optimize_with_reweighted_nb=True,
@@ -3337,7 +3367,12 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             / float(logical_groups)
             / float(logical_accumulation)
         )
-        self.manual_backward(gradient_loss)
+        try:
+            self.manual_backward(gradient_loss)
+        except RuntimeError as exc:
+            # Anomaly detection raises inside autograd, before on_after_backward.
+            exc.add_note(self._gradient_failure_context())
+            raise
         self._execution_has_pending_gradients = True
 
         is_last_chunk = (
@@ -3350,8 +3385,36 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 self._execution_optimizer_step()
         return metrics["loss"].detach()
 
+    def _gradient_failure_context(self) -> str:
+        context = getattr(self, "_gradient_batch_context", None)
+        if context is None:
+            return ""
+        dataset_ids = context["dataset_ids"].cpu().tolist()
+        lengths = context["lengths"].cpu().tolist()
+        ids = self._transcript_ids_as_strings(context["ids"], len(dataset_ids))
+        return (
+            f" Backward context: epoch={context['epoch']}, "
+            f"batch_idx={context['batch_idx']}, "
+            f"execution={context['execution']}, "
+            f"transcript_ids={list(dict.fromkeys(ids))}, "
+            f"dataset_ids={sorted(set(dataset_ids))}, "
+            f"length_range=({min(lengths)}, {max(lengths)})."
+        )
+
+    def on_after_backward(self) -> None:
+        # BF16 has no GradScaler: these are the actual accumulated gradients.
+        # Check each execution chunk so a later chunk cannot obscure its source.
+        # FP16 scaled gradients are checked by the existing optimizer hook.
+        trainer = getattr(self, "_trainer", None)
+        precision_plugin = getattr(trainer, "precision_plugin", None)
+        if getattr(precision_plugin, "scaler", None) is None:
+            self._raise_if_nonfinite_gradients("after backward (before clipping)")
+
     def on_before_optimizer_step(self, optimizer):
         del optimizer
+        self._raise_if_nonfinite_gradients("before the optimizer step")
+
+    def _raise_if_nonfinite_gradients(self, stage: str) -> None:
         named_gradients = [
             (name, parameter.grad)
             for name, parameter in self.named_parameters()
@@ -3373,9 +3436,11 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         ]
         if nonfinite:
             raise FloatingPointError(
-                "Non-finite gradients detected before the optimizer step. "
+                f"Non-finite gradients detected {stage}. "
                 "Refusing to silently discard the complete accumulated update; "
-                f"first affected parameters: {nonfinite[:10]}."
+                f"first affected parameters: {nonfinite[:10]} "
+                f"({len(nonfinite)} affected tensors)."
+                + self._gradient_failure_context()
             )
 
     def validation_step(self, batch, batch_idx):

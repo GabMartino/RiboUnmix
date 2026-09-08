@@ -1909,12 +1909,12 @@ def print_grouped_optimizer_batch_plan(
             f"{statistics.minimum_group_size} / {statistics.median_group_size:.1f} / "
             f"{statistics.mean_group_size:.2f} / {statistics.maximum_group_size}",
         ),
-        ("pair rows/microbatch min/median/mean/max", range_text(pair_rows)),
+        ("pair rows/logical batch min/median/mean/max", range_text(pair_rows)),
         (
-            "unique transcripts/microbatch min/median/mean/max",
+            "unique transcripts/logical batch min/median/mean/max",
             range_text(unique_transcripts),
         ),
-        ("unique transcripts/microbatch CV", f"{unique_transcript_cv:.6f}"),
+        ("unique transcripts/logical batch CV", f"{unique_transcript_cv:.6f}"),
         (
             "configured target transcripts/update",
             str(plan.configured_target_unique_transcripts),
@@ -1938,7 +1938,7 @@ def print_grouped_optimizer_batch_plan(
             f"{plan.estimated_global_pair_rows_per_optimizer_step:.2f}",
         ),
         (
-            "estimated microbatches/epoch/rank",
+            "estimated logical batches/epoch/rank",
             str(plan.microbatches_per_epoch_per_rank),
         ),
         (
@@ -1956,10 +1956,11 @@ def print_grouped_optimizer_batch_plan(
     for label, value in rows:
         print(f"{label:<{width}} : {value}")
     print(
-        "Automatic accumulation averages microbatch gradients. It approximates "
-        "one materialized target-transcript batch per rank; DDP additionally "
-        "averages across ranks. It is not exact when group sizes, pair-row "
-        "counts, or sample weights vary."
+        "The accumulation factor counts logical grouped batches, not execution "
+        "chunks. Execution chunks reconstruct each transcript-balanced logical-"
+        "batch mean with group-count scaling. When the factor is greater than "
+        "one, logical-batch means are averaged; exact equal weighting across the "
+        "whole optimizer window additionally requires equal logical group counts."
     )
 
 
@@ -2457,7 +2458,10 @@ def main(cfg: DictConfig) -> None:
         filename="val-loss-{epoch}-{val_loss:.4f}",
         save_top_k=1,
         save_last=True,
-        save_weights_only=True,
+        # Full-state checkpoints are required to continue long jobs across
+        # scheduler wall-time limits without resetting Adam/scheduler state.
+        # Prediction still loads only the state_dict from these files.
+        save_weights_only=False,
         monitor="val_loss",
         mode="min",
     )
@@ -2506,6 +2510,7 @@ def main(cfg: DictConfig) -> None:
         "devices": devices_cfg,
         "num_nodes": int(cfg_get(cfg, "trainer.num_nodes", 1)),
         "precision": cfg.trainer.precision,
+        "detect_anomaly": cfg_bool(cfg, "trainer.detect_anomaly", False),
         "max_epochs": int(cfg.trainer.max_epochs),
         "num_sanity_val_steps": int(
             cfg_get(cfg, "trainer.num_sanity_val_steps", 2)
@@ -2555,20 +2560,41 @@ def main(cfg: DictConfig) -> None:
     do_train = cfg_bool(cfg, "experiment.train", True)
     do_predict = cfg_bool(cfg, "experiment.predict", False)
     from_checkpoint = cfg_bool(cfg, "experiment.from_checkpoint", False)
+    resume_training_state = cfg_bool(
+        cfg, "experiment.resume_training_state", False
+    )
+    allow_weights_only_resume = cfg_bool(
+        cfg, "experiment.allow_weights_only_resume", False
+    )
 
     selected_ckpt = None
+    trainer_resume_ckpt = None
 
-    if from_checkpoint and do_train:
-        selected_ckpt = choose_checkpoint(
-            checkpoint_callback=val_loss_checkpoint_callback,
-            ckpt_dir=ckpt_dir,
-            run_checkpoint_root=paths_checkpoints,
-            prefer="latest",
+    if resume_training_state and not do_train:
+        raise ValueError("resume_training_state=true requires experiment.train=true.")
+
+    if (from_checkpoint or resume_training_state) and do_train:
+        configured_resume_path = cfg_get(
+            cfg, "experiment.resume_checkpoint_path", None
         )
+        if configured_resume_path:
+            selected_ckpt = str(Path(str(configured_resume_path)).expanduser().resolve())
+            if not Path(selected_ckpt).is_file():
+                raise FileNotFoundError(
+                    f"Configured resume checkpoint does not exist: {selected_ckpt}"
+                )
+        else:
+            selected_ckpt = choose_checkpoint(
+                checkpoint_callback=val_loss_checkpoint_callback,
+                ckpt_dir=ckpt_dir,
+                run_checkpoint_root=paths_checkpoints,
+                prefer="last" if resume_training_state else "latest",
+            )
 
         if selected_ckpt is None:
             raise FileNotFoundError(
-                f"from_checkpoint=True but no checkpoint found under: {paths_checkpoints}"
+                "Checkpoint continuation was requested but no checkpoint was "
+                f"found under: {paths_checkpoints}"
             )
 
         print(f"Checkpoint selected from disk: {selected_ckpt}")
@@ -2583,10 +2609,41 @@ def main(cfg: DictConfig) -> None:
     # ------------------------------------------------------------
     if do_train:
         if selected_ckpt is not None:
-            print("Loading checkpoint weights before training.")
-            load_weights_only(lit_model=lit_model, ckpt_path=selected_ckpt)
+            if resume_training_state:
+                checkpoint_payload = torch.load(
+                    selected_ckpt, map_location="cpu", weights_only=False
+                )
+                has_optimizer_state = bool(checkpoint_payload.get("optimizer_states"))
+                del checkpoint_payload
+                if has_optimizer_state:
+                    trainer_resume_ckpt = selected_ckpt
+                    print(
+                        "Resuming complete Trainer state (model, optimizer, "
+                        "scheduler, epoch, callbacks, and loops)."
+                    )
+                elif allow_weights_only_resume:
+                    print(
+                        "WARNING: historical checkpoint is weights-only. Loading "
+                        "model weights, but Adam/scheduler/callback state will restart; "
+                        "this is a warm continuation, not an exact Trainer resume."
+                    )
+                    load_weights_only(lit_model=lit_model, ckpt_path=selected_ckpt)
+                else:
+                    raise RuntimeError(
+                        "Exact training resume requested, but the checkpoint has no "
+                        "optimizer state (it was saved with save_weights_only=True). "
+                        "Set experiment.allow_weights_only_resume=true only if an "
+                        "explicitly labelled warm continuation is acceptable."
+                    )
+            else:
+                print("Loading checkpoint weights before training.")
+                load_weights_only(lit_model=lit_model, ckpt_path=selected_ckpt)
 
-        trainer.fit(lit_model, datamodule=datamodule)
+        trainer.fit(
+            lit_model,
+            datamodule=datamodule,
+            ckpt_path=trainer_resume_ckpt,
+        )
 
     # ------------------------------------------------------------
     # Prediction
@@ -2607,10 +2664,13 @@ def main(cfg: DictConfig) -> None:
         prediction_manifest: dict[str, dict[str, Any]] = {}
 
         for variant in prediction_variants:
-            ckpt_to_use = callback_paths[variant] or find_prediction_checkpoint(
-                paths_checkpoints,
-                variant,
-            )
+            # Search the complete task checkpoint tree first. This matters for
+            # a historical weights-only warm continuation: the newly created
+            # callback cannot restore its old best-k bookkeeping, but the
+            # scientifically selected checkpoint must still be the minimum
+            # val-loss file across both the original and continuation segments.
+            disk_selected = find_prediction_checkpoint(paths_checkpoints, variant)
+            ckpt_to_use = disk_selected or callback_paths[variant]
             if ckpt_to_use is None:
                 raise FileNotFoundError(
                     f"Prediction requested {variant!r}, but no matching checkpoint "

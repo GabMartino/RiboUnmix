@@ -11,6 +11,7 @@ from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 from Models.RiboQueuingModel.DatasetBiasSubmodel import DatasetBiasSubmodel
 from Models.RiboQueuingModel.QueuingBiologicalModel import QueuingBiologicalModel
+from Utils.transcript_batch_metadata import ValidatedTranscriptMetadata
 
 
 def build_bias_sequence_embedding_tables(
@@ -731,6 +732,7 @@ class RiboQueuingModel(nn.Module):
         position_features: torch.Tensor,
         dataset_bias_sequence_features: torch.Tensor | None,
         biological_sequence_features: torch.Tensor | None,
+        validated_transcript_metadata: ValidatedTranscriptMetadata | None = None,
     ) -> dict[str, torch.Tensor]:
         """Center requested raw scores using a fixed, checkpointed dataset panel.
 
@@ -790,45 +792,57 @@ class RiboQueuingModel(nn.Module):
         ):
             raise RuntimeError("Gamma reference weights must be finite and positive.")
 
-        sample_id_list = self._normalize_sample_ids(sample_ids, B)
-        if sample_id_list is None:
-            # A singleton/manual call need not supply IDs. Treat each row as a
-            # separate transcript; identical inputs still receive identical
-            # deterministic centers.
-            sample_id_list = [f"__gamma_reference_row_{index}" for index in range(B)]
+        if validated_transcript_metadata is not None:
+            # CPU collate checked sequence invariants before canonical packing.
+            # Masks and position features are generated from those same lengths.
+            # Keep host metadata on the host: no row-wise CUDA bool decisions.
+            rows_by_transcript = validated_transcript_metadata.rows_by_transcript
+            canonical_rows = validated_transcript_metadata.canonical_rows
+            group_index_by_row = torch.as_tensor(
+                validated_transcript_metadata.group_indices,
+                device=device,
+                dtype=torch.long,
+            )
+        else:
+            sample_id_list = self._normalize_sample_ids(sample_ids, B)
+            if sample_id_list is None:
+                # A singleton/manual call need not supply IDs. Treat each row
+                # as a separate transcript with its own reference evaluation.
+                sample_id_list = [f"__gamma_reference_row_{index}" for index in range(B)]
 
-        grouped_rows: dict[str, list[int]] = {}
-        for row_index, sample_id in enumerate(sample_id_list):
-            grouped_rows.setdefault(sample_id, []).append(row_index)
-        canonical_rows = [indices[0] for indices in grouped_rows.values()]
-        group_index_by_row = torch.empty(B, device=device, dtype=torch.long)
-        for group_index, indices in enumerate(grouped_rows.values()):
-            self._assert_transcript_tensor_consistency(
-                name="codon IDs",
-                tensor=codon_ids,
-                row_indices=indices,
-            )
-            self._assert_transcript_tensor_consistency(
-                name="valid-position mask",
-                tensor=mask_b,
-                row_indices=indices,
-            )
-            self._assert_transcript_tensor_consistency(
-                name="position features",
-                tensor=position_features,
-                row_indices=indices,
-            )
-            self._assert_transcript_tensor_consistency(
-                name="dataset-bias optional sequence features",
-                tensor=dataset_bias_sequence_features,
-                row_indices=indices,
-            )
-            self._assert_transcript_tensor_consistency(
-                name="biological sequence features",
-                tensor=biological_sequence_features,
-                row_indices=indices,
-            )
-            group_index_by_row[indices] = group_index
+            grouped_rows: dict[str, list[int]] = {}
+            for row_index, sample_id in enumerate(sample_id_list):
+                grouped_rows.setdefault(sample_id, []).append(row_index)
+            rows_by_transcript = tuple(grouped_rows.values())
+            canonical_rows = [indices[0] for indices in rows_by_transcript]
+            group_index_by_row = torch.empty(B, device=device, dtype=torch.long)
+            for group_index, indices in enumerate(rows_by_transcript):
+                self._assert_transcript_tensor_consistency(
+                    name="codon IDs",
+                    tensor=codon_ids,
+                    row_indices=indices,
+                )
+                self._assert_transcript_tensor_consistency(
+                    name="valid-position mask",
+                    tensor=mask_b,
+                    row_indices=indices,
+                )
+                self._assert_transcript_tensor_consistency(
+                    name="position features",
+                    tensor=position_features,
+                    row_indices=indices,
+                )
+                self._assert_transcript_tensor_consistency(
+                    name="dataset-bias optional sequence features",
+                    tensor=dataset_bias_sequence_features,
+                    row_indices=indices,
+                )
+                self._assert_transcript_tensor_consistency(
+                    name="biological sequence features",
+                    tensor=biological_sequence_features,
+                    row_indices=indices,
+                )
+                group_index_by_row[indices] = group_index
 
         canonical_index = torch.as_tensor(
             canonical_rows,
@@ -869,7 +883,7 @@ class RiboQueuingModel(nn.Module):
         can_reuse_requested_reference = not self.training
         if can_reuse_requested_reference:
             reference_id_list = [int(value) for value in reference_ids.tolist()]
-            for indices in grouped_rows.values():
+            for indices in rows_by_transcript:
                 row_by_dataset: dict[int, int] = {}
                 for row_index in indices:
                     dataset_id = int(requested_ids[row_index].item())
@@ -926,6 +940,17 @@ class RiboQueuingModel(nn.Module):
                     if canonical_optional is None
                     else canonical_optional.repeat_interleave(chunk_count, dim=0)
                 )
+                length_kwargs = (
+                    {
+                        "cpu_lengths": tuple(
+                            length
+                            for length in validated_transcript_metadata.unique_lengths
+                            for _ in range(chunk_count)
+                        )
+                    }
+                    if validated_transcript_metadata is not None
+                    else {}
+                )
                 raw_reference = self.dataset_bias_model(
                     dataset_ids=synthetic_ids,
                     mask=synthetic_mask,
@@ -934,6 +959,7 @@ class RiboQueuingModel(nn.Module):
                     sequence_features=synthetic_optional,
                     compute_log_sigma=False,
                     embedding_center_ids=self.gamma_selected_dataset_ids,
+                    **length_kwargs,
                 )["gamma_raw"]
                 raw_reference = (
                     raw_reference.to(device=device, dtype=accum_dtype)
@@ -1135,6 +1161,7 @@ class RiboQueuingModel(nn.Module):
         x_packed,
         mask_b: torch.Tensor,
         transcript_group_index: torch.Tensor | None,
+        validated_transcript_metadata: ValidatedTranscriptMetadata | None = None,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         """Evaluate the shared branch once per transcript and gather to pairs.
 
@@ -1158,10 +1185,18 @@ class RiboQueuingModel(nn.Module):
             return self.biological_model(x_packed, mask_b), padded
 
         groups = transcript_group_index.to(device=mask_b.device, dtype=torch.long)
-        canonical_rows, unique_count = self._canonical_transcript_rows(
-            groups,
-            batch_size=batch_size,
-        )
+        if validated_transcript_metadata is None:
+            canonical_rows, unique_count = self._canonical_transcript_rows(
+                groups,
+                batch_size=batch_size,
+            )
+        else:
+            canonical_rows = torch.as_tensor(
+                validated_transcript_metadata.canonical_rows,
+                device=mask_b.device,
+                dtype=torch.long,
+            )
+            unique_count = len(validated_transcript_metadata.rows_by_transcript)
         unique_mask = mask_b.index_select(0, canonical_rows)
         unique_padded, _ = pad_packed_sequence(
             x_packed,
@@ -1179,7 +1214,11 @@ class RiboQueuingModel(nn.Module):
         if self.training and float(self.biological_model.dropout) > 0.0:
             # Preserve the former independent per-pair dropout masks for any
             # nonbaseline configuration that enables biological dropout.
-            pair_lengths = mask_b.sum(dim=1).clamp_min(1).to("cpu")
+            pair_lengths = (
+                validated_transcript_metadata.lengths
+                if validated_transcript_metadata is not None
+                else mask_b.sum(dim=1).clamp_min(1).to("cpu")
+            )
             pair_packed = pack_padded_sequence(
                 pair_padded,
                 pair_lengths,
@@ -1210,7 +1249,22 @@ class RiboQueuingModel(nn.Module):
         transcript_group_index: torch.Tensor | None = None,
         dataset_bias_sequence_features: torch.Tensor | None = None,
         dataset_quality_weights: torch.Tensor | None = None,
+        validated_transcript_metadata: ValidatedTranscriptMetadata | None = None,
     ):
+        if validated_transcript_metadata is not None:
+            if not isinstance(
+                validated_transcript_metadata, ValidatedTranscriptMetadata
+            ):
+                raise TypeError("Expected CPU-collated ValidatedTranscriptMetadata.")
+            if (
+                len(validated_transcript_metadata.lengths) != mask.shape[0]
+                or len(validated_transcript_metadata.group_indices) != mask.shape[0]
+                or transcript_group_index is None
+                or transcript_group_index.shape != (mask.shape[0],)
+            ):
+                raise ValueError(
+                    "Validated transcript metadata must match the collated pair rows."
+                )
         # --------------------------------------------------------
         # 1. Biological branch -> queue load
         # --------------------------------------------------------
@@ -1220,6 +1274,7 @@ class RiboQueuingModel(nn.Module):
                 x_packed=x_packed,
                 mask_b=mask_b,
                 transcript_group_index=transcript_group_index,
+                validated_transcript_metadata=validated_transcript_metadata,
             )
         )
         L_bio = bio["L_bio"]
@@ -1242,6 +1297,11 @@ class RiboQueuingModel(nn.Module):
         # 2. Dataset branch -> gamma residual + NB dispersion
         # --------------------------------------------------------
         position_features = self.make_position_features(mask=mask_b, dtype=dtype)
+        length_kwargs = (
+            {"cpu_lengths": validated_transcript_metadata.lengths}
+            if validated_transcript_metadata is not None
+            else {}
+        )
         bias = self.dataset_bias_model(
             dataset_ids=id_datasets,
             mask=mask_b,
@@ -1254,6 +1314,7 @@ class RiboQueuingModel(nn.Module):
                 else None
             ),
             compute_log_sigma=self.alpha_mode == "learned",
+            **length_kwargs,
         )
         gamma_log_residual = bias["gamma_raw"].to(dtype=dtype, device=device) * mask_f
         gamma_raw_bound_active_fraction = bias.get(
@@ -1293,6 +1354,7 @@ class RiboQueuingModel(nn.Module):
                 position_features=position_features,
                 dataset_bias_sequence_features=dataset_bias_sequence_features,
                 biological_sequence_features=biological_sequence_features,
+                validated_transcript_metadata=validated_transcript_metadata,
             )
         else:
             centered = self._center_log_gamma_across_transcripts(

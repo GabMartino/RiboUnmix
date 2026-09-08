@@ -63,6 +63,7 @@ class BiGRUContextEncoder(nn.Module):
         self,
         x: torch.Tensor,
         mask: torch.Tensor | None = None,
+        cpu_lengths: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
         # x: [B, C_in, T] -> GRU wants [B, T, C_in]
         seq = x.transpose(1, 2)
@@ -70,7 +71,11 @@ class BiGRUContextEncoder(nn.Module):
 
         if mask is not None:
             mask_b = mask.bool()
-            lengths = mask_b.sum(dim=1).clamp_min(1).to("cpu")
+            lengths = (
+                cpu_lengths
+                if cpu_lengths is not None
+                else mask_b.sum(dim=1).clamp_min(1).to("cpu")
+            )
             packed = nn.utils.rnn.pack_padded_sequence(
                 seq, lengths, batch_first=True, enforce_sorted=False
             )
@@ -199,6 +204,7 @@ class DatasetBiasSubmodel(nn.Module):
         sequence_features: torch.Tensor | None = None,
         compute_log_sigma: bool = True,
         embedding_center_ids: torch.Tensor | None = None,
+        cpu_lengths: tuple[int, ...] | None = None,
     ) -> dict[str, torch.Tensor]:
         B, T = codon_ids.shape
 
@@ -268,6 +274,7 @@ class DatasetBiasSubmodel(nn.Module):
         local_context = self.local_context_gru(
             encoder_input,
             mask=mask_b,
+            cpu_lengths=cpu_lengths,
         ).transpose(1, 2)
         features = [dataset_emb, local_context, position_features]
 

@@ -8,6 +8,8 @@ import torch
 from torch.nn.utils.rnn import pack_padded_sequence, pad_sequence
 from torch.utils.data import Dataset
 
+from Utils.transcript_batch_metadata import ValidatedTranscriptMetadata
+
 
 def transcript_group_indices_from_ids(
     transcript_ids: Sequence[str],
@@ -115,6 +117,7 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
             bias_features_pad,     # [B, T_max, F_bias], optional
             replica_pad,           # [B, R_max, T_max]
             replica_mask,          # [B, R_max]
+            transcript_metadata,   # validated host grouping and lengths
             execution_microbatch_metadata, # dict or None
         )
 
@@ -1120,27 +1123,50 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         # per transcript group, while retaining pair-row codon IDs for the
         # dataset-specific branch. Group IDs are contiguous and assigned by
         # first occurrence, so canonical order remains length-sorted.
-        unique_group_count = int(transcript_group_indices_sorted.max().item()) + 1
-        canonical_pair_rows: list[int] = []
-        for group in range(unique_group_count):
-            rows = torch.nonzero(
-                transcript_group_indices_sorted == group,
-                as_tuple=False,
-            ).reshape(-1)
-            if rows.numel() == 0:
-                raise RuntimeError(f"Missing transcript group {group} in collate.")
-            canonical_pair_rows.append(int(rows[0].item()))
+        group_indices = tuple(transcript_group_indices_sorted.tolist())
+        rows_by_transcript: list[list[int]] = []
+        for pair_row, group in enumerate(group_indices):
+            if group == len(rows_by_transcript):
+                rows_by_transcript.append([])
+            rows_by_transcript[group].append(pair_row)
 
-        if __debug__:
-            for pair_row, group in enumerate(transcript_group_indices_sorted.tolist()):
-                canonical_row = canonical_pair_rows[int(group)]
-                if not torch.equal(
-                    codon_ids_sorted[pair_row],
-                    codon_ids_sorted[canonical_row],
-                ):
-                    raise RuntimeError(
-                        "Dataset rows for one transcript have different codon IDs."
+        # Validate immutable sequence inputs here, before device transfer and
+        # before canonical packing could hide a conflicting optional feature.
+        # Equal codons imply equal lengths/masks and generated position inputs.
+        # The base biological channels are derived from the shared codon LUT.
+        invariant_fields = [("codon IDs", codon_ids_sorted)]
+        if self.biological_extra_dim > 0:
+            invariant_fields.append(
+                ("biological sequence features", biological_extra_sorted)
+            )
+        if bias_features_sorted is not None:
+            invariant_fields.append(
+                ("dataset-bias optional sequence features", bias_features_sorted)
+            )
+        for rows in rows_by_transcript:
+            for name, values in invariant_fields:
+                reference = values[rows[0]]
+                for row in rows[1:]:
+                    candidate = values[row]
+                    same = candidate.shape == reference.shape and (
+                        torch.allclose(
+                            reference, candidate, rtol=0.0, atol=0.0, equal_nan=True
+                        )
+                        if reference.is_floating_point()
+                        else torch.equal(reference, candidate)
                     )
+                    if not same:
+                        raise ValueError(
+                            "Dataset rows for one transcript have different "
+                            f"{name} (rows {rows[0]} and {row})."
+                        )
+
+        transcript_metadata = ValidatedTranscriptMetadata(
+            group_indices=group_indices,
+            rows_by_transcript=tuple(tuple(rows) for rows in rows_by_transcript),
+            lengths=tuple(lengths_sorted.tolist()),
+        )
+        canonical_pair_rows = transcript_metadata.canonical_rows
 
         canonical_index = torch.as_tensor(canonical_pair_rows, dtype=torch.long)
         unique_lengths = lengths_sorted.index_select(0, canonical_index)
@@ -1222,4 +1248,4 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
         )
         if bias_features_pad is not None:
             collated = (*collated, bias_features_pad)
-        return (*collated, replica_pad, replica_mask, execution_metadata)
+        return (*collated, replica_pad, replica_mask, transcript_metadata, execution_metadata)
