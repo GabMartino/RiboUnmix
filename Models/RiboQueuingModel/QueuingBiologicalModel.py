@@ -5,6 +5,7 @@ import math
 import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pad_packed_sequence
+from Models.utils.stable_numerics import log_softplus, masked_logmeanexp, masked_mean
 
 
 def inv_softplus(x: float) -> float:
@@ -112,19 +113,21 @@ class QueuingBiologicalModel(nn.Module):
 
 
         # 1. Local mean-normalized biological factor: mean_valid(w_norm) = 1.
-        w_raw = self.ff_local_hazard(out).squeeze(-1)
-        w_raw = w_raw * mask_f
-        valid_len = mask_f.sum(dim=1, keepdim=True).clamp_min(1.0)
-        w_mean = (w_raw * mask_f).sum(dim=1, keepdim=True) / valid_len
-        w_norm = w_raw / w_mean.clamp_min(self.eps)
-        w_norm = w_norm * mask_f
+        # The final Softplus has no parameters: bypass only its materialized
+        # value, retaining every existing checkpoint key and neural AMP op.
+        log_w_raw = log_softplus(self.ff_local_hazard[:-1](out).squeeze(-1))
+        log_w_norm = log_w_raw - masked_logmeanexp(log_w_raw, mask_b)
+        log_w_norm = torch.where(mask_b, log_w_norm, 0.0)
+        w_raw = torch.where(mask_b, log_w_raw.exp(), 0.0)
+        w_norm = torch.where(mask_b, log_w_norm.exp(), 0.0)
+        mask_f = mask_b.to(w_norm.dtype)
 
         # 2. Direct-load queue: L_bio = w_norm (mean-one), rho = L/(1+L),
         #    lambda = log(1 + L_bio). J is the mean-lambda diagnostic.
         L_bio = w_norm
         rho = (L_bio / (1.0 + L_bio).clamp_min(self.eps)) * mask_f
-        lambda_bio = torch.log1p(L_bio).to(dtype=out.dtype) * mask_f
-        J = (lambda_bio * mask_f).sum(dim=1, keepdim=True) / valid_len
+        lambda_bio = torch.log1p(L_bio) * mask_f
+        J = masked_mean(lambda_bio, mask_b)
 
         return {
             "w_raw": w_raw,
@@ -133,5 +136,6 @@ class QueuingBiologicalModel(nn.Module):
             "lambda_bio": lambda_bio,
             "rho": rho,
             "L_bio": L_bio,
+            "log_L_bio": log_w_norm,
             "h_n": h_n,
         }

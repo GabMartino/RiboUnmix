@@ -1,4 +1,5 @@
 #!/bin/bash
+#SBATCH --exclude=dgx1
 #SBATCH --job-name=riboai_qrank_ablation
 #SBATCH --partition=boost_usr_prod
 #SBATCH --account=euhpc_d35_089

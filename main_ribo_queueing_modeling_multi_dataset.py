@@ -2302,6 +2302,13 @@ def main(cfg: DictConfig) -> None:
         f"reference_count={torch_model.gamma_reference_dataset_ids.numel()}, "
         f"manifest={torch_model.gamma_reference_manifest_hash[:12]}"
     )
+    print(
+        "Bias context GRU precision: "
+        f"{torch_model.dataset_bias_model.local_context_gru.precision}; "
+        f"Trainer precision: {cfg.trainer.precision}. "
+        "FP32 context, when selected, includes embeddings and LayerNorm; "
+        "observation/alpha heads keep Trainer precision."
+    )
     if env_global_rank() == 0:
         gamma_raw_weights = (
             torch_model.gamma_reference_weights.detach().cpu().to(torch.float64)

@@ -1,4 +1,5 @@
 #!/bin/bash
+#SBATCH --exclude=dgx1
 #SBATCH --job-name=riboai_individual_final
 #SBATCH --partition=zen3_0512_a100x2
 #SBATCH --nodes=1

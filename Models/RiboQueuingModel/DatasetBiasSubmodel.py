@@ -5,6 +5,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from Models.utils.stable_numerics import require_finite
 
 from Models.RiboQueuingModel.submodels.DatasetLogSigmaHead import DatasetLogSigmaHead
 from Models.RiboQueuingModel.submodels.DatasetMultiplicativeAllocationBiasHead import (
@@ -42,12 +43,19 @@ class BiGRUContextEncoder(nn.Module):
         hidden_size: int,
         num_layers: int = 1,
         dropout: float = 0.0,
+        precision: str = "inherit",
     ):
         super().__init__()
         self.in_channels = int(in_channels)
         self.hidden_size = int(hidden_size)
         self.num_layers = int(num_layers)
         self.out_channels = 2 * self.hidden_size  # bidirectional
+        self.precision = str(precision).strip().lower()
+        if self.precision not in {"inherit", "float32"}:
+            raise ValueError(
+                "dataset_bias_params.context_gru_precision must be 'inherit' "
+                "or 'float32'."
+            )
 
         self.rnn = nn.GRU(
             input_size=self.in_channels,
@@ -64,6 +72,26 @@ class BiGRUContextEncoder(nn.Module):
         x: torch.Tensor,
         mask: torch.Tensor | None = None,
         cpu_lengths: tuple[int, ...] | None = None,
+    ) -> torch.Tensor:
+        if self.precision == "float32":
+            # A bounded log-gamma output does not bound the recurrent Jacobian
+            # through a long sequence. Keep *both* the GRU and its normalization
+            # out of reduced-precision autocast; casting only their output is
+            # too late to protect backward. This adds no parameters/state keys.
+            if self.rnn.weight_ih_l0.dtype != torch.float32:
+                raise ValueError(
+                    "context_gru_precision=float32 requires FP32 model weights "
+                    "(use mixed precision or 32-true, not model.bfloat16()/half())."
+                )
+            with torch.autocast(device_type=x.device.type, enabled=False):
+                return self._forward_impl(x.float(), mask, cpu_lengths)
+        return self._forward_impl(x, mask, cpu_lengths)
+
+    def _forward_impl(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor | None,
+        cpu_lengths: tuple[int, ...] | None,
     ) -> torch.Tensor:
         # x: [B, C_in, T] -> GRU wants [B, T, C_in]
         seq = x.transpose(1, 2)
@@ -178,6 +206,7 @@ class DatasetBiasSubmodel(nn.Module):
             hidden_size=int(config_params.get("context_gru_hidden_size", 128)),
             num_layers=int(config_params.get("context_gru_num_layers", 2)),
             dropout=float(config_params.get("context_gru_dropout", 0.0)),
+            precision=config_params.get("context_gru_precision", "inherit"),
         )
         self.context_dim = self.local_context_gru.out_channels
 
@@ -208,11 +237,17 @@ class DatasetBiasSubmodel(nn.Module):
     ) -> dict[str, torch.Tensor]:
         B, T = codon_ids.shape
 
-        mask_b = mask.bool()
-        mask_f = mask_b.to(dtype=position_features.dtype)
-
         device = codon_ids.device
-        dtype = position_features.dtype
+        # Do not round the trainable embeddings to BF16 and then cast back
+        # inside the GRU: that would leave a low-precision edge in backward.
+        # The observation/alpha heads below still follow the outer AMP context.
+        dtype = (
+            torch.float32
+            if self.local_context_gru.precision == "float32"
+            else position_features.dtype
+        )
+        mask_b = mask.bool()
+        mask_f = mask_b.to(dtype=dtype)
 
         dataset_ids = dataset_ids.to(device=device, dtype=torch.long)
         dataset_weight = self.dataset_embedding.weight
@@ -287,6 +322,7 @@ class DatasetBiasSubmodel(nn.Module):
             mask=mask_b,
         )
         raw_log_gamma = out["gamma_raw"]
+        require_finite(torch.where(mask_b, raw_log_gamma, 0.0), "unbounded dataset log-gamma scores")
         if self.raw_log_gamma_bound is None:
             bounded_log_gamma = raw_log_gamma
             bound_active = torch.zeros_like(mask_b)

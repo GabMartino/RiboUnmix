@@ -12,6 +12,10 @@ import torch
 import torch.nn as nn
 
 from Utils.transcript_batch_metadata import ValidatedTranscriptMetadata
+from Models.utils.stable_numerics import (
+    masked_mean, nb2_nll_from_log_mean, nb_vst, require_finite,
+    standardized_profile, working_float, clip_grad_norm_stable, NUMERICAL_FORMULATION_VERSION,
+)
 
 matplotlib.use("Agg")
 
@@ -49,13 +53,12 @@ def reduce_sequence_nll(
     reduction = str(reduction)
     mask_f = mask.to(dtype=nll_pos.dtype)
     valid_len = mask_f.sum(dim=1).clamp_min(1.0)
-    nll_sum = (nll_pos * mask_f).sum(dim=1)
-    nll_mean = nll_sum / valid_len
+    nll_mean = masked_mean(nll_pos, mask.bool(), keepdim=False)
 
     if reduction == "mean":
         return nll_mean
     if reduction == "sum":
-        return nll_sum
+        return torch.where(mask.bool(), nll_pos, 0.0).sum(dim=1)
     if reduction == "length_tempered":
         gamma_t = min(max(float(gamma), float(eps)), 1.0)
         length_ref_t = max(float(length_ref), float(eps))
@@ -266,40 +269,24 @@ def masked_pcc(
     min_target_var: float = 1.0e-6,
     eps: float = 1.0e-8,
 ) -> dict[str, torch.Tensor]:
-    x = x.float()
-    y = y.float()
-    mask_b = mask.bool() & torch.isfinite(x) & torch.isfinite(y)
+    x = working_float(x)
+    y = working_float(y)
+    mask_b = mask.bool() & torch.isfinite(y)
+    require_finite(torch.where(mask_b, x, 0.0), "PCC predictions")
     mask_f = mask_b.to(dtype=x.dtype)
 
     x = torch.where(mask_b, x, torch.zeros_like(x))
     y = torch.where(mask_b, y, torch.zeros_like(y))
 
-    w = mask_f
-
-    w_sum = w.sum(dim=1, keepdim=True).clamp_min(float(eps))
-    x_mean = (w * x).sum(dim=1, keepdim=True) / w_sum
-    y_mean = (w * y).sum(dim=1, keepdim=True) / w_sum
-
-    x_c = (x - x_mean) * mask_f
-    y_c = (y - y_mean) * mask_f
-
-    # Work with mask-normalized covariance and variances.  The historical
-    # ``sum_cov / sqrt(sum_x_var * sum_y_var + eps**2)`` expression leaves a
-    # singular derivative when the prediction is nearly flat: its denominator
-    # is then only ``eps`` even for a variable target.  Adding eps to each
-    # variance gives a finite, scale-consistent derivative while changing
-    # ordinary well-conditioned Pearson values only at numerical precision.
-    normalization = w_sum.squeeze(1).clamp_min(float(eps))
-    covariance = (w * x_c * y_c).sum(dim=1) / normalization
-    x_variance = (w * x_c.pow(2)).sum(dim=1) / normalization
-    y_variance = (w * y_c.pow(2)).sum(dim=1) / normalization
-    pcc = covariance / torch.sqrt(
-        (x_variance + float(eps)) * (y_variance + float(eps))
-    )
-    pcc = torch.nan_to_num(pcc, nan=0.0, posinf=0.0, neginf=0.0)
-
-    target_var = y_variance
-    valid = target_var > float(min_target_var)
+    # Algebraically the same epsilon-regularized PCC, but neither raw
+    # squares nor a product of variances can overflow along its gradient path.
+    x_standard, _ = standardized_profile(x, mask_b, eps)
+    y_standard, log_y_variance = standardized_profile(y, mask_b, eps)
+    pcc = masked_mean(x_standard * y_standard, mask_b, keepdim=False)
+    valid = log_y_variance > math.log(max(float(min_target_var), torch.finfo(y.dtype).tiny))
+    # Variance itself may exceed FP32 even when PCC is representable. This is
+    # detached reporting only, not a FP64 model/loss execution policy.
+    target_var = log_y_variance.detach().double().exp()
     pcc = torch.where(valid, pcc, torch.zeros_like(pcc))
 
     valid_f = valid.to(dtype=x.dtype)
@@ -445,12 +432,7 @@ class NegativeBinomialProfileLoss(nn.Module):
         log_sigma: torch.Tensor | None = None,
     ) -> torch.Tensor:
         del log_sigma
-        mu = torch.nan_to_num(
-            mu,
-            nan=self.eps,
-            posinf=torch.finfo(mu.dtype).max,
-            neginf=self.eps,
-        )
+        require_finite(mu, "NB mean")
         return mu.clamp_min(self.eps)
 
     def _log_alpha_from_model_output(
@@ -460,23 +442,19 @@ class NegativeBinomialProfileLoss(nn.Module):
         target_shape: torch.Size | tuple[int, ...],
     ) -> torch.Tensor:
         log_alpha = _broadcast_profile_param(log_sigma, target_shape)
-        log_alpha = torch.nan_to_num(
-            log_alpha,
-            nan=0.0,
-            posinf=self.log_alpha_max,
-            neginf=self.log_alpha_min,
-        )
+        require_finite(log_alpha, "NB log dispersion")
         return log_alpha.clamp(min=self.log_alpha_min, max=self.log_alpha_max)
 
     def forward(
         self,
-        mu_phys: torch.Tensor,
+        mu_phys: torch.Tensor | None,
         log_sigma: torch.Tensor,
         y_true: torch.Tensor,
         mask: torch.Tensor,
         return_per_sample: bool = False,
         apply_mean_gradient_reweighting: bool = True,
         return_details: bool = False,
+        log_mu_phys: torch.Tensor | None = None,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
         """Evaluate raw NB2 and the configured optimization surrogate.
 
@@ -495,51 +473,53 @@ class NegativeBinomialProfileLoss(nn.Module):
         alpha head. The raw NB2 likelihood remains the validation objective.
         Every position tensor passes through the identical sequence reduction.
         """
-        with torch.amp.autocast(device_type=mu_phys.device.type, enabled=False):
+        mean_input = log_mu_phys if log_mu_phys is not None else mu_phys
+        if mean_input is None:
+            raise ValueError("Provide mu_phys or log_mu_phys for NB2.")
+        with torch.amp.autocast(device_type=mean_input.device.type, enabled=False):
             finite_mask = mask.bool() & torch.isfinite(y_true)
             y = torch.nan_to_num(
-                y_true.to(torch.float32),
+                working_float(y_true),
                 nan=0.0,
                 posinf=0.0,
                 neginf=0.0,
             ).clamp_min(0.0)
 
-            mu = self.positive_mean_from_params(
-                mu=mu_phys.to(torch.float32),
-                log_sigma=None,
-            ).to(torch.float32)
+            y = torch.where(finite_mask, y, 0.0)
+            if log_mu_phys is None:
+                mu = self.positive_mean_from_params(
+                    mu=torch.where(finite_mask, working_float(mu_phys), 1.0),
+                )
+                log_mu = mu.log()
+            else:
+                log_mu = torch.where(finite_mask, working_float(log_mu_phys), 0.0)
+                require_finite(log_mu, "NB log mean")
+                # Retain the existing NB mean floor, but never exponentiate
+                # just to take a logarithm or form a reciprocal in backward.
+                log_mu = log_mu.clamp_min(math.log(self.eps))
             log_alpha = self._log_alpha_from_model_output(
-                log_sigma=log_sigma.to(torch.float32),
+                log_sigma=torch.where(finite_mask, _broadcast_profile_param(
+                    working_float(log_sigma), y.shape), 0.0),
                 target_shape=y.shape,
             )
             def nb2_nll(
-                mean: torch.Tensor,
+                log_mean: torch.Tensor,
                 log_dispersion: torch.Tensor,
             ) -> torch.Tensor:
-                size = torch.exp(-log_dispersion).clamp_min(self.eps)
-                return (
-                    torch.lgamma(size)
-                    - torch.lgamma(y + size)
-                    + torch.lgamma(y + 1.0)
-                    - size * torch.log(size.clamp_min(self.eps))
-                    - y * torch.log(mean.clamp_min(self.eps))
-                    + (size + y)
-                    * torch.log((size + mean).clamp_min(self.eps))
-                )
+                return nb2_nll_from_log_mean(y, log_mean, log_dispersion)
 
-            nll = nb2_nll(mu, log_alpha)
-
-            nll = torch.nan_to_num(nll, nan=0.0, posinf=1.0e8, neginf=1.0e8)
+            nll = nb2_nll(log_mu, log_alpha)
+            require_finite(nll, "NB2 log-space likelihood")
 
             raw_nll = torch.where(finite_mask, nll, torch.zeros_like(nll))
 
             if self.nb_mean_gradient_beta == 0.0:
-                mean_gradient_weight = torch.ones_like(mu).detach()
+                mean_gradient_weight = torch.ones_like(log_mu).detach()
             else:
                 # softplus(log(alpha) + log(mu)) is a stable evaluation of
                 # log(1 + alpha * mu). The weight is deliberately detached;
                 # alpha remains attached inside ``raw_nll`` above.
-                log_alpha_mu = log_alpha + torch.log(mu.clamp_min(self.eps))
+                log_alpha_mu = log_alpha + log_mu
                 log_weight = self.nb_mean_gradient_beta * torch.nn.functional.softplus(
                     log_alpha_mu
                 )
@@ -556,20 +536,8 @@ class NegativeBinomialProfileLoss(nn.Module):
                     )
 
             if self.experiment_mode == "decoupled_nb_mean_gradient":
-                mean_branch_nll = nb2_nll(mu, log_alpha.detach())
-                alpha_branch_nll = nb2_nll(mu.detach(), log_alpha)
-                mean_branch_nll = torch.nan_to_num(
-                    mean_branch_nll,
-                    nan=0.0,
-                    posinf=1.0e8,
-                    neginf=1.0e8,
-                )
-                alpha_branch_nll = torch.nan_to_num(
-                    alpha_branch_nll,
-                    nan=0.0,
-                    posinf=1.0e8,
-                    neginf=1.0e8,
-                )
+                mean_branch_nll = nb2_nll(log_mu, log_alpha.detach())
+                alpha_branch_nll = nb2_nll(log_mu.detach(), log_alpha)
                 mean_branch_nll = torch.where(
                     finite_mask,
                     mean_gradient_weight * mean_branch_nll,
@@ -743,6 +711,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 f"model.alpha_mode={expected_alpha_mode!r}, got {self.alpha_mode!r}."
             )
         self.hparams["experiment_mode"] = self.experiment_mode
+        self.hparams["numerical_formulation_version"] = NUMERICAL_FORMULATION_VERSION
         self.hparams["alpha_mode"] = self.alpha_mode
         self.hparams["fixed_alpha"] = float(getattr(self.model, "fixed_alpha", 0.1))
         self.hparams["nb_mean_gradient_beta"] = self.nb_mean_gradient_beta
@@ -1303,11 +1272,8 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
     def _nb_vst(self, x: torch.Tensor, log_alpha: torch.Tensor) -> torch.Tensor:
         alpha = self._pcc_alpha(log_alpha, x.shape).to(device=x.device, dtype=x.dtype)
-        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
-        eps = self.eps
-        return 2.0 / torch.sqrt(alpha + eps) * torch.asinh(
-            torch.sqrt(alpha * x + eps)
-        )
+        require_finite(x, "NB-VST input")
+        return nb_vst(x.clamp_min(0.0), alpha, self.eps)
 
     def _pcc_loss_per_sample(
         self,
@@ -1374,6 +1340,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             "alpha_max": alpha_diag[mask].amax() if bool(mask.any()) else mu.new_tensor(0.0),
         }
 
+    @torch.no_grad()
     def _pearson_per_sample(
         self,
         pred: torch.Tensor,
@@ -1390,21 +1357,17 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         target = torch.where(mask_b, target, torch.zeros_like(target))
 
         valid_len = weight_f.sum(dim=1).clamp_min(1.0)
-        pred_mean = (pred * weight_f).sum(dim=1, keepdim=True) / valid_len.unsqueeze(1)
-        target_mean = (target * weight_f).sum(dim=1, keepdim=True) / valid_len.unsqueeze(1)
-
-        pred_c = torch.where(mask_b, pred - pred_mean, torch.zeros_like(pred))
-        target_c = torch.where(mask_b, target - target_mean, torch.zeros_like(target))
-
-        numerator = (weight_f * pred_c * target_c).sum(dim=1)
-        pred_var = (weight_f * pred_c.pow(2)).sum(dim=1)
-        target_var = (weight_f * target_c.pow(2)).sum(dim=1)
-        denom = torch.sqrt((pred_var * target_var).clamp_min(0.0) + eps * eps)
-
-        pcc = numerator / denom
-        valid = (pred_var > eps) & (target_var > eps)
+        pred_z, log_pred_var = standardized_profile(pred, mask_b, 0.0)
+        target_z, log_target_var = standardized_profile(target, mask_b, 0.0)
+        # Exactly the historical reporting denominator sqrt(Sx*Sy+eps^2),
+        # expressed using log variances rather than overflowing squares.
+        log_sum_var = log_pred_var + log_target_var + 2.0 * valid_len.log()
+        correction = torch.exp(-0.5 * torch.nn.functional.softplus(2.0 * math.log(eps) - log_sum_var))
+        pcc = masked_mean(pred_z * target_z, mask_b, keepdim=False) * correction
+        valid = ((log_pred_var + valid_len.log() > math.log(eps))
+                 & (log_target_var + valid_len.log() > math.log(eps)))
         pcc = torch.where(valid, pcc, torch.zeros_like(pcc))
-        return torch.nan_to_num(pcc, nan=0.0, posinf=0.0, neginf=0.0)
+        return pcc
 
     def _gamma_regularization_per_sample(
         self,
@@ -1576,7 +1539,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         ).clamp_min(0.0)
 
         valid_len = valid_pos_f.sum(dim=2).clamp_min(1.0)
-        scale_rep = (target_clean * valid_pos_f).sum(dim=2) / valid_len
+        scale_rep = masked_mean(target_clean, valid_pos, keepdim=False)
         scale_rep = scale_rep.clamp_min(self.eps)
 
         extras = out["extras"]
@@ -1591,19 +1554,13 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 "normalized_shape must match [B, T] for replica NB; got "
                 f"{tuple(shape.shape)} instead of {(B, T)}."
             )
-        shape = torch.where(
-            base_mask & torch.isfinite(shape),
-            shape.clamp_min(0.0),
-            torch.zeros_like(shape),
-        )
-        mu_rep = scale_rep.unsqueeze(-1) * shape.unsqueeze(1)
-        mu_rep = torch.nan_to_num(
-            mu_rep,
-            nan=self.eps,
-            posinf=float(torch.finfo(mu_rep.dtype).max),
-            neginf=self.eps,
-        )
-        mu_rep = torch.where(valid_pos, mu_rep, torch.ones_like(mu_rep))
+        log_shape = extras.get("log_normalized_shape")
+        if log_shape is None:
+            # External/manual fixtures may provide only a materialized shape.
+            require_finite(torch.where(base_mask, shape, 0.0), "replica shape")
+            log_shape = shape.clamp_min(torch.finfo(shape.dtype).tiny).log()
+        log_mu_rep = scale_rep.log().unsqueeze(-1) + log_shape.unsqueeze(1)
+        log_mu_rep = torch.where(valid_pos, log_mu_rep, 0.0)
 
         log_sigma_rep = (
             out["log_sigma"]
@@ -1614,14 +1571,15 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         )
 
         flat_target = target_clean.reshape(B * R, T)
-        flat_mu = mu_rep.reshape(B * R, T)
+        flat_log_mu = log_mu_rep.reshape(B * R, T)
         flat_mask = valid_pos.reshape(B * R, T)
         flat_log_sigma = log_sigma_rep.reshape(B * R, T)
 
-        zero_flat = flat_mu.new_zeros(B * R)
+        zero_flat = flat_log_mu.new_zeros(B * R)
         if self.replica_nb_weight > 0.0:
             nb_details = self.loss_fn(
-                mu_phys=flat_mu,
+                mu_phys=None,
+                log_mu_phys=flat_log_mu,
                 log_sigma=flat_log_sigma,
                 y_true=flat_target,
                 mask=flat_mask,
@@ -1645,7 +1603,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             reweighted_nll_flat = zero_flat
             alpha_nll_flat = zero_flat
             optimization_surrogate_flat = zero_flat
-            one = flat_mu.new_tensor(1.0)
+            one = flat_log_mu.new_tensor(1.0)
             nb_details = {
                 "mean_gradient_weight_mean": one,
                 "mean_gradient_weight_median": one,
@@ -1781,6 +1739,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             sample_weights,
             transcript_group_ids,
         )
+        require_finite(loss, "combined training/validation loss")
         # All three diagnostics reuse the same detached pair values. Only the
         # selected objective above remains attached to the optimization graph.
         loss_by_mode = {
@@ -1960,12 +1919,9 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             valid_xy = torch.isfinite(x) & torch.isfinite(y)
             if int(valid_xy.sum().detach().cpu().item()) < 2:
                 return x.new_tensor(0.0)
-            x = x[valid_xy]
-            y = y[valid_xy]
-            x = x - x.mean()
-            y = y - y.mean()
-            denom = torch.sqrt(x.pow(2).sum() * y.pow(2).sum()).clamp_min(self.eps)
-            return torch.nan_to_num((x * y).sum() / denom, nan=0.0, posinf=0.0, neginf=0.0)
+            x = x[valid_xy].unsqueeze(0)
+            y = y[valid_xy].unsqueeze(0)
+            return self._pearson_per_sample(x, y, torch.ones_like(x, dtype=torch.bool), self.eps)[0]
 
         def masked_abs_mean(t: torch.Tensor, selected: torch.Tensor) -> torch.Tensor:
             selected = selected.to(device=mask.device).bool() & mask
@@ -3287,11 +3243,15 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         self._raise_if_nonfinite_gradients("before gradient clipping")
         clip_value = self.execution_gradient_clip_val
         if clip_value > 0.0:
-            self.clip_gradients(
-                optimizer,
-                gradient_clip_val=clip_value,
-                gradient_clip_algorithm=self.execution_gradient_clip_algorithm,
-            )
+            precision_plugin = getattr(getattr(self, "_trainer", None), "precision_plugin", None)
+            if self.execution_gradient_clip_algorithm == "norm" and getattr(precision_plugin, "scaler", None) is None:
+                clip_grad_norm_stable(self.parameters(), clip_value)
+            else:
+                self.clip_gradients(
+                    optimizer,
+                    gradient_clip_val=clip_value,
+                    gradient_clip_algorithm=self.execution_gradient_clip_algorithm,
+                )
         optimizer.step()
         optimizer.zero_grad()
         self._execution_logical_batches_since_step = 0

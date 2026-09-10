@@ -6,6 +6,7 @@ import json
 import math
 
 import torch
+from Models.utils.stable_numerics import masked_logmeanexp, masked_mean, require_finite
 import torch.nn as nn
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
@@ -284,6 +285,9 @@ class RiboQueuingModel(nn.Module):
         self.gamma_centering_weighting = weighting
         self.gamma_centering_quality_rank_power = quality_rank_power
         self.gamma_reference_chunk_size = chunk_size
+        self.gamma_reference_chunk_size_override_on_load = bool(
+            reference_cfg.get('chunk_size_override_on_load', False)
+        )
         self.gamma_reference_minimum_datasets = minimum_datasets
         self.gamma_reference_dataset_names = names
         self.gamma_reference_manifest_hash = manifest_hash
@@ -390,9 +394,10 @@ class RiboQueuingModel(nn.Module):
                 self.gamma_centering_quality_rank_power,
             )
         )
-        self.gamma_reference_chunk_size = int(
-            state.get("gamma_reference_chunk_size", self.gamma_reference_chunk_size)
-        )
+        if not getattr(self, 'gamma_reference_chunk_size_override_on_load', False):
+            self.gamma_reference_chunk_size = int(
+                state.get("gamma_reference_chunk_size", self.gamma_reference_chunk_size)
+            )
         self.gamma_reference_minimum_datasets = int(
             state.get(
                 "gamma_reference_minimum_datasets",
@@ -980,6 +985,7 @@ class RiboQueuingModel(nn.Module):
                     reference_positional_mean * weights_chunk.reshape(1, chunk_count)
                 ).sum(dim=1)
 
+        require_finite(weighted_sum, "reference-panel log-gamma sum")
         center_by_transcript = weighted_sum / weight_sum.clamp_min(self.eps)
         a_bar_by_transcript = (
             weighted_positional_mean_sum / weight_sum.clamp_min(self.eps)
@@ -1109,9 +1115,7 @@ class RiboQueuingModel(nn.Module):
         valid = mask_b & torch.isfinite(target)
         mask_f = valid.to(dtype=dtype)
         target = torch.where(valid, target.clamp_min(0.0), torch.zeros_like(target))
-        target_sum = (target * mask_f).sum(dim=1, keepdim=True)
-        valid_len = mask_f.sum(dim=1, keepdim=True).clamp_min(1.0)
-        return (target_sum / valid_len).clamp_min(self.eps)
+        return masked_mean(target, valid).clamp_min(self.eps)
 
     # ============================================================
     # Forward
@@ -1385,23 +1389,22 @@ class RiboQueuingModel(nn.Module):
         # --------------------------------------------------------
         # 5. Prediction
         # --------------------------------------------------------
-        mu_inner = gamma * L_bio
+        # Keep the product and optional mass normalization in log space.
+        # The legacy mean/shape outputs remain available for PCC and exports.
+        log_L_bio = bio.get("log_L_bio")
+        if log_L_bio is None:  # compatibility with external biological modules
+            log_L_bio = L_bio.clamp_min(torch.finfo(L_bio.dtype).tiny).log()
+        log_mu_inner = log_gamma + log_L_bio
         if self.mass_conservation:
             # Renormalize the shape to mean 1 over valid positions so that
             # mean_valid(mu) = S exactly. gamma and L_bio keep their
             # per-position meaning; only the overall shape level is pinned.
-            inner_valid_len = mask_f.sum(dim=1, keepdim=True).clamp_min(1.0)
-            inner_mean = (mu_inner * mask_f).sum(dim=1, keepdim=True) / inner_valid_len
-            mu_inner = mu_inner / inner_mean.clamp_min(self.eps)
-        mu = scale_dt * mu_inner
-        # The mean has no configured upper bound. Keep only finite numerical
-        # values for pathological overflow/underflow cases.
-        mu = torch.nan_to_num(
-            mu,
-            nan=self.eps,
-            posinf=torch.finfo(mu.dtype).max,
-            neginf=self.eps,
-        )
+            log_mu_inner = log_mu_inner - masked_logmeanexp(log_mu_inner, mask_b)
+        log_mu_inner = torch.where(mask_b, log_mu_inner, 0.0)
+        log_mu = torch.where(mask_b, scale_dt.log() + log_mu_inner, 0.0)
+        mu_inner = torch.where(mask_b, log_mu_inner.exp(), 0.0)
+        mu = log_mu.exp()
+        require_finite(mu, "observation mean (needed by raw-PCC and prediction exports)")
         mu = torch.where(mask_b, mu, torch.ones_like(mu))
 
         # --------------------------------------------------------
@@ -1409,7 +1412,7 @@ class RiboQueuingModel(nn.Module):
         # --------------------------------------------------------
         valid_len = mask_f.sum(dim=1).clamp_min(1.0)
         target_mean = scale_dt.reshape(-1)
-        mu_mean = (mu * mask_f).sum(dim=1) / valid_len
+        mu_mean = masked_mean(mu, mask_b, keepdim=False)
         mean_ratio = mu_mean / target_mean.clamp_min(self.eps)
         alpha = torch.exp(log_sigma) * mask_f
 
@@ -1529,6 +1532,8 @@ class RiboQueuingModel(nn.Module):
             "J_max": J_flat,
             "mu": mu,
             "normalized_shape": mu_inner,
+            "log_normalized_shape": log_mu_inner,
+            "log_mu": log_mu,
             "log_sigma": log_sigma,
             "log_sigma_t": (log_sigma * mask_f).sum(dim=1, keepdim=True)
             / mask_f.sum(dim=1, keepdim=True).clamp_min(1.0),

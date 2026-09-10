@@ -1,4 +1,5 @@
 #!/bin/bash
+#SBATCH --exclude=dgx1
 #SBATCH --job-name=riboai_2gpu_smoke
 #SBATCH --partition=p_csunivie_gres
 #SBATCH --ntasks=1

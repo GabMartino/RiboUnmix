@@ -108,7 +108,7 @@ data:
   # every batch. These are separate from transcript `sample_weight` and do not
   # reweight the likelihood/PCC losses.
   dataset_quality_ranking:
-    path: "Datasets/data/HEK_riboseq_profile_quality_rank.tsv"
+    path: "Datasets/data/HEK_riboseq_profile_quality_rank_components.tsv"
     dataset_column: dataset
     rank_column: quality_rank
     strict: true
@@ -402,7 +402,7 @@ trainer:
   gradient_clip_algorithm: norm
 
 callbacks:
-  early_stopping_patience: 20
+  early_stopping_patience: 10
   save_best_pcc_checkpoint: true
 
 metrics:
