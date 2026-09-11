@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 
 from Utils.transcript_batch_metadata import ValidatedTranscriptMetadata
+from Models.utils.gru_precision import GRU_COMPUTE_POLICY
 from Models.utils.stable_numerics import (
     masked_mean, nb2_nll_from_log_mean, nb_vst, require_finite,
     standardized_profile, working_float, clip_grad_norm_stable, NUMERICAL_FORMULATION_VERSION,
@@ -712,6 +713,9 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             )
         self.hparams["experiment_mode"] = self.experiment_mode
         self.hparams["numerical_formulation_version"] = NUMERICAL_FORMULATION_VERSION
+        self.hparams["gru_compute_policy"] = GRU_COMPUTE_POLICY
+        bias_encoder = getattr(getattr(self.model, "dataset_bias_model", None), "local_context_gru", None)
+        self.hparams["bias_gru_tbptt_window"] = int(getattr(bias_encoder, "tbptt_window", 0))
         self.hparams["alpha_mode"] = self.alpha_mode
         self.hparams["fixed_alpha"] = float(getattr(self.model, "fixed_alpha", 0.1))
         self.hparams["nb_mean_gradient_beta"] = self.nb_mean_gradient_beta
@@ -802,6 +806,14 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         self.execution_microbatching_enabled = bool(
             getattr(execution_cfg, "enabled", False)
         )
+        distributed_mode = str(getattr(execution_cfg, 'distributed_mode', 'single_process'))
+        if distributed_mode not in {'single_process', 'global_batch'}:
+            raise ValueError('execution_microbatching.distributed_mode must be single_process or global_batch.')
+        self.global_batch_distributed = distributed_mode == 'global_batch'
+        if self.global_batch_distributed and not self.execution_microbatching_enabled:
+            raise ValueError('global_batch requires execution microbatching.')
+        self.hparams['distributed_execution_mode'] = distributed_mode
+        self._global_epoch_totals = {}
         execution_clip_value = getattr(execution_cfg, "gradient_clip_val", None)
         if execution_clip_value is None:
             execution_clip_value = getattr(
@@ -2333,6 +2345,12 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         out: dict[str, Any],
         metrics: dict[str, torch.Tensor],
     ) -> None:
+        if getattr(self, 'global_batch_distributed', False):
+            from Utils.global_batch_strategy import accumulate_metrics
+            accumulate_metrics(self._global_epoch_totals[stage], metrics,
+                transcripts=int(torch.unique(out['transcript_group_index']).numel()),
+                pairs=int(out['target'].shape[0]))
+            return
         batch_size = int(out["target"].shape[0])
         sync_dist = bool(getattr(self.config.trainer, "sync_dist_logs", False))
         transcript_count = int(
@@ -2709,11 +2727,16 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             )
 
     def on_validation_epoch_start(self) -> None:
+        if getattr(self, 'global_batch_distributed', False):
+            if self._execution_has_pending_gradients:
+                raise RuntimeError('global_batch validation must start at an optimizer boundary; use end-of-epoch validation.')
+            self._reset_global_metrics('val')
         self._val_profile_plot_logged_this_epoch = False
         self._validation_transcript_mu_pcc = {}
         self._synthetic_ground_truth_epoch = {}
 
     def on_validation_epoch_end(self) -> None:
+        global_values = self._finish_global_metrics('val') if getattr(self, 'global_batch_distributed', False) else {}
         self._log_validation_transcript_mu_pcc_distribution()
         self._log_synthetic_ground_truth_metrics()
         if (
@@ -2721,7 +2744,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             and not bool(getattr(self.trainer, "sanity_checking", False))
         ):
             monitor = str(self.config.optim.scheduler.monitor)
-            monitored_value = self.trainer.callback_metrics.get(monitor)
+            monitored_value = global_values.get(monitor, self.trainer.callback_metrics.get(monitor))
             if monitored_value is None:
                 raise RuntimeError(
                     "Manual execution microbatching could not find scheduler "
@@ -2730,6 +2753,22 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             self.lr_schedulers().step(float(monitored_value.detach().cpu().item()))
         self._validation_transcript_mu_pcc = {}
         self._synthetic_ground_truth_epoch = {}
+
+    def _reset_global_metrics(self, stage):
+        from Utils.global_batch_strategy import METRICS
+        self._global_epoch_totals[stage] = torch.zeros(len(METRICS), 2, device=self.device, dtype=torch.float64)
+
+    def _finish_global_metrics(self, stage):
+        from Utils.global_batch_strategy import finish_metrics
+        values = finish_metrics(self._global_epoch_totals.pop(stage))
+        logs = {f'{stage}_{name}': value for name, value in values.items()}
+        logs[f'{stage}_mu_pcc'] = values['mu_pcc_unweighted']
+        # Every rank has the same reduced values. Do not start another metric
+        # collective stream, especially on ranks whose last slot was empty.
+        for name, value in logs.items():
+            self.log(name, value, on_step=False, on_epoch=True, sync_dist=False,
+                     prog_bar=name in {f'{stage}_loss', f'{stage}_mu_pcc'}, batch_size=1)
+        return logs
 
     def _likelihood_positive_mean(self, out: dict[str, Any]) -> torch.Tensor:
         with torch.no_grad():
@@ -2878,6 +2917,15 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
     # ============================================================
 
     def on_fit_start(self) -> None:
+        # Report the instantiated model's policy, not just the launch override:
+        # saved configs/checkpoints can otherwise obscure a precision mismatch.
+        self.print(self._numerical_runtime_context().strip())
+        if getattr(self, 'global_batch_distributed', False):
+            from Utils.global_batch_strategy import GlobalBatchStrategy
+            if not isinstance(self.trainer.strategy, GlobalBatchStrategy):
+                raise RuntimeError('global_batch requires GlobalBatchStrategy; ordinary DDP would average these gradients incorrectly.')
+            if getattr(self.trainer.precision_plugin, 'scaler', None) is not None:
+                raise RuntimeError('global_batch does not support scaled FP16 gradients.')
         if not self._grouped_optimizer_batch_plan:
             return
         expected = int(
@@ -2899,6 +2947,8 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             )
 
     def on_train_epoch_start(self) -> None:
+        if getattr(self, 'global_batch_distributed', False):
+            self._reset_global_metrics('train')
         self._train_batch_structure_records = []
         if self.execution_microbatching_enabled:
             if (
@@ -3045,6 +3095,9 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
             # gradients retain the configured 1/A scaling even when the last
             # epoch window contains fewer than A logical batches.
             self._execution_optimizer_step()
+        if getattr(self, 'global_batch_distributed', False):
+            self._finish_global_metrics('train')
+            return
         if not self._grouped_batch_logging_enabled:
             return
         records = self._gather_batch_structure_records(
@@ -3237,6 +3290,9 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
     def _execution_optimizer_step(self) -> None:
         """Apply one optimizer step after complete logical-batch gradients."""
         optimizer = self.optimizers()
+        if getattr(self, 'global_batch_distributed', False):
+            from Utils.global_batch_strategy import sum_global_gradients
+            sum_global_gradients(self.parameters())
         # Norm clipping uses one coefficient for all parameters. A single NaN
         # would otherwise contaminate every branch before the optimizer hook
         # can identify the original affected parameters.
@@ -3260,6 +3316,10 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
 
     @staticmethod
     def _execution_metadata(batch) -> dict[str, int] | None:
+        from Utils.global_batch import empty_execution_metadata
+        idle = empty_execution_metadata(batch)
+        if idle is not None:
+            return dict(idle)
         if not batch:
             return None
         value = batch[-1]
@@ -3284,7 +3344,14 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         return {name: int(value[name]) for name in required}
 
     def training_step(self, batch, batch_idx):
-        self._record_train_batch_structure(batch)
+        from Utils.global_batch import empty_execution_metadata
+        if empty_execution_metadata(batch) is not None:
+            if not getattr(self, 'global_batch_distributed', False):
+                raise RuntimeError('Idle slots are only supported by global_batch execution.')
+            self._finish_execution_chunk(self._execution_metadata(batch))
+            return torch.zeros((), device=self.device)
+        if not getattr(self, 'global_batch_distributed', False):
+            self._record_train_batch_structure(batch)
         out = self._forward_batch(batch)
         # Keep only small metadata tensors, never the forward graph. Materialize
         # their values on the host only if a numerical failure occurs.
@@ -3329,21 +3396,64 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         )
         try:
             self.manual_backward(gradient_loss)
-        except RuntimeError as exc:
+        except (RuntimeError, FloatingPointError) as exc:
             # Anomaly detection raises inside autograd, before on_after_backward.
-            exc.add_note(self._gradient_failure_context())
+            exc.add_note(self._gradient_failure_context() + self._numerical_runtime_context())
             raise
-        self._execution_has_pending_gradients = True
+        self._finish_execution_chunk(metadata)
+        return metrics["loss"].detach()
 
+    def _finish_execution_chunk(self, metadata):
+        # The optimizer boundary is global, including ranks with zero local
+        # groups. Such ranks receive the other ranks' gradients before stepping.
+        self._execution_has_pending_gradients = True
+        logical_accumulation = self._logical_accumulation_factor()
         is_last_chunk = (
             metadata["execution_chunk_index"]
             == metadata["execution_chunk_count"] - 1
         )
         if is_last_chunk:
             self._execution_logical_batches_since_step += 1
-            if self._execution_logical_batches_since_step >= logical_accumulation:
+            final_window = (getattr(self, 'global_batch_distributed', False)
+                            and self.trainer.is_last_batch)
+            if self._execution_logical_batches_since_step >= logical_accumulation or final_window:
                 self._execution_optimizer_step()
-        return metrics["loss"].detach()
+
+    def on_save_checkpoint(self, checkpoint):
+        if getattr(self, 'global_batch_distributed', False):
+            if self._execution_has_pending_gradients:
+                raise RuntimeError('Save global_batch checkpoints at optimizer boundaries; partial gradients are not checkpointed.')
+            checkpoint['global_batch_execution'] = {
+                'version': 1, 'world_size': self.trainer.world_size,
+                'logical_accumulation_factor': self._logical_accumulation_factor(),
+                'gradient_reduction': 'sum',
+            }
+
+    def _numerical_runtime_context(self) -> str:
+        """Cheap on startup/failure only; never changes precision or gradients."""
+        trainer = getattr(self, "_trainer", None)
+        plugin = getattr(trainer, "precision_plugin", None)
+        bias = getattr(getattr(self, "model", None), "dataset_bias_model", None)
+        encoder = getattr(bias, "local_context_gru", None)
+        weight = getattr(getattr(encoder, "rnn", None), "weight_ih_l0", None)
+        parameter = next(self.parameters(), None)
+        device = parameter.device if parameter is not None else torch.device("cpu")
+        gpu = torch.cuda.get_device_name(device) if device.type == "cuda" else "none"
+        cudnn = torch.backends.cudnn.version() if device.type == "cuda" else "unused"
+        return (
+            f" Numerical runtime: formulation={NUMERICAL_FORMULATION_VERSION}, "
+            f"gru_compute_policy={GRU_COMPUTE_POLICY} (both GRUs FP32 under CUDA AMP), "
+            f"trainer_precision={getattr(plugin, 'precision', 'unavailable')}, "
+            f"global_batch={getattr(self, 'global_batch_distributed', False)}, "
+            f"world_size={getattr(trainer, 'world_size', 1)}, "
+            f"bias_gru_precision={getattr(encoder, 'precision', 'unavailable')}, "
+            f"bias_gru_tbptt_window={getattr(encoder, 'tbptt_window', 0)} "
+            "(0=full BPTT; >0=biased truncated training gradient), "
+            f"bias_gru_weight_dtype={getattr(weight, 'dtype', 'unavailable')}, "
+            f"device={device}, gpu={gpu}, torch={torch.__version__}, "
+            f"cuda={torch.version.cuda}, cudnn={cudnn}, "
+            f"anomaly_detection={torch.is_anomaly_enabled()}."
+        )
 
     def _gradient_failure_context(self) -> str:
         context = getattr(self, "_gradient_batch_context", None)
@@ -3401,9 +3511,13 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
                 f"first affected parameters: {nonfinite[:10]} "
                 f"({len(nonfinite)} affected tensors)."
                 + self._gradient_failure_context()
+                + self._numerical_runtime_context()
             )
 
     def validation_step(self, batch, batch_idx):
+        from Utils.global_batch import empty_execution_metadata
+        if empty_execution_metadata(batch) is not None:
+            return None
         out = self._forward_batch(batch)
         # Validation and checkpoint ``val_loss`` retain the ordinary NB2
         # likelihood. Mean-gradient reweighting is an optimization device, not
@@ -3416,7 +3530,7 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         # Sanity validation exists only to catch a broken forward/loss path.
         # Avoid expensive CPU diagnostics and Matplotlib work that will be
         # repeated during the first real validation epoch.
-        if not bool(getattr(self.trainer, "sanity_checking", False)):
+        if not bool(getattr(self.trainer, "sanity_checking", False)) and not getattr(self, 'global_batch_distributed', False):
             self._record_synthetic_ground_truth_metrics(out)
             self._record_validation_transcript_mu_pcc(out, metrics)
             self._plot_profile_example(out, batch_idx=batch_idx)
@@ -3429,6 +3543,9 @@ class RiboQueuingModelLightningModule(pl.LightningModule):
         return value
 
     def predict_step(self, batch, batch_idx, dataloader_idx: int = 0):
+        from Utils.global_batch import empty_execution_metadata
+        if empty_execution_metadata(batch) is not None:
+            return None
         out = self._forward_batch(batch)
         extras = out["extras"]
         likelihood_positive_mean = self._likelihood_positive_mean(out)

@@ -440,6 +440,7 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
         execution_microbatch_max_transcript_groups: int | None = None,
         execution_microbatch_max_pair_rows: int | None = None,
         execution_microbatch_max_padded_codon_tokens: int | None = None,
+        global_batch_distributed: bool = False,
     ):
         self.flat_transcript_ids = _as_numpy_str(flat_transcript_ids)
         self.flat_dataset_ids = _as_numpy_int(flat_dataset_ids)
@@ -463,6 +464,7 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
         self.shuffle_batches = bool(shuffle_batches)
         self.num_replicas = max(int(num_replicas), 1)
         self.rank = int(rank) % self.num_replicas
+        self.global_batch_distributed = bool(global_batch_distributed)
         self.execution_microbatch_max_transcript_groups = (
             None
             if execution_microbatch_max_transcript_groups is None
@@ -506,6 +508,7 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
                 or self.execution_microbatch_max_padded_codon_tokens is not None
             )
             and self.num_replicas > 1
+            and not self.global_batch_distributed
         ):
             raise ValueError(
                 "Execution microbatching is currently single-process only. Run one "
@@ -615,6 +618,7 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
             maximum_groups is None
             and maximum_pair_rows is None
             and maximum_padded_tokens is None
+            and not self.global_batch_distributed
         ):
             return [indices for indices, _, _ in packed]
 
@@ -638,6 +642,24 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
                 raise RuntimeError(
                     "Logical batch metadata does not cover every pair row."
                 )
+
+            if self.global_batch_distributed:
+                from Utils.global_batch import partition_execution_groups
+                rank_chunks = partition_execution_groups(
+                    group_indices, self.lengths, world_size=self.num_replicas,
+                    reference_count=len(self.selected_dataset_ids),
+                    max_groups=maximum_groups, max_pairs=maximum_pair_rows,
+                    max_tokens=maximum_padded_tokens,
+                )[self.rank]
+                for slot, chunk_groups in enumerate(rank_chunks):
+                    metadata = (logical_batch_index, slot, len(rank_chunks),
+                                logical_group_count, len(chunk_groups), logical_pair_count)
+                    # -1 is an idle-slot token, NOT an index into the dataset.
+                    indices_for_slot = [i for group in chunk_groups for i in group] or [-1]
+                    execution_batches.append([
+                        ('execution_microbatch_v1', i, *metadata) for i in indices_for_slot
+                    ])
+                continue
 
             chunks: list[list[list[int]]] = []
             current_chunk: list[list[int]] = []
@@ -793,7 +815,8 @@ class TranscriptGroupedMultiDatasetBatchSampler(BatchSampler):
             batch_order = rng.permutation(len(packed))
             packed = [packed[int(i)] for i in batch_order]
 
-        packed = _shard_batches_padded(packed, self.num_replicas, self.rank)
+        if not self.global_batch_distributed:
+            packed = _shard_batches_padded(packed, self.num_replicas, self.rank)
         logical_batches = [indices for indices, _, _ in packed]
         pair_rows = tuple(len(indices) for indices in logical_batches)
         unique_transcripts = tuple(
@@ -917,6 +940,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         execution_microbatch_max_transcript_groups: int | None = None,
         execution_microbatch_max_pair_rows: int | None = None,
         execution_microbatch_max_padded_codon_tokens: int | None = None,
+        global_batch_distributed: bool = False,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -985,6 +1009,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
         self.sequence_only_shared_profile_prediction = bool(
             sequence_only_shared_profile_prediction
         )
+        self.global_batch_distributed = bool(global_batch_distributed)
         self.execution_microbatch_max_transcript_groups = (
             None
             if execution_microbatch_max_transcript_groups is None
@@ -1915,6 +1940,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             ),
             num_replicas=max(int(num_replicas), 1),
             rank=int(rank),
+            global_batch_distributed=self.global_batch_distributed,
             execution_microbatch_max_transcript_groups=(
                 self.execution_microbatch_max_transcript_groups
             ),
@@ -1992,6 +2018,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             shuffle_batches=False,
             num_replicas=num_replicas,
             rank=rank,
+            global_batch_distributed=self.global_batch_distributed,
             execution_microbatch_max_transcript_groups=(
                 self.execution_microbatch_max_transcript_groups
             ),
@@ -2037,6 +2064,7 @@ class RiboAIQueuingDatamoduleMultiDataset(pl.LightningDataModule):
             shuffle_batches=False,
             num_replicas=num_replicas,
             rank=rank,
+            global_batch_distributed=self.global_batch_distributed,
             execution_microbatch_max_transcript_groups=(
                 self.execution_microbatch_max_transcript_groups
             ),

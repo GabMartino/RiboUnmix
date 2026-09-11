@@ -6,6 +6,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from Models.utils.stable_numerics import require_finite
+from Models.utils.gru_failure_capture import begin_gru_capture, attach_gru_capture
+from Models.utils.gru_tbptt import gru_tbptt
+from Models.utils.gru_precision import gru_precision_context
 
 from Models.RiboQueuingModel.submodels.DatasetLogSigmaHead import DatasetLogSigmaHead
 from Models.RiboQueuingModel.submodels.DatasetMultiplicativeAllocationBiasHead import (
@@ -44,6 +47,8 @@ class BiGRUContextEncoder(nn.Module):
         num_layers: int = 1,
         dropout: float = 0.0,
         precision: str = "inherit",
+        failure_capture_dir: str | None = None,
+        tbptt_window: int = 0,
     ):
         super().__init__()
         self.in_channels = int(in_channels)
@@ -51,6 +56,10 @@ class BiGRUContextEncoder(nn.Module):
         self.num_layers = int(num_layers)
         self.out_channels = 2 * self.hidden_size  # bidirectional
         self.precision = str(precision).strip().lower()
+        self.failure_capture_dir = failure_capture_dir
+        self.tbptt_window = int(tbptt_window)
+        if self.tbptt_window != tbptt_window or self.tbptt_window < 0:
+            raise ValueError("context_gru_tbptt_window must be a non-negative integer (0 = full BPTT).")
         if self.precision not in {"inherit", "float32"}:
             raise ValueError(
                 "dataset_bias_params.context_gru_precision must be 'inherit' "
@@ -66,6 +75,10 @@ class BiGRUContextEncoder(nn.Module):
             dropout=float(dropout) if self.num_layers > 1 else 0.0,
         )
         self.output_norm = ChannelLayerNorm(self.out_channels)
+        if self.tbptt_window and self.rnn.dropout:
+            raise ValueError("Bias GRU TBPTT requires context_gru_dropout=0; head dropout is unchanged.")
+        if self.tbptt_window and self.failure_capture_dir:
+            raise ValueError("Whole-GRU failure capture is not compatible with TBPTT window states.")
 
     def forward(
         self,
@@ -73,19 +86,12 @@ class BiGRUContextEncoder(nn.Module):
         mask: torch.Tensor | None = None,
         cpu_lengths: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
-        if self.precision == "float32":
-            # A bounded log-gamma output does not bound the recurrent Jacobian
-            # through a long sequence. Keep *both* the GRU and its normalization
-            # out of reduced-precision autocast; casting only their output is
-            # too late to protect backward. This adds no parameters/state keys.
-            if self.rnn.weight_ih_l0.dtype != torch.float32:
-                raise ValueError(
-                    "context_gru_precision=float32 requires FP32 model weights "
-                    "(use mixed precision or 32-true, not model.bfloat16()/half())."
-                )
-            with torch.autocast(device_type=x.device.type, enabled=False):
-                return self._forward_impl(x.float(), mask, cpu_lengths)
-        return self._forward_impl(x, mask, cpu_lengths)
+        # CUDA AMP is protected even for legacy precision='inherit'. Cover
+        # full BPTT, TBPTT, reference-panel calls, and the output LayerNorm.
+        with gru_precision_context(
+            self.rnn, x, force_float32=self.precision == "float32"
+        ) as recurrent_input:
+            return self._forward_impl(recurrent_input, mask, cpu_lengths)
 
     def _forward_impl(
         self,
@@ -97,6 +103,7 @@ class BiGRUContextEncoder(nn.Module):
         seq = x.transpose(1, 2)
         B, T, _ = seq.shape
 
+        truncated = self.tbptt_window > 0 and self.training and torch.is_grad_enabled()
         if mask is not None:
             mask_b = mask.bool()
             lengths = (
@@ -104,14 +111,28 @@ class BiGRUContextEncoder(nn.Module):
                 if cpu_lengths is not None
                 else mask_b.sum(dim=1).clamp_min(1).to("cpu")
             )
+        else:
+            lengths = (T,) * B
+
+        # A batch fitting in one window has no boundary to detach. Keep the
+        # original fused stacked/bidirectional call in that common case.
+        if truncated and T > self.tbptt_window:
+            out = gru_tbptt(self.rnn, seq, lengths, self.tbptt_window)
+        elif mask is not None:
             packed = nn.utils.rnn.pack_padded_sequence(
                 seq, lengths, batch_first=True, enforce_sorted=False
             )
+            capture = bool(self.failure_capture_dir and self.training and torch.is_grad_enabled())
+            before = begin_gru_capture(self.rnn, packed) if capture else None
             out_packed, _ = self.rnn(packed)
+            if capture:
+                attach_gru_capture(self.rnn, packed, out_packed, before, self.failure_capture_dir)
             out, _ = nn.utils.rnn.pad_packed_sequence(
                 out_packed, batch_first=True, total_length=T
             )
         else:
+            if self.failure_capture_dir and self.training and torch.is_grad_enabled():
+                raise ValueError("GRU failure capture requires a mask/packed-sequence input.")
             out, _ = self.rnn(seq)
 
         out = out.transpose(1, 2)  # [B, C_out, T]
@@ -207,6 +228,8 @@ class DatasetBiasSubmodel(nn.Module):
             num_layers=int(config_params.get("context_gru_num_layers", 2)),
             dropout=float(config_params.get("context_gru_dropout", 0.0)),
             precision=config_params.get("context_gru_precision", "inherit"),
+            failure_capture_dir=config_params.get("context_gru_failure_capture_dir"),
+            tbptt_window=config_params.get("context_gru_tbptt_window", 0),
         )
         self.context_dim = self.local_context_gru.out_channels
 

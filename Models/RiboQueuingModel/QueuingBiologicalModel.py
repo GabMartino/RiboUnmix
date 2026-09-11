@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pad_packed_sequence
 from Models.utils.stable_numerics import log_softplus, masked_logmeanexp, masked_mean
+from Models.utils.gru_precision import gru_precision_context
 
 
 def inv_softplus(x: float) -> float:
@@ -101,7 +102,10 @@ class QueuingBiologicalModel(nn.Module):
             nn.init.constant_(final_h.bias, inv_softplus(init_factor))
 
     def forward(self, x_packed, mask) -> dict[str, torch.Tensor]:
-        out_packed, h_n = self.rnn(x_packed)
+        # The biological GRU uses the same CUDA-AMP protection as the bias
+        # GRU; the feed-forward head below retains the caller's AMP policy.
+        with gru_precision_context(self.rnn, x_packed) as recurrent_input:
+            out_packed, h_n = self.rnn(recurrent_input)
         out, _ = pad_packed_sequence(
             out_packed,
             batch_first=True,

@@ -381,6 +381,10 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
                 "execution_group_count": int(execution_group_count),
                 "logical_pair_count": int(logical_pair_count),
             }
+            if int(index) == -1 and int(execution_group_count) == 0:
+                return {'empty_execution': execution_metadata}
+            if int(index) < 0 or int(execution_group_count) < 1:
+                raise ValueError('Invalid active execution-microbatch index.')
         index = int(index)
         local_idx = int(self.flat_local_indices[index])
         transcript_id = str(self.flat_transcript_ids[index])
@@ -977,6 +981,9 @@ class RiboAIQueuingDatasetMultiDataset(Dataset):
     # ============================================================
 
     def collate_fn(self, batch):
+        from Utils.global_batch import empty_execution_metadata
+        if len(batch) == 1 and empty_execution_metadata(batch[0]) is not None:
+            return batch[0]
         has_bias_features = self.dataset_bias_extra_dim > 0
         expected_fields = 11 + int(has_bias_features)
         if any(len(sample) != expected_fields for sample in batch):

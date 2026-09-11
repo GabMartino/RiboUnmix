@@ -118,10 +118,13 @@ training:
   # materializing only a memory-safe subset of its complete transcript groups
   # in each GPU forward. This is exact for transcript-balanced loss because
   # each chunk loss is rescaled by its fraction of the logical groups.
-  # The current implementation is deliberately single-process; disable this
-  # block before launching DDP.
+  # Default: one process. For multiple GPUs preserving this same global plan,
+  # select distributed_mode=global_batch; do not use ordinary DDP with chunks.
   execution_microbatching:
     enabled: true
+    # Opt in to distribute each unchanged global logical batch across GPUs.
+    # No division of data.batch_size; optimizer windows remain those of one GPU.
+    distributed_mode: single_process  # single_process | global_batch
     # Manual optimization clips once after every execution chunk and every
     # accumulated logical batch for the optimizer window have contributed.
     gradient_clip_val: 1.0
@@ -142,6 +145,8 @@ training:
     # Desired unique-transcript count per optimizer update, AFTER gradient
     # accumulation. Under per_rank, every DDP rank targets this many; under
     # global, this number is divided across ranks before resolving accumulation.
+    # global_batch execution always resolves on the unchanged one-process plan;
+    # target_scope is then reported as global, irrespective of this legacy flag.
     target_unique_transcripts_per_optimizer_step: 32
     # Resolve Trainer.accumulate_grad_batches from a non-mutating preview of the
     # actual packed transcript groups. A non-default explicit Trainer value is a
@@ -228,6 +233,7 @@ model:
       minimum_datasets: 2
 
   biological_params:
+    # CUDA AMP always executes this GRU in FP32; the neural head still uses AMP.
     # Base one-hot dimension. The model automatically adds the dimensions of
     # features routed to biological/both (13 currently -> actual input 110).
     input_size: 97
@@ -273,6 +279,14 @@ model:
     context_gru_hidden_size: 256
     context_gru_num_layers: 2
     context_gru_dropout: 0.0
+    # cuDNN autocast otherwise uses FP16 even under BF16 mixed precision.
+    # Legacy 'inherit' is also protected on CUDA by the model code.
+    context_gru_precision: float32
+    # Opt-in biased training gradient: carry full-CDS state, detach every K
+    # codons per layer/direction. 0 = full BPTT; precision protection does not
+    # require truncating the training gradient.
+    # Evaluation/prediction always uses the original full GRU.
+    context_gru_tbptt_window: 0
     # Dataset correction head for log-gamma residuals.
     dataset_multiplicative_allocation_bias_submodule_params:
       hidden_size: 128

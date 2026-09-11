@@ -6,6 +6,7 @@ import math
 import os
 import re
 from collections import defaultdict
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -504,6 +505,11 @@ def shared_logger_version_from_environment() -> str | None:
 
 
 def env_global_rank() -> int:
+    # Lightning's local subprocess launcher sets LOCAL_RANK but can inherit
+    # SLURM_PROCID=0 from the single srun parent. Those children must not write
+    # rank-zero manifests before the Trainer initializes its process group.
+    if 'RANK' not in os.environ and 'LOCAL_RANK' in os.environ and os.environ.get('SLURM_NTASKS', '1') == '1':
+        return int(os.environ['LOCAL_RANK'])
     for key in ("RANK", "SLURM_PROCID"):
         value = os.environ.get(key)
         if value is not None:
@@ -1659,6 +1665,9 @@ def make_datamodule(
     execution_enabled = cfg_bool(
         cfg, "training.execution_microbatching.enabled", False
     )
+    global_batch = cfg_get(cfg, 'training.execution_microbatching.distributed_mode', 'single_process') == 'global_batch'
+    if global_batch and not execution_enabled:
+        raise ValueError('global_batch distributed execution requires execution_microbatching.enabled=true.')
     raw_execution_groups = cfg_get(
         cfg,
         "training.execution_microbatching.max_transcript_groups_per_forward",
@@ -1752,6 +1761,7 @@ def make_datamodule(
         execution_microbatch_max_transcript_groups=execution_groups,
         execution_microbatch_max_pair_rows=execution_pairs,
         execution_microbatch_max_padded_codon_tokens=execution_tokens,
+        global_batch_distributed=global_batch,
     )
 
 
@@ -1788,6 +1798,7 @@ def resolve_training_grouped_optimizer_batching(
     datamodule.setup("fit")
     statistics = datamodule.preview_train_grouped_batch_statistics(iteration_index=0)
     world_size = configured_trainer_world_size(cfg)
+    global_batch = cfg_get(cfg, 'training.execution_microbatching.distributed_mode', 'single_process') == 'global_batch'
     auto = cfg_bool(
         cfg,
         f"{grouped_cfg_path}.auto_accumulate_grad_batches",
@@ -1822,7 +1833,9 @@ def resolve_training_grouped_optimizer_batching(
         target_scope=str(
             cfg_get(cfg, f"{grouped_cfg_path}.target_scope", "per_rank")
         ),
-        world_size=world_size,
+        # Construct exactly the one-process optimizer windows, then distribute
+        # their computation. GPU count must never affect membership or A.
+        world_size=1 if global_batch else world_size,
         forced_accumulate_grad_batches=(None if auto else configured_accumulation),
     )
     execution_microbatching = cfg_bool(
@@ -1830,11 +1843,16 @@ def resolve_training_grouped_optimizer_batching(
         "training.execution_microbatching.enabled",
         False,
     )
-    if execution_microbatching and world_size != 1:
+    if execution_microbatching and world_size != 1 and not global_batch:
         raise ValueError(
             "training.execution_microbatching is single-process only. Launch one "
             "independent experiment per GPU with trainer.devices=[0]."
         )
+    if global_batch:
+        plan = replace(plan, world_size=world_size, target_scope='global',
+            effective_local_target_unique_transcripts=math.ceil(plan.configured_target_unique_transcripts / world_size),
+            estimated_unique_transcripts_per_optimizer_step=plan.estimated_unique_transcripts_per_optimizer_step / world_size,
+            estimated_pair_rows_per_optimizer_step=plan.estimated_pair_rows_per_optimizer_step / world_size)
     OmegaConf.update(
         cfg,
         "trainer.accumulate_grad_batches",
@@ -2543,6 +2561,16 @@ def main(cfg: DictConfig) -> None:
     }
     if n_devices > 1:
         trainer_kwargs["strategy"] = "ddp_find_unused_parameters_true"
+    if cfg_get(cfg, 'training.execution_microbatching.distributed_mode', 'single_process') == 'global_batch':
+        from Utils.global_batch_strategy import GlobalBatchStrategy
+        from lightning.fabric.plugins.environments import LightningEnvironment
+        if int(cfg_get(cfg, 'trainer.num_nodes', 1)) != 1:
+            raise ValueError('global_batch currently supports multiple GPUs on one node.')
+        if cfg_bool(cfg, 'trainer.use_distributed_sampler', False):
+            raise ValueError('global_batch owns sharding; set trainer.use_distributed_sampler=false.')
+        if str(cfg.trainer.precision) not in {'bf16-mixed', '32-true', '64-true', '32', '64'}:
+            raise ValueError('global_batch supports BF16 mixed or FP32/FP64, not scaled FP16.')
+        trainer_kwargs['strategy'] = GlobalBatchStrategy(cluster_environment=LightningEnvironment())
 
     execution_microbatching = cfg_bool(
         cfg,
