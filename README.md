@@ -7,13 +7,10 @@ sequence. RiboUnmix models those observations with a shared, sequence-based
 profile and a positive correction for each dataset. It is a research framework
 built with PyTorch, Lightning, and Hydra.
 
-![RiboUnmix model overview: independent shared and dataset branches combine in a negative-binomial observation model.](Docs/assets/ribounmix_overview.svg)
-
 [Try the notebook](notebooks/01_model_checks_and_predictions.ipynb) ·
 [Run the synthetic smoke experiment](examples/synthetic_smoke/README.md) ·
 [Explore the analyses](analyses/README.md) ·
-[Training configuration](config/config_ribounmix_multidataset.yaml) ·
-[Repository alignment](Docs/repository_alignment.md)
+[Training configuration](config/config_ribounmix_multidataset.yaml)
 
 ## Start here
 
@@ -105,11 +102,6 @@ Fixed-reference centering anchors log-gamma to a specified dataset panel and
 removes its positional constant when the configured centering conditions hold.
 The choice of reference panel and weights is part of the model definition.
 `log_sigma` in existing exports is the historical name for **log(alpha)**.
-
-![An explicitly simulated example showing two count profiles, their generating shared profile, and dataset corrections. These are not fitted results.](Docs/assets/ribounmix_profiles.svg)
-
-*Illustrative simulation only. Regenerate both README figures with
-`python Docs/assets/create_readme_figures.py`.*
 
 **Interpretation matters.** `L_bio` is shared by construction; that does not prove
 that it is purely biological. Dataset-specific biology and technical effects can
@@ -210,7 +202,6 @@ Dataloaders/RiboUnmix*/           Data loading, masks, replicas, and grouped bat
 config/                          Runnable configurations and experiment designs
 analyses/                        Analysis and figure-generation source
 Tests/                           Scientific and numerical regression checks
-Docs/                            Documentation, diagrams, and alignment notes
 Datasets/                        Preprocessing source and local data assets
 ```
 
@@ -226,12 +217,12 @@ this lightweight repository. They are retained as executable specifications,
 but require the corresponding private or separately archived artifacts.
 
 The project is named **RiboUnmix**. Earlier `RiboAI`, `Queuing`, and `Queueing`
-imports remain as compatibility adapters. Historical experiment paths retain
-their original names to preserve provenance; see the
-[naming migration](Docs/renaming_to_ribounmix.md).
+imports remain as compatibility adapters so historical checkpoints and command
+lines are not silently broken.
 
 ## Research status
 
 This is evolving research code. The repository currently has no license file
-or finalized citation metadata. Do not infer performance claims from the toy
-figures; use the corresponding experiment reports and frozen configurations.
+or finalized citation metadata. Do not infer article-scale performance from
+the bundled smoke fixture; use the frozen configurations and authoritative
+experiment artifacts associated with the manuscript.

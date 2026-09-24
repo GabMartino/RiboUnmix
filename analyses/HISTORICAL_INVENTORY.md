@@ -10,14 +10,13 @@ in place during the 2026-09-11 cleanup.
 For a **design-only audit** of global dataset ranks, gamma-reference mass and
 source-family concentration, use `python analyses/audit_four_panel_reference_quality.py`
 from the repository root. It defaults to CPU-only audit and never reads model
-performance. Its two optional preparation modes are documented in
-[the reference-quality audit guide](../Docs/four_panel_reference_quality_audit.md).
+performance. Run it with `--help` for its two optional preparation modes.
 
 All paths in this table are relative to `results/`.
 
 For the manuscript's **ten-component ranking-effect Figure 2 (C/D)**, use
-`create_real_data_ranking_effect_figure.py`; see
-[the matching and regeneration guide](../Docs/real_data_ranking_effect_figure.md).
+`create_real_data_ranking_effect_figure.py` and inspect its `--help` output for
+the matching and regeneration interface.
 It checks true equal/ranked matches before evaluating arrays. The currently
 available six-component panel run and cumulative ranked Exp8 run are not valid
 counterparts; unavailable effects are reported, not plotted.

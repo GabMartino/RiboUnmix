@@ -267,7 +267,6 @@ def write_report(root, out, manifest, cohort, task_results, fold_table, transiti
                          fold['validation_ids'] == fold_values[0]['validation_ids'] for fold in fold_values)
     audit_text = ('Training, validation and test memberships are identical at every N. Every fold is disjoint, and each dataset has the same complete transcript cohort. This design controls transcript membership while adding datasets.' if fixed_training else
         'Within each model, train/validation/test are disjoint; policies at a given N reuse the same inputs. The legacy cumulative setup nevertheless reassigned training and validation membership across N. These test metrics repair the evaluation comparison; they cannot remove that training-design confound from existing checkpoints. Fresh fixed-cohort training is required to isolate adding datasets while holding transcript membership constant.')
-    audit_link = html.escape(os.path.relpath(ROOT / 'Docs/cumulative_cohort_audit_and_correction.html', out), quote=True)
     stability_link = html.escape(os.path.relpath(root / 'analysis/analysis_report.html', out), quote=True)
     refresh_output = f' --output-dir {html.escape(str(out))}' if out != root / 'fixed_observed_evaluation' else ''
     content = f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Fixed-observation cumulative evaluation</title><style>{STYLE}</style></head><body>
@@ -283,7 +282,7 @@ def write_report(root, out, manifest, cohort, task_results, fold_table, transiti
 <h2>Training and validation audit of these existing models</h2>{table_html(fold_table)}
 {table_html(transition_table)}
 <p>{audit_text}</p>
-<p><a href="{audit_link}">Why the old comparison was confounded and how the corrected experiment works</a>.</p>
+<p>The fold tables above record the training-design confound and the corrected fixed-cohort requirements.</p>
 <p>The complete observation intersection favors broadly observed transcripts; report it alongside coverage, rather than claiming representative performance over every transcript.</p>
 <p><a href="cohort_manifest.json">Exact cohort and evaluation rules</a> · <a href="original_test_coverage.csv">Original test coverage per dataset</a> · <a href="observed_fit_summary.csv">Mean metrics</a> · <a href="analysis_manifest.json">Snapshot provenance</a> · <a href="{stability_link}">Training diagnostics and L_bio stability</a></p>
 <h2>Refresh</h2><pre>python analyses/reevaluate_cumulative_fixed_observations.py --experiment-root {html.escape(str(root))}{refresh_output}</pre>

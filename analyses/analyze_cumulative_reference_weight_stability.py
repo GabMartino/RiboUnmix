@@ -489,7 +489,7 @@ def main(argv=None):
     body=f'''<!doctype html><html><head><meta charset="utf-8"><title>Cumulative profile stability</title><style>{STYLE}</style></head><body>
 <h1>Does ranking stabilize L_bio as lower-ranked datasets are added?</h1>
 <p>Partial results · generated {created} · training seed {seed}</p>
-<p class="note">{audit_note} <a href="../../../Docs/cumulative_cohort_audit_and_correction.html">Split audit and corrected experiment</a>.</p>
+<p class="note">{audit_note}</p>
 {observed_link}
 {snapshot_text(availability,len(ids))}
 <details><summary><b>Verified transcript folds</b></summary>{table_html(fold_counts)}
