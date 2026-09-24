@@ -7,9 +7,26 @@ sequence. RiboUnmix models those observations with a shared, sequence-based
 profile and a positive correction for each dataset. It is a research framework
 built with PyTorch, Lightning, and Hydra.
 
+[Model overview](#model-overview) ·
 [Try the notebook](notebooks/01_model_checks_and_predictions.ipynb) ·
 [Run the synthetic smoke experiment](examples/synthetic_smoke/README.md) ·
 [Training configuration](config/config_ribounmix_multidataset.yaml)
+
+## Model overview
+
+<p align="center">
+  <a href="assets/ribounmix_architecture.pdf">
+    <img src="assets/ribounmix_architecture.png" width="100%" alt="RiboUnmix architecture: a shared sequence branch and a dataset-conditioned correction and dispersion branch define replicate-level NB2 count profiles.">
+  </a>
+</p>
+
+The sequence-only branch produces a positive, mean-one shared profile
+`L_bio`. A separate branch combines sequence with dataset identity to estimate
+the multiplicative correction `gamma` and position-specific NB2 dispersion.
+Fixed-reference centering defines the coordinate system of the decomposition;
+the observed replicate mean supplies count scale. Raw replicates supervise the
+NB2 likelihood, while their arithmetic consensus supplies auxiliary shape
+objectives. [Open the vector figure.](assets/ribounmix_architecture.pdf)
 
 ## Start here
 
@@ -168,6 +185,45 @@ replica consensus; their coefficients and the gamma penalty are configurable.
 Use each run's frozen config to describe its objective. One observed profile
 stored as one replica does not establish a benefit from biological replication.
 
+## Selected manuscript results
+
+These panels provide scientific context for the software; the lightweight
+repository does not include the complete manuscript result trees or their
+analysis pipeline, and the bundled smoke experiment does not reproduce them.
+
+### Controlled synthetic recovery
+
+<p align="center">
+  <a href="assets/synthetic_recovery.pdf">
+    <img src="assets/synthetic_recovery.png" width="100%" alt="Synthetic recovery of the shared profile, programmed kinetic profile, and centered dataset corrections as the number of included datasets increases.">
+  </a>
+</p>
+
+Across cumulative panels of 2--10 simulated datasets and three nominal read
+depths, the figure compares the fitted shared profile with the simulated
+two-trajectory occupancy consensus (A), with the upstream programmed
+kinetic profile (B), and the fitted log-corrections with the identifiable
+centered injected effects (C). PCC and RMSE quantify different properties and
+use separately labelled axes. These estimates are conditional on seed-42,
+best-validation-loss fits; they are not uncertainty over training seeds.
+[Open the vector figure.](assets/synthetic_recovery.pdf)
+
+### Reproducibility on heterogeneous real data
+
+<p align="center">
+  <a href="assets/real_data_stability.pdf">
+    <img src="assets/real_data_stability.png" width="100%" alt="Shared-profile reproducibility across source-disjoint real-data panels and stability along nested best-first dataset collections.">
+  </a>
+</p>
+
+Panel A compares transcript-level shared profiles across four source-family-
+disjoint HEK Ribo-seq collections. Panel B follows agreement with each
+reference policy's own initial `N = 2` fit as datasets are added along a nested
+best-first path. Cross-panel agreement supports reproducibility under the
+model, whereas cumulative agreement measures reference sensitivity; neither
+establishes biological correctness. All displayed fits use training seed 42.
+[Open the vector figure.](assets/real_data_stability.pdf)
+
 ## Verify the public package
 
 The bundled verifier checks fixture and checkpoint hashes, finite tensors,
@@ -183,6 +239,7 @@ python examples/synthetic_smoke/run.py replay
 
 ```text
 notebooks/                        Interactive model checks and prediction inspection
+assets/                           Web previews and vector manuscript figures
 examples/synthetic_smoke/         Runnable data, checkpoint, replay, and verifier
 Models/RiboUnmixModel/            Shared and dataset-conditioned branches
 Models/RiboUnmixLightningModule.py Losses, training steps, and prediction export
