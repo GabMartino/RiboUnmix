@@ -40,7 +40,7 @@ from Models.RiboUnmixLightningModule import (
     RiboUnmixLightningModule,
     resolve_sample_reduction_mode,
 )
-from Utils.checkpoints import find_checkpoint
+from Utils.checkpoints import find_checkpoint, parameter_hash
 from Utils.external_transcript_split import (
     assert_expected_transcript_split,
     load_external_transcript_split,
@@ -2337,7 +2337,6 @@ def main(cfg: DictConfig) -> None:
     )
     expected_initialization = cfg_get(cfg, 'orchestrator.initialization_sha256', None)
     if expected_initialization is not None:
-        from Utils.campaign_training import parameter_hash
         if parameter_hash(torch_model) != expected_initialization:
             raise ValueError('Initial model parameters differ from the frozen campaign initialization audit.')
     print(

@@ -9,7 +9,6 @@ built with PyTorch, Lightning, and Hydra.
 
 [Try the notebook](notebooks/01_model_checks_and_predictions.ipynb) ·
 [Run the synthetic smoke experiment](examples/synthetic_smoke/README.md) ·
-[Explore the analyses](analyses/README.md) ·
 [Training configuration](config/config_ribounmix_multidataset.yaml)
 
 ## Start here
@@ -21,7 +20,6 @@ built with PyTorch, Lightning, and Hydra.
 | Inspect a trained prediction | Optional prediction section of the notebook | A saved prediction Parquet file |
 | Train across Ribo-seq datasets | `main_ribounmix_multidataset.py` | Prepared sequence and replica-profile tables |
 | Train a single-organism benchmark | `main_ribounmix_benchmarking.py` | The corresponding CDS and weighted profile tables |
-| Reproduce experiment figures | [Analysis index](analyses/README.md) | The experiment's saved outputs and manifests |
 
 ## Run the reviewer smoke experiment
 
@@ -170,26 +168,16 @@ replica consensus; their coefficients and the gamma penalty are configurable.
 Use each run's frozen config to describe its objective. One observed profile
 stored as one replica does not establish a benefit from biological replication.
 
-## Evaluate and reproduce
+## Verify the public package
 
-Analysis code lives in **`analyses/`**. Training outputs stay in **`results/`**;
-derived tables and working figures go in **`analyses/artifacts/`**. See the
-[analysis index](analyses/README.md) for experiment-specific commands.
-
-For the matched four-organism loss ablation, explicitly include all completed
-training seeds:
+The bundled verifier checks fixture and checkpoint hashes, finite tensors,
+positive predictions, shared-profile normalization, and gamma-centering
+constraints:
 
 ```bash
-RIBOUNMIX_PLOT_TEX=0 python analyses/analyze_benchmark_loss_ablation.py \
-  --experiment-root results/riboai_benchmarking_experiments/loss_ablation_v1 \
-  --training-seeds 42,43,44 --require-complete
+python examples/synthetic_smoke/run.py verify
+python examples/synthetic_smoke/run.py replay
 ```
-
-Use identical held-out transcripts and a common checkpoint rule when comparing
-objectives. Transcript-bootstrap intervals are conditional on fitted runs;
-show seed variability separately. For transformed-PCC comparisons, use a common
-transform such as `log1p`: the saved model-specific NB-VST transform changes
-with each model's predicted dispersion.
 
 ## Project map
 
@@ -199,26 +187,12 @@ examples/synthetic_smoke/         Runnable data, checkpoint, replay, and verifie
 Models/RiboUnmixModel/            Shared and dataset-conditioned branches
 Models/RiboUnmixLightningModule.py Losses, training steps, and prediction export
 Dataloaders/RiboUnmix*/           Data loading, masks, replicas, and grouped batches
-config/                          Runnable configurations and experiment designs
-analyses/                        Analysis and figure-generation source
-Tests/                           Scientific and numerical regression checks
+config/                          Runnable model and dataset configurations
 Datasets/                        Preprocessing source and local data assets
 ```
 
-Run the self-contained public test profile from the repository root:
-
-```bash
-python Tests/run_public_tests.py
-```
-
-The remaining test modules include integration checks for full experimental
-data and historical result trees that are intentionally not distributed in
-this lightweight repository. They are retained as executable specifications,
-but require the corresponding private or separately archived artifacts.
-
-The project is named **RiboUnmix**. Earlier `RiboAI`, `Queuing`, and `Queueing`
-imports remain as compatibility adapters so historical checkpoints and command
-lines are not silently broken.
+The public package uses the **RiboUnmix** names throughout. Historical run
+orchestration and manuscript-specific analysis code are intentionally omitted.
 
 ## Research status
 

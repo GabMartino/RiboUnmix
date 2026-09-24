@@ -28,13 +28,12 @@ job_*.err
 /Datasets/benchmarking_data/*.parquet
 /Datasets/benchmarking_data/weighted/
 
-# Generated training and analysis artifacts
+# Generated training artifacts
 /checkpoints/
 /logs/
 /outputs/
 /results/
 /figures/
-/analyses/artifacts/
 lightning_logs/
 wandb/
 *.ckpt

@@ -1,9 +1,0 @@
-name: synthetic_gamma_unity_C2_seed42
-depth_reads_per_codon: 2
-# Resolve these exact archived runs, not whichever run has the best score.
-# The frozen saved configs supply every scientific/training setting.
-experiments:
-  - N: 2
-    source_run: results/riboai_synthetic_experiments/riboai_synthetic_within_2_per_codon_panel2_gammaequal_seed42_massfree_bf16_test_20260828_232959_9
-  - N: 10
-    source_run: results/riboai_synthetic_experiments/riboai_synthetic_within_2_per_codon_panel10_gammaequal_seed42_massfree_bf16_test_20260828_232959_17
