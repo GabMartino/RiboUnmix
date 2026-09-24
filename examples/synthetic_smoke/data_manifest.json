@@ -1,0 +1,117 @@
+{
+  "datasets": [
+    "artificial_bias_5prime_aa",
+    "artificial_bias_3prime_cc"
+  ],
+  "published_files": {
+    "data/artificial_bias_3prime_cc.parquet": {
+      "bytes": 24016,
+      "sha256": "7e78d3e4994b3b97f3efe51a94859e4d01d5fefc45c872b5028b47a13b32db90"
+    },
+    "data/artificial_bias_5prime_aa.parquet": {
+      "bytes": 23541,
+      "sha256": "1958170dc5abb5ab9b6ff87f7a34e7c6a7f09270606eb591ebef1dfd0bf4c97e"
+    },
+    "data/sequences.parquet": {
+      "bytes": 11740,
+      "sha256": "eefabdda005f9f3baa817dc46ed7b920bdb797d33b8db534267b647a4c8f13be"
+    }
+  },
+  "purpose": "CPU-runnable integration smoke test; not an article-scale result",
+  "schema_version": 1,
+  "seed_note": "No random selection was used. Production train/validation splitting uses seed 42.",
+  "selection": {
+    "eligible_conditions": [
+      "present in both datasets",
+      "stored weight > 0",
+      "positive consensus total",
+      "80 <= CDS codons <= 240",
+      "sequence/profile lengths match"
+    ],
+    "maximum_cds_codons": 240,
+    "minimum_cds_codons": 80,
+    "rule": "64 evenly spaced records after sorting eligible transcripts by (CDS length, transcript_id)",
+    "source_depth_reads_per_codon": 2,
+    "transcript_count": 64,
+    "transcript_ids": [
+      "ENST00000219400.8",
+      "ENST00000448599.2",
+      "ENST00000382656.2",
+      "ENST00000278282.3",
+      "ENST00000244930.6",
+      "ENST00000695931.1",
+      "ENST00000403376.4",
+      "ENST00000578186.3",
+      "ENST00000369838.6",
+      "ENST00000391624.1",
+      "ENST00000273968.5",
+      "ENST00000683896.1",
+      "ENST00000339468.8",
+      "ENST00000315732.3",
+      "ENST00000215829.8",
+      "ENST00000259254.9",
+      "ENST00000331128.6",
+      "ENST00000579755.2",
+      "ENST00000267884.11",
+      "ENST00000330133.5",
+      "ENST00000331587.9",
+      "ENST00000296871.4",
+      "ENST00000222402.8",
+      "ENST00000647634.2",
+      "ENST00000259881.10",
+      "ENST00000683975.1",
+      "ENST00000356714.6",
+      "ENST00000318364.13",
+      "ENST00000373824.9",
+      "ENST00000338483.7",
+      "ENST00000373699.6",
+      "ENST00000367975.7",
+      "ENST00000371626.9",
+      "ENST00000272324.10",
+      "ENST00000450660.3",
+      "ENST00000369585.4",
+      "ENST00000640271.3",
+      "ENST00000403490.3",
+      "ENST00000261313.3",
+      "ENST00000228534.6",
+      "ENST00000371625.8",
+      "ENST00000643770.2",
+      "ENST00000638166.2",
+      "ENST00000286428.7",
+      "ENST00000639969.1",
+      "ENST00000640159.2",
+      "ENST00000398531.3",
+      "ENST00000086933.3",
+      "ENST00000380591.8",
+      "ENST00000381394.9",
+      "ENST00000643224.2",
+      "ENST00000215368.4",
+      "ENST00000267838.7",
+      "ENST00000320776.5",
+      "ENST00000342972.3",
+      "ENST00000359995.10",
+      "ENST00000327299.8",
+      "ENST00000329271.8",
+      "ENST00000372780.6",
+      "ENST00000527958.6",
+      "ENST00000286317.6",
+      "ENST00000334176.4",
+      "ENST00000404589.8",
+      "ENST00000672715.1"
+    ]
+  },
+  "source_files": {
+    "Datasets/data/sequence/MANE.selection.sequence_embeddings_with_css.parquet": {
+      "bytes": 166031790,
+      "sha256": "ded2606fffe2abd7be9043e9ca81d614e3b828d1c2c5f676d201c97ccd515961"
+    },
+    "Datasets/data/weighted_synthetic/2_per_codon/artificial_bias_3prime_cc.parquet": {
+      "bytes": 28986853,
+      "sha256": "02ccc6baf21892b8f04efd6b64a6a92aa8a0d22fb946783d78b1e610b1213b6d"
+    },
+    "Datasets/data/weighted_synthetic/2_per_codon/artificial_bias_5prime_aa.parquet": {
+      "bytes": 27088233,
+      "sha256": "799a6a21e8a2852d4ca781213e2be56a4d477c87d96b84ee7e7b7db2b48f7cb7"
+    }
+  }
+}

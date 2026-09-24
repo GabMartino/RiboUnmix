@@ -1,0 +1,63 @@
+study_id: benchmark_loss_ablation_v1
+description: >-
+  Matched ablation of the two consensus-correlation terms in the four
+  single-dataset organism benchmarks. The full arm is rerun as a contemporaneous
+  control; historical outputs are descriptive only.
+
+datasets:
+  - human_iwasaki_2014
+  - yeast_stein_2021
+  - celegans_stein_2021
+  - ecoli_zhang_2016
+
+# Order is frozen because it defines the stable SLURM-array task mapping.
+arms:
+  full:
+    label: Replica NB + raw PCC + NB-VST PCC
+    replica_nb_weight: 1.0
+    consensus_raw_pcc_weight: 0.5
+    consensus_nb_vst_pcc_weight: 0.5
+  nb_only:
+    label: Replica NB only
+    replica_nb_weight: 1.0
+    consensus_raw_pcc_weight: 0.0
+    consensus_nb_vst_pcc_weight: 0.0
+  nb_raw_pcc:
+    label: Replica NB + raw PCC
+    replica_nb_weight: 1.0
+    consensus_raw_pcc_weight: 0.5
+    consensus_nb_vst_pcc_weight: 0.0
+  nb_vst_pcc:
+    label: Replica NB + NB-VST PCC
+    replica_nb_weight: 1.0
+    consensus_raw_pcc_weight: 0.0
+    consensus_nb_vst_pcc_weight: 0.5
+
+fixed:
+  split_seed: 42
+  batch_size: 32
+  gamma_reg_weight: 1.0e-4
+  checkpoint_variants:
+    - best_nb_nll
+    - best_val_loss
+    - best_pcc
+
+analysis:
+  primary_checkpoint: best_nb_nll
+  bootstrap_draws: 5000
+  bootstrap_seed: 20260918
+
+scientific_scope:
+  consensus_note: >-
+    Each benchmark dataset supplies one observed profile per transcript, stored
+    internally as one replica. Its arithmetic consensus is therefore the same
+    profile. This design tests the raw and NB-VST correlation objectives, not a
+    benefit from combining multiple biological replicates.
+  regularizer_note: >-
+    gamma_reg_weight is held fixed in every arm. “NB2 only” means NB2 is the
+    only active data-fit term; removing the gamma regularizer would be a second
+    intervention and would confound this ablation.
+  nb_mode_note: >-
+    Every arm retains experiment_mode=mean_gradient_reweighted_nb and
+    nb_mean_gradient_beta=0.5. The ablation removes PCC terms; it is not an
+    ablation of the configured NB mean-gradient reweighting.

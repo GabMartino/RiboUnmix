@@ -1,0 +1,16 @@
+{
+  "created_utc": "2026-09-16T15:33:08.748224+00:00",
+  "source_sha256": {
+    "results/four_panel_stability_seed42/analysis/analysis_manifest.json": "c0e7b7a6e6aa027df6584d31d4c5dce5401e789cfdc179a4e26c38ce336a0e4f",
+    "results/four_panel_stability_seed42/analysis/agreement_summary.csv": "594a2da7eae1873f030ee65c176628b82335a79e63cd4208b4a056ba3c757490",
+    "results/four_panel_stability_seed42/analysis/paired_policy_improvements.csv": "d00b172786c8844f662c8fa78d6dc4fa3f499b236d7b1114133a98e6692217b3",
+    "results/four_panel_stability_seed42/analysis/gamma_ablation_effects.csv": "0da5dbe2888aba60ffc619be31a95e21850f89d2df40db13b2edc8e6c24b5af2",
+    "results/four_panel_stability_seed42/analysis/validation_fit.csv": "3d3653515c8a987c0763cfca2da67a5c2a84b8cf1ed55d1751f6fa84003def46",
+    "results/four_panel_stability_seed42/analysis/profile_variance.csv": "4516de85054eb50e1eed213afd471e688468e2c71c34a135b429317e67a8cc03",
+    "results/four_panel_stability_seed42/analysis/transcript_agreement.csv": "d3368e528b376d14fbaf5e5bc0fa7d85eea72e8741f447dee4120d16cee6a13f",
+    "results/four_panel_stability_seed42/analysis/availability.csv": "92c5427b3d2b79b056800f32e874e486c58d3af2f8295cf54d7f93bba79ba6e0",
+    "results/cumulative_stability_seed42/analysis/analysis_manifest.json": "70a5e2d26f70ca06ffe8d8631ab9702a1cb9079ab849ae59358c6ee7cf7d0bc2",
+    "results/cumulative_stability_seed42/analysis/paired_policy_improvements.csv": "f0be251511a403bd74c01bdcbec612b53d6d9b33b7f28ef3028ab68fcfbef470",
+    "results/cumulative_stability_seed42/analysis/stability_summary.csv": "85508925ffb6f758b3a993b319588c7fec1970b3c969e93905e78d8a91c47b9c"
+  }
+}

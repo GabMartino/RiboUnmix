@@ -1,0 +1,197 @@
+name: ribounmix_benchmarking
+
+experiment:
+  from_checkpoint: false
+  train: true
+  predict: true
+  # Exactly one key from benchmarking.datasets. Lists and "all" are rejected.
+  dataset: human_iwasaki_2014
+  seed: 42
+
+prediction:
+  # Produce separately labelled test predictions from the three canonical
+  # checkpoint choices; none silently replaces another.  The NB2 checkpoint
+  # is especially useful when comparing objectives whose total validation
+  # losses have different definitions/scales.
+  checkpoint_variants:
+    - best_val_loss
+    - best_pcc
+    - best_nb_nll
+
+benchmarking:
+  datasets:
+    human_iwasaki_2014:
+      ribo_path: ./Datasets/benchmarking_data/weighted/human_iwasaki_2014.parquet
+      cds_path: ./Datasets/benchmarking_data/human_iwasaki_2014_cds.parquet
+    yeast_stein_2021:
+      ribo_path: ./Datasets/benchmarking_data/weighted/yeast_stein_2021.parquet
+      cds_path: ./Datasets/benchmarking_data/yeast_stein_2021_yeast_cds.parquet
+    celegans_stein_2021:
+      ribo_path: ./Datasets/benchmarking_data/weighted/celegans_stein_2021.parquet
+      cds_path: ./Datasets/benchmarking_data/celegans_stein_2021_cds.parquet
+    ecoli_zhang_2016:
+      ribo_path: ./Datasets/benchmarking_data/weighted/ecoli_zhang_2016.parquet
+      cds_path: ./Datasets/benchmarking_data/ecoli_zhang_2016_cds.parquet
+
+split:
+  # Splits are generated independently within every selected dataset.
+  # null preserves the historical behavior (use experiment.seed).  Ablations
+  # can set this explicitly to keep data partitions fixed across training seeds.
+  seed: null
+  train_frac: 0.8
+  val_frac: 0.1
+  test_frac: 0.1
+
+paths:
+  checkpoints: ./checkpoints/ribounmix_benchmarking
+  logs: ./logs/ribounmix_benchmarking
+  results: ./results/ribounmix_benchmarking
+  encodings:
+    nt: Datasets/encodings/nt_encoding.yaml
+    codon_to_aa: Datasets/encodings/codon2aa.yaml
+    codon: Datasets/encodings/codon_encoding.yaml
+    aa: Datasets/encodings/aa_encoding.yaml
+    datasets: Datasets/encodings/benchmarking_dataset_encoding.yaml
+
+data:
+  # One pair per transcript is present in a single-dataset benchmark run.
+  # Consequently this is also the number of unique transcripts in a physical
+  # batch (apart from the final partial batch).
+  batch_size: 32
+  num_workers: 2
+  predict_num_workers: 0
+  multiprocessing_context: spawn
+  train_sampling_strategy: transcript_grouped_pairs
+  pin_memory: true
+  prefetch_factor: 2
+  # false stores compact uint8 codons and expands the 97 features per batch.
+  # true is faster per epoch but the largest dataset needs about 4.4 GB.
+  precompute_features: false
+  # Run Datasets/benchmarking_data/weight_benchmarking_datasets.py before
+  # training. It physically removes zero-information rows, writes the shared
+  # median-normalized reliability weight, and records the one observed source
+  # profile as one explicit replica. There is no runtime replica synthesis.
+
+model:
+  # These columns are not present in the benchmarking CDS files; keep all routes off.
+  additional_sequence_features:
+    exo: {dimension: 3, route: none, scale: 1.0}
+    gmp: {dimension: 3, route: none, scale: 1.0}
+    tmp: {dimension: 3, route: none, scale: 1.0}
+    openen: {dimension: 3, route: none, scale: 1.0}
+    tAI_profile_codon: {dimension: 1, route: none, scale: 1.0, missing_values: [-1000.0], fill_value: 0.0}
+    fra: {dimension: 3, route: none, scale: 1.0}
+
+  init_gamma: 1.0
+  # gamma = exp(centered_log_score), with no separate sparse support gate.
+  # Current mass-free model: the predicted profile depth is not forced to equal
+  # the observed profile depth exactly. The NB2/PCC objective learns it instead.
+  mass_conservation: false
+  alpha_mode: learned
+  fixed_alpha: 0.1
+  gamma_centering:
+    # A run contains only one dataset, so cross-dataset centering is not
+    # identifiable and batch_grouped uses its documented singleton fallback.
+    mode: batch_grouped
+    dataset_constant_scale_gauge: geometric_mean_one
+
+  biological_params:
+    input_size: 97
+    hidden_size: 256
+    num_layers: 2
+    dropout: 0.0
+    init_local_hazard_factor: 1.0
+    init_local_hazard_weight_std: 1.0e-2
+
+  dataset_bias_params:
+    position_features:
+      - rel_pos
+      - start_window
+      - stop_window
+    position_edge_tau: 100.0
+    position_scale: 5000.0
+    # Capacity of the shared dataset-ID embedding table. It does NOT combine
+    # datasets: main_ribounmix_benchmarking.py selects exactly one
+    # ID and constructs one independent Trainer/model run at a time.
+    num_datasets: 4
+    dataset_embeddings_size: 32
+    num_codons: 64
+    codon_embeddings_size: 16
+    use_nucleotide_amino_acid_embeddings: true
+    nucleotide_embeddings_size: 4
+    amino_acid_embeddings_size: 8
+    context_gru_hidden_size: 128
+    context_gru_num_layers: 2
+    context_gru_dropout: 0.0
+    dataset_multiplicative_allocation_bias_submodule_params:
+      hidden_size: 128
+      dropout: 0.1
+    dataset_log_sigma_submodule_params:
+      dataset_embedding_size: 16
+      hidden_size: 128
+      dropout: 0.1
+      init_log_sigma: 0.2
+
+loss:
+  experiment_mode: mean_gradient_reweighted_nb
+  # Fixed four-term objective. A benchmarking source has one profile,
+  # represented internally as one replica, so its arithmetic consensus is that
+  # same profile. Zero-weight terms are not computed.
+  replica_nb_weight: 1.0
+  consensus_raw_pcc_weight: 0.5
+  consensus_nb_vst_pcc_weight: 0.5
+  gamma_reg_weight: 1.0e-4
+  # In a one-dataset run, transcript_balanced would reduce each singleton
+  # group to its own loss and therefore cancel its reliability weight. A global
+  # weighted mean is the intended benchmark objective: sum_t w_t*z_t/sum_t w_t.
+  # dataset_balanced is mathematically identical here because only one dataset
+  # is represented.
+  sample_reduction: global_weighted
+  eps: 1.0e-8
+  nb_log_alpha_min: -5.0
+  nb_log_alpha_max: 1.0
+  nb_mean_gradient_beta: 0.5
+  nb_mean_gradient_max_weight: null
+  nb_sequence_reduction: length_tempered
+  nb_length_temper_gamma: 0.75
+  nb_length_temper_ref: 1000.0
+  nb_length_temper_min_weight: 0.5
+  nb_length_temper_max_weight: 2.0
+  min_pcc_target_var: 1.0e-6
+  pcc_detach_alpha: true
+  pcc_prediction_floor: 0.0
+
+optim:
+  lr_biological: 5.0e-4
+  lr_rest: 1.0e-3
+  # The NB2 log-alpha head uses lr_rest times this scale.
+  alpha_learning_rate_scale: 0.1
+  weight_decay_bio: 1.0e-2
+  weight_decay_rest: 1.0e-2
+  scheduler:
+    monitor: val_loss
+    mode: min
+    factor: 0.99
+    patience: 5
+    min_lr: 1.0e-6
+
+trainer:
+  devices: [0]
+  accelerator: gpu
+  precision: bf16-mixed
+  use_distributed_sampler: false
+  accumulate_grad_batches: 1
+  max_epochs: 200
+  log_every_n_steps: 1
+  sync_dist_logs: false
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+
+callbacks:
+  early_stopping_patience: 20
+
+metrics:
+  log_train_per_dataset_metrics: false
+  log_validation_transcript_mu_pcc_distribution: true
+  log_example_plot: true
+  example_plot_max_datasets: 2

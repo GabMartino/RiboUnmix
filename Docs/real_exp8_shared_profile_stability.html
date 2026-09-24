@@ -1,0 +1,943 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RiboUnmix Experiment 8 — Stability of the shared profile</title>
+  <style>
+    :root {
+      --ink: #17212b;
+      --muted: #5b6873;
+      --paper: #fbfcfe;
+      --panel: #ffffff;
+      --line: #dbe3ea;
+      --blue: #225ea8;
+      --blue-soft: #eaf3ff;
+      --green: #17795a;
+      --green-soft: #eaf8f2;
+      --amber: #925d00;
+      --amber-soft: #fff6df;
+      --violet: #6b4bb6;
+      --violet-soft: #f2edff;
+      --red: #a23a3a;
+      --red-soft: #fff0ef;
+      --shadow: 0 12px 30px rgba(24, 43, 67, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 10% 0%, #edf5ff 0, transparent 28rem),
+        radial-gradient(circle at 95% 12%, #f4efff 0, transparent 24rem),
+        var(--paper);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", sans-serif;
+      line-height: 1.63;
+    }
+
+    code, pre {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    }
+
+    code {
+      padding: 0.08rem 0.32rem;
+      border-radius: 0.3rem;
+      background: #eef2f6;
+      font-size: 0.91em;
+    }
+
+    a { color: var(--blue); }
+
+    .page {
+      width: min(1180px, calc(100% - 32px));
+      margin: 28px auto 80px;
+    }
+
+    .hero {
+      padding: clamp(28px, 5vw, 62px);
+      color: white;
+      background: linear-gradient(128deg, #123b68 0%, #245f9f 55%, #6344a0 100%);
+      border-radius: 24px;
+      box-shadow: var(--shadow);
+    }
+
+    .eyebrow {
+      margin: 0 0 0.45rem;
+      text-transform: uppercase;
+      letter-spacing: 0.13em;
+      font-size: 0.78rem;
+      font-weight: 750;
+      opacity: 0.82;
+    }
+
+    h1 {
+      max-width: 900px;
+      margin: 0;
+      font-size: clamp(2rem, 5vw, 4rem);
+      line-height: 1.08;
+      letter-spacing: -0.035em;
+    }
+
+    .subtitle {
+      max-width: 850px;
+      margin: 1.2rem 0 0;
+      font-size: clamp(1rem, 2vw, 1.23rem);
+      color: #e8f1ff;
+    }
+
+    .badges {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.65rem;
+      margin-top: 1.5rem;
+    }
+
+    .badge {
+      padding: 0.36rem 0.72rem;
+      border: 1px solid rgba(255,255,255,0.34);
+      border-radius: 999px;
+      background: rgba(255,255,255,0.12);
+      font-size: 0.86rem;
+      font-weight: 650;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 260px;
+      gap: 28px;
+      align-items: start;
+      margin-top: 28px;
+    }
+
+    main { min-width: 0; }
+
+    nav {
+      position: sticky;
+      top: 18px;
+      padding: 20px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: rgba(255,255,255,0.94);
+      box-shadow: var(--shadow);
+      font-size: 0.9rem;
+    }
+
+    nav strong { display: block; margin-bottom: 0.5rem; }
+    nav a { display: block; padding: 0.25rem 0; text-decoration: none; }
+    nav a:hover { text-decoration: underline; }
+
+    section {
+      margin-bottom: 24px;
+      padding: clamp(22px, 4vw, 38px);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: var(--panel);
+      box-shadow: 0 8px 24px rgba(24, 43, 67, 0.045);
+    }
+
+    h2 {
+      margin: 0 0 1rem;
+      color: #173e67;
+      font-size: clamp(1.4rem, 3vw, 2rem);
+      line-height: 1.2;
+    }
+
+    h3 {
+      margin: 1.8rem 0 0.7rem;
+      color: #264c70;
+      font-size: 1.2rem;
+    }
+
+    h4 { margin: 1.2rem 0 0.45rem; }
+    p { margin: 0.68rem 0; }
+
+    .lead {
+      font-size: 1.08rem;
+      color: #34495b;
+    }
+
+    .callout {
+      margin: 1rem 0;
+      padding: 16px 18px;
+      border-left: 5px solid var(--blue);
+      border-radius: 10px;
+      background: var(--blue-soft);
+    }
+
+    .callout.green { border-color: var(--green); background: var(--green-soft); }
+    .callout.amber { border-color: var(--amber); background: var(--amber-soft); }
+    .callout.red { border-color: var(--red); background: var(--red-soft); }
+
+    .equation {
+      overflow-x: auto;
+      margin: 1rem 0;
+      padding: 8px 16px;
+      border: 1px solid #d7e4f1;
+      border-radius: 10px;
+      background: #f8fbff;
+      text-align: center;
+    }
+
+    .grid-2, .grid-3 {
+      display: grid;
+      gap: 16px;
+      margin: 1rem 0;
+    }
+
+    .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+
+    .card {
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #fbfdff;
+    }
+
+    .card h3, .card h4 { margin-top: 0; }
+    .card.pi { border-top: 5px solid var(--violet); background: var(--violet-soft); }
+    .card.w { border-top: 5px solid var(--green); background: var(--green-soft); }
+
+    .pipeline {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(120px, 1fr));
+      gap: 9px;
+      margin: 1.2rem 0;
+      align-items: stretch;
+    }
+
+    .pipeline .step {
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      min-height: 120px;
+      padding: 14px;
+      border: 1px solid #cfddeb;
+      border-radius: 12px;
+      background: #f4f9ff;
+      text-align: center;
+    }
+
+    .pipeline .step:not(:last-child)::after {
+      content: "→";
+      position: absolute;
+      right: -15px;
+      top: 42%;
+      z-index: 2;
+      color: var(--blue);
+      font-size: 1.35rem;
+      font-weight: 800;
+    }
+
+    .step b { display: block; margin-bottom: 0.3rem; }
+    .step span { color: var(--muted); font-size: 0.85rem; }
+
+    table {
+      width: 100%;
+      margin: 1rem 0;
+      border-collapse: collapse;
+      font-size: 0.93rem;
+    }
+
+    th, td {
+      padding: 0.68rem 0.72rem;
+      border: 1px solid var(--line);
+      vertical-align: top;
+      text-align: left;
+    }
+
+    th { color: #173e67; background: #edf4fb; }
+    tbody tr:nth-child(even) { background: #fbfcfd; }
+    .num { text-align: right; font-variant-numeric: tabular-nums; }
+
+    ul, ol { padding-left: 1.35rem; }
+    li { margin: 0.38rem 0; }
+
+    pre {
+      overflow-x: auto;
+      padding: 16px;
+      color: #eaf3ff;
+      background: #172636;
+      border-radius: 12px;
+      line-height: 1.48;
+      font-size: 0.86rem;
+    }
+
+    .mini { color: var(--muted); font-size: 0.87rem; }
+    .good { color: var(--green); font-weight: 700; }
+    .nowrap { white-space: nowrap; }
+
+    footer {
+      padding: 14px 4px;
+      color: var(--muted);
+      text-align: center;
+      font-size: 0.85rem;
+    }
+
+    @media (max-width: 900px) {
+      .layout { grid-template-columns: 1fr; }
+      nav { position: static; order: -1; }
+      .pipeline { grid-template-columns: 1fr; }
+      .pipeline .step:not(:last-child)::after {
+        content: "↓";
+        right: auto;
+        left: 49%;
+        top: auto;
+        bottom: -20px;
+      }
+    }
+
+    @media (max-width: 680px) {
+      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+      table { display: block; overflow-x: auto; }
+    }
+  </style>
+  <script>
+    window.MathJax = {
+      tex: {
+        inlineMath: [['\\(', '\\)']],
+        displayMath: [['\\[', '\\]']],
+        processEscapes: true
+      },
+      options: {
+        skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code']
+      }
+    };
+  </script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+</head>
+<body>
+<div style="padding:10px 18px;background:#eaf4fb;border-bottom:1px solid #bdd7e8;text-align:center;font:600 14px/1.4 system-ui,sans-serif">Continuing Experiment 8? First read the <a href="project_model_onboarding.html">project onboarding and safe-handoff guide</a>.</div>
+  <div class="page">
+    <header class="hero">
+      <p class="eyebrow">RiboUnmix · real-data Experiment 8</p>
+      <h1>Stability of the shared profile as dataset number and diversity increase</h1>
+      <p class="subtitle">
+        A reproducible, overlap-controlled experiment asking whether independently trained
+        models converge toward the same sequence-dependent profile \(L_t\) when they receive
+        more heterogeneous Ribo-seq views.
+      </p>
+      <div class="badges">
+        <span class="badge">114-dataset universe</span>
+        <span class="badge">34 default trainings</span>
+        <span class="badge">source-family atomic</span>
+        <span class="badge">mass free</span>
+        <span class="badge">best validation loss</span>
+      </div>
+    </header>
+
+    <div class="layout">
+      <main>
+        <section id="answer">
+          <h2>The short answer about equal weighting</h2>
+          <div class="callout green">
+            <strong>“Equal weighting” applies only to the fixed-reference gamma gauge:</strong>
+            each selected dataset has \(\pi_d=1/N\) when defining what counts as a shared
+            effect versus a dataset-specific effect. It does <em>not</em> give every observed
+            transcript–dataset pair the same influence on training. Observation quality is
+            still handled separately by the reliability weight \(w_{dt}\).
+          </div>
+          <p class="lead">
+            This choice is necessary for the primary dataset-count experiment because a
+            quality-ranked gamma reference would change both the evidence available to the
+            model and the mathematical definition of \(L_t\) as \(N\) changes. Uniform
+            \(\pi_d\) keeps the reference convention neutral; \(w_{dt}\) continues to tell the
+            loss which measurements are more reliable.
+          </p>
+        </section>
+
+        <section id="question">
+          <h2>1. Scientific question and model</h2>
+          <p>
+            For dataset \(d\), transcript \(t\), codon position \(i\), and raw replica \(r\),
+            the current model uses the mass-free mean
+          </p>
+          <div class="equation">
+            \[
+              Y_{dtri}\sim\operatorname{NB2}(\mu_{dti},\alpha_{dti}),
+              \qquad
+              \mu_{dti}=S_{dt}\,L_{ti}\,\gamma_{dti},
+              \qquad
+              \operatorname{Var}(Y)=\mu+\alpha\mu^2.
+            \]
+          </div>
+          <ul>
+            <li>\(S_{dt}\) is the target-derived transcript–dataset mean-count scale.</li>
+            <li>\(L_{ti}\) is the dataset-independent sequence-dependent profile and has valid-position mean one.</li>
+            <li>\(\gamma_{dti}\) is the positive dataset-specific positional observation effect.</li>
+            <li>\(\alpha_{dti}\) is learned NB2 dispersion.</li>
+          </ul>
+          <p>
+            Experiment 8 asks whether two models trained on independently selected datasets
+            produce increasingly similar \(L_t\) as the number of datasets grows. It is a
+            <strong>stability/convergence</strong> experiment, not a ground-truth recovery
+            experiment. The model trained on all 114 datasets is an empirical reference,
+            not biological truth.
+          </p>
+
+          <div class="pipeline" aria-label="Experiment workflow">
+            <div class="step"><b>114 datasets</b><span>eligible weighted real profiles</span></div>
+            <div class="step"><b>Atomic families</b><span>publication-linked datasets stay together</span></div>
+            <div class="step"><b>QC-matched subsets</b><span>exact \(N\), deterministic search</span></div>
+            <div class="step"><b>Independent models</b><span>same architecture and training seed</span></div>
+            <div class="step"><b>Common test \(L_t\)</b><span>PCC, Spearman, and RMSE</span></div>
+          </div>
+        </section>
+
+        <section id="matrix">
+          <h2>2. Exact experiment matrix</h2>
+          <table>
+            <thead>
+              <tr><th>Dataset count \(N\)</th><th>Construction</th><th class="num">Models</th><th>Primary use</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>2</td><td>3 source-family-disjoint A/B pairs</td><td class="num">6</td><td>Independent stability + convergence to full</td></tr>
+              <tr><td>5</td><td>3 source-family-disjoint A/B pairs</td><td class="num">6</td><td>Independent stability + convergence to full</td></tr>
+              <tr><td>10</td><td>3 source-family-disjoint A/B pairs</td><td class="num">6</td><td>Independent stability + convergence to full</td></tr>
+              <tr><td>20</td><td>3 source-family-disjoint A/B pairs</td><td class="num">6</td><td>Independent stability + convergence to full</td></tr>
+              <tr><td>40</td><td>3 source-family-disjoint A/B pairs</td><td class="num">6</td><td>Independent stability + convergence to full</td></tr>
+              <tr><td>80</td><td>3 independent quality-matched subsets</td><td class="num">3</td><td>Convergence to full; overlap recorded</td></tr>
+              <tr><td>114</td><td>Complete retained collection</td><td class="num">1</td><td>Empirical full-collection reference</td></tr>
+              <tr><th colspan="2">Default total</th><th class="num">34</th><th></th></tr>
+            </tbody>
+          </table>
+          <p>
+            Runs are named, for example, <code>real_exp8_N020_pair02_A</code>,
+            <code>real_exp8_N020_pair02_B</code>, <code>real_exp8_N080_subset01</code>, and
+            <code>real_exp8_N114_full</code>. Each run saves its explicit dataset list,
+            source families, resolved configuration, splits, fitted reliability references,
+            checkpoint selection, logs, and predictions.
+          </p>
+        </section>
+
+        <section id="overlap">
+          <h2>3. Why overlap control is central</h2>
+          <p>
+            If two subsets of size \(N\) are drawn from \(D=114\) datasets, their expected
+            random overlap is
+          </p>
+          <div class="equation">
+            \[
+              \mathbb E\lvert A\cap B\rvert=\frac{N^2}{114},
+              \qquad
+              \min\lvert A\cap B\rvert=\max(0,2N-114).
+            \]
+          </div>
+          <p>
+            At \(N=80\), for example, two subsets must share at least 46 datasets. A high
+            correlation between their learned profiles could therefore reflect shared
+            training data rather than true convergence with dataset count.
+          </p>
+          <div class="grid-2">
+            <div class="card">
+              <h3>Primary statistic</h3>
+              <p>For \(N\in\{2,5,10,20,40\}\), only the designated disjoint A/B comparison is primary:</p>
+              <div class="equation">
+                \[
+                  R_N^{\mathrm{disjoint}}
+                  =\mathbb E_p\,\mathbb E_t
+                  \left[\operatorname{PCC}\!\left(L_t^{(N,p,A)},L_t^{(N,p,B)}\right)\right].
+                \]
+              </div>
+            </div>
+            <div class="card">
+              <h3>Full-reference convergence</h3>
+              <p>Every \(N&lt;114\) model is also compared with the one complete-collection solution:</p>
+              <div class="equation">
+                \[
+                  C_N=\mathbb E_a\,\mathbb E_t
+                  \left[\operatorname{PCC}\!\left(L_t^{(N,a)},L_t^{(114)}\right)\right].
+                \]
+              </div>
+            </div>
+          </div>
+          <p>
+            Every pair of runs additionally receives intersection size, union size, both
+            containment fractions, source-family overlap, expected random overlap, and
+            Jaccard similarity
+            \(J(A,B)=\lvert A\cap B\rvert/\lvert A\cup B\rvert\). Same-\(N\) all-pair
+            agreement is deliberately secondary and is never interpreted without its
+            overlap.
+          </p>
+        </section>
+
+        <section id="selection">
+          <h2>4. How datasets are selected</h2>
+
+          <h3>Source families are indivisible</h3>
+          <p>
+            The implementation reuses the Experiment-1 source-family rule. A non-empty
+            explicit <code>source_identifier</code> is preferred. Otherwise the existing
+            author/year prefix inference is used: a name whose second underscore-separated
+            token contains a digit is grouped by its first two tokens; otherwise it is
+            grouped by its first token. If one dataset in a family is selected, every
+            dataset in that family is selected.
+          </p>
+          <p>
+            Exact \(N\) is solved under this atomic-family constraint. The default behavior
+            fails clearly if exact cardinality is impossible. Only explicit
+            <code>--allow-nearest-family-size</code> permits a nearest feasible count.
+          </p>
+
+          <h3>Quality matching uses continuous observed QC—not quality ranking</h3>
+          <p>The full 114-dataset pool defines the target distribution using:</p>
+          <ul>
+            <li><code>log1p_median_read_density</code>;</li>
+            <li><code>median_positive_codon_coverage</code>;</li>
+            <li><code>number_of_eligible_transcripts</code>;</li>
+            <li><code>median_replica_PCC</code> when finite for enough datasets.</li>
+          </ul>
+          <p>
+            Each active variable is median-imputed only where needed and standardized over
+            the full retained pool. For variable (j),
+          </p>
+          <div class="equation">
+            \[
+              z_{dj}=\frac{x_{dj}-\overline{x}_{\cdot j}}{s_j}.
+            \]
+          </div>
+          <p>
+            A candidate subset is scored by the root-mean-square discrepancy from the full
+            pool in standardized means and quartiles. Writing
+            \(\Delta\bar z_j\) for the mean discrepancy and
+            \(\Delta q_{j,k}\) for quartile discrepancies,
+          </p>
+          <div class="equation">
+            \[
+              Q(A)=\operatorname{RMS}_{j,k}
+              \left(\Delta\bar z_j,\;0.5\Delta q_{j,0.25},\;
+              0.5\Delta q_{j,0.50},\;0.5\Delta q_{j,0.75}\right).
+            \]
+          </div>
+          <p>For a designated disjoint pair, the joint objective is</p>
+          <div class="equation">
+            \[
+              Q_{\mathrm{pair}}(A,B)=Q(A)+Q(B)
+              +0.5\operatorname{RMS}_j(\overline z_{Aj}-\overline z_{Bj}).
+            \]
+          </div>
+          <p>
+            A deterministic randomized dynamic-programming search proposes exact
+            source-family-atomic subsets. The launcher evaluates 2,000 candidate restarts by
+            default and retains the lowest-QC-mismatch candidate. For the primary mode,
+            neither the legacy scalar <code>quality_rank</code> nor a top-\(N\) ordering enters
+            selection. This matters especially at small \(N\): the design seeks a miniature
+            representation of the full quality distribution rather than simply choosing the
+            two “best” experiments.
+          </p>
+          <div class="callout amber">
+            <strong>Where ranking is still used:</strong> transcript reliability quantile
+            bins are used only to stratify test/validation transcript sampling, and rank
+            operations are used to compute Spearman correlations. Neither chooses which
+            Ribo-seq datasets belong to an Experiment-8 subset.
+          </div>
+        </section>
+
+        <section id="weights">
+          <h2>5. The two weights—and why they must not be confused</h2>
+          <div class="grid-2">
+            <div class="card pi">
+              <h3>\(\pi_d\): gamma-reference weight</h3>
+              <p><strong>Level:</strong> one constant per selected dataset.</p>
+              <p><strong>Used in:</strong> the identification/gauge convention separating shared \(L\) from dataset-specific \(\gamma\).</p>
+              <p><strong>Experiment-8 value:</strong> \(\pi_d=1/N\).</p>
+              <p><strong>Not used in:</strong> NB2/PCC loss weighting.</p>
+            </div>
+            <div class="card w">
+              <h3>\(w_{dt}\): reliability weight</h3>
+              <p><strong>Level:</strong> one value per transcript–dataset observation.</p>
+              <p><strong>Used in:</strong> the existing transcript-balanced loss reduction.</p>
+              <p><strong>Experiment-8 value:</strong> density/coverage SNR score fitted on training transcripts only.</p>
+              <p><strong>Can exceed one:</strong> yes, after median normalization.</p>
+            </div>
+          </div>
+
+          <h3>What equal gamma weighting does mathematically</h3>
+          <p>
+            Let \(a^{\mathrm{ref}}_{dti}\) be raw log-gamma for reference dataset \(d\),
+            and let \(m_{dt}\) be its mean across valid positions. The fixed-reference center
+            is
+          </p>
+          <div class="equation">
+            \[
+              c_{ti}=\sum_{d\in\mathcal R}\pi_d a^{\mathrm{ref}}_{dti},
+              \qquad
+              m_{dt}=\operatorname{mean}_{i:\,M_{ti}=1}a^{\mathrm{ref}}_{dti},
+              \qquad
+              \bar a_t=\sum_{d\in\mathcal R}\pi_d m_{dt}.
+            \]
+          </div>
+          <p>The final requested log-gamma is</p>
+          <div class="equation">
+            \[
+              g_{dti}=a^{\mathrm{raw}}_{dti}-c_{ti}-m^{\mathrm{req}}_{dt}+\bar a_t,
+              \qquad
+              \gamma_{dti}=\exp(g_{dti}).
+            \]
+          </div>
+          <p>For the reference panel, this imposes both</p>
+          <div class="equation">
+            \[
+              \sum_{d\in\mathcal R}\pi_d g_{dti}=0
+              \quad\text{for each codon }i,
+              \qquad
+              \operatorname{mean}_i g_{dti}=0
+              \quad\text{for each pair }(d,t).
+            \]
+          </div>
+          <p>
+            Therefore the weighted geometric mean of gamma across reference datasets is one
+            at every codon, and each dataset–transcript gamma profile also has positional
+            geometric mean one. With equal weights, the cross-dataset center is the ordinary
+            mean of the selected experimental views.
+          </p>
+
+          <h3>Why equal \(\pi_d\) is the primary scientific choice</h3>
+          <ol>
+            <li>
+              <strong>It keeps the estimand stable.</strong> The experiment should change the
+              number and composition of views, not simultaneously redefine the shared
+              baseline toward whichever datasets have the best external rank.
+            </li>
+            <li>
+              <strong>It separates convention from evidence quality.</strong> Gamma centering
+              is an attribution constraint; it is not an estimator of measurement variance.
+              Reliability \(w_{dt}\), raw replicas, and the NB2 likelihood already handle
+              observation quality where it belongs—in the fit.
+            </li>
+            <li>
+              <strong>It prevents double quality weighting.</strong> Using a quality-ranked
+              \(\pi_d\) while retaining \(w_{dt}\) would let quality affect both the loss and
+              the definition of the gamma center, via two unrelated mechanisms.
+            </li>
+            <li>
+              <strong>It gives every experimental view one vote in the reference
+              convention.</strong> That matches the scientific question about adding
+              heterogeneous views, while the subset sampler keeps their observed QC
+              distributions comparable.
+            </li>
+          </ol>
+          <div class="callout red">
+            <strong>Equal \(\pi_d\) does not assert that all datasets are equally precise.</strong>
+            It does not make all pair rows equally influential, erase coverage/depth
+            differences, or bypass NB2 dispersion. It only defines the zero point of
+            log-gamma across the selected reference datasets.
+          </div>
+
+          <h3>The actual reliability score \(w_{dt}\)</h3>
+          <p>For an eligible transcript–dataset pair, let</p>
+          <div class="equation">
+            \[
+              D_{dt}=\frac{\text{total reads}_{dt}}{L_t},
+              \qquad
+              C_{dt}=\frac{\#\{i:y_{dti}>0\}}{L_t}.
+            \]
+          </div>
+          <p>
+            For each dataset, both references are fitted using its training transcripts
+            only:
+          </p>
+          <div class="equation">
+            \[
+              \tau_d=\operatorname{median}_{t\in\mathrm{train}}D_{dt},
+              \qquad
+              q_{dt}=\frac{\sqrt{D_{dt}}}{\sqrt{D_{dt}}+\sqrt{\tau_d}},
+            \]
+            \[
+              w^{\mathrm{raw}}_{dt}=0.70q_{dt}+0.30C_{dt},
+              \qquad
+              w_{dt}=\frac{w^{\mathrm{raw}}_{dt}}
+              {\operatorname{median}_{t\in\mathrm{train}}w^{\mathrm{raw}}_{dt}}.
+            \]
+          </div>
+          <p>
+            The fitted \(\tau_d\) and normalization median are frozen for validation/test.
+            Held-out rows cannot alter them. Read density is not percentile-ranked, coverage
+            is linear rather than square-root transformed, and median normalization permits
+            reliable observations to have \(w_{dt}>1\).
+          </p>
+
+          <h3>Why not quality-ranked \(\pi_d\) here?</h3>
+          <p>
+            Quality-ranked gamma centering remains a defensible sensitivity analysis for a
+            different question—for example, defining the shared baseline preferentially by
+            a curated high-quality reference panel. It is not theoretically “wrong.” It is
+            simply a confound in this primary experiment. If used later, it should be a
+            matched ablation with exactly the same subsets and checkpoints clearly labeled
+            as a different gauge convention.
+          </p>
+        </section>
+
+        <section id="splits">
+          <h2>6. Transcript splits and leakage prevention</h2>
+          <h3>One common sequence-only test set</h3>
+          <p>
+            The comparison requires identical sequences in every model. If a valid
+            Experiment-1 manifest is supplied, its common test IDs are reused. Otherwise the
+            launcher builds one global test set from sequence-eligible transcripts supported
+            by at least two datasets in the complete 114-dataset universe. It samples 10%
+            after stratification by global median reliability decile and CSS class.
+          </p>
+          <p>
+            A test transcript does not need two observations inside every tiny subset because
+            \(L_t\) is produced by the sequence-only biological branch. It must, however, be
+            excluded from training and validation in every run.
+          </p>
+
+          <h3>Run-specific measured validation</h3>
+          <p>
+            Checkpoint selection needs measured profiles. For each subset, validation
+            candidates therefore require at least two usable selected datasets and exclude
+            the common test set. Ten percent are sampled deterministically, stratified by
+            within-run reliability decile and CSS class. Training uses the remaining eligible
+            transcripts, each with support in at least two selected datasets.
+          </p>
+          <div class="callout">
+            Different runs may have different validation counts and training counts. This is
+            intentional and follows observed support in each selected subset. The central
+            cross-model comparison is nevertheless made on exactly the same common test IDs.
+          </div>
+        </section>
+
+        <section id="training">
+          <h2>7. Fixed training configuration</h2>
+          <p>
+            The launcher delegates training to
+            <code>main_ribounmix_multidataset.py</code>. It does not create a
+            second model implementation. The following experiment-defining overrides are
+            enforced for every \(N\).
+          </p>
+          <table>
+            <thead><tr><th>Setting</th><th>Experiment-8 value</th><th>Reason</th></tr></thead>
+            <tbody>
+              <tr><td>Dataset config</td><td><code>weighted_hek_riboseq_codon_replicas</code></td><td>Production weighted, replica-aware profiles.</td></tr>
+              <tr><td>Mass model</td><td><code>model.mass_conservation=false</code></td><td>Use \(S_{dt}L_{ti}\gamma_{dti}\) without final profile renormalization.</td></tr>
+              <tr><td>Dispersion</td><td><code>model.alpha_mode=learned</code></td><td>Current learned NB2 alpha branch.</td></tr>
+              <tr><td>NB objective</td><td><code>standard_nb</code>, <code>beta=0.0</code></td><td>Classical NB2 training; no mean-gradient reweighting.</td></tr>
+              <tr><td>Gamma center</td><td><code>fixed_reference</code></td><td>Independent of minibatch composition and row order.</td></tr>
+              <tr><td>Reference set</td><td>All selected datasets</td><td><code>dataset_names=null</code> resolves to the complete run subset.</td></tr>
+              <tr><td>Gamma \(\pi_d\)</td><td><code>equal</code>, \(1/N\)</td><td>Neutral gauge convention across changing \(N\).</td></tr>
+              <tr><td>Reference chunk</td><td>16 datasets</td><td>64-GB A100 execution setting; all chunks remain in autograd and the exact center is unchanged.</td></tr>
+              <tr><td>Training sampler</td><td><code>transcript_grouped_multidataset_pairs</code></td><td>Keep all available selected-dataset rows for a transcript together.</td></tr>
+              <tr><td>Minimum support</td><td>2 selected datasets</td><td>Required for every training transcript.</td></tr>
+              <tr><td>Pair reduction</td><td><code>transcript_balanced</code></td><td>Each transcript receives one outer vote after its dataset observations are combined.</td></tr>
+              <tr><td>Checkpoint</td><td>minimum <code>val_loss</code> only</td><td>PCC-best checkpoint saving is disabled for this experiment.</td></tr>
+              <tr><td>Test export</td><td><code>sequence_only_shared_profile=true</code></td><td>Export \(L_t\) on identical held-out sequences without requiring pair observations.</td></tr>
+              <tr><td>Training seed</td><td>42</td><td>Hold initialization/stochasticity fixed while dataset composition changes.</td></tr>
+            </tbody>
+          </table>
+
+          <h3>Inherited production defaults</h3>
+          <p>
+            These values come from the current multidataset YAML and are copied into every
+            run's <code>resolved_config.yaml</code>. That saved file is the authoritative
+            record if project defaults later change.
+          </p>
+          <table>
+            <thead><tr><th>Area</th><th>Current value</th></tr></thead>
+            <tbody>
+              <tr><td>Logical grouped batch quota</td><td><code>data.batch_size=32</code> pair rows per selected dataset.</td></tr>
+              <tr><td>Optimizer target</td><td>32 unique transcripts per optimizer step; automatic accumulation from the median packed microbatch; maximum accumulation 32; per-rank scope.</td></tr>
+              <tr><td>Execution microbatching</td><td>Enabled; at most 512 pair rows or 256,000 padded codon tokens per forward when possible; complete transcript groups remain atomic.</td></tr>
+              <tr><td>Training diagnostics</td><td>Scalar logger interval 25; repeated validation PCC histograms and Matplotlib example plots disabled.</td></tr>
+              <tr><td>Biological encoder</td><td>Input base size 97, bidirectional GRU hidden size 256, 2 layers, dropout 0.</td></tr>
+              <tr><td>Dataset-bias encoder</td><td>Dataset embedding 32; codon embedding 16; nucleotide embedding 4; amino-acid embedding 8; bidirectional context GRU hidden size 256, 2 layers, dropout 0.</td></tr>
+              <tr><td>Position features</td><td><code>rel_pos</code>, <code>start_window</code>, <code>stop_window</code>; edge scale \(\tau=100\), position scale 5000.</td></tr>
+              <tr><td>Loss coefficients</td><td>Raw-replica NB2 1.0; consensus raw PCC 0.5; consensus NB-VST PCC 0.5; gamma regularization 0.</td></tr>
+              <tr><td>NB sequence reduction</td><td>Length-tempered: exponent 0.75, reference 1000 codons, clamp 0.5–2.0.</td></tr>
+              <tr><td>Dispersion range</td><td><code>log_alpha</code> constrained to ([-5,1]); alpha-head context remains detached from its shared upstream representation.</td></tr>
+              <tr><td>Learning rates</td><td>Biological branch \(5\times10^{-4}\); remaining main parameters \(10^{-3}\); alpha-specific scale 0.1; weight decay \(10^{-2}\).</td></tr>
+              <tr><td>Scheduler</td><td>Monitor validation loss, minimize, factor 0.99, patience 5, minimum LR \(10^{-6}\).</td></tr>
+              <tr><td>Trainer</td><td>One process per GPU, <code>bf16-mixed</code>, maximum 200 epochs, early-stopping patience 20.</td></tr>
+              <tr><td>Gradient clipping</td><td>Global norm 1.0 at the complete manual optimizer-window boundary.</td></tr>
+              <tr><td>Data workers</td><td>4 training workers, 0 prediction workers, <code>spawn</code> in Experiment 8.</td></tr>
+            </tbody>
+          </table>
+          <p class="mini">
+            The base YAML currently contains defaults that are deliberately overridden by
+            the launcher (for example, mass conservation and gamma weighting). Always inspect
+            each run's resolved configuration rather than inferring settings from the base
+            YAML alone.
+          </p>
+        </section>
+
+        <section id="analysis">
+          <h2>8. Post-training measurements</h2>
+          <p>
+            Every best-validation-loss checkpoint exports the common test transcripts with
+            <code>transcript_id</code>, length, \(L_t\), valid-position mask, run ID, \(N\),
+            and subset identity. The analysis asserts identical transcript identities,
+            identical masks, finite values, and valid-position mean \(L_t\approx1\). It does
+            not silently renormalize predictions.
+          </p>
+          <ul>
+            <li><strong>Primary disjoint analysis:</strong> per-transcript PCC, Spearman, and mean-one RMSE for the 15 designated A/B pairs.</li>
+            <li><strong>Convergence to full:</strong> every \(N&lt;114\) run versus the N=114 reference.</li>
+            <li><strong>Secondary all-pairs analysis:</strong> same-\(N\) agreement accompanied by actual overlap.</li>
+            <li><strong>Interior robustness:</strong> optional metrics excluding the first and last five valid codons, alongside—not instead of—the full-profile metrics.</li>
+            <li><strong>Hierarchy-aware uncertainty:</strong> pair-level summaries are retained; bootstrap resampling acts at subset-pair and transcript levels rather than treating codons as independent.</li>
+            <li><strong>Descriptive saturation:</strong> an optional monotonic curve summarizes the raw convergence points without presenting its timescale as a biological constant.</li>
+          </ul>
+          <p>
+            Generated figures cover stability versus \(N\), convergence to the full
+            collection, overlap versus agreement, subset quality balance, and deterministic
+            representative transcript profiles. All figure source tables are saved.
+          </p>
+
+          <h3>Optional diversity hook</h3>
+          <p>
+            A gamma-fingerprint table can supply dataset vectors \(B_d\). The raw subset
+            diversity is the average pairwise Euclidean distance
+          </p>
+          <div class="equation">
+            \[
+              \Delta(\mathcal D)=\frac{2}{N(N-1)}
+              \sum_{d&lt;e,\;d,e\in\mathcal D}\lVert B_d-B_e\rVert_2.
+            \]
+          </div>
+          <p>
+            Raw and feature-z-scored versions are reported separately. The default
+            <code>quality_matched</code> experiment does not use fingerprints to select
+            subsets. <code>high_diversity</code> and <code>low_diversity</code> are explicit,
+            non-default confirmatory modes and should not be mixed into the primary curve.
+          </p>
+        </section>
+
+        <section id="settings">
+          <h2>9. Launcher settings and reproducibility controls</h2>
+          <table>
+            <thead><tr><th>CLI option</th><th>Default</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code>--dataset-sizes</code></td><td><code>2,5,10,20,40,80,114</code></td><td>Target number of datasets per scale.</td></tr>
+              <tr><td><code>--disjoint-pairs</code></td><td>3</td><td>Independent A/B pairs for every feasible (2N\le114).</td></tr>
+              <tr><td><code>--large-n-subsets</code></td><td>3</td><td>Number of N=80 subsets.</td></tr>
+              <tr><td><code>--subset-seed</code></td><td>42</td><td>Dataset composition and common-test sampling.</td></tr>
+              <tr><td><code>--training-seed</code></td><td>42</td><td>Fixed model initialization/training stochasticity.</td></tr>
+              <tr><td><code>--training-seeds</code></td><td>unset</td><td>Optional later optimization-stability expansion.</td></tr>
+              <tr><td><code>--candidate-restarts</code></td><td>2000</td><td>Deterministic constrained subset candidates.</td></tr>
+              <tr><td><code>--validation-fraction</code></td><td>0.10</td><td>Measured, run-specific validation fraction.</td></tr>
+              <tr><td><code>--test-fraction</code></td><td>0.10</td><td>Global sequence-only test fraction when not reusing Experiment 1.</td></tr>
+              <tr><td><code>--reliability-bins</code></td><td>10</td><td>Transcript split-stratification bins.</td></tr>
+              <tr><td><code>--batch-size</code></td><td>32</td><td>Per-dataset logical grouped-batch quota.</td></tr>
+              <tr><td><code>--max-pair-rows-per-forward</code></td><td>512</td><td>Execution-only pair-row memory limit.</td></tr>
+              <tr><td><code>--max-padded-codon-tokens-per-forward</code></td><td>256,000</td><td>Execution-only padded-token memory limit.</td></tr>
+              <tr><td><code>--log-every-n-steps</code></td><td>25</td><td>TensorBoard scalar logging interval.</td></tr>
+              <tr><td><code>--reference-chunk-size</code></td><td>16</td><td>Fixed-reference execution chunk; not a statistical weight.</td></tr>
+              <tr><td><code>--gpus</code></td><td><code>0,1</code></td><td>One serial task queue per physical GPU; additional allocated IDs may be supplied.</td></tr>
+              <tr><td><code>--sampling-mode</code></td><td><code>quality_matched</code></td><td>Primary observed-QC-matched selection.</td></tr>
+              <tr><td><code>--dry-run</code></td><td>off</td><td>Build and audit everything without GPU training.</td></tr>
+              <tr><td><code>--resume</code></td><td>off</td><td>Reuse only complete runs with matching design/test hashes.</td></tr>
+              <tr><td><code>--full-run-checkpoint</code></td><td>unset</td><td>Explicit compatible N=114 best-val-loss checkpoint reuse.</td></tr>
+              <tr><td><code>--experiment1-manifest</code></td><td>unset</td><td>Reuse a scientifically valid common test set.</td></tr>
+              <tr><td><code>--allow-nearest-family-size</code></td><td>off</td><td>Explicit opt-in only; exact \(N\) is the publication default.</td></tr>
+            </tbody>
+          </table>
+          <p>
+            The launcher writes a canonical design hash per run. Resume requires the subset
+            manifest, selected best-loss checkpoint, common-test shared-profile predictions,
+            and matching hashes. A stale run is not silently reused.
+          </p>
+        </section>
+
+        <section id="outputs">
+          <h2>10. Output structure</h2>
+          <pre>results/real_exp8_L_stability/seed42/
+├── experiment_manifest.json
+├── dataset_quality_table.csv
+├── source_family_mapping.csv
+├── common_test_manifest.json
+├── experiment_split_manifest.json
+├── subset_assignments.csv
+├── subset_quality_report.csv
+├── overlap_report.csv
+├── subset_diversity.csv
+├── experimental_contract.csv
+├── N002/
+│   ├── pair01_A/
+│   ├── pair01_B/
+│   └── ...
+├── N005/ ... N010/ ... N020/ ... N040/
+├── N080/
+│   ├── subset01/
+│   ├── subset02/
+│   └── subset03/
+├── N114/full/
+└── analysis/
+    ├── stability_disjoint_per_transcript.parquet
+    ├── stability_disjoint_summary.csv
+    ├── convergence_to_full_per_transcript.parquet
+    ├── convergence_to_full_summary.csv
+    ├── same_N_all_pairs.csv
+    ├── saturation_fit.json
+    └── figures/</pre>
+        </section>
+
+        <section id="commands">
+          <h2>11. Commands</h2>
+          <h3>Audit the complete design without training</h3>
+          <pre>./.venv/bin/python run_real_exp8_L_stability.py \
+  --dry-run \
+  --gpus 0,1,2,3 \
+  --run-id seed42_audit</pre>
+
+          <h3>Launch the primary experiment on four GPUs</h3>
+          <pre>nohup ./.venv/bin/python -u run_real_exp8_L_stability.py \
+  --gpus 0,1,2,3 \
+  --run-id seed42 \
+  &gt; results/real_exp8_L_stability_seed42_launcher.log 2&gt;&amp;1 &amp;</pre>
+
+          <h3>Analyze an already completed run explicitly</h3>
+          <pre>./.venv/bin/python analyses/analyze_real_exp8_stability.py \
+  --run-root results/real_exp8_L_stability/seed42</pre>
+        </section>
+
+        <section id="interpretation">
+          <h2>12. How to interpret the eventual result</h2>
+          <ul>
+            <li>If \(R_N^{\mathrm{disjoint}}\) rises and plateaus, independent experimental collections increasingly identify the same shared profile.</li>
+            <li>If convergence to the 114-dataset solution rises but disjoint stability does not, overlap or a dominant full-panel convention may be contributing.</li>
+            <li>If both remain low, the learned \(L_t\) is sensitive to dataset composition at the tested scale.</li>
+            <li>If quality mismatch explains much of the variation at small \(N\), uncertainty in tiny subsets should be reported rather than hidden.</li>
+            <li>The N=114 profile is never described as truth; it is only the most data-rich empirical reference available in this experiment.</li>
+          </ul>
+          <div class="callout green">
+            <strong>Validated design state (3 September 2026):</strong> the full dry run
+            constructed 34 tasks and 561 run-pair overlap records. All 15 designated A/B
+            comparisons had zero dataset overlap and zero source-family overlap; all 114
+            weighted dataset sources passed preflight. These are design checks, not yet
+            scientific convergence results.
+          </div>
+        </section>
+      </main>
+
+      <nav aria-label="Page contents">
+        <strong>Contents</strong>
+        <a href="#answer">Equal weighting—short answer</a>
+        <a href="#question">1. Scientific question</a>
+        <a href="#matrix">2. Experiment matrix</a>
+        <a href="#overlap">3. Overlap control</a>
+        <a href="#selection">4. Dataset selection</a>
+        <a href="#weights">5. \(\pi_d\) versus \(w_{dt}\)</a>
+        <a href="#splits">6. Transcript splits</a>
+        <a href="#training">7. Training configuration</a>
+        <a href="#analysis">8. Analysis</a>
+        <a href="#settings">9. Launcher settings</a>
+        <a href="#outputs">10. Outputs</a>
+        <a href="#commands">11. Commands</a>
+        <a href="#interpretation">12. Interpretation</a>
+      </nav>
+    </div>
+
+    <footer>
+      Experiment implementation: <code>run_real_exp8_L_stability.py</code> ·
+      analysis: <code>analyses/analyze_real_exp8_stability.py</code>
+    </footer>
+  </div>
+</body>
+</html>

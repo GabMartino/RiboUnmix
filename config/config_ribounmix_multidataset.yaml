@@ -1,0 +1,432 @@
+name: ribounmix_multi_datasets
+
+
+defaults:
+  # All weighted HEK datasets with their raw per-codon replica profiles.
+  - dataset_config: weighted_hek_riboseq_codon_replicas
+  - _self_
+
+experiment:
+  from_checkpoint: false
+  # Continue an interrupted Trainer run from a last.ckpt, restoring epoch,
+  # optimizer, scheduler, callbacks, and loop state. New checkpoints contain
+  # this complete state. Historical save_weights_only checkpoints require the
+  # explicit approximate fallback below because Adam moments do not exist.
+  resume_training_state: false
+  resume_checkpoint_path: null
+  allow_weights_only_resume: false
+  train: true
+  predict: true
+  dataset: ["martinez_2019", "sharma_2021"]
+  seed: 42
+
+prediction:
+  # Run validation prediction twice from independently selected checkpoints.
+  # Output filenames include best_val_loss or best_pcc explicitly.
+  checkpoint_variants:
+    - best_val_loss
+    - best_pcc
+  # Experiment orchestrators may request one sequence-only inference row for
+  # every held-out transcript, even when a tiny selected dataset subset has no
+  # measured profile for that sequence. Ordinary runs retain observed pairs.
+  sequence_only_shared_profile: false
+
+split:
+  master_dataset_universe: all
+  # Optional experiment-orchestrator manifest. When set, the entrypoint uses
+  # its panel-specific training IDs and common validation/test IDs verbatim.
+  # external_panel_name identifies which panel is being trained.
+  external_manifest: null
+  external_panel_name: null
+  # The active defaults.dataset_config mapping defines both the complete
+  # transcript universe and the fixed common-transcript validation panel.
+  # Validation candidates must have one retained positive-weight row in EVERY
+  # master-universe dataset. CSS count is a joint stratification label, not a
+  # separate benchmark or reserved percentage. With an unchanged master
+  # universe, seed, and inputs, all dataset-subset runs use the same IDs.
+  validation_frac: 0.1
+  validation_weight_bins: 10
+
+paths:
+  sequences_path: "./Datasets/data/sequence/MANE.selection.sequence_embeddings_with_css.parquet"
+
+  checkpoints: "./checkpoints/ribounmix"
+  logs: "./logs/ribounmix"
+  results: "./results/ribounmix"
+
+  encodings:
+    nt: "Datasets/encodings/nt_encoding.yaml"
+    codon_to_aa: "Datasets/encodings/codon2aa.yaml"
+    codon: "Datasets/encodings/codon_encoding.yaml"
+    aa: "Datasets/encodings/aa_encoding.yaml"
+    datasets: "Datasets/encodings/dataset_encoding.yaml"
+
+data:
+  # Per-dataset pair-row quota on each GPU. With D selected datasets, one
+  # logical grouped batch contains at most batch_size * D pair rows. For the
+  # current two-dataset multidataset sampler, every eligible transcript has one
+  # row in each dataset, so 32 means 32 transcripts and 64 pair rows per rank.
+  # Atomic packing can underfill some dataset quotas when support differs.
+  # This production value targets dedicated 64-GB A100 GPUs. Execution
+  # microbatching below still bounds the tensors resident in any one forward.
+  batch_size: 32
+  num_workers: 4
+  # Prediction is a one-pass operation; avoiding spawned workers here prevents
+  # another full copy of the already in-memory validation dataset per rank.
+  predict_num_workers: 0
+  # Local default: fork avoids re-serializing the already materialized in-memory
+  # dataset. The multi-GPU Slurm launchers explicitly override this to spawn so
+  # workers do not inherit initialized CUDA state. Ignored when num_workers is 0.
+  multiprocessing_context: fork
+
+  # Keeps each transcript's selected-dataset rows atomic, but requires at least
+  # two represented datasets. Use transcript_grouped_pairs instead when
+  # single-dataset transcript groups must also be optimized.
+  train_sampling_strategy: transcript_grouped_multidataset_pairs
+  # Count distinct positive, eligible dataset observations, not physical rows.
+  # This check runs before microbatch packing and accumulation planning.
+  minimum_positive_datasets_per_transcript: 2
+
+  # Null uses the exact positive `weight` values stored in the configured
+  # weighted artifacts. Historical compact artifacts may contain physical
+  # weight==0 exclusion rows; the datamodule removes those before support,
+  # split, and group construction, so only strictly positive w_dt reaches the
+  # loss. A manifest opts into frozen SNR/coverage references fitted on
+  # explicit training IDs and requires the corresponding audit columns.
+  reliability_reference_manifest: null
+
+  pin_memory: true
+  prefetch_factor: 2
+
+  # Every input parquet must contain `ribo_cds_replicas` with shape [R, L].
+  # NB2 uses all raw replicas. Both PCC terms use their arithmetic mean once
+  # per transcript-dataset pair.
+  # There is no replica-loading switch or configurable column name.
+
+  # Dataset-level profile-quality metadata. Rank 1 is best. The dataloader puts
+  # both `dataset_quality_rank` and a positive rank-derived quality weight in
+  # every batch. These are separate from transcript `sample_weight` and do not
+  # reweight the likelihood/PCC losses.
+  dataset_quality_ranking:
+    path: "Datasets/data/HEK_riboseq_profile_quality_rank_components.tsv"
+    dataset_column: dataset
+    rank_column: quality_rank
+    strict: true
+
+training:
+  # Keep data.batch_size as the biological/logical batch definition, while
+  # materializing only a memory-safe subset of its complete transcript groups
+  # in each GPU forward. This is exact for transcript-balanced loss because
+  # each chunk loss is rescaled by its fraction of the logical groups.
+  # Default: one process. For multiple GPUs preserving this same global plan,
+  # select distributed_mode=global_batch; do not use ordinary DDP with chunks.
+  execution_microbatching:
+    enabled: true
+    # Opt in to distribute each unchanged global logical batch across GPUs.
+    # No division of data.batch_size; optimizer windows remain those of one GPU.
+    distributed_mode: single_process  # single_process | global_batch
+    # Manual optimization clips once after every execution chunk and every
+    # accumulated logical batch for the optimizer window have contributed.
+    gradient_clip_val: 1.0
+    gradient_clip_algorithm: norm
+    # These are forward-memory limits, not changes to data.batch_size or the
+    # target number of transcripts per optimizer update. A transcript group is
+    # never split; one oversized group is consequently allowed past a limit.
+    # 64-GB A100 throughput profile. On smaller GPUs these can be overridden
+    # independently without changing the logical batch or optimizer target.
+    max_pair_rows_per_forward: 512
+    max_padded_codon_tokens_per_forward: 256000
+    max_transcript_groups_per_forward: null
+
+  grouped_optimizer_batch:
+    # This resolver is active for either supported transcript-grouped sampler.
+    # A non-grouped future sampler would retain the explicit Trainer setting.
+    enabled: true
+    # Desired unique-transcript count per optimizer update, AFTER gradient
+    # accumulation. Under per_rank, every DDP rank targets this many; under
+    # global, this number is divided across ranks before resolving accumulation.
+    # global_batch execution always resolves on the unchanged one-process plan;
+    # target_scope is then reported as global, irrespective of this legacy flag.
+    target_unique_transcripts_per_optimizer_step: 32
+    # Resolve Trainer.accumulate_grad_batches from a non-mutating preview of the
+    # actual packed transcript groups. A non-default explicit Trainer value is a
+    # conflict; set this false to keep an explicit Trainer value instead.
+    auto_accumulate_grad_batches: true
+    # Median represents a typical full batch without letting the final partial
+    # epoch batch distort the active ceil(target / typical_groups) estimate.
+    accumulation_statistic: median  # median | mean | p25 | minimum
+    # Safety ceiling for the automatically resolved accumulation factor. It is
+    # not a batch-size multiplier unless the target requires that many
+    # logical batches. If the required factor is larger, clamp here and warn.
+    max_accumulate_grad_batches: 32
+    target_scope: per_rank  # per_rank | global
+    # A complete transcript group must fit one physical microbatch. Gradient
+    # accumulation cannot repair a group split across microbatches.
+    log_batch_structure: true
+
+    # The runtime adds a `resolved` subtree to the saved Hydra configuration
+    # and writes the same plan to grouped_optimizer_batch_plan.json.
+
+  # At 114 datasets the logical ceiling is 32*114 pair rows, but the execution
+  # limits above divide it between complete transcript groups. The preview
+  # measures the actual atomic packing and resolves accumulation independently.
+
+model:
+  # Optional per-codon columns from paths.sequences_path. `route` may be:
+  #   none          -> do not load or use the column (current baseline)
+  #   biological    -> append to the 97 one-hot inputs of the biological GRU
+  #   dataset_bias  -> append to the independent dataset-bias GRU inputs
+  #   both          -> provide the feature independently to both GRUs
+  # `scale` is a fixed multiplicative preprocessing factor. `missing_values`
+  # and all non-finite values are replaced by `fill_value` before scaling.
+  # Dimensions are validated against every transcript.
+  additional_sequence_features:
+    exo: {dimension: 3, route: none, scale: 1.0}
+    gmp: {dimension: 3, route: none, scale: 1.0}
+    tmp: {dimension: 3, route: none, scale: 1.0}
+    openen: {dimension: 3, route: none, scale: 1.0}
+    # tAI is undefined at stop codons: the parquet uses -1000 at every terminal
+    # stop and NaN at a few internal stops. Both are mapped to neutral zero.
+    tAI_profile_codon: {dimension: 1, route: none, scale: 1.0, missing_values: [-1000.0], fill_value: 0.0}
+    # This parquet has fra=[1,0,0] at every position, so it has zero variance.
+    fra: {dimension: 3, route: none, scale: 1.0}
+
+  # --- Minimal queue-load model ---
+  # S[d,t]     = mean over valid positions of the target (mean gauge, not learned)
+  # L_bio       = normalized biological load, so mean_valid(L_bio)=1.
+  # rho         = L_bio / (1 + L_bio). High rho marks locally saturated peaks.
+  # lambda      = log(1 + L_bio), so L_bio = rho / (1 - rho).
+  # Mean model: mu = S * gamma * L_bio.
+  # Gamma starts neutral at 1. Mean(score^2) regularization can pull dataset
+  # adaptation back toward the shared L_bio baseline.
+  init_gamma: 1.0
+  # gamma = exp(centered_log_score): strictly positive on valid positions and
+  # equal to one at the neutral score.
+  # Mass conservation: renormalize the shape gamma*L_bio to mean 1
+  # over valid positions before applying S, so mean_valid(mu) = S exactly and
+  # sum(mu) = sum(target). Makes zero-suppression mass-neutral (mass leaves the
+  # zeros and lands on the peaks). gamma/L_bio stay per-position interpretable.
+  mass_conservation: true
+  alpha_mode: learned
+  fixed_alpha: 0.1
+  # Geometric anchoring of dataset-specific gamma. This removes a multiplicative
+  # reference ambiguity when enough same-transcript datasets are present.
+  gamma_centering:
+    # fixed_reference is deterministic across training, validation, prediction,
+    # singleton inference, requested partners, batch size, ordering, and DDP
+    # partitioning. batch_grouped remains an explicit alternative.
+    mode: fixed_reference
+    # Remove the otherwise invisible positive constant multiplying gamma for
+    # each dataset-transcript pair: mean_valid(log_gamma)=0, equivalently the
+    # positional geometric mean of gamma is one. This is imposed jointly with
+    # the weighted cross-dataset reference constraint.
+    dataset_constant_scale_gauge: geometric_mean_one
+    reference:
+      # null means every dataset selected for this experiment. When non-null,
+      # this explicit panel must be a subset of the selected datasets.
+      dataset_names: null
+      # equal: every distinct reference dataset has weight 1.
+      # quality_rank: weight=(max_rank-rank+1)/max_rank, raised to this power.
+      weighting: quality_rank
+      quality_rank_power: 1.0
+      chunk_size: 32
+      minimum_datasets: 2
+
+  biological_params:
+    # CUDA AMP always executes this GRU in FP32; the neural head still uses AMP.
+    # Base one-hot dimension. The model automatically adds the dimensions of
+    # features routed to biological/both (13 currently -> actual input 110).
+    input_size: 97
+    hidden_size: 256
+    num_layers: 2
+    dropout: 0.0
+    # Direct-load queue: L_bio is already mean-one.
+    init_local_hazard_factor: 1.0
+    init_local_hazard_weight_std: 1.0e-2
+
+  dataset_bias_params:
+    position_features:
+      - rel_pos
+      - start_window
+      - stop_window
+
+    position_edge_tau: 100.0
+    position_scale: 5000.0
+
+    # Size of the global dataset-ID vocabulary, not the number of active files.
+    # Existing IDs were preserved, so the encoding is contiguous from 0..130.
+    num_datasets: 131
+    dataset_embeddings_size: 32
+
+    num_codons: 64
+    codon_embeddings_size: 16
+    # Numerical support for the uncentered dataset log-effect. Centering and
+    # both gamma gauges are still applied exactly after this bound. The range
+    # leaves orders of magnitude of multiplicative freedom while preventing an
+    # unconstrained exp(log_gamma) from overflowing before gradient clipping.
+    raw_log_gamma_bound: 8.0
+    # Codon identity remains available, while direct nucleotide-position and
+    # amino-acid embeddings give gamma a compositional inductive bias matching
+    # the biological sequence representation. Lookup tables are built from the
+    # same configured encodings; no dense per-pair one-hot tensors are sent.
+    use_nucleotide_amino_acid_embeddings: true
+    nucleotide_embeddings_size: 4
+    amino_acid_embeddings_size: 8
+
+    # Dedicated dataset-bias BiGRU. It is deliberately separate from the
+    # biological BiGRU, so gamma remains a pure function of (sequence,
+    # dataset_id) and L_bio and gamma stay separately interpretable.
+    context_gru_hidden_size: 256
+    context_gru_num_layers: 2
+    context_gru_dropout: 0.0
+    # cuDNN autocast otherwise uses FP16 even under BF16 mixed precision.
+    # Legacy 'inherit' is also protected on CUDA by the model code.
+    context_gru_precision: float32
+    # Opt-in biased training gradient: carry full-CDS state, detach every K
+    # codons per layer/direction. 0 = full BPTT; precision protection does not
+    # require truncating the training gradient.
+    # Evaluation/prediction always uses the original full GRU.
+    context_gru_tbptt_window: 0
+    # Dataset correction head for log-gamma residuals.
+    dataset_multiplicative_allocation_bias_submodule_params:
+      hidden_size: 128
+      dropout: 0.1
+
+    dataset_log_sigma_submodule_params:
+      dataset_embedding_size: 16
+      hidden_size: 128
+      dropout: 0.1
+      # Initial log_sigma head bias. 0.0 -> sigma = 1.
+      init_log_sigma: 0.2
+
+loss:
+  # Classical NB2 maximum-likelihood objective. No detached multiplicative
+  # mean-gradient correction is applied to the per-position NB2 NLL.
+  experiment_mode: standard_nb
+  # The observation likelihood is fixed to NB2. There is no loss-mode or PCC
+  # enable selector: each explicit coefficient below controls exactly one term.
+  # A term whose coefficient is zero is skipped instead of being computed.
+  # NB2 is evaluated against each valid raw replica and averaged within the
+  # pair. Raw and NB-VST PCC are each evaluated once against the arithmetic
+  # replica consensus; gamma regularization is evaluated once per pair.
+  replica_nb_weight: 1.0
+  consensus_raw_pcc_weight: 0.5
+  consensus_nb_vst_pcc_weight: 0.5
+  gamma_reg_weight: 0.0
+
+  # Pair-to-batch aggregation (one mode only):
+  #   transcript_balanced: local reliability weights compare datasets within
+  #     each transcript; every transcript has one equal outer vote.
+  #   dataset_balanced: local weights compare transcripts within each dataset;
+  #     every represented dataset has one equal outer vote.
+  #   global_weighted: one reliability-weighted mean over all pairs.
+  # Dataset-quality rank is never part of these loss reductions.
+  sample_reduction: transcript_balanced
+
+  eps: 1.0e-8
+  nb_log_alpha_min: -5.0
+  # Dispersion cap. alpha = exp(log_alpha), Var = mu + alpha*mu^2. Lower max ->
+  # NB approaches Poisson -> a nonzero mu at a true zero becomes expensive, so
+  # the model is forced to push mu down at zeros (instead of hiding the misfit
+  # as overdispersion). Was 3.0 (alpha<=~20, very overdispersed); 1.0 caps
+  # alpha<=~2.7. Lower it further to push zeros harder, at some cost to peak
+  # tail calibration.
+  nb_log_alpha_max: 1.0
+  # Detached mean-gradient correction for the optimized training NB2 term:
+  #   w = stopgrad((1 + alpha * mu) ** beta)
+  #   optimized_NLL = w * raw_NB2_NLL
+  # beta=0 reproduces ordinary NB2 training; beta=1 approximately cancels the
+  # 1/(1+alpha*mu) attenuation of the log-mu gradient. Validation and
+  # checkpoint val_loss always retain the ordinary unweighted NB2 likelihood.
+  # Ablation values: 0.0, 0.25, 0.5, 0.75, 1.0.
+  nb_mean_gradient_beta: 0.0
+  # Optional safety cap for extreme applications. null leaves the correction
+  # mathematically unclipped; non-finite weights raise instead of being hidden.
+  nb_mean_gradient_max_weight: null
+  # Negative-binomial valid-position reduction inside each sequence:
+  #   mean = average NLL over sequence length before aggregation
+  #   sum  = sum NLL over sequence length, then aggregate across batch/datasets
+  #   length_tempered = mean * clamp((valid_len/ref) ** (1-gamma), min, max)
+  nb_sequence_reduction: length_tempered
+  nb_length_temper_gamma: 0.75
+  nb_length_temper_ref: 1000.0
+  nb_length_temper_min_weight: 0.5
+  nb_length_temper_max_weight: 2.0
+
+  min_pcc_target_var: 1.0e-6
+  pcc_detach_alpha: true
+
+  # Fixed objective structure (only the four coefficients above are tunable):
+  #   replica_nb_weight * mean_r[NB_NLL(mu_r, replica_r)]
+  #   + consensus_raw_pcc_weight * (1 - PCC(mu, consensus))
+  #   + consensus_nb_vst_pcc_weight
+  #       * (1 - PCC(VST(mu), VST(consensus)))
+  #   + gamma_reg_weight * mean_valid(log_gamma^2)
+  # Here consensus is the arithmetic mean of the valid raw replicas.
+
+  # Recommended matched configuration:
+  #   data.train_sampling_strategy: transcript_grouped_multidataset_pairs
+  #   data.minimum_positive_datasets_per_transcript: 2
+  #   loss.sample_reduction: transcript_balanced
+
+  # Predicted-value floor for PCC only (honest zero handling, no extra
+  # parameter): when computing Pearson correlation, predictions below this
+  # count are treated as 0 ("undetected"), matching the target zeros without
+  # ever looking at the target. 0.0 disables. The likelihood is unchanged; the
+  # model must still push mu down at zeros to benefit.
+  pcc_prediction_floor: 0.0
+
+optim:
+  lr_biological: 5.0e-4
+  lr_rest: 1.0e-3
+  # The NB2 log-alpha head uses lr_rest times this scale. Its input context is
+  # detached, so dispersion learns without shaping the shared bias encoder.
+  alpha_learning_rate_scale: 0.1
+  weight_decay_bio: 1.0e-2
+  weight_decay_rest: 1.0e-2
+
+  scheduler:
+    monitor: val_loss
+    mode: min
+    factor: 0.99
+    patience: 5
+    min_lr: 1.0e-6
+
+trainer:
+  devices: [0]
+  accelerator: gpu
+  precision: bf16-mixed
+  # Diagnostic reruns only: reports the forward operation behind NaN backward.
+  detect_anomaly: false
+  use_distributed_sampler: false
+
+  accumulate_grad_batches: 1
+  max_epochs: 200
+  num_sanity_val_steps: 2
+  # Logging every execution chunk is expensive for the large real-data matrix.
+  # Epoch metrics and checkpoint monitoring are unaffected by this interval.
+  log_every_n_steps: 25
+  # Required for globally reduced validation/checkpoint metrics under DDP;
+  # harmless for the default one-GPU run.
+  sync_dist_logs: true
+  # Execution microbatching uses manual optimization and clips once at the
+  # logical optimizer-step boundary. Trainer-level clipping must stay disabled
+  # to avoid clipping partial execution chunks or clipping twice.
+  gradient_clip_val: null
+  gradient_clip_algorithm: norm
+
+callbacks:
+  early_stopping_patience: 10
+  save_best_pcc_checkpoint: true
+
+metrics:
+  log_train_per_dataset_metrics: false
+  # Accumulate only one CPU float per validation transcript, then log summary
+  # quantiles and one TensorBoard histogram of its equal-dataset mean PCC. This
+  # reuses the existing forward pass and complete transcript groups.
+  # Publication diagnostics are generated from exported predictions. Keeping
+  # these TensorBoard-only diagnostics off avoids repeated CPU aggregation and
+  # Matplotlib work at every validation epoch.
+  log_validation_transcript_mu_pcc_distribution: false
+  log_example_plot: false
+  example_plot_max_datasets: 2

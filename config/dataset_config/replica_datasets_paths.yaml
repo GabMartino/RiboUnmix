@@ -1,0 +1,36 @@
+
+# Same transcripts as weighted_datasets_paths, but the parquet files additionally
+# carry a `ribo_cds_replicas` column ([n_replicas, L] raw per-codon counts).
+# These replica-aware parquets are mandatory for multidataset training. The
+# loader always reads `ribo_cds_replicas`; their arithmetic mean is the
+# consensus target used by both PCC terms, and `weight` supplies sample
+# reliability.
+_name_: ribo_replicas
+dataset_path:
+  cui_2024: "Datasets/data/weighted_datasets_ribo_replicas/cui_2024.parquet"
+  eichhorn_2014: "Datasets/data/weighted_datasets_ribo_replicas/eichhorn_2014.parquet"
+  gillen_2019: "Datasets/data/weighted_datasets_ribo_replicas/gillen_2019.parquet"
+  green_2020: "Datasets/data/weighted_datasets_ribo_replicas/green_2020.parquet"
+  grimson_2019: "Datasets/data/weighted_datasets_ribo_replicas/grimson_2019.parquet"
+  ichihara_2021: "Datasets/data/weighted_datasets_ribo_replicas/ichihara_2021.parquet"
+  ingolia_2014: "Datasets/data/weighted_datasets_ribo_replicas/ingolia_2014.parquet"
+  iwasaki_2014: "Datasets/data/weighted_datasets_ribo_replicas/iwasaki_2014.parquet"
+  iwasaki_2018: "Datasets/data/weighted_datasets_ribo_replicas/iwasaki_2018.parquet"
+  iwasaki_2019: "Datasets/data/weighted_datasets_ribo_replicas/iwasaki_2019.parquet"
+  iwasaki_2020: "Datasets/data/weighted_datasets_ribo_replicas/iwasaki_2020.parquet"
+  iwasaki_2021: "Datasets/data/weighted_datasets_ribo_replicas/iwasaki_2021.parquet"
+  kito_2023: "Datasets/data/weighted_datasets_ribo_replicas/kito_2023.parquet"
+  kulakovskiy_2019: "Datasets/data/weighted_datasets_ribo_replicas/kulakovskiy_2019.parquet"
+  kulakovskiy_2024: "Datasets/data/weighted_datasets_ribo_replicas/kulakovskiy_2024.parquet"
+  kutay_2021: "Datasets/data/weighted_datasets_ribo_replicas/kutay_2021.parquet"
+  martinez_2019: "Datasets/data/weighted_datasets_ribo_replicas/martinez_2019.parquet"
+  riepe_2018: "Datasets/data/weighted_datasets_ribo_replicas/riepe_2018.parquet"
+  sako_2020: "Datasets/data/weighted_datasets_ribo_replicas/sako_2020.parquet"
+  sauer_2019: "Datasets/data/weighted_datasets_ribo_replicas/sauer_2019.parquet"
+  sidrauski_2015: "Datasets/data/weighted_datasets_ribo_replicas/sidrauski_2015.parquet"
+  song_2019: "Datasets/data/weighted_datasets_ribo_replicas/song_2019.parquet"
+  tsvetanova_2025: "Datasets/data/weighted_datasets_ribo_replicas/tsvetanova_2025.parquet"
+  volegova_2018: "Datasets/data/weighted_datasets_ribo_replicas/volegova_2018.parquet"
+  wakigawa_2025: "Datasets/data/weighted_datasets_ribo_replicas/wakigawa_2025.parquet"
+  wan_2019: "Datasets/data/weighted_datasets_ribo_replicas/wan_2019.parquet"
+  wang_2016: "Datasets/data/weighted_datasets_ribo_replicas/wang_2016.parquet"

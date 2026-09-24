@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RiboUnmix prediction-output reference</title>
+  <style>
+    :root {
+      --ink: #18242f;
+      --muted: #5d6a75;
+      --blue: #245b91;
+      --line: #d9e2ea;
+      --soft: #f4f8fc;
+      --green: #eaf8f1;
+      --amber: #fff6dd;
+      --red: #fff0ef;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: #f8fafc;
+      font: 15.5px/1.58 Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    main { width: min(1120px, calc(100% - 28px)); margin: 26px auto 64px; }
+    header {
+      padding: 30px 34px;
+      color: white;
+      border-radius: 18px;
+      background: linear-gradient(125deg, #153d66, #3978ad);
+    }
+    h1 { margin: 0; font-size: clamp(1.9rem, 4vw, 3rem); line-height: 1.12; }
+    header p { max-width: 780px; margin-bottom: 0; color: #eaf4ff; }
+    section {
+      margin-top: 18px;
+      padding: 24px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: white;
+    }
+    h2 { margin: 0 0 10px; color: #194b78; }
+    h3 { margin: 22px 0 8px; color: #315d82; }
+    p { margin: 0.55rem 0; }
+    code, pre { font-family: "SFMono-Regular", Consolas, monospace; }
+    code { padding: 0.08rem 0.3rem; border-radius: 4px; background: #edf2f6; }
+    pre {
+      overflow-x: auto;
+      padding: 15px;
+      color: #edf6ff;
+      border-radius: 10px;
+      background: #172737;
+    }
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 0.9rem; }
+    th, td { padding: 9px 10px; border: 1px solid var(--line); vertical-align: top; text-align: left; }
+    th { color: #183e60; background: #edf4fa; }
+    tbody tr:nth-child(even) { background: #fbfcfd; }
+    .vector { white-space: nowrap; color: #6844a5; font-weight: 650; }
+    .scalar { white-space: nowrap; color: #176c52; font-weight: 650; }
+    .note {
+      margin: 14px 0;
+      padding: 13px 15px;
+      border-left: 5px solid var(--blue);
+      border-radius: 8px;
+      background: var(--soft);
+    }
+    .warning { border-color: #a36a00; background: var(--amber); }
+    .critical { border-color: #aa3f3f; background: var(--red); }
+    .good { border-color: #167250; background: var(--green); }
+    .equation {
+      overflow-x: auto;
+      margin: 11px 0;
+      padding: 5px 12px;
+      border-radius: 8px;
+      background: var(--soft);
+      text-align: center;
+    }
+    .small { color: var(--muted); font-size: 0.88rem; }
+    nav { margin-top: 14px; }
+    nav a { margin-right: 14px; color: white; }
+    @media (max-width: 700px) {
+      section { padding: 17px; }
+      table { display: block; overflow-x: auto; }
+    }
+  </style>
+  <script>
+    window.MathJax = {
+      tex: {
+        inlineMath: [['\\(', '\\)']],
+        displayMath: [['\\[', '\\]']],
+        processEscapes: true
+      },
+      options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] }
+    };
+  </script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+</head>
+<body>
+<div style="padding:10px 18px;background:#eaf4fb;border-bottom:1px solid #bdd7e8;text-align:center;font:600 14px/1.4 system-ui,sans-serif">Continuing development? Start with the <a href="project_model_onboarding.html">project onboarding and safe-handoff guide</a>.</div>
+<main>
+  <header>
+    <h1>Prediction outputs: field-by-field reference</h1>
+    <p>
+      This page describes the schema produced by the current
+      <code>predict_step()</code> and <code>predictions_to_parquet()</code>
+      implementations. It covers the ordinary 40-column prediction parquet and
+      the compact 8-column Experiment-8 shared-profile parquet.
+    </p>
+    <nav>
+      <a href="#files">Files</a>
+      <a href="#main-schema">Main 40 columns</a>
+      <a href="#shared-schema">Compact \(L_t\)</a>
+      <a href="#sequence-only">Sequence-only warning</a>
+      <a href="#reading">Reading example</a>
+    </nav>
+  </header>
+
+  <section id="files">
+    <h2>1. Which prediction file is which?</h2>
+    <table>
+      <thead><tr><th>File</th><th>Contents</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>predictions_main_val_best_val_loss_*.parquet</code></td>
+          <td>Validation predictions loaded from the checkpoint with minimum validation loss.</td>
+        </tr>
+        <tr>
+          <td><code>predictions_main_val_best_pcc_*.parquet</code></td>
+          <td>Validation predictions loaded from the checkpoint with maximum validation \(\mu\)-PCC, when that checkpoint was requested and saved.</td>
+        </tr>
+        <tr>
+          <td><code>predictions_main_test_*.parquet</code></td>
+          <td>The same schema evaluated on an explicit test fold. Experiment 8 uses this form.</td>
+        </tr>
+        <tr>
+          <td><code>common_test_L_profiles.parquet</code></td>
+          <td>Compact, one-row-per-transcript \(L_t\) export from the best-validation-loss checkpoint.</td>
+        </tr>
+        <tr>
+          <td><code>common_test_L_profiles_best_pcc.parquet</code></td>
+          <td>Compact \(L_t\) export from the PCC-best checkpoint, only if that variant was explicitly requested.</td>
+        </tr>
+        <tr>
+          <td><code>prediction_checkpoint_manifest.json</code></td>
+          <td>Maps each requested checkpoint variant to its exact checkpoint and prediction artifact.</td>
+        </tr>
+      </tbody>
+    </table>
+    <div class="note">
+      In ordinary prediction, one row represents one eligible
+      <strong>transcript–dataset pair</strong>, so a transcript can appear once per
+      selected dataset. In Experiment-8 sequence-only prediction, there is one
+      dummy interface row per held-out transcript; the compact \(L_t\) file is
+      the scientific artifact.
+    </div>
+    <p>
+      Every stored positional vector is trimmed to <code>length</code>. Batch
+      padding is not written to parquet, and vector element \(i\) refers to the
+      same modeled codon in every positional column.
+    </p>
+  </section>
+
+  <section id="main-schema">
+    <h2>2. Main prediction parquet: all 40 columns</h2>
+
+    <h3>Identity, sequence, and metadata</h3>
+    <table>
+      <thead><tr><th>Column</th><th>Type</th><th>Exact meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>transcript_id</code></td><td class="scalar">string</td><td>Transcript identifier, including the version suffix where present.</td></tr>
+        <tr><td><code>ids</code></td><td class="scalar">string</td><td>Compatibility alias of <code>transcript_id</code>; the two values are identical.</td></tr>
+        <tr><td><code>dataset_id</code></td><td class="scalar">integer</td><td>Encoded dataset identity. Convert it back with the inverse of <code>Datasets/encodings/dataset_encoding.yaml</code>; the parquet does not contain a dataset-name column.</td></tr>
+        <tr><td><code>length</code></td><td class="scalar">integer</td><td>Number of valid modeled codon positions stored in this row.</td></tr>
+        <tr><td><code>lengths</code></td><td class="scalar">integer</td><td>Compatibility alias of <code>length</code>.</td></tr>
+        <tr><td><code>css</code></td><td>list or null</td><td>Conserved-stalling-site indices inherited from the sequence table. Current analyses interpret them directly as zero-based indices into the modeled codon vectors. Null means no annotation.</td></tr>
+        <tr><td><code>mask</code></td><td class="vector">boolean vector [L]</td><td>Valid-position mask. Because vectors are trimmed to <code>length</code> during export, it is normally all <code>true</code>; it is retained for explicit alignment checks.</td></tr>
+        <tr><td><code>codon_ids</code></td><td class="vector">integer vector [L]</td><td>Codon at every position, encoded with <code>Datasets/encodings/codon_encoding.yaml</code>.</td></tr>
+        <tr><td><code>sample_weight</code></td><td class="scalar">float</td><td>The transcript–dataset reliability weight \(w_{dt}\) used by the configured loss reduction. It is median-normalized and may exceed one.</td></tr>
+        <tr><td><code>dataset_quality_rank</code></td><td class="scalar">float</td><td>Dataset-level quality rank; rank 1 is best. It can be NaN when no ranking exists, as in some synthetic data.</td></tr>
+        <tr><td><code>dataset_quality_weight</code></td><td class="scalar">float</td><td>Rank-derived metadata \((R-r_d+1)/R\). It is distinct from <code>sample_weight</code>. Under Experiment-8 equal fixed-reference centering, it does not weight gamma or the loss.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Observed target and predicted mean</h3>
+    <table>
+      <thead><tr><th>Column</th><th>Type</th><th>Exact meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>target</code></td><td class="vector">float vector [L]</td><td>Arithmetic consensus of the raw replica count profiles for this transcript–dataset pair. Individual replica vectors are used by the NB2 loss but are not exported here.</td></tr>
+        <tr><td><code>mu</code></td><td class="vector">float vector [L]</td><td>NB2 mean prediction \(\mu_{dti}\). In the active mass-free model, \(\mu_{dti}=S_{dt}L_{ti}\gamma_{dti}\).</td></tr>
+        <tr><td><code>likelihood_positive_mean</code></td><td class="vector">float vector [L]</td><td>Current likelihood-safe mean. Despite the historical name, the current NB2 implementation is not zero-truncated and this is normally identical to <code>mu</code> after finite-value handling and the positive epsilon floor.</td></tr>
+        <tr><td><code>scale_dt</code></td><td class="scalar">float</td><td>\(S_{dt}\), the mean of <code>target</code> over valid positions.</td></tr>
+        <tr><td><code>normalized_shape</code></td><td class="vector">float vector [L]</td><td>The inner mean shape before multiplication by \(S_{dt}\). With <code>mass_conservation=false</code>, it is \(\gamma_{dti}L_{ti}\) and need not have mean one. With mass conservation enabled, it is divided by its valid-position arithmetic mean.</td></tr>
+      </tbody>
+    </table>
+    <div class="equation">
+      \[
+        \texttt{mu}=\texttt{scale\_dt}\times\texttt{normalized\_shape}.
+      \]
+    </div>
+
+    <h3>Shared biological branch</h3>
+    <table>
+      <thead><tr><th>Column</th><th>Type</th><th>Exact meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>L_bio</code></td><td class="vector">float vector [L]</td><td>The shared, dataset-blind sequence prediction \(L_{ti}\). It is positive and normalized to valid-position arithmetic mean one independently for each transcript.</td></tr>
+        <tr><td><code>rho_bio</code></td><td class="vector">float vector [L]</td><td>Bounded transform \(\rho_{ti}=L_{ti}/(1+L_{ti})\). It contains no information beyond \(L_{ti}\).</td></tr>
+        <tr><td><code>J</code></td><td class="scalar">float</td><td>Diagnostic transcript summary \(J_t=\operatorname{mean}_i[\log(1+L_{ti})]\). It is not a separately learned flux parameter and does not enter the prediction equation.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Dataset-specific gamma branch</h3>
+    <table>
+      <thead><tr><th>Column</th><th>Type</th><th>Exact meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>log_gamma_raw</code></td><td class="vector">float vector [L]</td><td>Raw dataset-branch log score before cross-dataset and positional gauge fixing.</td></tr>
+        <tr><td><code>gamma_raw</code></td><td class="vector">float vector [L]</td><td>\(\exp(\texttt{log\_gamma\_raw})\). This is ungauged and should not be used as the final bias estimate.</td></tr>
+        <tr><td><code>log_gamma</code></td><td class="vector">float vector [L]</td><td>Final gauge-fixed log correction \(g_{dti}\).</td></tr>
+        <tr><td><code>gamma</code></td><td class="vector">float vector [L]</td><td>Final positive correction \(\gamma_{dti}=\exp(g_{dti})\). This is the gamma quantity to use for interpretation and synthetic recovery.</td></tr>
+        <tr><td><code>gamma_cross_dataset_log_center</code></td><td class="vector">float vector [L]</td><td>The cross-reference log center \(c_{ti}\) subtracted from the raw score. The additional within-pair positional shift is not exported as its own column, so this field alone is insufficient to reconstruct final <code>log_gamma</code>.</td></tr>
+        <tr><td><code>additive_bias</code></td><td class="vector">float vector [L]</td><td>Compatibility placeholder. The current mean model is purely multiplicative, so this column is zero.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Gamma-centering diagnostics</h3>
+    <table>
+      <thead><tr><th>Column</th><th>Type</th><th>Exact meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>gamma_centering_reliability</code></td><td class="vector">float vector [L]</td><td>Normalized gamma-centering weight assigned to the requested dataset/row. In Experiment-8 equal fixed-reference mode it is \(1/N\). Despite its name, it is not the observation reliability <code>sample_weight</code>.</td></tr>
+        <tr><td><code>gamma_centering_eligible</code></td><td class="vector">boolean vector [L]</td><td>Positions with valid inputs that are eligible for the centering calculation. Eligibility does not necessarily imply that centering was applied.</td></tr>
+        <tr><td><code>gamma_centering_applied</code></td><td class="vector">boolean vector [L]</td><td>True where the configured cross-dataset gamma center was actually applied.</td></tr>
+        <tr><td><code>gamma_num_distinct_datasets</code></td><td class="vector">float vector [L]</td><td>Number of distinct datasets contributing to the center at each position. In active fixed-reference mode this normally equals the reference-panel size.</td></tr>
+        <tr><td><code>gamma_total_reliability</code></td><td class="vector">float vector [L]</td><td>Sum of the raw gamma-reference weights. With equal raw weights it equals \(N\). It is not a sum of transcript reliability weights.</td></tr>
+        <tr><td><code>gamma_centering_constraint_error</code></td><td class="vector">float vector [L]</td><td>Absolute residual of the weighted cross-dataset log-gamma constraint; values near zero indicate numerically successful centering.</td></tr>
+        <tr><td><code>gamma_centering_mode</code></td><td class="scalar">string</td><td>Configured mode, currently one of <code>fixed_reference</code>, <code>batch_grouped</code>, or <code>disabled</code>.</td></tr>
+        <tr><td><code>gamma_reference_dataset_count</code></td><td class="scalar">float</td><td>Number of datasets stored in the fixed reference panel.</td></tr>
+        <tr><td><code>gamma_reference_dataset_ids</code></td><td>integer list</td><td>Encoded IDs of the fixed reference datasets. Due to scalar simplification by the serializer, a one-dataset panel can appear as a scalar rather than a length-one list.</td></tr>
+        <tr><td><code>gamma_reference_manifest_hash</code></td><td class="scalar">string</td><td>SHA-256-like identity of the resolved reference membership and weighting convention, used for reproducibility checks.</td></tr>
+        <tr><td><code>gamma_reference_weighting</code></td><td class="scalar">string</td><td><code>equal</code> or <code>quality_rank</code>; describes only the gamma gauge.</td></tr>
+        <tr><td><code>gamma_reference_quality_rank_power</code></td><td class="scalar">float</td><td>Exponent applied to rank-derived reference weights. It has no effect when weighting is <code>equal</code>.</td></tr>
+        <tr><td><code>gamma_reference_chunk_size</code></td><td class="scalar">integer</td><td>Number of reference identities evaluated per internal forward chunk. This affects memory/runtime, not the mathematical center.</td></tr>
+        <tr><td><code>gamma_all_requested_in_reference</code></td><td class="scalar">boolean</td><td>Whether the requested dataset identity belongs to the stored fixed reference panel. False indicates extrapolation or a centering fallback.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>NB2 dispersion</h3>
+    <table>
+      <thead><tr><th>Column</th><th>Type</th><th>Exact meaning</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>log_sigma</code></td>
+          <td class="vector">float vector [L]</td>
+          <td>
+            Historical name for the alpha-head output. It is interpreted by the
+            likelihood as log NB2 dispersion, not log standard deviation. The
+            likelihood first clamps it to the configured
+            <code>nb_log_alpha_min/max</code>, then uses
+            \(\alpha=\exp(\operatorname{clip}(\texttt{log\_sigma}))\).
+            The current defaults are \([-5,1]\); inspect the run's resolved
+            configuration before deriving alpha.
+          </td>
+        </tr>
+      </tbody>
+    </table>
+    <div class="note warning">
+      There is currently no separate <code>alpha</code> column. Do not blindly
+      calculate <code>exp(log_sigma)</code> without applying the loss bounds if
+      you want the dispersion actually used by NB2.
+    </div>
+  </section>
+
+  <section id="shared-schema">
+    <h2>3. Compact Experiment-8 shared-profile file: all 8 columns</h2>
+    <p>
+      <code>common_test_L_profiles.parquet</code> is deliberately small and
+      contains exactly one row for every common held-out transcript.
+    </p>
+    <table>
+      <thead><tr><th>Column</th><th>Type</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>transcript_id</code></td><td class="scalar">string</td><td>Held-out transcript identifier.</td></tr>
+        <tr><td><code>transcript_length</code></td><td class="scalar">integer</td><td>Number of valid modeled codons.</td></tr>
+        <tr><td><code>L_t</code></td><td class="vector">float vector [L]</td><td>Direct copy of <code>L_bio</code>, the shared sequence-only mean-one profile used for cross-model comparisons.</td></tr>
+        <tr><td><code>valid_position_mask</code></td><td class="vector">boolean vector [L]</td><td>Mask that must be identical between runs before comparing positions.</td></tr>
+        <tr><td><code>run_id</code></td><td class="scalar">string</td><td>Experiment task identifier, such as <code>real_exp8_N020_pair02_A</code>.</td></tr>
+        <tr><td><code>N</code></td><td class="scalar">integer or null</td><td>Number of selected training datasets, supplied by the Experiment-8 orchestrator.</td></tr>
+        <tr><td><code>subset_identifier</code></td><td>string or null</td><td>Pair/subset label, such as <code>pair02</code> or <code>subset01</code>.</td></tr>
+        <tr><td><code>L_mean</code></td><td class="scalar">float</td><td>Audited mean of <code>L_t</code> over valid positions; it must be within \(10^{-4}\) of one.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="sequence-only">
+    <h2>4. Critical Experiment-8 sequence-only distinction</h2>
+    <div class="note critical">
+      In Experiment 8, the dataloader inserts one all-ones dummy profile and one
+      dummy selected-dataset identity solely to pass a held-out sequence through
+      the existing prediction interface. Therefore the large
+      <code>predictions_main_test_*.parquet</code> must not be interpreted as an
+      observed test-profile reconstruction.
+    </div>
+    <table>
+      <thead><tr><th>Meaningful in sequence-only mode</th><th>Dummy-dependent; do not use scientifically</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>
+            <code>transcript_id</code>, <code>ids</code>, <code>length</code>,
+            <code>lengths</code>, <code>css</code>, <code>mask</code>,
+            <code>codon_ids</code>, <code>L_bio</code>, <code>rho_bio</code>,
+            and <code>J</code>.
+          </td>
+          <td>
+            <code>target</code>, <code>dataset_id</code>, <code>sample_weight</code>,
+            dataset-quality fields, <code>scale_dt</code>, <code>mu</code>,
+            <code>normalized_shape</code>, gamma fields, alpha/<code>log_sigma</code>,
+            and their centering diagnostics.
+          </td>
+        </tr>
+      </tbody>
+    </table>
+    <div class="note good">
+      For Experiment-8 convergence analysis, read
+      <code>common_test_L_profiles.parquet</code>. The checkpoint manifest also
+      records <code>observation_dependent_dummy_outputs_are_scientific: false</code>.
+    </div>
+  </section>
+
+  <section id="manifest">
+    <h2>5. Prediction checkpoint manifest</h2>
+    <p>
+      <code>prediction_checkpoint_manifest.json</code> contains one top-level
+      object per requested variant: <code>best_val_loss</code> and optionally
+      <code>best_pcc</code>. Each object records:
+    </p>
+    <table>
+      <thead><tr><th>Entry</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>checkpoint_path</code></td><td>Exact checkpoint loaded before prediction.</td></tr>
+        <tr><td><code>output_path</code></td><td>Main 40-column parquet path.</td></tr>
+        <tr><td><code>shared_profile_output_path</code></td><td>Compact \(L_t\) path, or null when sequence-only export was disabled.</td></tr>
+        <tr><td><code>prediction_rows</code></td><td>Number of rows written to the main parquet.</td></tr>
+        <tr><td><code>split_name</code></td><td><code>val</code> or <code>test</code>.</td></tr>
+        <tr><td><code>transcript_count</code></td><td>Number of transcript IDs requested for that split.</td></tr>
+        <tr><td><code>transcript_id_hash</code></td><td>Stable hash for checking identical prediction transcript sets.</td></tr>
+        <tr><td><code>sequence_only_shared_profile_prediction</code></td><td>Whether the dummy-interface sequence-only path was active.</td></tr>
+        <tr><td><code>observation_dependent_dummy_outputs_are_scientific</code></td><td>Explicitly false for the current sequence-only export.</td></tr>
+      </tbody>
+    </table>
+    <p class="small">
+      Nearby JSON files are provenance rather than prediction columns:
+      <code>gamma_reference_manifest.json</code> defines the gamma gauge;
+      <code>loss_reduction_manifest.json</code> records the objective;
+      <code>split_manifest.json</code> records folds; and
+      <code>grouped_optimizer_batch_plan.json</code> records batch packing and
+      accumulation.
+    </p>
+  </section>
+
+  <section id="reading">
+    <h2>6. Minimal safe reading example</h2>
+    <pre>from pathlib import Path
+import numpy as np
+import pandas as pd
+import yaml
+
+prediction = Path(".../predictions_main_val_best_val_loss_....parquet")
+df = pd.read_parquet(prediction)
+
+# Resolve integer dataset IDs.
+name_to_id = yaml.safe_load(
+    Path("Datasets/encodings/dataset_encoding.yaml").read_text()
+)
+id_to_name = {int(value): name for name, value in name_to_id.items()}
+df["dataset_name"] = df["dataset_id"].map(id_to_name)
+
+# Dispersion actually used by the current default NB2 likelihood.
+df["alpha"] = df["log_sigma"].map(
+    lambda x: np.exp(np.clip(np.asarray(x, float), -5.0, 1.0))
+)
+
+# Every positional output in one row must align.
+row = df.iloc[0]
+assert len(row["mu"]) == row["length"]
+assert len(row["L_bio"]) == row["length"]
+assert len(row["gamma"]) == row["length"]
+assert np.allclose(
+    row["mu"],
+    row["scale_dt"] * np.asarray(row["normalized_shape"]),
+    rtol=1e-4,
+    atol=1e-6,
+)</pre>
+    <p class="small">
+      Replace the hard-coded alpha bounds with values from the corresponding
+      run's <code>resolved_config.yaml</code> when analyzing an ablation.
+    </p>
+  </section>
+</main>
+</body>
+</html>

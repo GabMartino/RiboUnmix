@@ -1,0 +1,33 @@
+{
+  "centering_mode": "fixed_reference",
+  "dataset_constant_scale_gauge": "geometric_mean_one",
+  "pi_is_gamma_reference_only": true,
+  "quality_rank_power": 1.0,
+  "reference_dataset_ids": [
+    0,
+    5
+  ],
+  "reference_dataset_names": [
+    "artificial_bias_5prime_aa",
+    "artificial_bias_3prime_cc"
+  ],
+  "reference_manifest_hash": "34f379ec4e33fb8d4b2defa99da7723ca91c58262d0bac68ab7dd7ac11a9ae5a",
+  "reference_pi": [
+    0.5,
+    0.5
+  ],
+  "reference_raw_weights": [
+    1.0,
+    1.0
+  ],
+  "selected_dataset_ids": [
+    0,
+    5
+  ],
+  "selected_dataset_names": [
+    "artificial_bias_5prime_aa",
+    "artificial_bias_3prime_cc"
+  ],
+  "w_dt_source": "input_parquet_weight",
+  "weighting": "equal"
+}

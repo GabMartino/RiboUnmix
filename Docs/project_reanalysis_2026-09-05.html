@@ -1,0 +1,459 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="Independent mathematical, implementation, and biological review of RiboUnmix (formerly QueueingRiboAI), based on the working tree on 5 September 2026.">
+<title>RiboUnmix — Project reanalysis · 5 September 2026</title>
+<style>
+:root{--paper:#fff;--bg:#f0f3f2;--ink:#172c31;--muted:#52666b;--line:#d7e1df;--accent:#086c65;--soft:#e9f5f1;--warn:#fff4de;--red:#983e30;--blue:#24548e;--code:#f1f4f5}
+*{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:20px}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.65 system-ui,-apple-system,"Segoe UI",sans-serif}a{color:var(--accent);text-underline-offset:3px}a:hover{color:var(--blue)}a:focus-visible,button:focus-visible,input:focus-visible,summary:focus-visible{outline:3px solid var(--blue);outline-offset:4px}
+.shell{max-width:1370px;margin:auto;display:grid;grid-template-columns:245px minmax(0,1fr)}nav{position:sticky;top:0;height:100vh;padding:30px 20px;overflow:auto}nav .brand{font-size:20px;font-weight:750;letter-spacing:-.5px}nav .subtitle{color:var(--muted);font-size:12px;margin:3px 0 24px}nav a{display:block;padding:7px 9px;margin:2px 0;border-radius:6px;text-decoration:none;font-size:13px}nav a:hover{background:var(--soft)}nav small{display:block;margin:24px 9px;color:var(--muted)}main{background:var(--paper);padding:48px 54px 80px;min-width:0;border-left:1px solid var(--line)}header{padding-bottom:30px;border-bottom:2px solid var(--accent)}.eyebrow{font-size:12px;font-weight:700;letter-spacing:.12em;color:var(--accent);text-transform:uppercase}h1{font-size:clamp(30px,4vw,47px);line-height:1.12;letter-spacing:-1.3px;margin:14px 0 18px}h2{font-size:27px;line-height:1.3;margin:0 0 18px;letter-spacing:-.4px}h3{font-size:20px;line-height:1.4;margin:28px 0 10px}h4{font-size:16px;margin:18px 0 8px}p{margin:12px 0}.lede{font-size:19px;line-height:1.6;max-width:76ch;color:var(--muted)}.meta,.source,.caption{font-size:12px;color:var(--muted)}.meta{margin-top:22px}.source{margin-top:9px}.source a{overflow-wrap:anywhere}section{padding-top:42px;margin-top:28px;border-top:1px solid var(--line)}header+section{border-top:0;margin-top:0}.cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:25px 0}.card{padding:18px;border:1px solid var(--line);border-radius:10px;background:var(--bg)}.card strong{display:block;font-size:26px;line-height:1.3;color:var(--accent)}.card span{display:block;font-size:12px;margin-top:6px;color:var(--muted)}.note,.warning,.finding{padding:18px 21px;margin:21px 0;border-radius:7px;border-left:4px solid var(--accent);background:var(--soft)}.warning{background:var(--warn);border-color:#b87b11}.finding{border:1px solid var(--line);border-left:4px solid var(--red);background:var(--paper)}.finding h3{margin:0 0 12px}.tag{display:inline-block;font:700 10px/1.5 system-ui;letter-spacing:.06em;text-transform:uppercase;border-radius:4px;padding:3px 6px;background:var(--soft);color:var(--accent);vertical-align:middle;margin-right:6px}.tag.p1{background:#fbe9e5;color:var(--red)}.tag.p2{background:var(--warn);color:#865500}.tag.proof{background:#e8effa;color:var(--blue)}.table-wrap{overflow:auto;margin:18px 0}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:11px 12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}th{background:var(--bg);font-weight:700}td p{margin:0 0 7px}.numeric td:not(:first-child),.numeric th:not(:first-child){text-align:right;font-variant-numeric:tabular-nums}code{font: .86em ui-monospace,SFMono-Regular,Consolas,monospace;background:var(--code);padding:2px 5px;border-radius:4px;overflow-wrap:anywhere}pre{background:var(--code);padding:18px;border-radius:7px;overflow:auto;font:12px/1.65 ui-monospace,SFMono-Regular,Consolas,monospace}pre code{padding:0;background:none;overflow-wrap:normal}.equation{padding:15px 20px;background:var(--bg);border:1px solid var(--line);border-radius:7px;overflow:auto;font:16px/1.9 "Cambria Math",Georgia,serif}.equation .row{display:block;min-width:max-content}.flow{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:22px 0}.flow div{border:1px solid var(--line);border-radius:8px;padding:16px}.flow .shared{border-top:4px solid var(--accent)}.flow .dataset{border-top:4px solid var(--blue)}.flow .merge{grid-column:1/-1;text-align:center;background:var(--soft)}ul,ol{padding-left:24px}li{margin:8px 0}.compact li{margin:5px 0}details{border:1px solid var(--line);border-radius:7px;padding:14px 18px;margin:16px 0}summary{cursor:pointer;font-weight:650}details[open] summary{margin-bottom:14px}.lab{padding:22px;background:var(--bg);border:1px solid var(--line);border-radius:10px}.controls{display:flex;align-items:center;gap:16px;flex-wrap:wrap}input[type=range]{width:min(310px,65vw);accent-color:var(--accent)}output{font-weight:700;font-variant-numeric:tabular-nums}.result{padding:12px 16px;background:var(--paper);border:1px solid var(--line);border-radius:6px}.toolbar{display:flex;gap:10px;margin-top:18px}button{background:var(--paper);border:1px solid var(--line);border-radius:6px;padding:8px 13px;color:var(--ink);font:inherit;font-size:12px;cursor:pointer}button:hover{background:var(--soft)}footer{border-top:2px solid var(--accent);padding-top:22px;margin-top:45px;font-size:13px;color:var(--muted)}.nowrap{white-space:nowrap}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+@media(max-width:960px){.shell{display:block}nav{position:static;height:auto;padding:22px;border-bottom:1px solid var(--line)}nav .links{display:flex;flex-wrap:wrap;gap:0 10px}nav a{font-size:12px}nav .subtitle{margin-bottom:10px}nav small{display:none}main{border:0;padding:32px 23px 60px}.cards{grid-template-columns:1fr 1fr 1fr}}
+@media(max-width:540px){.cards{grid-template-columns:1fr}.card{padding:12px}.card strong{font-size:23px}.flow{grid-template-columns:1fr}.flow .merge{grid-column:auto}h2{font-size:24px}table{min-width:580px}.lab table{min-width:0}.finding,.note,.warning{padding:15px}}
+@media print{body{background:white;font-size:10pt;color:black}.shell{display:block}nav,.toolbar,.controls{display:none}main{padding:0;border:0}h1{font-size:30pt}h2{font-size:20pt}section{margin-top:18px;padding-top:23px}.table-wrap,.equation,pre{overflow:visible}.equation .row{min-width:0;overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere}table{font-size:9pt;min-width:0!important}a{color:inherit}.cards,.lab,.equation,tr{break-inside:avoid}.finding{break-inside:auto}details{break-inside:auto}footer{font-size:9pt}}
+</style>
+</head>
+<body>
+<div style="padding:10px 18px;background:#eaf4fb;border-bottom:1px solid #bdd7e8;text-align:center;font:600 14px/1.4 system-ui,sans-serif">This is a dated analysis. For current operational guidance, read the <a href="project_model_onboarding.html">project onboarding and safe-handoff guide</a>.</div>
+<a href="#main" class="sr-only">Skip to report</a>
+<div class="shell">
+<nav aria-label="Report sections">
+<div class="brand">RiboUnmix</div><div class="subtitle">PROJECT REANALYSIS · 05 SEP 2026</div>
+<div class="links">
+<a href="#verdict">1. Overall assessment</a>
+<a href="#actual-model">2. What the code models</a>
+<a href="#mathematics">3. Mathematical findings</a>
+<a href="#implementation">4. Code correctness</a>
+<a href="#optimization">5. Optimization opportunities</a>
+<a href="#redundancy">6. Redundancy and cleanup</a>
+<a href="#biology">7. Biological interpretation</a>
+<a href="#evidence">8. Existing experimental evidence</a>
+<a href="#validation">9. Stronger validation design</a>
+<a href="#priorities">10. Recommended work order</a>
+<a href="#verification">11. Scope and verification</a>
+<a href="#sources">12. Source map</a>
+</div>
+<small>This file works offline. The mathematical example runs locally. Source links require the repository; literature links require internet access.</small>
+</nav>
+<main id="main">
+<header>
+<div class="eyebrow">Mathematics · implementation · translation biology</div>
+<h1>A useful shared-profile model,<br>with limits that need to be explicit.</h1>
+<p class="lede">RiboUnmix has a substantial implementation and convincing synthetic results for learning relative sequence-dependent profiles from heterogeneous observations. Its strongest scientific claim is a reference-defined shared representation. Absolute ribosome kinetics, causal technical-bias removal, and a mechanistic queueing interpretation are not established by the current formulation.</p>
+<p class="meta">Reviewed 5 September 2026 · Working tree based on commit <code>07872b5</code>, including existing modified and untracked files · Documentation reviewed first, then implementation and artifacts · Analysis only: model, training code, configurations, and datasets were not edited.</p>
+<div class="toolbar"><button type="button" id="print-button">Print / save as PDF</button><button type="button" id="expand-button">Expand technical details</button></div>
+</header>
+
+<section id="verdict">
+<h2>1. Overall assessment</h2>
+<p><strong>The project is worth developing, but “the code runs” and “the decomposition is biologically identified” are different conclusions.</strong> The separation of a dataset-blind sequence branch from a dataset-conditioned observation branch is useful. Raw replicates, atomic transcript groups, explicit loss reductions, checkpoint manifests, and held-out panel experiments are meaningful strengths.</p>
+<div class="cards">
+<div class="card"><strong>165 / 166</strong><span>Existing unit tests passed; one analysis test errored.</span></div>
+<div class="card"><strong>77 selected runs</strong><span>Saved synthetic inventory; one training seed, all mass-free.</span></div>
+<div class="card"><strong>114 datasets</strong><span>Weight-column scan covered 1,599,681 real-data rows.</span></div>
+</div>
+<p>The main issues to resolve are the interaction of normalization and identifiability in the mass-free model, stochastic gamma centering during training, incomplete restoration of prediction semantics from checkpoints, and synthetic boundary masking. These have higher priority than making the GRUs larger.</p>
+<div class="note"><strong>How to read this review.</strong> <span class="tag proof">Derived</span> means an algebraic consequence of the equations. <span class="tag">Reproduced</span> means a local execution or artifact check. <span class="tag p2">Needs experiment</span> means a plausible improvement whose benefit has not been measured. Recommendations below are proposed changes, not changes already implemented.</div>
+</section>
+
+<section id="actual-model">
+<h2>2. What the current code actually models</h2>
+<p>For transcript <em>t</em>, dataset <em>d</em>, replicate <em>r</em>, and codon <em>i</em>, the input contains the CDS sequence and observed count profiles. Let <em>n</em><sub>t</sub> be the number of valid modeled codons. The two branches produce:</p>
+<div class="flow" aria-label="Model branches and observation scale">
+<div class="shared"><strong>Shared sequence branch</strong><br>Codon-derived features → bidirectional GRU → positive local score → within-transcript mean normalization → <em>L</em><sub>ti</sub>.</div>
+<div class="dataset"><strong>Dataset-conditioned branch</strong><br>Sequence embeddings + dataset identity → separate bidirectional GRU → raw log-gamma; a detached copy of the context feeds the dispersion head.</div>
+<div class="merge">Reference-center log-gamma → exponentiate → combine with <em>L</em> and observed mean scale <em>S</em> → predict counts.</div>
+</div>
+<div class="equation">
+<span class="row">L<sub>ti</sub> = softplus(f<sub>θ</sub>(X<sub>t</sub>)<sub>i</sub>) / mean<sub>j valid</sub> softplus(f<sub>θ</sub>(X<sub>t</sub>)<sub>j</sub>), &nbsp; mean<sub>i</sub> L<sub>ti</sub> = 1.</span>
+<span class="row">g<sub>dti</sub> = a<sub>dti</sub> − Σ<sub>e∈R</sub> π<sub>e</sub>a<sub>eti</sub> − mean<sub>j</sub>a<sub>dtj</sub> + Σ<sub>e∈R</sub>π<sub>e</sub> mean<sub>j</sub>a<sub>etj</sub>; &nbsp; γ<sub>dti</sub> = exp(g<sub>dti</sub>).</span>
+<span class="row">S<sub>dt</sub> = mean<sub>i</sub> ȳ<sub>dti</sub>, &nbsp; S<sub>dtr</sub> = mean<sub>i</sub> y<sub>dtri</sub>.</span>
+<span class="row">Mass-free: μ<sub>dti</sub> = S<sub>dt</sub>L<sub>ti</sub>γ<sub>dti</sub>.</span>
+<span class="row">Mass-conserved: μ<sub>dti</sub> = S<sub>dt</sub>L<sub>ti</sub>γ<sub>dti</sub> / mean<sub>j</sub>(L<sub>tj</sub>γ<sub>dtj</sub>).</span>
+</div>
+<p>For the replicate NB term, the model reuses the final inner shape and substitutes the replicate-specific observed mean <em>S</em><sub>dtr</sub>. The consensus mean is used for ordinary prediction and PCC. Replicates therefore do not all receive an identical numerical count mean when their observed totals differ.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Entry point / configuration</th><th>Current mean model</th><th>Gamma / objective distinction</th></tr></thead>
+<tbody>
+<tr><td>Default real multidataset YAML</td><td><code>mass_conservation: true</code></td><td>Fixed reference, quality-rank weights; standard NB2 + raw/VST PCC; transcript-balanced.</td></tr>
+<tr><td>Synthetic YAML and current synthetic result inventory</td><td><code>mass_conservation: false</code></td><td>Normally equal fixed reference; standard NB2, β = 0; transcript-balanced.</td></tr>
+<tr><td>Real panel-convergence and Experiment-8 launchers</td><td>Explicitly force <code>false</code></td><td>Equal fixed reference; standard NB2; train-only reliability references.</td></tr>
+<tr><td>Four-organism benchmark</td><td><code>false</code></td><td>One dataset per run; global-weighted loss; mean-gradient reweighting with β = 0.5; gamma penalty 10<sup>−4</sup>.</td></tr>
+</tbody></table></div>
+<p class="source">Sources: <a href="../config/config_ribounmix_multidataset.yaml">real YAML, line 192</a>; <a href="../config/config_ribounmix_synthetic.yaml">synthetic YAML</a>; <a href="../config/config_ribounmix_benchmarking.yaml">benchmark YAML</a>; <a href="../Models/RiboUnmixModel/RiboUnmixModel.py">model forward, line 1202</a>; <a href="../Models/RiboUnmixLightningModule.py">replicate loss, line 1521</a>.</p>
+<h3>The optimized quantity is a hybrid objective</h3>
+<div class="equation">
+<span class="row">Y<sub>dtri</sub> ∼ NB2(μ<sub>dtri</sub>, α<sub>dti</sub>), &nbsp; Var(Y) = μ + αμ², &nbsp; α = exp(clip(log_sigma, −5, 1)).</span>
+<span class="row">z<sub>dt</sub> = mean<sub>r</sub>[τ(n<sub>t</sub>) mean<sub>i</sub> NLL<sub>dtri</sub>] + 0.5(1 − PCC<sub>raw</sub>) + 0.5(1 − PCC<sub>VST</sub>).</span>
+<span class="row">τ(n) = clip((n / 1000)<sup>0.25</sup>, 0.5, 2), &nbsp; ℒ<sub>B</sub> = mean<sub>t∈B</sub> [Σ<sub>d</sub>w<sub>dt</sub>z<sub>dt</sub> / Σ<sub>d</sub>w<sub>dt</sub>].</span>
+</div>
+<p>This is a useful prediction objective with an NB2 component. Because it also includes PCC penalties, outcome-derived scales and weights, replicate averaging, and length tempering, it should not be described as ordinary joint maximum likelihood for all raw counts. The classical NB2 label correctly describes the local count-loss component when β = 0.</p>
+</section>
+
+<section id="mathematics">
+<h2>3. Mathematical findings</h2>
+<article class="finding" id="mass-free-finding">
+<h3><span class="tag p1">Priority 1</span> M1. The mass-free constraints exclude ordinary normalized profiles</h3>
+<p><span class="tag proof">Derived + numerical check</span> Suppose the same valid positions are observed in every reference dataset, all π<sub>d</sub> are positive, and we consider exact, deterministic evaluation. Cross-dataset centering implies Σ<sub>d</sub>π<sub>d</sub> log γ<sub>di</sub> = 0. If the mass-free model fit relative expected profiles h<sub>di</sub> exactly, then:</p>
+<div class="equation"><span class="row">h<sub>di</sub> = μ<sub>di</sub>/S<sub>d</sub> = L<sub>i</sub>γ<sub>di</sub> &nbsp; ⇒ &nbsp; L<sub>i</sub> = ∏<sub>d</sub>h<sub>di</sub><sup>π<sub>d</sub></sup>.</span></div>
+<p>With a scale equal to each noiseless profile's own mean, each target <em>h</em><sub>d</sub> has arithmetic mean one. Weighted AM–GM gives:</p>
+<div class="equation"><span class="row">mean<sub>i</sub> ∏<sub>d</sub>h<sub>di</sub><sup>π<sub>d</sub></sup> ≤ Σ<sub>d</sub>π<sub>d</sub> mean<sub>i</sub>h<sub>di</sub> = 1.</span></div>
+<p>The inequality is strict when the datasets have different positive relative profiles at any position. Yet the biological branch requires mean(<em>L</em>) = 1. Consequently, <strong>the mass-free model cannot exactly fit all such profiles while preserving its constraints</strong>. This is a representational restriction, not an optimizer failure. It already follows from cross-dataset centering; the additional positional gamma constraint restricts the family further.</p>
+<p>Another view is the model's reference-weighted mass ratio:</p>
+<div class="equation"><span class="row">Σ<sub>d</sub>π<sub>d</sub> mean<sub>i</sub>(L<sub>i</sub>γ<sub>di</sub>) ≥ mean<sub>i</sub>L<sub>i</sub> = 1.</span></div>
+<p>It is strictly above one for nontrivial centered dataset effects where <em>L</em> is positive. Individual datasets may underpredict; the reference-weighted average cannot. This statement concerns the ideal constrained forward function, not the stochastic training draw discussed below.</p>
+<div class="lab" aria-label="Interactive mass-normalization counterexample">
+<h4 style="margin-top:0">Explore a two-position counterexample</h4>
+<p>Dataset A has relative profile [1 + a, 1 − a]; B has the reverse. Both have mean one. Their normalized shared geometric center is [1, 1].</p>
+<div class="controls"><label for="contrast">Dataset contrast a</label><input id="contrast" type="range" min="0" max="0.90" step="0.01" value="0.50"><output id="contrast-value" for="contrast">0.50</output></div>
+<div class="table-wrap"><table class="numeric"><thead><tr><th>Profile</th><th>Position 1</th><th>Position 2</th><th>Mean</th></tr></thead><tbody>
+<tr><td>Target A</td><td id="target-1">1.5000</td><td id="target-2">0.5000</td><td>1.0000</td></tr>
+<tr><td>Mass-free A, constrained L and γ</td><td id="free-1">1.7321</td><td id="free-2">0.5774</td><td id="free-mean">1.1547</td></tr>
+<tr><td>Mass-conserved A</td><td id="conserved-1">1.5000</td><td id="conserved-2">0.5000</td><td>1.0000</td></tr>
+</tbody></table></div>
+<p class="result" id="mass-result" aria-live="polite">At a = 0.50, the mass-free example overpredicts both datasets' totals by 15.47%.</p>
+<p class="caption">Illustration, not a fitted experiment. The chosen gamma has geometric mean one along both axes. Its mass-free mean is 1/√(1 − a²). The example shows an unavoidable conflict for exact fitting; it does not say that every trained model uses these exact gamma values.</p>
+</div>
+<p><strong>Recommendation:</strong> make the statistical target explicit before another mass-mode comparison. If the goal is relative shape conditional on observed depth, the conserved form is coherent. If the goal is absolute count generation, introduce a separately identified abundance/exposure model rather than taking <em>S</em> from the outcome and interpreting residual mass as recovered abundance. A free pair amplitude could improve fit, but would introduce a new identifiability problem requiring its own constraints.</p>
+<p>For the conserved model the corresponding shared-profile identity is <em>L</em> = mean-normalize(∏<sub>d</sub>h<sub>d</sub><sup>π<sub>d</sub></sup>), not the unnormalized identity above. Do not apply the mass-free theorem unchanged to the current base configuration.</p>
+<p class="source"><a href="../Models/RiboUnmixModel/SharedProfileModel.py">biological normalization, lines 113–122</a>; <a href="../Models/RiboUnmixModel/RiboUnmixModel.py">centering and mass switch, lines 723 and 1329</a>; contrast with <a href="ribounmix_model_core_concepts.html">the existing identifiability discussion</a>.</p>
+</article>
+
+<h3>M2. A fixed gauge is a definition, not an unbiased estimator of biology</h3>
+<p>For a fixed collection of model-admitted expectations, centering removes a common multiplicative attribution ambiguity. It does not identify which shared patterns are biological. If every experiment contains the same sequence-dependent distortion, that distortion is indistinguishable from shared biology using these observations alone.</p>
+<p>Also, <strong>equal weighting across different panels does not keep the finite-panel target identical</strong>. Changing panel membership changes the geometric center even when π<sub>d</sub> = 1/N everywhere. Equal weights preserve a weighting rule; they do not freeze the shared quantity being estimated. Cross-panel stability therefore mixes estimation uncertainty with differences between panel-defined targets.</p>
+<p>Repeated conditions from one publication still receive multiple dataset votes in the gamma reference. Consider a source-balanced sensitivity analysis, π<sub>d</sub> ∝ 1/(number of datasets from source(d)), alongside the current equal-dataset convention. This changes the estimand and must be labeled as such. Missing transcript–dataset pairs also mean that some reference predictions are extrapolated from learned sequence rules, rather than directly constrained by measurements of that transcript.</p>
+<p class="source"><a href="../Models/RiboUnmixModel/RiboUnmixModel.py">fixed reference, line 723</a>; <a href="real_exp8_shared_profile_stability.html">Experiment-8 discussion of equal weights</a>; <a href="../Utils/real_panel_convergence.py">source-family grouping</a>.</p>
+
+<h3>M3. Target-derived scale changes the interpretation of inference</h3>
+<p>Using each target's mean is legitimate for evaluating conditional profile shape if every comparator receives equivalent scale information. It does mean that <em>μ</em> is not a sequence-only prediction of transcript abundance. Replicate-specific scale absorbs observed between-replicate depth differences, so learned alpha describes residual variation after this adjustment, not all sources of replicate variability.</p>
+<p>A product of NB probability masses with <em>S</em> recomputed from the same outcome vector is not automatically a normalized joint generative likelihood for that vector. A rigorous shape-only alternative is a conditional count model: for example, conditioning independent Poisson counts on their total yields a multinomial shape likelihood. Overdispersed conditional alternatives require a specified generative construction. Keep absolute-abundance and conditional-shape evaluations separate.</p>
+
+<h3>M4. The current VST-PCC can create apparent shape from alpha</h3>
+<p><span class="tag">Reproduced</span> The transform T<sub>α</sub>(x) = 2 asinh(√(αx + ε))/√(α + ε) uses a different alpha at every codon. This is not one common monotone transformation applied along the profile. A spatially varying alpha can create a spatial pattern even when the original counts are constant.</p>
+<p>With constant target 3, constant prediction 2, and log-alpha spanning [−5, 1], the existing transform and PCC function return <strong>PCC = 0.998797</strong> and mark the comparison valid. The raw target has variance zero. Alpha detachment prevents direct optimization through this PCC term, but does not remove the induced pattern.</p>
+<p><strong>Recommendation:</strong> apply the raw-target variance validity check to both shape terms; compare the existing VST with a dataset- or transcript-scalar dispersion transform and a fixed log1p/square-root transform. Treat the current score as agreement after position-specific variance adjustment, not pure positional shape. Use held-out accuracy and calibration to decide whether both PCC penalties are worth keeping.</p>
+<p class="source"><a href="../Models/RiboUnmixLightningModule.py">_nb_vst, _pcc_loss_per_sample and masked_pcc; lines 1288, 1296 and 260</a>.</p>
+
+<h3>M5. Reliability weighting has a narrower role than its name suggests</h3>
+<p>The default transcript-balanced reducer gives each transcript one outer vote. Multiplying all its dataset weights by a common positive factor changes nothing. With one dataset, the weight cancels completely. This is an intentional estimand choice, not a loss bug; it means “reliability” primarily chooses between datasets for the same transcript.</p>
+<p>Dataset-median normalization of the SNR score further removes much of the absolute depth scale. A uniformly shallow dataset need not get smaller normalized weights than a uniformly deep dataset. NB2 already makes information depend on mean and dispersion; extra weights are a heuristic preference, not calibrated inverse-variance weights.</p>
+<p>Estimate the effective number of views for each transcript, N<sub>eff,t</sub> = (Σ<sub>d</sub>w<sub>dt</sub>)² / Σ<sub>d</sub>w<sub>dt</sub>², and report support and depth alongside it. Replica counts and shared-source dependence require additional treatment; this formula alone does not measure independent biological information.</p>
+</section>
+
+<section id="implementation">
+<h2>4. Is the code correct?</h2>
+<p><strong>Much of the core implementation is carefully protected, but there are specific correctness and reproducibility gaps.</strong> The following findings distinguish behavior reproduced in the current tree from risks inferred from the source.</p>
+<article class="finding">
+<h3><span class="tag p1">Priority 1</span> C1. Training dropout breaks the reported gamma constraint</h3>
+<p>The requested rows and reference rows are evaluated separately during training. The gamma head has dropout 0.1. The centering calculation therefore subtracts a center formed from a different stochastic realization. Within-profile centering still holds, but the requested reference rows need not satisfy the cross-dataset constraint.</p>
+<div class="table-wrap"><table class="numeric"><thead><tr><th>Small CPU probe</th><th>Actual max |mean<sub>d</sub> log γ|</th><th>Reported constraint error</th></tr></thead><tbody><tr><td>Training mode</td><td>0.0218472</td><td>0</td></tr><tr><td>Evaluation mode</td><td>9.31 × 10<sup>−10</sup></td><td>0</td></tr></tbody></table></div>
+<p><span class="tag">Reproduced</span> This used the actual modules with reduced hidden widths, two equal-weight reference datasets, seed 23, and a nonzero gamma-head weight to exercise behavior after neutral initialization. It was not a measurement from a trained production checkpoint.</p>
+<p>The diagnostic currently evaluates an algebraic cancellation of its own reference sums. It does not establish that the separately evaluated requested outputs satisfy the constraint. In training, exponentiation also converts zero-mean log noise into a non-neutral expected multiplicative effect.</p>
+<p><strong>Fix direction:</strong> compute reference scores once per transcript and gather observed reference rows from the same stochastic tensor, including their attached gradient paths. Alternatively, make the gamma-score path deterministic. Evaluate missing/non-reference rows explicitly. Add a test with nonzero head weights and active dropout; the deterministic centering tests do not exercise this failure.</p>
+<p class="source"><a href="../Models/RiboUnmixModel/RiboUnmixModel.py">reference reuse is evaluation-only, lines 861–958; diagnostic, line 987</a>; <a href="../Models/RiboUnmixModel/submodels/DatasetMultiplicativeAllocationBiasHead.py">gamma-head dropout</a>; <a href="../Tests/test_gamma_centering.py">existing deterministic centering tests</a>.</p>
+</article>
+
+<article class="finding">
+<h3><span class="tag p1">Priority 1</span> C2. Strict checkpoint loading does not restore the mass mode</h3>
+<p><span class="tag">Reproduced</span> <code>mass_conservation</code> is a Python attribute and is absent from <code>get_extra_state()</code>. Loading a mass-free model's state into an otherwise identical conserved model succeeds with “All keys matched successfully,” yet the receiver remains conserved and gives different count predictions.</p>
+<p>The small probe produced a maximum prediction difference of 5.26 × 10<sup>−5</sup> because its gamma effects were deliberately small. The important result is the silent change of function; the size depends on the checkpoint. The Lightning module also excludes the config from saved hyperparameters, and <code>load_weights_only()</code> does not reconstruct it from the saved resolved YAML.</p>
+<p><strong>Fix direction:</strong> persist and validate all function-defining settings: mass mode, feature routing/scales, position conventions, encoding identity, alpha bounds and relevant loss semantics. Pair the checkpoint with a versioned configuration and input-schema hash. Test that loading under a contradictory config either restores the original function or fails clearly.</p>
+<p>Separately, <code>from_checkpoint=true</code> before training loads weights and starts a fresh optimizer/scheduler. It is a warm start, not an exact training resume. That behavior is documented in the loader but should be explicit in launcher names and experiment provenance.</p>
+<p class="source"><a href="../Models/RiboUnmixModel/RiboUnmixModel.py">get_extra_state, line 315</a>; <a href="../Models/RiboUnmixLightningModule.py">save_hyperparameters, line 725</a>; <a href="../main_ribounmix_multidataset.py">load_weights_only, line 1099; training restart, line 2585</a>.</p>
+</article>
+
+<article class="finding">
+<h3><span class="tag p1">Priority 1</span> C3. An artificial synthetic terminal zero is treated as data</h3>
+<p>The synthetic preprocessor appends a zero when the count profile is one position shorter than the CDS. The collator then constructs the mask solely from sequence length. Thus the appended terminal position is valid for NB2, consensus PCC, observed scale, and normalization.</p>
+<p>This supervises an unobserved position as a measured zero and changes every transcript's scale/normalization slightly. Excluding boundaries in the later recovery report does not remove their influence during training.</p>
+<p><strong>Fix direction:</strong> carry an observation mask separately from sequence/context validity. Retain the stop codon as context if desired, but exclude a synthetic placeholder from likelihood and target-derived scale. Specify whether biological/gamma normalization is over physical observed positions or the complete modeled CDS and align the truth accordingly. Do not simply introduce an internal hole in the packed-GRU mask; sequence packing assumes valid prefixes.</p>
+<p class="source"><a href="../Datasets/data/weight_synthetic_riboseq_codon_replicas.py">_validate_and_pad, lines 64–96</a>; <a href="../Dataloaders/RiboUnmixMultiDataset/RiboUnmixMultiDataset.py">collate_fn, mask construction near line 1092</a>.</p>
+</article>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Other finding</th><th>Evidence and consequence</th><th>Recommended action</th></tr></thead>
+<tbody>
+<tr><td><span class="tag p2">P2</span> One stale analysis test</td><td><code>test_plotters_reject_mixed_depth_input</code> calls removed <code>RECOVERY.plot_recovery</code> and errors. This does not establish a failure in the current replacement plotter.</td><td>Rewrite the test around the current plotting API and intended mixed-depth contract; do not add a dummy compatibility function just to make it green.</td></tr>
+<tr><td><span class="tag p2">P2</span> NB2 numerical cancellation</td><td>For alpha = 1 and y = μ = 10<sup>6</sup>, float32 NLL is 15 instead of 14.8155. At 10<sup>12</sup>, it is 0 instead of 28.6310. These are stress inputs, not confirmed values in production data. <code>nan_to_num(nll, nan=0)</code> also makes an invalid likelihood contribution look perfect.</td><td>Use numerically stable log-probability algebra and a float64 reference for stress checks. Fail or explicitly count invalid model outputs; masking invalid observations and repairing invalid predictions are different operations.</td></tr>
+<tr><td><span class="tag p2">P2</span> Silent clamping can stop learning</td><td>Raw log-gamma is hard-clamped at ±8 before centering; log-alpha is clamped to [−5, 1] in the likelihood. Gradients outside a hard clamp are zero.</td><td>Monitor saturation, including reference evaluations. Compare a smooth bounded parameterization or explicit regularization. This is a stability/optimization tradeoff, not a reason to remove bounds unconditionally.</td></tr>
+<tr><td><span class="tag p2">P2</span> Alternate epoch reducers are approximate</td><td><code>_log_stage</code> weights global-weighted batch means by row count instead of total weight; dataset-balanced batch means cannot generally reconstruct a dataset-balanced epoch mean when support/weight sums vary. The default transcript-balanced metric has the appropriate outer group count for complete groups.</td><td>Aggregate exact numerators/denominators over the epoch for alternate reducers, especially the global-weighted benchmark checkpoint monitor.</td></tr>
+<tr><td><span class="tag p2">P2</span> CSS version mapping is not proven coordinate-safe</td><td>The sequence builder copies CSS positions using a versionless transcript ID and range checks, whereas preservation of other features checks identical codons. In-range CSS positions may still be wrong after a CDS revision.</td><td>Require exact annotation/transcript-version agreement or validated sequence remapping. This is a potential misalignment, not a demonstrated count of wrong sites.</td></tr>
+<tr><td><span class="tag p2">P2</span> Legacy filtering contracts disagree</td><td>The datamodule now excludes legacy zero-weight/zero-information rows. The default master split loader rejects nonpositive weights. The current scan found zero zero-weight rows in the 114 real parquets, so this mismatch was not triggered there.</td><td>Share one eligibility function between preflight, split and dataloader. Include counts and reasons in a single manifest.</td></tr>
+</tbody></table></div>
+<p class="source">Sources: <a href="../Tests/test_gamma_ablation_depth_partitioning.py">failed test, line 121</a>; <a href="../analyses/synthetic_gamma_ablation_lbio_recovery.py">current plotter, line 667</a>; <a href="../Models/RiboUnmixLightningModule.py">NB2, line 524; epoch logs, line 2357</a>; <a href="../Models/RiboUnmixModel/DatasetBiasSubmodel.py">raw-score clamp, line 287</a>; <a href="../Datasets/build_mane_sequence_embeddings.py">CSS mapping, lines 203 and 263</a>; <a href="../main_ribounmix_multidataset.py">split eligibility, line 652</a>.</p>
+
+<h3>Things the implementation already does well</h3>
+<ul class="compact">
+<li>Packed bidirectional GRUs prevent right-padding from contaminating backward sequence context.</li>
+<li>The shared biological GRU runs once per unique transcript under the default zero-dropout setting; gathering outputs preserves gradients from all dataset rows.</li>
+<li>Raw replicas remain separate for NB2; the consensus is used once per pair for each PCC component.</li>
+<li>Gamma reference membership and weights are checkpointed; evaluation does not require co-resident partner datasets.</li>
+<li>Optimizer parameter groups check completeness and uniqueness; fixed-alpha parameters are excluded, and nonfinite gradients fail before the update.</li>
+<li>The current sampler keeps physical packing deterministic and shuffles complete logical batches, addressing the historical changing-epoch-length failure visible in an older real-panel log.</li>
+</ul>
+</section>
+
+<section id="optimization">
+<h2>5. Where optimization would have the most value</h2>
+<p>There are two distinct goals: improve statistical estimation and reduce compute/memory without changing the target. The following priorities are based on source structure; no GPU throughput benchmark was run for this review.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Opportunity</th><th>Why it matters</th><th>How to verify the benefit</th></tr></thead>
+<tbody>
+<tr><td><strong>Reuse one reference computation during training</strong></td><td>With U unique transcripts, K observed views and R reference views, the dataset GRU evaluates about U(K + R) sequences. Complete panels with K = R approximately duplicate that work. Evaluation already reuses complete reference rows; training does not.</td><td>Combine with C1. Compare outputs/gradients using deterministic scores, then test coherent dropout. Measure dataset-branch forwards, peak memory and transcripts/second. Do not assume a twofold end-to-end speedup.</td></tr>
+<tr><td><strong>Treat reference chunking honestly</strong></td><td>Chunks cap the size of individual forwards, but their autograd graphs remain attached until backward. Decreasing chunk size does not necessarily bound total retained training activation memory.</td><td>Profile retained tensors and peak allocated memory. Compare activation checkpointing/recomputation or a carefully designed two-pass reference calculation; preserve reference-center gradients.</td></tr>
+<tr><td><strong>Skip baseline diagnostics that are mathematically constant</strong></td><td>With β = 0, mean-gradient weights are all one, yet the NB code computes their quantiles and repeats equivalent sequence reductions. Position features also build unused alternatives, and several output aliases duplicate diagnostics.</td><td>Add a cheap standard-NB path with identical loss and gradients. Time it on representative padded batches, not just scalar examples.</td></tr>
+<tr><td><strong>Reduce repeated grouping and host synchronization</strong></td><td>The collator already supplies integer transcript groups, but gamma centering regroups strings, checks repeated tensors, uses per-row <code>.item()</code>, and recreates canonical rows. Packed lengths also cross to CPU in the bias encoder.</td><td>Pass validated canonical indices/lengths from collate; retain boundary validation and a debug mode. Use the profiler to confirm fewer CPU/GPU stalls.</td></tr>
+<tr><td><strong>Cache static packing and immutable data</strong></td><td><code>__len__</code>, previews and iteration each rebuild the grouped plan. Data and pair dictionaries are loaded eagerly; spawning workers or independent models can multiply resident memory.</td><td>Cache the deterministic logical packing, then shuffle its order each epoch. Consider Arrow-backed/contiguous indexed arrays and streaming exports. Measure CPU RSS, startup time and paging.</td></tr>
+<tr><td><strong>Provide a direct shared-profile inference API</strong></td><td>Experiment 8 needs only L, but currently creates a dummy dataset/target row and executes the observation branch before exporting a compact L file.</td><td>Expose sequence → L directly and compare against current evaluation outputs. This avoids all reference-panel gamma work and dummy-dependent outputs for that task.</td></tr>
+<tr><td><strong>Start alpha simpler, then add flexibility</strong></td><td>A per-codon alpha field is flexible relative to two synthetic replicas and may absorb model misspecification. Detachment protects the upstream context from alpha gradients, but does not make alpha uniquely interpretable.</td><td>Compare fixed synthetic alpha, dataset-scalar alpha, and a shrunk position-specific head. Evaluate calibration on unseen replicas and stratify by depth; inspect bound saturation and residual structure.</td></tr>
+<tr><td><strong>Use a meaningful learning-rate schedule</strong></td><td>The real baseline plateau factor is 0.99: one reduction changes LR by only 1%; ten reductions retain 90.4% of the starting rate. Early stopping can end the run before this produces much adaptation.</td><td>Compare a stronger plateau reduction or a fixed warmup/decay schedule under identical data, seeds and training budget. Benefit is unmeasured.</td></tr>
+</tbody></table></div>
+<p>Execution chunks correctly reconstruct a transcript-balanced logical batch when the group losses are held fixed. Accumulating differently sized logical-batch means still weights logical batches equally, and a short final accumulation window retains the full 1/A factor. If exact equal-transcript updates are desired, accumulate loss numerators and divide by the actual transcript count per optimizer window. Preserve full groups, finite-gradient checks and once-per-update clipping.</p>
+<p>Only after these changes should a lighter CNN/TCN, shared sequence-context cache with dataset conditioning, or smaller GRU be compared. Moving dataset identity after the GRU changes the function class and is an architectural ablation, not an algebraically equivalent optimization. Keeping two separate encoders is a defensible design choice.</p>
+<p class="source"><a href="../Models/RiboUnmixModel/RiboUnmixModel.py">unique biological forward and reference path</a>; <a href="../Models/RiboUnmixLightningModule.py">NB details, line 595; accumulation, line 3306</a>; <a href="../Dataloaders/RiboUnmixMultiDataset/RiboUnmixMultiDatasetDataModule.py">sampler, lines 734–872</a>; <a href="../config/config_ribounmix_multidataset.yaml">optimizer schedule</a>.</p>
+</section>
+
+<section id="redundancy">
+<h2>6. What is redundant, and what should remain separate?</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Item</th><th>Assessment</th><th>Practical recommendation</th></tr></thead>
+<tbody>
+<tr><td>L, ρ, λ and J</td><td>ρ = L/(1 + L), λ = log(1 + L), J = mean λ. These are transformations/summaries of L, not separately identified physical variables. <code>w_norm</code> is also L.</td><td>Keep L as the primary scientific quantity. Retain derived displays only when useful, with explicit non-kinetic names.</td></tr>
+<tr><td>Codon + three nucleotide one-hots + amino-acid one-hot</td><td>The 97-dimensional base input is informationally redundant: nucleotides and amino acid are deterministic functions of the codon. For the first affine projection, these features can be represented through an effective 64-codon lookup.</td><td>Compare codon-only and compositional encodings. The redundant encoding changes parameter sharing, regularization and optimization, so deleting it is not guaranteed to improve generalization.</td></tr>
+<tr><td>Codon, nucleotide and AA embeddings in gamma</td><td>Also encode the same underlying sequence, but offer useful compositional structure. Dataset identity appears both inside the context GRU and directly in the head.</td><td>Use controlled ablations; neither the second encoder nor the direct dataset shortcut is automatically redundant.</td></tr>
+<tr><td><code>init_gamma</code> in an active centered panel</td><td>A constant log shift added to all requested/reference scores cancels in centering. It matters in the uncentered singleton/disabled paths. The final scalar head bias is also locally a null direction while raw-score clipping is inactive.</td><td>Document mode-specific effect. Remove only proven inactive parameters/settings in a versioned architecture.</td></tr>
+<tr><td><code>dataset_log_sigma_submodule_params.dataset_embedding_size</code></td><td>The current log-sigma head reads hidden size, dropout and initial bias; it does not read this embedding-size setting.</td><td>Remove or deprecate the unused config key. Alpha already receives dataset context through its assembled input.</td></tr>
+<tr><td>Output compatibility fields</td><td><code>ids/transcript_id</code>, <code>lengths/length</code>, gamma/log-gamma/raw variants, a zero <code>additive_bias</code>, and repeated reference metadata increase file size and interpretation burden. <code>normalized_shape</code> is not normalized in mass-free mode.</td><td>Introduce a versioned compact schema with canonical fields, an explicit mass-mode field, and one sidecar manifest. Maintain a reader for historical files.</td></tr>
+<tr><td>Repeated analysis functions</td><td>AST comparison found identical <code>sequence_or_none</code> implementations in five result scripts, and identical <code>safe_pearsonr</code> in two. Existing <code>gamma_ablation/common.py</code> and PCC helpers already provide a consolidation point.</td><td>Share parsing, masks, coordinate alignment, metric definitions and artifact selection. Preserve intentionally different estimands as explicit options.</td></tr>
+<tr><td>Large modules and repeated launchers</td><td>The Lightning module has 3,647 lines; result scripts total 29,063 lines. Local/Slurm variants can encode different experiment matrices and checkpoint defaults.</td><td>Extract loss, metrics, prediction IO and execution planning into tested components. Define experiments once and make launchers thin environment adapters.</td></tr>
+</tbody></table></div>
+<h3>Documentation drift is a scientific reproducibility issue</h3>
+<p>The HTML reports contain useful reasoning but must be treated as dated snapshots. <a href="model_mathematics.html">model_mathematics.html</a> describes mass-free operation and an unclipped raw gamma score; the current real base YAML uses mass conservation and bounds the raw score at 8. <a href="synthetic_experiments_results.html">synthetic_experiments_results.html</a> labels its runs mass-free but displays a conserved mean equation; it also says a singleton reference forces gamma to one, whereas the code skips centering below the minimum reference size and leaves raw gamma active.</p>
+<p>The README contains obsolete paths and lowercase <code>tests/</code> commands, while the current tests are in <code>Tests/</code>. Its single-dataset command and <code>run_parallel.sh</code> do not switch away from the current sampler's minimum-two-dataset requirement. Generate the active equation, configuration summary, checkpoint rule and output schema from the same resolved run manifest; keep older reports visibly historical.</p>
+<p class="source"><a href="../Models/RiboUnmixModel/submodels/DatasetLogSigmaHead.py">unused key check</a>; <a href="../results/8_CSS_recall_single_vs_multi.py">sequence_or_none, line 96</a>; <a href="../results/9_L_bio_biological_profile_analyses.py">same helper, line 314</a>; <a href="../README.md">README</a>; <a href="../run_parallel.sh">older launcher</a>.</p>
+</section>
+
+<section id="biology">
+<h2>7. Biological interpretation: what can be extracted?</h2>
+<p><strong>The most defensible output is a relative, sequence-dependent ribosome-footprint profile that is shared under a specified dataset reference.</strong> Biological interpretation becomes stronger when it survives independent panels, matched technical comparisons, independent annotations and perturbations.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Question</th><th>What this model can contribute</th><th>What it cannot establish by itself</th></tr></thead>
+<tbody>
+<tr><td>Where does a transcript tend to show elevated footprints?</td><td>L ranks relative within-transcript positions and can predict a shared profile for an unseen sequence.</td><td>A peak is not a calibrated ribosome occupancy probability or direct proof of a stall.</td></tr>
+<tr><td>Which codons or peptide contexts associate with higher load?</td><td>Held-out motif metaprofiles, matched-context comparisons, and sequence perturbation sensitivity can reveal associations.</td><td>Context effects are not intrinsic codon dwell times. Synonymous sequence changes can also alter technical recovery and RNA structure.</td></tr>
+<tr><td>How do experimental datasets differ?</td><td>Gamma can describe relative sequence-associated deviations and support dataset fingerprints.</td><td>Gamma does not uniquely separate protocol effects from stress, treatment, cell-state, or other genuine biology.</td></tr>
+<tr><td>How noisy is a position?</td><td>Alpha describes fitted NB overdispersion after the model's scale adjustment.</td><td>Alpha is not epistemic uncertainty in L/gamma and is not a causal measure of technical quality.</td></tr>
+<tr><td>What are the elongation rate, initiation rate and protein flux?</td><td>The profile can suggest hypotheses or candidate bottlenecks for independent kinetic experiments.</td><td>No rates in s<sup>−1</sup>, absolute ribosome density, or proteins per second are identified.</td></tr>
+<tr><td>Does a peak represent a collision or queue?</td><td>It may identify candidate regions for comparison with collision-sensitive assays.</td><td>The architecture has no ribosome exclusion, footprint-length dynamics or coupled traffic law. Monosome-like count profiles alone do not identify a collision rate.</td></tr>
+<tr><td>Does the model predict translation efficiency?</td><td>External TE may be examined as a separate exploratory association with profile features.</td><td>Mean-one L contains no absolute transcript abundance. Target-scaled μ and the diagnostic J are not independent TE predictions.</td></tr>
+<tr><td>Can it discover uORFs, start-site choice, readthrough or frameshifts?</td><td>Only features represented in its supplied CDS-coordinate inputs and targets can be modeled.</td><td>The current CDS-only, codon-aggregated setup cannot establish events outside the represented frame/region.</td></tr>
+</tbody></table></div>
+
+<h3>“Queueing” is currently an analogy, not an identified mechanism</h3>
+<p>The biological model applies softplus and mean normalization to a neural score. There is no fitted initiation rate, service/elongation rate, exclusion interaction, or continuity equation linking adjacent codons. The algebraic identity ρ = L/(1 + L) can resemble a queue formula without making the learned variables physical queue parameters.</p>
+<div class="equation"><span class="row">J = mean<sub>i</sub> log(1 + L<sub>i</sub>) ≤ log(1 + mean<sub>i</sub>L<sub>i</sub>) = log 2.</span><span class="row">mean<sub>i</sub> ρ<sub>i</sub> ≤ 1/2.</span></div>
+<p>These bounds follow from concavity and mean-one normalization. A flat profile maximizes J at log 2; concentrating the same relative mass lowers it. <strong>J is a profile-shape summary, not ribosome flux.</strong> Inferring residence times from occupancy would require additional assumptions such as steady state, known flux and negligible traffic; those assumptions are not enforced here.</p>
+<p class="source">Repository: <a href="../Models/RiboUnmixModel/SharedProfileModel.py">forward, lines 99–137</a>. Biological context: <a href="https://pmc.ncbi.nlm.nih.gov/articles/PMC7484464/">Meydan &amp; Guydosh, disome/trisome profiling (2020)</a> directly studies collision-sensitive measurements and their dependence on translation dynamics.</p>
+
+<h3>Biological catches that matter for this particular project</h3>
+<ul>
+<li><strong>Nuclease effects can change local profiles even when gene-level measurements agree.</strong> This is a good motivation for gamma, but it requires testing whether the learned signature matches independently documented protocol variation. <a href="https://academic.oup.com/nar/article/45/2/e6/2953303">Gerashchenko &amp; Gladyshev (2017)</a>.</li>
+<li><strong>Cycloheximide interpretation is organism- and protocol-dependent.</strong> Yeast experiments show redistribution biases, while a human-focused study reports resistance to several such effects. A CHX-associated gamma signature is not automatically a universal artifact mechanism. <a href="https://pmc.ncbi.nlm.nih.gov/articles/PMC4684354/">Hussmann et al. (2015)</a>; <a href="https://www.nature.com/articles/s41467-021-25411-y">Sharma et al. (2021)</a>.</li>
+<li><strong>Polyproline is a useful predefined validation target, with context.</strong> eIF5A-dependent translation of polyproline gives a mechanistic reason to examine these motifs. It does not imply that every PP/PPP occurrence must produce a large pause in every dataset. Match sequence context and test perturbations where available. <a href="https://pmc.ncbi.nlm.nih.gov/articles/PMC3744875/">Gutierrez et al. (2013)</a>.</li>
+<li><strong>CDS-only inputs omit footprint-end context at boundaries.</strong> The saved synthetic boundary analysis inferred required offsets −12/−11 and +16/+17 relative to the P-site codon start. A GRU cannot determine unseen UTR nucleotides exactly. Add matched transcript flanks and explicit unknown tokens, or restrict exact-recovery claims to observable windows. That flank-complete recovery experiment has not been established by the reviewed artifacts.</li>
+<li><strong>Codon aggregation hides upstream processing uncertainty.</strong> The pipeline starts from aligned count parquets. It does not independently validate raw read-length distributions, frame periodicity, multimapping, or per-length P-site offsets. Protocol-induced coordinate shifts may be absorbed into gamma or alpha rather than identified as shifts.</li>
+<li><strong>Sequence-only predictions cannot respond to an unencoded biological state.</strong> The same sequence gets the same shared L whether tRNA availability or cellular stress changes. Dataset-conditioned differences can capture those effects, but then gamma includes genuine biology. Unseen dataset identities need calibration or a metadata-conditioned model; an unused embedding is not a scientifically validated new protocol.</li>
+</ul>
+<p class="source">Boundary evidence: <a href="synthetic_gamma_boundary_failure_analysis.html">existing boundary investigation</a>. Scope follows the <a href="../Datasets/build_mane_sequence_embeddings.py">CDS sequence builder</a> and <a href="../Dataloaders/RiboUnmixMultiDataset/RiboUnmixMultiDatasetDataModule.py">parquet input interface</a>.</p>
+</section>
+
+<section id="evidence">
+<h2>8. What the existing experiments support</h2>
+<p>The saved synthetic inventory contains 79 physical attempts and 77 selected logical runs: 30 singleton controls, 27 within-depth cumulative panels, and 20 cross-depth equal/ranked panels. The selected-run snapshot uses seed 42 and mass-free models. The figures below are values re-read from existing summary tables; the models were not retrained for this review.</p>
+<div class="table-wrap"><table class="numeric"><thead><tr><th>Unbiased baseline depth</th><th>L–K PCC, N = 2</th><th>L–K PCC, N = 10</th><th>RMSE, N = 2 → 10</th></tr></thead><tbody>
+<tr><td>0.25 reads/codon</td><td>0.776996</td><td>0.964284</td><td>0.387599 → 0.133955</td></tr>
+<tr><td>2 reads/codon</td><td>0.796765</td><td>0.966595</td><td>0.382238 → 0.138716</td></tr>
+<tr><td>20 reads/codon</td><td>0.783160</td><td>0.963079</td><td>0.414210 → 0.152117</td></tr>
+</tbody></table></div>
+<p class="caption">Best-validation-loss predictions; CDS interior; deterministic kinetic reference K. PCC is the transcript-length Fisher-weighted statistic in the table. RMSE is the mean of within-transcript shape RMSE after the analysis normalization.</p>
+<p>The within-depth gamma table has 27 panels with log-gamma Fisher PCC from <strong>0.996008 to 0.999722</strong> and mean log-RMSE from <strong>0.008908 to 0.026545</strong>. That is strong evidence that the model can learn the programmed relative bias contrasts in this synthetic setting.</p>
+<div class="warning"><strong>Two qualifications are essential.</strong> The kinetic reference is a deterministic programmed relative-residence profile; its documented metadata exclude TASEP exclusion and Gillespie sampling. These experiments do not validate ribosome traffic dynamics. Also, the modern gamma analysis re-centers both learned and true log-gamma over the evaluated interior. Its excellent metrics validate those projected contrasts, not raw multipliers, full-CDS normalization, or the absence of the mass-mode conflict.</div>
+<p>The cross-depth equal-versus-rank table contains ten comparable pairs. Small differences in L recovery are descriptive; changing gamma weights changes the reference and gradient coupling even though those weights do not directly enter the loss. Similar L scores in this particular dataset are empirical, not a mathematical guarantee of invariance.</p>
+<h3>Limits of the current evidence</h3>
+<ul class="compact">
+<li>Ordinary synthetic studies report validation predictions selected using that validation set, not a locked independent test result.</li>
+<li>A cumulative panel changes bias identity together with dataset count. One order and one training seed do not identify a pure causal effect of N.</li>
+<li>Increasing dataset count also changes the reference target. Add an oracle gauge-compatible shared target alongside physical K to separate estimator error from reference mismatch.</li>
+<li>Fisher weights n − 3 assume more independence than adjacent codons and shared-transcript datasets usually provide. These summaries are useful descriptively; their apparent precision is not independent-experiment precision.</li>
+<li>The absence of a matched conserved/mass-free pair means the current synthetic results cannot resolve M1 empirically or establish that mass-free is superior.</li>
+</ul>
+<h3>Real-data state found on disk</h3>
+<p>The inspected <code>my_exp8_run_20260904_224038</code> directory contains eight successful training-status records: six N = 2 models and two N = 5 models. This does not establish completion of the documented 34-model design or a full saturation curve. The inspected four-panel-convergence run records panel 01 as failed with a partial-logical-batch error. The current datamodule contains a deterministic-packing change aimed at that failure, and its relevant tests passed. The old log is evidence of a historical failed run, not proof that the current fix fails.</p>
+<p>Cross-panel agreement remains a reproducibility test. High agreement alone cannot distinguish recovered biology from shared sequence bias or shared architectural preference; independent biological controls remain necessary.</p>
+<p class="source">Saved tables: <a href="../analyses/artifacts/synthetic/gamma_ablation/recovery/run_inventory.csv">run inventory</a>; <a href="../analyses/artifacts/synthetic/gamma_ablation/recovery/L_bio_shared_reference_comparisons.csv">shared recovery</a>; <a href="../analyses/artifacts/synthetic/gamma_ablation/gamma_recovery/gamma_recovery_by_condition.csv">gamma recovery</a>; <a href="../analyses/artifacts/synthetic/inter_artificial_bias/shared_signal/inter_shared_signal_equal_vs_quality_rank.tsv">paired reference comparison</a>; <a href="../results/my_exp8_run_20260904_224038/N002/pair01_A/training_status.json">example successful real run</a>; <a href="../results/real_independent_panel_convergence/panel_convergence_fixed_20260904_173530/panel_01/training_status.json">failed panel status</a>. Analysis projection: <a href="../analyses/synthetic_gamma_ablation_gamma_recovery.py">lines 582–589</a>.</p>
+</section>
+
+<section id="validation">
+<h2>9. A stronger validation design</h2>
+<ol>
+<li><strong>Lock the unit of generalization.</strong> Create an untouched test partition before architecture/loss selection. Split by gene or sequence-similarity cluster where possible, not just transcript ID; transcript-disjoint sets can still contain highly related sequences. Report sparse/rare transcripts separately from the master-common validation intersection.</li>
+<li><strong>Freeze preprocessing on training IDs.</strong> The real panel/Experiment-8 workflows already fit reliability references on training IDs. Extend that practice to ordinary real, synthetic and benchmark workflows. Outcome-based stratification is not direct label injection into the network, but it selects the evaluation population and should be reported.</li>
+<li><strong>Run a small matched correctness matrix first.</strong> Identical panels, seeds, masks and training budget: conserved versus mass-free; coherent versus independent-dropout reference evaluation; observed-only versus appended-zero supervision; scalar versus position-specific VST alpha. Report mass ratios, raw NB2, shared recovery and gamma recovery separately.</li>
+<li><strong>Use genuinely competitive baselines.</strong> Compare gamma = 1, a direct sequence-to-profile model with matched backbone/scale handling, a zero-aware/shrunk geometric-consensus baseline, a sequence model trained on that consensus, and a simpler local sequence model. An empirical geometric mean on test-transcript measurements has extra input information; label it as a transductive denoising comparator, not an equivalent sequence-only predictor.</li>
+<li><strong>Separate seeds, sources and transcript uncertainty.</strong> Repeat initialization seeds within fixed panels and panel selections within fixed N. Bootstrap source/panel and transcript levels; use block-aware positional diagnostics. Three subset pairs provide limited evidence about a distribution of possible experiments.</li>
+<li><strong>Calibrate uncertainty on unseen measurements.</strong> Hold out a replicate where available; predict it using an explicit depth convention. Check randomized quantile residuals or predictive intervals, zero-count frequency, dispersion by depth, and residual autocorrelation. Ensembles address parameter/panel uncertainty that alpha cannot.</li>
+<li><strong>Make biological controls independent.</strong> Validate CSS alignment and source independence, use matched negatives and precision–recall as well as recall, and account for transcript clustering. For motifs, predefine offsets and windows; compare synonymous/codon/GC/length-matched backgrounds and replicate the effect across source-disjoint models.</li>
+<li><strong>Add the missing context before claiming boundary recovery.</strong> Supply isoform-matched UTR flanks for the sequence window used by the synthetic generator. Keep output coordinates unchanged and test a fixed-alpha control first. For traffic claims, add independent disome/runoff/kinetic evidence and an explicit traffic model.</li>
+</ol>
+<p>The default intersection-based validation panel favors transcripts detectable in every master dataset. That makes subset comparisons convenient but does not represent all transcripts encountered at deployment. The newer sequence-only common test path helps broaden support, but source selection, gene similarity, and biological context still need their own controls.</p>
+</section>
+
+<section id="priorities">
+<h2>10. Recommended work order</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Order</th><th>Concrete deliverable</th><th>Acceptance criterion</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>One explicit mathematical contract per mass mode; checkpoint semantic restoration; corrected documentation.</td><td>Fresh load reproduces the same predictions or rejects conflicting config. All equations match the resolved mode.</td></tr>
+<tr><td>2</td><td>Coherent gamma-reference evaluation and truthful constraint diagnostics.</td><td>Actual requested reference outputs satisfy the intended constraints under the supported training/evaluation semantics.</td></tr>
+<tr><td>3</td><td>Separate observation/context masks for synthetic boundary padding.</td><td>Unobserved terminal cells contribute zero likelihood/PCC weight and do not contaminate the observed scale.</td></tr>
+<tr><td>4</td><td>Repair the stale analysis test; add focused tests for the reproduced gaps.</td><td>Existing suite passes and new tests reproduce the prior failure before the fix.</td></tr>
+<tr><td>5</td><td>Small, locked, multi-seed loss/mass/mask study with simple baselines.</td><td>Report shared-profile recovery, gamma contrasts, count calibration, boundary/interior performance and runtime separately.</td></tr>
+<tr><td>6</td><td>Finish and analyze real disjoint-panel studies with biological controls.</td><td>Verified complete artifacts, matching held-out sequences, source-overlap accounting and no claim that full-panel L is truth.</td></tr>
+<tr><td>7</td><td>Consolidate analysis code, optimize reference execution and add direct L inference.</td><td>Equivalent deterministic outputs/gradients where equivalence is intended; measured memory and throughput improvements.</td></tr>
+</tbody></table></div>
+<p>My recommended scientific framing is: <em>“A multi-dataset sequence model that estimates a reference-defined shared relative ribosome-footprint profile and dataset-associated observation effects.”</em> Stronger claims about technical-bias removal or translation kinetics should follow the corresponding independent experiments.</p>
+</section>
+
+<section id="verification">
+<h2>11. Scope and verification performed</h2>
+<p>The review started with the nine HTML files in <code>Docs</code>, including the mathematical/core-concept pages and synthetic/real experiment reports. It then traced the model, likelihood, data loading, preprocessing, splitting, batching, checkpointing, prediction export, benchmarking, experiment orchestration and result-analysis paths. Historical markdown audits were not used as authority over current source.</p>
+<div class="table-wrap"><table class="numeric"><thead><tr><th>Repository area</th><th>Python files inventoried</th><th>Lines</th></tr></thead><tbody>
+<tr><td>Models</td><td>10</td><td>5,697</td></tr><tr><td>Dataloaders</td><td>5</td><td>3,845</td></tr><tr><td>Utils</td><td>14</td><td>4,067</td></tr><tr><td>Root entrypoints/orchestrators</td><td>5</td><td>5,673</td></tr><tr><td>Dataset preparation</td><td>16</td><td>2,701</td></tr><tr><td>Result analysis</td><td>36</td><td>29,063</td></tr><tr><td>Tests</td><td>23</td><td>5,066</td></tr><tr><td><strong>Total</strong></td><td><strong>109</strong></td><td><strong>56,112</strong></td></tr>
+</tbody></table></div>
+<p>The inventory includes ignored dataset-preparation scripts discovered explicitly. All 109 Python files parsed successfully. This is a repository-wide structural/syntax pass plus detailed tracing of the active scientific paths, not a claim that every line of every historical plotting script was dynamically exercised.</p>
+<ul class="compact">
+<li><strong>Tests:</strong> <code>.venv/bin/python -m unittest discover -s Tests -p 'test_*.py'</code> ran 166 tests in 12.216 seconds: 165 passed, one errored at the stale plotting API described in the code-correctness table.</li>
+<li><strong>Environment:</strong> <code>.venv/bin/python -m pip check</code> found no broken installed requirements. Pytest is not installed in this environment; the existing suite uses unittest and did run.</li>
+<li><strong>Data:</strong> read the weight column from all 114 configured HEK parquets: 1,599,681 rows, zero rows with weight exactly zero. This check does not replace revalidating every profile array or upstream raw read.</li>
+<li><strong>Probes:</strong> actual-module dropout centering; strict state loading across conflicting mass modes; exact two-position normalization example; position-specific VST on flat profiles; float32 NB2 stress values. These are small CPU diagnostic checks, not additional training studies.</li>
+<li><strong>Artifacts:</strong> re-read synthetic inventories/recovery summaries and the local real-run status records. Status is a disk snapshot, not remote-cluster monitoring or a complete audit of every binary checkpoint.</li>
+</ul>
+<p><strong>Not performed:</strong> full GPU retraining, throughput/memory benchmarking, a fresh environment installation, raw FASTQ/BAM processing, exhaustive evaluation of every prediction parquet, or biological wet-lab validation. Existing user changes were preserved. Only this report was added to the repository.</p>
+<details>
+<summary>Reproduce the central algebra and VST checks</summary>
+<p>Run from the repository root in the existing environment. These checks construct small tensors and do not train or change data.</p>
+<pre><code>import numpy as np
+import torch
+from Models.RiboUnmixLightningModule import masked_pcc
+
+# Exact normalized profiles with complementary dataset effects.
+h = np.array([[1.5, 0.5], [0.5, 1.5]])
+center = np.exp(np.log(h).mean(axis=0))
+L = center / center.mean()
+gamma = h / center
+mass_free = L * gamma
+mass_conserved = mass_free / mass_free.mean(axis=1, keepdims=True)
+print(center.mean())                # 0.8660254038, not 1
+print(mass_free.mean(axis=1))        # [1.15470054, 1.15470054]
+print(np.allclose(mass_conserved, h))  # True
+
+# Position-specific alpha induces a pattern in otherwise flat profiles.
+alpha = torch.exp(torch.linspace(-5, 1, 30))[None, :]
+vst = lambda x: 2 / torch.sqrt(alpha + 1e-8) * torch.asinh(
+    torch.sqrt(alpha * x + 1e-8))
+out = masked_pcc(vst(torch.full_like(alpha, 2.0)),
+                 vst(torch.full_like(alpha, 3.0)),
+                 torch.ones_like(alpha, dtype=torch.bool),
+                 min_target_var=1e-6, eps=1e-8)
+print(out["pcc_per_sample"], out["valid"])  # approximately 0.998797, True</code></pre>
+</details>
+<details>
+<summary>Reproduce training centering and the checkpoint mass-mode gap</summary>
+<p>Use the current real YAML, reduce both GRU hidden widths and both head widths to 8, use one GRU layer, equal reference weights, and two reference IDs [0, 1]. Seed PyTorch with 23. Construct one random 17-codon transcript repeated across those IDs. Replace the gamma head's zero-initialized final weight with <code>normal_(0, 0.2)</code>. Leave its configured dropout active.</p>
+<pre><code># Given this constructed model and same-transcript batch:
+model.train()
+_, _, extras = model(**batch)
+actual = extras["log_gamma"].mean(dim=0).abs().max()
+reported = extras["gamma_centering_constraint_error"].max()
+# Compare actual versus reported; repeat in model.eval().
+# Independent dropout makes actual nonzero during training.
+
+import copy
+model.eval()
+model.mass_conservation = False
+receiver = copy.deepcopy(model)
+receiver.mass_conservation = True
+print(receiver.load_state_dict(model.state_dict(), strict=True))
+print(model.mass_conservation, receiver.mass_conservation)
+# All keys matched successfully; False, True.
+# Evaluate identical inputs to observe the changed mean prediction.</code></pre>
+<p>The displayed dropout magnitude is seed/configuration-specific. The independently sampled score paths and absent mass-mode state are the underlying findings.</p>
+</details>
+</section>
+
+<section id="sources">
+<h2>12. Source map</h2>
+<p>Line numbers identify the reviewed working-tree snapshot. Local links open the relevant source file or artifact; they are not links to an immutable remote commit. Mathematical conclusions labeled “derived” are calculations in this review.</p>
+<div class="table-wrap"><table><thead><tr><th>Topic</th><th>Primary repository sources</th></tr></thead><tbody>
+<tr><td>Biological normalization and derived outputs</td><td><a href="../Models/RiboUnmixModel/SharedProfileModel.py">SharedProfileModel.py</a>, forward line 99.</td></tr>
+<tr><td>Gamma, reference evaluation, target scale, mass switch, state</td><td><a href="../Models/RiboUnmixModel/RiboUnmixModel.py">RiboUnmixModel.py</a>, lines 315, 723, 1075, 1132, 1202.</td></tr>
+<tr><td>Dataset embeddings, context, clamping and detached alpha</td><td><a href="../Models/RiboUnmixModel/DatasetBiasSubmodel.py">DatasetBiasSubmodel.py</a>; <a href="../Models/RiboUnmixModel/submodels/DatasetLogSigmaHead.py">DatasetLogSigmaHead.py</a>; <a href="../Models/RiboUnmixModel/submodels/DatasetMultiplicativeAllocationBiasHead.py">gamma head</a>.</td></tr>
+<tr><td>NB2, PCC, reductions, optimizer and output schema</td><td><a href="../Models/RiboUnmixLightningModule.py">Lightning module</a>, lines 145, 260, 316, 1288, 1521, 2357, 3306, 3406, 3544.</td></tr>
+<tr><td>Raw replicates, masks and grouped execution</td><td><a href="../Dataloaders/RiboUnmixMultiDataset/RiboUnmixMultiDataset.py">dataset/collator</a>; <a href="../Dataloaders/RiboUnmixMultiDataset/RiboUnmixMultiDatasetDataModule.py">datamodule/sampler</a>.</td></tr>
+<tr><td>Weighting and sequence construction</td><td><a href="../Datasets/data/weight_hek_riboseq_codon_replicas.py">HEK weighting</a>; <a href="../Datasets/data/weight_synthetic_riboseq_codon_replicas.py">synthetic adapter</a>; <a href="../Utils/reliability_references.py">train-only references</a>; <a href="../Datasets/build_mane_sequence_embeddings.py">sequence builder</a>.</td></tr>
+<tr><td>Split, checkpoint, export and benchmark</td><td><a href="../main_ribounmix_multidataset.py">main trainer</a>; <a href="../main_ribounmix_benchmarking.py">benchmark trainer</a>; <a href="../Utils/external_transcript_split.py">external split validation</a>; <a href="../Dataloaders/RiboUnmixBenchmarking/RiboUnmixBenchmarkingDataModule.py">benchmark adapter</a>.</td></tr>
+<tr><td>Independent-panel and dataset-count experiments</td><td><a href="../run_real_independent_panel_convergence.py">panel orchestrator</a>; <a href="../run_real_exp8_L_stability.py">Experiment-8 orchestrator</a>; <a href="../Utils/real_panel_convergence.py">panel design</a>; <a href="../Utils/real_exp8_stability.py">stability design</a>; <a href="../analyses/analyze_real_exp8_stability.py">stability analysis</a>.</td></tr>
+<tr><td>Synthetic scientific analysis</td><td><a href="../analyses/synthetic_gamma_ablation_lbio_recovery.py">shared-profile recovery</a>; <a href="../analyses/synthetic_gamma_ablation_gamma_recovery.py">gamma recovery</a>; <a href="../analyses/analyze_synthetic_gamma_compensation.py">compensation analysis</a>; <a href="../results/gamma_ablation/common.py">shared metric helpers</a>.</td></tr>
+<tr><td>Documentation entry points</td><td><a href="model_mathematics.html">model mathematics</a>; <a href="ribounmix_model_core_concepts.html">core concepts</a>; <a href="synthetic_experiment_setup.html">synthetic setup</a>; <a href="synthetic_experiments_results.html">synthetic results</a>; <a href="prediction_outputs_reference.html">output reference</a>; <a href="ribounmix_five_real_data_experiments.html">real-data plan</a>.</td></tr>
+</tbody></table></div>
+<p>External biological statements were checked against the original studies linked next to those statements. They provide biological context; none validates this repository's learned parameters directly.</p>
+</section>
+<footer>
+<strong>Review conclusion:</strong> prioritize a consistent mathematical contract, reproducible checkpoint semantics and accurate observation masks. Preserve the useful multi-dataset architecture, test simpler statistical alternatives, and validate biology through independent evidence. The synthetic success is valuable; it does not erase the distinction between shared relative footprints and identified translation kinetics.
+</footer>
+</main>
+</div>
+<script>
+(() => {
+  'use strict';
+  const byId = id => document.getElementById(id);
+  const contrast = byId('contrast');
+  function updateExample() {
+    const a = Number(contrast.value);
+    const up = 1 + a, down = 1 - a;
+    const center = Math.sqrt(up * down);
+    byId('contrast-value').textContent = a.toFixed(2);
+    byId('target-1').textContent = up.toFixed(4);
+    byId('target-2').textContent = down.toFixed(4);
+    byId('conserved-1').textContent = up.toFixed(4);
+    byId('conserved-2').textContent = down.toFixed(4);
+    byId('free-1').textContent = (up / center).toFixed(4);
+    byId('free-2').textContent = (down / center).toFixed(4);
+    byId('free-mean').textContent = (1 / center).toFixed(4);
+    byId('mass-result').textContent = a === 0
+      ? 'At a = 0, the datasets are identical and both formulations fit this example exactly.'
+      : `At a = ${a.toFixed(2)}, the mass-free example overpredicts both datasets’ totals by ${((1 / center - 1) * 100).toFixed(2)}%.`;
+  }
+  contrast.addEventListener('input', updateExample);
+  updateExample();
+  byId('print-button').addEventListener('click', () => window.print());
+  byId('expand-button').addEventListener('click', () => {
+    const details = [...document.querySelectorAll('details')];
+    const open = details.some(item => !item.open);
+    details.forEach(item => { item.open = open; });
+    byId('expand-button').textContent = open ? 'Collapse technical details' : 'Expand technical details';
+  });
+  let printState = [];
+  window.addEventListener('beforeprint', () => {
+    printState = [...document.querySelectorAll('details')].map(item => item.open);
+    document.querySelectorAll('details').forEach(item => { item.open = true; });
+  });
+  window.addEventListener('afterprint', () => {
+    document.querySelectorAll('details').forEach((item, index) => { item.open = printState[index]; });
+  });
+})();
+</script>
+</body>
+</html>

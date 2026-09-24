@@ -1,0 +1,11 @@
+artificial_bias_5prime_aa: 0
+artificial_bias_5prime_cc: 1
+artificial_bias_5prime_gg: 2
+artificial_bias_5prime_uu: 3
+artificial_bias_3prime_aa: 4
+artificial_bias_3prime_cc: 5
+artificial_bias_3prime_gg: 6
+artificial_bias_3prime_uu: 7
+artificial_bias_gc_fraction_gt_0p7: 8
+artificial_bias_au_fraction_gt_0p7: 9
+artificial_ground_truth: 10

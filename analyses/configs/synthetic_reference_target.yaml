@@ -1,0 +1,62 @@
+paths:
+  results_root: results/riboai_synthetic_experiments
+  occupancy: Datasets/Synthetic_data/artificial_ground_truth_tasep_occupancy_replicates.parquet
+  bias_root: Datasets/Synthetic_data/bias_profile
+  output_dir: analyses/artifacts/synthetic/reference_target
+
+run_selection:
+  checkpoint_variant: best_pcc
+  checkpoint_selection_metric: val_mu_pcc
+  training_seed: 42
+  include_within_depth_cumulative: true
+  include_cross_depth_reference_sensitivity: true
+  exclude_single_dataset_runs: true
+  primary_family: within_depth
+
+targets:
+  occupancy_definition: two_trajectory_consensus
+  occupancy_replica_samples:
+    - replicate_1_mean_psite_occupancy
+    - replicate_2_mean_psite_occupancy
+  bias_definition: one_plus_added_bias
+  reference_target_preferred_construction: geometric_mean_noiseless_expected_profiles
+
+evaluation:
+  split: validation
+  independent_test_available: false
+  drop_synthetic_terminal_entry: true
+  boundary_trim_codons: 10
+  observed_zero_filtering: false
+  smooth_profiles: false
+  normalization: arithmetic_mean_one_on_exact_evaluation_mask
+  primary_matched_cohort: intersection_across_all_within_depth_cumulative_runs
+  cross_depth_matched_cohort: intersection_across_all_cross_depth_runs
+
+bootstrap:
+  seed: 20260918
+  replicates: 2000
+  cluster: transcript
+  interval: percentile_95
+  paired_indices_within_experiment_family: true
+  hierarchical_panel_or_seed_bootstrap: unavailable_one_panel_chain_and_one_training_seed
+
+tolerances:
+  reference_weight_sum: 1.0e-6
+  mean_one: 2.0e-6
+  h_construction_max_abs: 2.0e-10
+  clr_identity_max_abs: 2.0e-10
+  gamma_weighted_log_center: 2.0e-5
+  constant_g_h_equals_q: 2.0e-12
+  centered_bias_h_equals_q: 2.0e-12
+  artificial_l_equals_h: 2.0e-12
+  decoder_mean_compatibility: 1.0e-3
+
+figures:
+  primary_metric: pearson
+  representative_run:
+    family: within_depth
+    depth: 20_per_codon
+    n_datasets: 10
+    reference_weighting: equal
+  representative_rule: closest_transcripts_to_10th_50th_90th_percentiles_of_analysis2_clr_rmse
+  png_dpi: 600

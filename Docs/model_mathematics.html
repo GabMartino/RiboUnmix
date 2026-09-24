@@ -1,0 +1,1923 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RiboUnmix — data, weights, loss, and splits</title>
+<script>
+  MathJax = {
+    tex: {inlineMath: [['\\(','\\)']], displayMath: [['$$','$$']]},
+    options: {skipHtmlTags: ['script','noscript','style','textarea','pre','code']}
+  };
+</script>
+<script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+<style>
+  :root{--bg:#f5f7fb;--paper:#fff;--ink:#1d2433;--muted:#5f6b7a;--line:#dfe5ee;--accent:#4338ca;--soft:#eef0ff;--warn:#fff4e5;--code:#f0f2f6;--good:#15803d;--good-soft:#ecfdf3;--bad:#b91c1c;--bad-soft:#fff1f2;--blue:#2563eb;--orange:#c2410c}
+  @media(prefers-color-scheme:dark){:root{--bg:#0e1117;--paper:#161b25;--ink:#e7eaf1;--muted:#a1aabb;--line:#2a3342;--accent:#a5b4fc;--soft:#20243a;--warn:#332719;--code:#202634;--good:#4ade80;--good-soft:#10291d;--bad:#fca5a5;--bad-soft:#321b20;--blue:#93c5fd;--orange:#fdba74}}
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif}
+  .layout{display:grid;grid-template-columns:245px minmax(0,980px);max-width:1260px;margin:auto}
+  nav{position:sticky;top:0;height:100vh;overflow:auto;padding:26px 16px;background:var(--paper);border-right:1px solid var(--line);font-size:13px}
+  nav strong{display:block;margin-bottom:18px;color:var(--accent);font-size:16px}
+  nav a{display:block;padding:4px 7px;color:var(--muted);text-decoration:none;border-radius:5px}
+  nav a:hover{background:var(--soft);color:var(--ink)}
+  nav .group{margin-top:16px;color:var(--ink);font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase}
+  main{padding:42px 48px 100px;background:var(--paper);min-height:100vh}
+  h1{margin:0 0 8px;font-size:31px;line-height:1.2}
+  h2{margin:48px 0 10px;padding-top:16px;border-top:1px solid var(--line);font-size:24px}
+  h3{margin:30px 0 6px;font-size:19px}
+  h4{margin:24px 0 4px;font-size:16px}
+  p,li{max-width:88ch}
+  .lede{color:var(--muted);font-size:18px}
+  .meta{color:var(--muted);font-size:13px}
+  code{padding:1px 5px;background:var(--code);border-radius:4px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.88em}
+  pre{overflow:auto;padding:14px 16px;background:var(--code);border-radius:8px;line-height:1.45}
+  .note,.warning{padding:15px 18px;margin:18px 0;border-left:4px solid var(--accent);border-radius:8px;background:var(--soft)}
+  .warning{border-left-color:#c2410c;background:var(--warn)}
+  table{width:100%;border-collapse:collapse;margin:16px 0;font-size:13px}
+  th,td{text-align:left;padding:7px 9px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+  td:nth-child(n+2),th:nth-child(n+2){text-align:right;white-space:nowrap}
+  .equation{overflow-x:auto;margin:16px 0}
+  .source{color:var(--accent);text-decoration:none;border-bottom:1px dotted var(--accent)}
+  .footer{margin-top:70px;padding-top:18px;border-top:1px solid var(--line);color:var(--muted);font-size:13px}
+  .pill{display:inline-block;padding:2px 8px;border-radius:12px;background:var(--soft);color:var(--accent);font-size:11px;letter-spacing:.05em;text-transform:uppercase}
+  .flow{display:flex;align-items:stretch;gap:8px;overflow-x:auto;margin:20px 0;padding:4px 0 10px}
+  .flow .step{min-width:145px;padding:12px;border:1px solid var(--line);border-radius:8px;background:var(--soft);font-size:13px}
+  .flow .arrow{align-self:center;color:var(--accent);font-size:21px}
+  .concept-table td:nth-child(n+2),.concept-table th:nth-child(n+2){text-align:left;white-space:normal}
+  .plain{padding:16px 18px;margin:18px 0;border:1px solid var(--line);border-radius:10px;background:linear-gradient(135deg,var(--soft),var(--paper))}
+  .plain strong{color:var(--accent)}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin:18px 0}
+  .card{padding:15px;border:1px solid var(--line);border-radius:10px;background:var(--paper)}
+  .card h4{margin:0 0 5px;color:var(--accent)}
+  .card p{margin:5px 0;font-size:14px}
+  figure.visual{margin:22px 0;padding:14px;border:1px solid var(--line);border-radius:12px;background:var(--bg);overflow-x:auto}
+  figure.visual svg{display:block;width:100%;min-width:680px;height:auto}
+  figure.visual figcaption{margin-top:10px;color:var(--muted);font-size:13px}
+  .v-box{fill:var(--paper);stroke:var(--line);stroke-width:2}
+  .v-soft{fill:var(--soft);stroke:var(--accent);stroke-width:2}
+  .v-good{fill:var(--good-soft);stroke:var(--good);stroke-width:2}
+  .v-bad{fill:var(--bad-soft);stroke:var(--bad);stroke-width:2}
+  .v-line{stroke:var(--accent);stroke-width:2;fill:none;marker-end:url(#arrowhead)}
+  .v-dash{stroke:var(--muted);stroke-width:2;stroke-dasharray:6 5;fill:none}
+  .v-text{fill:var(--ink);font:600 15px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+  .v-small{fill:var(--muted);font:13px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+  .v-good-text{fill:var(--good);font:700 13px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+  .v-bad-text{fill:var(--bad);font:700 13px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+  .profile-bars{height:72px;display:flex;align-items:flex-end;gap:5px;padding:8px 4px;border-bottom:2px solid var(--line)}
+  .profile-bars i{display:block;flex:1;min-width:7px;background:var(--accent);border-radius:3px 3px 0 0;opacity:.8}
+  .profile-bars.zero i{height:2px!important;background:var(--bad)}
+  .badge-good,.badge-bad{display:inline-block;margin-top:8px;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:700}
+  .badge-good{color:var(--good);background:var(--good-soft)}
+  .badge-bad{color:var(--bad);background:var(--bad-soft)}
+  .batch-picture{display:grid;grid-template-columns:auto 1fr 1fr;gap:7px;align-items:center;margin:18px 0;font-size:13px}
+  .batch-picture .head{font-weight:700;color:var(--accent)}
+  .chip{padding:7px 9px;border:1px solid var(--line);border-radius:7px;background:var(--soft);text-align:center}
+  .vote-card{border-top:4px solid var(--accent)}
+  .equation-words{margin:-8px 0 18px;color:var(--muted);text-align:center;font-size:14px}
+  .chart-wrap{overflow-x:auto;margin:18px 0;padding:12px;border:1px solid var(--line);border-radius:8px;background:var(--bg)}
+  #dataset-count-chart svg{display:block;min-width:1200px;width:100%;height:340px}
+  #dataset-count-chart text{fill:var(--muted);font:11px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+  #dataset-count-chart .axis{stroke:var(--line);stroke-width:1}
+  #dataset-count-chart .bar{fill:var(--accent);opacity:.78}
+  #dataset-count-chart .bar:hover{opacity:1}
+  @media(max-width:850px){.layout{display:block}nav{position:static;height:auto;border-right:0;border-bottom:1px solid var(--line)}main{padding:28px 20px 70px}table{font-size:12px}.cards{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div style="padding:10px 18px;background:#eaf4fb;border-bottom:1px solid #bdd7e8;text-align:center;font:600 14px/1.4 system-ui,sans-serif">Continuing development? Start with the <a href="project_model_onboarding.html">project onboarding and safe-handoff guide</a>.</div>
+<svg width="0" height="0" aria-hidden="true" style="position:absolute">
+  <defs><marker id="arrowhead" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--accent)"/></marker></defs>
+</svg>
+<div class="layout">
+<nav>
+  <strong>RiboUnmix</strong>
+  <div class="group">This page</div>
+  <a href="#quick-start">Start here: plain-language map</a>
+  <a href="#scope">Scope</a>
+  <a href="#core-map">Core data flow</a>
+  <a href="#data">1. Data representation</a>
+  <a href="#counts">1.3 Dataset transcript counts</a>
+  <a href="#weights">2. Transcript reliability weights</a>
+  <a href="#splits">3. Transcript-level splitting</a>
+  <a href="#batching">4. Grouped optimizer batching</a>
+  <a href="#batch-execution-connection">4.4 Batch, execution, and update</a>
+  <a href="#gamma-centering">5. Prediction and gamma centering</a>
+  <a href="#loss">6. Optimized loss</a>
+  <a href="#reduction">6.6 Selectable pair reduction</a>
+  <a href="#objective">6.7 Complete current objective</a>
+  <a href="#sources">Source map and boundaries</a>
+</nav>
+<main>
+<h1>RiboUnmix — current data and objective</h1>
+<p class="lede">A source-aligned description of the data table, transcript weights,
+transcript split, group-aware optimizer batching, replica-aware
+negative-binomial/Pearson objective, mass-free prediction, fixed-reference gamma gauge, and loss
+reduction currently implemented in the repository.</p>
+<p class="meta">The numerical dataset summary below was regenerated from the checked-out
+weighted HEK parquets and
+<code>Datasets/data/sequence/MANE.selection.sequence_embeddings_with_css.parquet</code>.
+The equations follow the current code and the active mass-free training configuration
+with <code>model.mass_conservation=false</code>. The conserved path is documented only as
+an ablation. Last
+reviewed: 28 August 2026.</p>
+
+<h2 id="quick-start">Start here: the whole idea without equations</h2>
+<div class="plain"><strong>One-sentence version:</strong> the model learns where ribosomes
+pile up along a transcript, allows each experiment to adjust that shared shape, scores the
+prediction against the raw experimental repeats and their average, and gives every
+transcript one equal vote in the default loss.</div>
+
+<div class="cards">
+  <div class="card"><h4>Transcript</h4><p>One biological sequence—think of it as one recipe.</p></div>
+  <div class="card"><h4>Dataset</h4><p>One experiment that measured many recipes under its own laboratory conditions.</p></div>
+  <div class="card"><h4>Replica</h4><p>A repeated measurement inside the same experiment. It is not a new dataset.</p></div>
+  <div class="card"><h4>Pair</h4><p>One transcript measured in one dataset. This is one physical training row.</p></div>
+</div>
+
+<figure class="visual">
+<svg viewBox="0 0 900 300" role="img" aria-labelledby="data-picture-title data-picture-desc">
+  <title id="data-picture-title">How transcripts, datasets, replicas, and pair rows fit together</title>
+  <desc id="data-picture-desc">One shared transcript appears once in dataset A and once in dataset B. Each pair contains repeated profiles that are averaged into a consensus. Each pair gets one reliability weight and one final pair loss.</desc>
+  <rect class="v-soft" x="20" y="94" rx="12" width="150" height="92"/>
+  <text class="v-text" x="95" y="126" text-anchor="middle">Transcript t</text>
+  <text class="v-small" x="95" y="151" text-anchor="middle">one sequence</text>
+  <text class="v-small" x="95" y="170" text-anchor="middle">shared identity</text>
+  <path class="v-line" d="M170 120 C210 120,210 72,250 72"/>
+  <path class="v-line" d="M170 160 C210 160,210 222,250 222"/>
+  <rect class="v-box" x="250" y="18" rx="12" width="370" height="112"/>
+  <text class="v-text" x="270" y="46">Pair (A,t): dataset A</text>
+  <rect class="v-soft" x="275" y="63" rx="7" width="82" height="40"/><text class="v-small" x="316" y="87" text-anchor="middle">replica 1</text>
+  <rect class="v-soft" x="370" y="63" rx="7" width="82" height="40"/><text class="v-small" x="411" y="87" text-anchor="middle">replica 2</text>
+  <path class="v-line" d="M455 83 L502 83"/>
+  <rect class="v-good" x="505" y="55" rx="7" width="92" height="55"/><text class="v-small" x="551" y="78" text-anchor="middle">average</text><text class="v-small" x="551" y="97" text-anchor="middle">consensus</text>
+  <rect class="v-box" x="250" y="168" rx="12" width="370" height="112"/>
+  <text class="v-text" x="270" y="196">Pair (B,t): dataset B</text>
+  <rect class="v-soft" x="275" y="213" rx="7" width="82" height="40"/><text class="v-small" x="316" y="237" text-anchor="middle">replica 1</text>
+  <rect class="v-soft" x="370" y="213" rx="7" width="82" height="40"/><text class="v-small" x="411" y="237" text-anchor="middle">replica 2</text>
+  <path class="v-line" d="M455 233 L502 233"/>
+  <rect class="v-good" x="505" y="205" rx="7" width="92" height="55"/><text class="v-small" x="551" y="228" text-anchor="middle">average</text><text class="v-small" x="551" y="247" text-anchor="middle">consensus</text>
+  <path class="v-line" d="M620 74 L685 74"/>
+  <path class="v-line" d="M620 224 L685 224"/>
+  <rect class="v-soft" x="688" y="34" rx="12" width="185" height="80"/>
+  <text class="v-text" x="780" y="64" text-anchor="middle">weight w(A,t)</text>
+  <text class="v-small" x="780" y="89" text-anchor="middle">+ one pair loss</text>
+  <rect class="v-soft" x="688" y="184" rx="12" width="185" height="80"/>
+  <text class="v-text" x="780" y="214" text-anchor="middle">weight w(B,t)</text>
+  <text class="v-small" x="780" y="239" text-anchor="middle">+ one pair loss</text>
+</svg>
+<figcaption>The same transcript can create several pair rows—one per dataset. Replicas stay
+inside their pair. They never become extra datasets or extra outer transcript votes.</figcaption>
+</figure>
+
+<div class="note"><strong>Two kinds of “average” appear repeatedly:</strong> first, raw
+replicas are averaged to make a consensus profile for shape correlation. Later, losses are
+averaged according to the selected balancing rule. These are different operations.</div>
+
+<h3>Current default run at a glance</h3>
+<div class="cards">
+  <div class="card"><h4>2 datasets selected</h4><p><code>martinez_2019</code> and
+  <code>sharma_2021</code>.</p></div>
+  <div class="card"><h4>714 validation transcripts</h4><p>The same fixed IDs are used in
+  both datasets.</p></div>
+  <div class="card"><h4>13,276 training groups</h4><p>Each has a positive row in both
+  selected datasets.</p></div>
+  <div class="card"><h4>8 transcripts per full logical batch</h4><p>That is 16 pair rows:
+  eight from each dataset. Execution may split this only between groups.</p></div>
+  <div class="card"><h4>4 logical batches per update</h4><p>The automatic planner targets
+  about 32 transcripts per GPU optimizer step.</p></div>
+  <div class="card"><h4>Transcript-balanced loss</h4><p>Every transcript gets one equal
+  outer vote.</p></div>
+</div>
+
+<h2 id="scope">Scope</h2>
+<p>This document intentionally starts before the neural-network architecture. It explains
+the data, splitting, logical batches, memory-bounded execution, grouped accumulation, and optimized
+objective. It also explains the gamma-centering gauge because this determines how the
+dataset-specific correction is interpreted during both training and inference. It includes
+the essential two-branch model picture, but deliberately leaves out layer-by-layer tensor
+plumbing, optimizer internals, and plotting code.</p>
+<p>The basic observation is a transcript–dataset pair. A transcript can occur in many
+datasets, and each pair can contain several raw biological replicas. The pair is the unit
+that receives a local reliability weight and the unit whose replica losses are averaged.</p>
+
+<h2 id="core-map">The complete data flow in one view</h2>
+<div class="flow" aria-label="RiboUnmix data flow">
+  <div class="step"><strong>1. Raw pair</strong><br>One dataset + one transcript + its replicas.</div>
+  <div class="arrow">→</div>
+  <div class="step"><strong>2. Preprocess</strong><br>Remove unusable profiles; compute a positive reliability weight.</div>
+  <div class="arrow">→</div>
+  <div class="step"><strong>3. Split IDs</strong><br>Choose one fixed validation transcript panel.</div>
+  <div class="arrow">→</div>
+  <div class="step"><strong>4. Group rows</strong><br>Keep all selected-dataset rows for one transcript together.</div>
+  <div class="arrow">→</div>
+  <div class="step"><strong>5. Predict</strong><br>Shared biological shape × dataset correction × observed mean scale.</div>
+  <div class="arrow">→</div>
+  <div class="step"><strong>6. Reduce loss</strong><br>Replicas → pair → weighted transcript mean → equal transcript mean.</div>
+</div>
+
+<h3>Four quantities that must not be confused</h3>
+<table class="concept-table">
+  <thead><tr><th>Quantity</th><th>Defined over</th><th>Used for</th><th>Not used for</th></tr></thead>
+  <tbody>
+    <tr><td>\(w_{dt}\), transcript reliability</td><td>One retained transcript–dataset pair</td><td>Within-transcript dataset weighting in the default loss; construction of the split-only score \(q_t\)</td><td>Gamma centering, sampling probability, dataset rank</td></tr>
+    <tr><td>\(q_t=\operatorname{median}_d w_{dt}\)</td><td>One validation-candidate transcript across the master datasets</td><td>Reliability-bin stratification when selecting validation IDs</td><td>Training loss; it never replaces \(w_{dt}\)</td></tr>
+    <tr><td>\(u_d\), gamma-reference weight</td><td>One dataset in the fixed gamma reference panel</td><td>Weighted geometric gauge for gamma</td><td>Loss weighting and validation selection</td></tr>
+    <tr><td><code>data.batch_size</code> and <code>target_unique_transcripts_per_optimizer_step</code></td><td>Per-dataset logical-batch quota and desired optimizer-update transcript count</td><td>Grouped packing and automatic accumulation</td><td>They do not multiply any loss term</td></tr>
+  </tbody>
+</table>
+<div class="note"><strong>The central distinction:</strong> transcript reliability,
+dataset-quality rank, and batch construction are three separate mechanisms. They meet in
+the same training step, but they do not share a normalization or silently multiply one
+another.</div>
+
+<details>
+<summary><strong>A tiny math dictionary for this page</strong></summary>
+<table class="concept-table">
+  <thead><tr><th>Symbol or word</th><th>Read it as</th></tr></thead>
+  <tbody>
+    <tr><td>\(\sum\)</td><td>Add all the listed values.</td></tr>
+    <tr><td>mean</td><td>The ordinary average: add values, divide by how many there are.</td></tr>
+    <tr><td>median</td><td>The middle value after sorting; for an even count, average the two middle values.</td></tr>
+    <tr><td>\(\mathbf 1[\text{condition}]\)</td><td>One when the condition is true, otherwise zero.</td></tr>
+    <tr><td>percentile rank</td><td>Where a value sits relative to the other values in the same dataset.</td></tr>
+    <tr><td>\(\log\) and \(\exp\)</td><td>A convenient pair for multiplicative effects: multiplying positive numbers becomes adding their logs.</td></tr>
+    <tr><td>PCC</td><td>Pearson correlation, a shape-agreement score from −1 to 1. Higher is better.</td></tr>
+    <tr><td>NB2</td><td>A probability model for noisy non-negative counts whose variance may grow faster than its mean.</td></tr>
+    <tr><td>\(\varepsilon\)</td><td>A tiny positive number used only to prevent unsafe division or logarithms.</td></tr>
+  </tbody>
+</table>
+</details>
+
+<h2 id="data">1. Data representation</h2>
+<div class="plain"><strong>Plain language:</strong> the model does not receive “one
+transcript” as one sample. It receives one measurement of that transcript from one dataset.
+If the transcript was measured in five datasets, it can contribute five pair rows. Each row
+still carries all raw repeated measurements from its own dataset.</div>
+<h3>1.1 Indices and notation</h3>
+<p>Let \(d\) identify a dataset, \(t\) identify a transcript, \(r\) identify a raw
+replica within one dataset–transcript pair, and \(i\) identify a codon position. Let
+\(\mathcal D\) be the set of datasets, \(\mathcal T\) the set of transcript IDs, and
+\(L_t\) the number of codon positions in transcript \(t\). The symbol \(R_{dt}\) is the
+number of valid raw replicas for pair \((d,t)\); it is the number of replica entries
+marked true by the replica mask.</p>
+<p>The raw count at one position is \(y_{dtri}\). The consensus profile stored in the
+batch is \(y_{dti}\), and \(m_{dti}\) is the consensus position-validity mask: it is one
+for a real codon position with a finite target and zero for padding or a non-finite
+target. The raw-replica mask \(m_{dtri}\) is one when replica \(r\) is present and its
+position \(i\) is valid, and zero otherwise. The observed profile is never allowed to
+contain negative counts.</p>
+
+<h3>1.2 Parquet columns and their roles</h3>
+<table>
+  <thead><tr><th>Column</th><th>Meaning</th><th>Consumed by</th></tr></thead>
+  <tbody>
+    <tr><td><code>id</code></td><td>Transcript identifier for one dataset row.</td><td>Pair construction and split availability.</td></tr>
+    <tr><td><code>ribo_cds_replicas</code></td><td>Raw non-negative profiles with shape \(R_{dt}\times L_t\).</td><td>Replica-level NB2 and construction of the arithmetic consensus.</td></tr>
+    <tr><td><code>replica_ids</code></td><td>Labels identifying the raw replicas.</td><td>Provenance; not a separate dataset weight.</td></tr>
+    <tr><td><code>ribo</code></td><td>Arithmetic mean of the raw replica profiles.</td><td>Consensus batch target, model scale gauge, raw PCC, NB-VST PCC, and diagnostics.</td></tr>
+    <tr><td><code>weight</code></td><td>Positive local transcript reliability \(w_{dt}\), normalized by its dataset median and therefore allowed to exceed one.</td><td>The selected pair-loss reducer; by default it compares datasets inside one transcript.</td></tr>
+    <tr><td><code>coverage</code>, <code>coverage_score</code></td><td>Fraction of codon positions with a positive consensus count. In the recommended weighting mode the score is exactly the coverage: it is not square-rooted.</td><td>Weight construction and diagnostics.</td></tr>
+    <tr><td><code>read_density</code></td><td>Total consensus reads divided by CDS length.</td><td>Magnitude-sensitive depth score and diagnostics.</td></tr>
+    <tr><td><code>depth_reference_tau</code>, <code>depth_snr_score</code></td><td>The dataset's reference density and the saturating square-root depth score.</td><td>Auditable components of the recommended raw reliability.</td></tr>
+    <tr><td><code>raw_weight</code>, <code>weight_raw</code></td><td>The same pre-normalization local reliability value under a preferred name and its compatibility alias.</td><td>Auditing and median normalization.</td></tr>
+  </tbody>
+</table>
+<p>The datamodule reads the replica arrays and recomputes their arithmetic mean for the
+consensus cache. Before a flat pair can exist it rechecks that the parquet consensus is
+one-dimensional, non-empty, finite, non-negative, has positive total reads and positive
+coverage, and has a finite strictly positive weight. Duplicate transcript IDs within one
+dataset are an error. These are assertions on the filtered-data contract, not a second
+silent filtering policy: zero-coverage and zero-weight rows must not exist in the input.</p>
+
+<h2 id="counts">1.3 How many transcripts each dataset has</h2>
+<p>The checked-in dataset configuration lists 114 weighted HEK parquets. In the current
+files every row has a distinct <code>id</code>, so the retained row count equals the number
+of retained transcripts for that dataset. The table also reports the mean and range of
+\(w_{dt}\), because the row count alone does not describe the amount of influence a dataset
+can have in the loss.</p>
+<p>The per-dataset counts in the table are counts in the weighted parquets. The active
+datamodule keeps only rows whose transcript ID is also present in the selected sequence
+parquet; the aggregate MANE-overlap counts are reported immediately below the table.</p>
+<p>Across all files there are 1,599,681 retained rows and 18,632 distinct transcript IDs.
+After intersecting with the MANE sequence table, 1,557,804 pair rows and 18,176 distinct
+transcripts remain. The MANE sequence table itself contains 19,283 transcript IDs.</p>
+<div class="note"><strong>Artifact provenance:</strong> the counts are unaffected by the
+formula change, but the displayed weight ranges come from the currently materialized
+legacy-weight parquets. Newly regenerated <code>snr_depth_coverage</code> artifacts record
+their mode and reference density in <code>weight_manifest.tsv</code>.</div>
+<div class="chart-wrap">
+  <strong>Retained transcripts per weighted dataset</strong>
+  <p class="meta">Every bar is one dataset. Hover a bar for its name and exact retained
+  transcript count. One horizontal guide marks 15,000 transcripts.</p>
+  <div id="dataset-count-chart" role="img" aria-label="Bar plot of retained transcript counts for all weighted datasets"></div>
+</div>
+<details>
+<summary><strong>Retained transcript rows and weights by dataset</strong></summary>
+<table id="dataset-count-table">
+<thead><tr><th>Dataset</th><th>Rows / transcripts</th><th>Unique IDs</th><th>Mean weight</th><th>Weight range</th></tr></thead>
+<tbody>
+<tr><td><code>akichika_2019</code></td><td>13,017</td><td>13,017</td><td>1.100</td><td>0.026–3.122</td></tr>
+<tr><td><code>andreev_2015_rep1</code></td><td>12,607</td><td>12,607</td><td>1.054</td><td>0.012–3.041</td></tr>
+<tr><td><code>andreev_2015_rep2</code></td><td>13,598</td><td>13,598</td><td>1.058</td><td>0.026–2.528</td></tr>
+<tr><td><code>apostolopoulos_2024_Cas13</code></td><td>12,773</td><td>12,773</td><td>1.150</td><td>0.033–3.491</td></tr>
+<tr><td><code>apostolopoulos_2024_dCas13</code></td><td>13,430</td><td>13,430</td><td>1.124</td><td>0.023–3.039</td></tr>
+<tr><td><code>barrington_2023</code></td><td>14,477</td><td>14,477</td><td>1.037</td><td>0.009–2.542</td></tr>
+<tr><td><code>calviello_2016</code></td><td>14,838</td><td>14,838</td><td>0.944</td><td>0.017–1.770</td></tr>
+<tr><td><code>chang_2019</code></td><td>14,312</td><td>14,312</td><td>1.019</td><td>0.008–2.129</td></tr>
+<tr><td><code>cipullo_2023</code></td><td>12,330</td><td>12,330</td><td>1.107</td><td>0.033–3.847</td></tr>
+<tr><td><code>cui_2024</code></td><td>14,396</td><td>14,396</td><td>1.021</td><td>0.013–2.503</td></tr>
+<tr><td><code>dong_2025</code></td><td>12,029</td><td>12,029</td><td>1.099</td><td>0.041–3.636</td></tr>
+<tr><td><code>eichhorn_2014</code></td><td>10,937</td><td>10,937</td><td>1.096</td><td>0.045–4.017</td></tr>
+<tr><td><code>eliseeva_2024</code></td><td>14,684</td><td>14,684</td><td>0.967</td><td>0.010–1.834</td></tr>
+<tr><td><code>gillen_2021</code></td><td>15,914</td><td>15,914</td><td>0.884</td><td>0.014–1.529</td></tr>
+<tr><td><code>han_2020</code></td><td>14,710</td><td>14,710</td><td>1.069</td><td>0.009–2.494</td></tr>
+<tr><td><code>han_2021</code></td><td>13,216</td><td>13,216</td><td>1.133</td><td>0.013–3.559</td></tr>
+<tr><td><code>havkin-solomon_2023</code></td><td>14,080</td><td>14,080</td><td>1.023</td><td>0.022–2.155</td></tr>
+<tr><td><code>hia_2019</code></td><td>14,284</td><td>14,284</td><td>1.044</td><td>0.021–2.324</td></tr>
+<tr><td><code>huang_2026</code></td><td>13,535</td><td>13,535</td><td>1.062</td><td>0.017–3.145</td></tr>
+<tr><td><code>ichihara_2021</code></td><td>15,182</td><td>15,182</td><td>0.937</td><td>0.012–1.682</td></tr>
+<tr><td><code>ichihara_2021_chx</code></td><td>15,098</td><td>15,098</td><td>0.962</td><td>0.014–1.838</td></tr>
+<tr><td><code>ichihara_2021_si</code></td><td>14,545</td><td>14,545</td><td>1.010</td><td>0.011–2.112</td></tr>
+<tr><td><code>ichihara_2025</code></td><td>14,092</td><td>14,092</td><td>1.038</td><td>0.008–2.236</td></tr>
+<tr><td><code>ichihara_2025_si</code></td><td>13,711</td><td>13,711</td><td>1.066</td><td>0.013–2.546</td></tr>
+<tr><td><code>ingolia_2012</code></td><td>15,094</td><td>15,094</td><td>1.036</td><td>0.009–2.351</td></tr>
+<tr><td><code>iwasaki_2014</code></td><td>14,987</td><td>14,987</td><td>0.984</td><td>0.015–1.969</td></tr>
+<tr><td><code>iwasaki_2018</code></td><td>14,763</td><td>14,763</td><td>1.000</td><td>0.017–2.054</td></tr>
+<tr><td><code>jia_2025</code></td><td>14,548</td><td>14,548</td><td>1.072</td><td>0.022–2.623</td></tr>
+<tr><td><code>kashiwagi_2021</code></td><td>13,367</td><td>13,367</td><td>1.110</td><td>0.030–3.032</td></tr>
+<tr><td><code>kito_2023</code></td><td>14,657</td><td>14,657</td><td>0.982</td><td>0.007–1.925</td></tr>
+<tr><td><code>klauer_2025</code></td><td>15,139</td><td>15,139</td><td>0.989</td><td>0.013–2.182</td></tr>
+<tr><td><code>koubek_2025</code></td><td>12,202</td><td>12,202</td><td>1.138</td><td>0.014–3.696</td></tr>
+<tr><td><code>landthaler_2020</code></td><td>11,851</td><td>11,851</td><td>1.128</td><td>0.015–3.862</td></tr>
+<tr><td><code>lee_2025</code></td><td>15,568</td><td>15,568</td><td>0.954</td><td>0.010–1.804</td></tr>
+<tr><td><code>li_2022_1kcells</code></td><td>12,624</td><td>12,624</td><td>1.110</td><td>0.030–3.500</td></tr>
+<tr><td><code>li_2022_50kcells</code></td><td>13,920</td><td>13,920</td><td>1.070</td><td>0.020–3.133</td></tr>
+<tr><td><code>li_2022_high</code></td><td>13,553</td><td>13,553</td><td>1.153</td><td>0.034–3.997</td></tr>
+<tr><td><code>li_2022_std</code></td><td>13,380</td><td>13,380</td><td>1.124</td><td>0.030–3.130</td></tr>
+<tr><td><code>liu_2019</code></td><td>14,252</td><td>14,252</td><td>1.043</td><td>0.016–2.691</td></tr>
+<tr><td><code>liu_2025</code></td><td>14,253</td><td>14,253</td><td>1.047</td><td>0.020–2.394</td></tr>
+<tr><td><code>lyabin_2020</code></td><td>14,198</td><td>14,198</td><td>1.006</td><td>0.011–2.095</td></tr>
+<tr><td><code>m6atrans_2025</code></td><td>14,401</td><td>14,401</td><td>1.040</td><td>0.015–2.312</td></tr>
+<tr><td><code>mao_2019</code></td><td>13,823</td><td>13,823</td><td>1.111</td><td>0.028–2.906</td></tr>
+<tr><td><code>mao_2019_aaa</code></td><td>12,950</td><td>12,950</td><td>1.080</td><td>0.036–3.352</td></tr>
+<tr><td><code>mao_2023</code></td><td>15,280</td><td>15,280</td><td>1.024</td><td>0.012–2.223</td></tr>
+<tr><td><code>mao_2023_chx</code></td><td>14,473</td><td>14,473</td><td>1.060</td><td>0.017–2.624</td></tr>
+<tr><td><code>martinez_2019</code></td><td>14,560</td><td>14,560</td><td>1.022</td><td>0.013–2.412</td></tr>
+<tr><td><code>matsuura_suzuki_2022</code></td><td>13,015</td><td>13,015</td><td>1.123</td><td>0.013–3.460</td></tr>
+<tr><td><code>mazor_2018</code></td><td>12,787</td><td>12,787</td><td>1.150</td><td>0.013–3.530</td></tr>
+<tr><td><code>mazor_2018_chx</code></td><td>13,579</td><td>13,579</td><td>1.150</td><td>0.024–3.194</td></tr>
+<tr><td><code>muller_2023</code></td><td>13,918</td><td>13,918</td><td>1.083</td><td>0.023–3.054</td></tr>
+<tr><td><code>oconnell_2025_centri</code></td><td>15,303</td><td>15,303</td><td>0.919</td><td>0.009–1.659</td></tr>
+<tr><td><code>oconnell_2025_nocentri</code></td><td>15,668</td><td>15,668</td><td>0.917</td><td>0.010–1.659</td></tr>
+<tr><td><code>oconnell_2025_triton_01</code></td><td>15,854</td><td>15,854</td><td>0.888</td><td>0.011–1.520</td></tr>
+<tr><td><code>oconnell_2025_triton_05</code></td><td>15,786</td><td>15,786</td><td>0.889</td><td>0.008–1.526</td></tr>
+<tr><td><code>oconnell_2025_triton_1</code></td><td>15,691</td><td>15,691</td><td>0.899</td><td>0.016–1.564</td></tr>
+<tr><td><code>oh_2016</code></td><td>14,265</td><td>14,265</td><td>1.033</td><td>0.008–2.268</td></tr>
+<tr><td><code>patel_2020</code></td><td>16,091</td><td>16,091</td><td>0.924</td><td>0.016–1.714</td></tr>
+<tr><td><code>philippe_2020</code></td><td>14,250</td><td>14,250</td><td>1.002</td><td>0.010–1.995</td></tr>
+<tr><td><code>pkm_2022</code></td><td>14,379</td><td>14,379</td><td>1.034</td><td>0.013–2.256</td></tr>
+<tr><td><code>rao_2020</code></td><td>15,742</td><td>15,742</td><td>0.935</td><td>0.016–1.702</td></tr>
+<tr><td><code>rao_2025</code></td><td>14,267</td><td>14,267</td><td>1.038</td><td>0.018–2.328</td></tr>
+<tr><td><code>remes_2022</code></td><td>11,035</td><td>11,035</td><td>1.096</td><td>0.027–3.970</td></tr>
+<tr><td><code>riepe_2018</code></td><td>14,108</td><td>14,108</td><td>1.074</td><td>0.025–2.518</td></tr>
+<tr><td><code>rozman_2025</code></td><td>15,073</td><td>15,073</td><td>0.943</td><td>0.015–1.755</td></tr>
+<tr><td><code>rozman_2025_spike</code></td><td>14,805</td><td>14,805</td><td>0.974</td><td>0.016–1.851</td></tr>
+<tr><td><code>saito_2024_15</code></td><td>13,888</td><td>13,888</td><td>1.050</td><td>0.009–2.350</td></tr>
+<tr><td><code>sako_2020</code></td><td>14,438</td><td>14,438</td><td>1.055</td><td>0.027–2.825</td></tr>
+<tr><td><code>santos_2026</code></td><td>13,404</td><td>13,404</td><td>1.104</td><td>0.026–3.148</td></tr>
+<tr><td><code>sauer_2019</code></td><td>14,932</td><td>14,932</td><td>0.962</td><td>0.017–1.825</td></tr>
+<tr><td><code>schneider_poetsch_2024</code></td><td>14,401</td><td>14,401</td><td>1.047</td><td>0.019–2.330</td></tr>
+<tr><td><code>sehrawat_2022</code></td><td>12,619</td><td>12,619</td><td>1.118</td><td>0.033–3.156</td></tr>
+<tr><td><code>sharma_2020_dmso</code></td><td>14,833</td><td>14,833</td><td>1.027</td><td>0.014–2.103</td></tr>
+<tr><td><code>sharma_2021</code></td><td>15,767</td><td>15,767</td><td>0.890</td><td>0.011–1.502</td></tr>
+<tr><td><code>sharma_2021_100ug_2minchx</code></td><td>12,832</td><td>12,832</td><td>1.130</td><td>0.034–3.369</td></tr>
+<tr><td><code>sharma_2021_100ug_5minchx</code></td><td>13,205</td><td>13,205</td><td>1.115</td><td>0.024–3.094</td></tr>
+<tr><td><code>sharma_2021_200_1minugchx</code></td><td>12,905</td><td>12,905</td><td>1.127</td><td>0.033–3.253</td></tr>
+<tr><td><code>sharma_2021_200_2minugchx</code></td><td>13,159</td><td>13,159</td><td>1.118</td><td>0.030–3.129</td></tr>
+<tr><td><code>sharma_2021_300U</code></td><td>11,601</td><td>11,601</td><td>1.135</td><td>0.044–3.941</td></tr>
+<tr><td><code>sharma_2021_500U</code></td><td>12,915</td><td>12,915</td><td>1.122</td><td>0.012–3.292</td></tr>
+<tr><td><code>sharma_2021_700U</code></td><td>12,299</td><td>12,299</td><td>1.138</td><td>0.036–3.651</td></tr>
+<tr><td><code>sharma_2021_900U</code></td><td>12,995</td><td>12,995</td><td>1.117</td><td>0.017–3.166</td></tr>
+<tr><td><code>shichino_2024</code></td><td>14,446</td><td>14,446</td><td>1.005</td><td>0.015–2.035</td></tr>
+<tr><td><code>sidrauski_2015</code></td><td>14,191</td><td>14,191</td><td>1.033</td><td>0.019–2.303</td></tr>
+<tr><td><code>song_2019</code></td><td>12,681</td><td>12,681</td><td>1.112</td><td>0.020–3.467</td></tr>
+<tr><td><code>song_2019_MNase</code></td><td>15,285</td><td>15,285</td><td>0.961</td><td>0.008–2.049</td></tr>
+<tr><td><code>soto_2021</code></td><td>13,184</td><td>13,184</td><td>1.109</td><td>0.027–3.503</td></tr>
+<tr><td><code>spijker_2022_rnase</code></td><td>15,601</td><td>15,601</td><td>0.965</td><td>0.007–1.803</td></tr>
+<tr><td><code>spijker_2022_rnase_at</code></td><td>15,156</td><td>15,156</td><td>1.020</td><td>0.017–2.057</td></tr>
+<tr><td><code>suzuki_2020</code></td><td>14,964</td><td>14,964</td><td>1.003</td><td>0.008–2.040</td></tr>
+<tr><td><code>tang_2017</code></td><td>13,740</td><td>13,740</td><td>1.150</td><td>0.031–3.304</td></tr>
+<tr><td><code>tebaldi_2018</code></td><td>14,381</td><td>14,381</td><td>1.043</td><td>0.009–2.301</td></tr>
+<tr><td><code>thalalla_2025</code></td><td>15,142</td><td>15,142</td><td>0.969</td><td>0.010–1.840</td></tr>
+<tr><td><code>tomuro_2024</code></td><td>10,926</td><td>10,926</td><td>1.092</td><td>0.034–4.487</td></tr>
+<tr><td><code>tomuro_2024_dmso</code></td><td>13,944</td><td>13,944</td><td>1.113</td><td>0.027–2.945</td></tr>
+<tr><td><code>tomuro_2024_hs</code></td><td>13,773</td><td>13,773</td><td>1.119</td><td>0.012–3.168</td></tr>
+<tr><td><code>vaninsberghe_2021</code></td><td>10,316</td><td>10,316</td><td>1.072</td><td>0.044–4.103</td></tr>
+<tr><td><code>volegova_2018</code></td><td>15,762</td><td>15,762</td><td>0.875</td><td>0.008–1.459</td></tr>
+<tr><td><code>wan_2016</code></td><td>15,171</td><td>15,171</td><td>1.021</td><td>0.008–2.138</td></tr>
+<tr><td><code>weber_2020</code></td><td>14,751</td><td>14,751</td><td>0.965</td><td>0.018–1.829</td></tr>
+<tr><td><code>weber_2020_ctr</code></td><td>14,049</td><td>14,049</td><td>1.043</td><td>0.009–2.307</td></tr>
+<tr><td><code>weber_2022</code></td><td>14,745</td><td>14,745</td><td>0.965</td><td>0.018–1.831</td></tr>
+<tr><td><code>weber_2024</code></td><td>15,226</td><td>15,226</td><td>0.963</td><td>0.015–1.858</td></tr>
+<tr><td><code>wei_2022</code></td><td>12,527</td><td>12,527</td><td>1.112</td><td>0.014–3.518</td></tr>
+<tr><td><code>wilczynska_2019</code></td><td>14,957</td><td>14,957</td><td>0.947</td><td>0.012–1.863</td></tr>
+<tr><td><code>woo_2018</code></td><td>14,467</td><td>14,467</td><td>0.968</td><td>0.017–1.982</td></tr>
+<tr><td><code>wu_2020_hek</code></td><td>14,691</td><td>14,691</td><td>1.025</td><td>0.019–2.357</td></tr>
+<tr><td><code>wu_2021</code></td><td>15,600</td><td>15,600</td><td>0.959</td><td>0.007–1.779</td></tr>
+<tr><td><code>yoon_2025</code></td><td>16,142</td><td>16,142</td><td>0.922</td><td>0.015–1.599</td></tr>
+<tr><td><code>zhang_2018_hek</code></td><td>15,488</td><td>15,488</td><td>0.945</td><td>0.007–1.770</td></tr>
+<tr><td><code>zhou_2024</code></td><td>12,690</td><td>12,690</td><td>1.119</td><td>0.033–3.486</td></tr>
+<tr><td><code>zhu_2024</code></td><td>11,651</td><td>11,651</td><td>1.117</td><td>0.040–4.128</td></tr>
+<tr><td><code>zhu_2025_chx</code></td><td>13,573</td><td>13,573</td><td>1.114</td><td>0.016–3.075</td></tr>
+<tr><td><code>zou_2022</code></td><td>13,014</td><td>13,014</td><td>1.117</td><td>0.026–3.467</td></tr>
+</tbody>
+</table>
+</details>
+
+<h2 id="weights">2. Transcript reliability weights</h2>
+<div class="plain"><strong>Plain language:</strong> a reliability weight answers “how
+much should I trust this dataset's profile for this transcript?” The main evidence is now
+the actual number of reads per codon. Coverage remains a smaller check that the reads are
+spread across the transcript rather than concentrated at a few codons. The final value is
+not a probability: 1.25 is a perfectly valid weight.</div>
+<h3>2.1 Pair-local filtering</h3>
+<p>The weighting script is
+<code>Datasets/data/weight_hek_riboseq_codon_replicas.py</code>. Its
+<code>add_weights()</code> function validates each consensus profile before computing any
+weight. A profile is rejected with an error if it is nested, non-finite, or contains a
+negative count. An empty profile, or a non-empty profile with no positive codon, is not
+eligible and is removed from that dataset's output. A non-empty profile is eligible only
+when its positive-codon coverage and total read count are both greater than zero.</p>
+<p>Eligible filtering is applied to the pair \((d,t)\), not globally to \(t\). If transcript
+\(t\) is zero in dataset \(d_1\) but positive in dataset \(d_2\), only the row
+\((d_1,t)\) is removed. Empty and zero-coverage rows are always physically removed; there
+is no active keep-zero compatibility path. The preprocessor, split loader, training
+dataloader, and loss reducer all enforce the same contract: every materialized pair has a
+finite, strictly positive reliability weight.</p>
+
+<div class="cards" aria-label="Examples of eligible and ineligible ribosome profiles">
+  <div class="card">
+    <h4>All zero</h4>
+    <div class="profile-bars zero"><i></i><i></i><i></i><i></i><i></i><i></i></div>
+    <p>No observed codon and no reads.</p><span class="badge-bad">row removed</span>
+  </div>
+  <div class="card">
+    <h4>Sparse but real</h4>
+    <div class="profile-bars"><i style="height:2px"></i><i style="height:38px"></i><i style="height:2px"></i><i style="height:2px"></i><i style="height:21px"></i><i style="height:2px"></i></div>
+    <p>Some positive codons and positive total reads.</p><span class="badge-good">row retained</span>
+  </div>
+  <div class="card">
+    <h4>Broad coverage</h4>
+    <div class="profile-bars"><i style="height:24px"></i><i style="height:42px"></i><i style="height:32px"></i><i style="height:57px"></i><i style="height:37px"></i><i style="height:48px"></i></div>
+    <p>Many observed codons, usually a stronger raw score.</p><span class="badge-good">row retained</span>
+  </div>
+</div>
+<p class="meta">Filtering is local to a pair. If the first profile is transcript t in
+dataset A, only (A,t) disappears; a good profile for the same t in dataset B remains.</p>
+
+<h3>2.2 The recommended SNR-motivated equation</h3>
+<p>For an eligible consensus profile, define the positive-codon coverage \(C_{dt}\), the
+total read count \(Q_{dt}\), and the mean read density \(D_{dt}\) as follows. The symbol
+\(L_t\) is the number of profile positions and \(\mathbf 1[\cdot]\) is one when its condition
+is true and zero otherwise.</p>
+<div class="equation">$$
+C_{dt}=
+\frac{1}{L_t}\sum_{i=1}^{L_t}\mathbf 1[y_{dti}>0],
+\qquad
+Q_{dt}=\sum_{i=1}^{L_t}y_{dti},
+\qquad
+D_{dt}=\frac{Q_{dt}}{L_t}.
+$$</div>
+<p>Let \(\mathcal E_d\) be the eligible transcript IDs in dataset \(d\). The reference
+density \(\tau_d\) is, by default, the ordinary median of their positive read densities.</p>
+<div class="equation">$$
+\tau_d=\operatorname{median}_{u\in\mathcal E_d}D_{du},
+\qquad
+R^{\mathrm{depth}}_{dt}=
+\frac{\sqrt{D_{dt}}}{\sqrt{D_{dt}}+\sqrt{\tau_d}}.
+$$</div>
+<p>This depth score is zero at zero reads, exactly 0.5 at the typical density
+\(D_{dt}=\tau_d\), increases with actual density magnitude, and approaches one without
+crossing it. The new raw score gives depth the primary 70% role and uses coverage linearly
+for the remaining 30%.</p>
+<div class="equation">$$
+w^{\mathrm{raw}}_{dt}=0.70R^{\mathrm{depth}}_{dt}+0.30C_{dt}.
+$$</div>
+<p class="equation-words">raw reliability = 70% saturating depth score + 30% linear coverage</p>
+<div class="note"><strong>Small numerical example:</strong> if coverage is 0.25, then its
+coverage score stays 0.25. If read density equals \(\tau_d\), the depth score is 0.5, so
+<code>raw_weight = 0.70 × 0.5 + 0.30 × 0.25 = 0.425</code>.</div>
+
+<figure class="visual">
+<svg viewBox="0 0 760 260" role="img" aria-labelledby="depth-curve-title depth-curve-desc">
+  <title id="depth-curve-title">The new depth score rises and then saturates</title>
+  <desc id="depth-curve-desc">A concave curve starts at zero, passes through one half when read density equals tau, and approaches one at high density. Linear coverage is shown separately as a smaller breadth term.</desc>
+  <line x1="80" y1="205" x2="700" y2="205" stroke="#475569" stroke-width="2"/>
+  <line x1="80" y1="205" x2="80" y2="35" stroke="#475569" stroke-width="2"/>
+  <path d="M80 205 C125 150, 190 116, 285 94 C400 67, 545 54, 700 47" fill="none" stroke="#2563eb" stroke-width="5"/>
+  <line x1="285" y1="205" x2="285" y2="94" stroke="#dc2626" stroke-dasharray="6 5"/>
+  <line x1="80" y1="94" x2="285" y2="94" stroke="#dc2626" stroke-dasharray="6 5"/>
+  <circle cx="285" cy="94" r="7" fill="#dc2626"/>
+  <text x="286" y="229" text-anchor="middle" font-size="15">D = tau</text>
+  <text x="62" y="99" text-anchor="end" font-size="15">0.5</text>
+  <text x="70" y="42" text-anchor="end" font-size="15">1</text>
+  <text x="390" y="250" text-anchor="middle" font-size="16">actual read density D</text>
+  <text x="25" y="125" text-anchor="middle" font-size="16" transform="rotate(-90 25 125)">depth score</text>
+  <text x="475" y="82" font-size="15" fill="#1d4ed8">more reads still help, but less and less</text>
+</svg>
+<figcaption>The square root reflects sampling precision at low depth; the denominator makes
+the gain saturate instead of allowing deep profiles to dominate without bound.</figcaption>
+</figure>
+
+<h3>2.3 Why depth is primary and coverage stays linear</h3>
+<p>Coverage and depth are related: as more reads are collected, more codons are likely to
+be observed at least once. But they answer different questions. Density measures how much
+sampling information exists; coverage measures how broadly it is spread. Coverage is
+already bounded and naturally saturates near one. Applying a square root to it would boost
+every sparse value because \(\sqrt C>C\) for \(0&lt;C&lt;1\); for example, 10% coverage would
+be inflated from 0.10 to about 0.316.</p>
+<p>Depth has the stronger statistical motivation for a square-root response. Under a
+Poisson approximation, \(\operatorname{SD}(Y)=\sqrt\mu\), so signal-to-noise grows like
+\(\sqrt\mu\). Under the overdispersed NB2 model,
+\(\operatorname{Var}(Y)=\mu+\alpha\mu^2\), so gains should become sublinear at high depth.
+The chosen transform has that qualitative shape. The 70/30 coefficients are still a
+modeling choice, not a unique theorem; the separate replica-reproducibility utility exists
+to test whether the score actually predicts repeatability without fitting coefficients to
+validation loss.</p>
+
+<h3>2.4 Median normalization and use in the loss</h3>
+<p>The script then divides by the ordinary numerical median of the raw scores in the same
+eligible dataset. In the standalone default workflow no training-only references are
+passed, so both \(\tau_d\) and this denominator are fitted from the complete eligible
+dataset. The final weight is</p>
+<div class="equation">$$
+w_{dt}=\frac{w^{\mathrm{raw}}_{dt}}
+{\operatorname{median}_{u\in\mathcal E_d}\left(w^{\mathrm{raw}}_{du}\right)}.
+$$</div>
+<p class="equation-words">final reliability = raw reliability ÷ the typical raw reliability in that dataset</p>
+<p>The normalization bounds are disabled. Therefore \(w_{dt}\) is strictly positive but is
+not restricted to \([0,1]\); the table above contains values above one. A weight of 1 means
+“at this dataset's median,” 1.25 means “25% above that median scale,” and 0.5 means “half
+that median scale.” In the default transcript-balanced loss, \(w_{dt}\) compares the
+available dataset observations <em>inside the same transcript</em>. It does not change the
+profile, replica count, NB dispersion, or PCC calculation itself.</p>
+<div class="note"><strong>What median normalization can and cannot change:</strong>
+in <em>dataset-balanced</em> mode, the common median divisor cancels inside each dataset's
+weighted mean. In the default <em>transcript-balanced</em> mode it generally does not
+cancel, because one transcript's inner mean compares weights from different datasets,
+each with its own median. The normalization therefore puts those dataset-local reliability
+scores onto a comparable “typical value = 1” scale. It also affects the split-only score
+\(q_t=\operatorname{median}_d(w_{dt})\).</div>
+<div class="warning"><strong>Normalization-protocol caveat:</strong> the checked-in
+weighted parquets and their manifest predate the explicit mode field and contain the
+historical formula described below. The preprocessing code now defaults newly regenerated
+artifacts to <code>snr_depth_coverage</code>; existing files are not silently reinterpreted.
+For a future strict final train/validation protocol, fit both \(\tau_d\) and the raw-weight
+median on training IDs only and apply those two frozen values to validation and test IDs.
+Both references can already be supplied externally by the weighting functions.</div>
+
+<h3>2.5 Explicit legacy ablation</h3>
+<p><code>legacy_coverage_density_rank</code> exactly reproduces the prior equation. It first
+computes the within-dataset percentile rank of <code>log1p(read_density)</code>, then uses</p>
+<div class="equation">$$
+P_{dt}=\operatorname{rankPct}_{u\in\mathcal E_d}\!\left(\log(1+D_{du})\right),
+\qquad
+w^{\mathrm{raw,legacy}}_{dt}=0.70\sqrt{C_{dt}}+0.30P_{dt}.
+$$</div>
+<p>This mode is retained only for reproducibility and ablation. A percentile rank depends
+on ordering, not the magnitude of depth: ranking \(D\), \(\sqrt D\), or \(\log(1+D)\)
+gives the same order apart from ties and numerical details. That is why the new mode does
+not use percentile ranking at all.</p>
+
+<h2 id="splits">3. Transcript-level splitting</h2>
+<div class="plain"><strong>Plain language:</strong> validation is the exam. To compare
+runs fairly, every run gets the same exam questions: transcript IDs that exist in every
+dataset of the fixed 114-dataset master collection. Reliability bins and CSS classes make
+the exam representative; they do not give the “best” transcripts preferential admission.</div>
+<div class="note"><strong>The split in four steps:</strong>
+<ol>
+  <li>Build one master union of every retained transcript in the 114 weighted datasets.</li>
+  <li>Allow validation only from the master intersection: transcripts retained in all 114.</li>
+  <li>Choose 10% of that intersection across reliability deciles and CSS-count classes.</li>
+  <li>Freeze those transcript IDs as validation; every other master-union ID is training.</li>
+</ol>
+Changing only <code>experiment.dataset</code> does not redraw validation.</div>
+
+<figure class="visual">
+<svg viewBox="0 0 900 315" role="img" aria-labelledby="split-picture-title split-picture-desc">
+  <title id="split-picture-title">Fixed common-transcript validation split</title>
+  <desc id="split-picture-desc">The union of all transcript IDs supplies the training universe. Only the intersection present in every master dataset may be sampled for validation. Reliability bins and CSS classes preserve variety, and the selected IDs are frozen.</desc>
+  <rect class="v-box" x="20" y="35" rx="12" width="220" height="235"/>
+  <text class="v-text" x="130" y="65" text-anchor="middle">114 master datasets</text>
+  <text class="v-small" x="130" y="91" text-anchor="middle">A: t1 t2 t3 t4 …</text>
+  <text class="v-small" x="130" y="118" text-anchor="middle">B: t1 t2 t3 t8 …</text>
+  <text class="v-small" x="130" y="145" text-anchor="middle">C: t1 t2 t3 t9 …</text>
+  <rect class="v-good" x="47" y="171" rx="8" width="166" height="63"/>
+  <text class="v-text" x="130" y="196" text-anchor="middle">common intersection</text>
+  <text class="v-small" x="130" y="219" text-anchor="middle">t1, t2, t3, …</text>
+  <path class="v-line" d="M240 202 L305 202"/>
+  <rect class="v-soft" x="308" y="125" rx="12" width="225" height="154"/>
+  <text class="v-text" x="420" y="154" text-anchor="middle">representative sampling</text>
+  <text class="v-small" x="420" y="181" text-anchor="middle">10 reliability bands</text>
+  <rect x="337" y="197" width="15" height="44" fill="var(--bad)" opacity=".65"/><rect x="357" y="185" width="15" height="56" fill="var(--orange)" opacity=".72"/><rect x="377" y="172" width="15" height="69" fill="var(--accent)" opacity=".72"/><rect x="397" y="160" width="15" height="81" fill="var(--blue)" opacity=".75"/><rect x="417" y="148" width="15" height="93" fill="var(--good)" opacity=".72"/>
+  <rect x="437" y="167" width="15" height="74" fill="var(--blue)" opacity=".75"/><rect x="457" y="182" width="15" height="59" fill="var(--accent)" opacity=".72"/><rect x="477" y="194" width="15" height="47" fill="var(--orange)" opacity=".72"/>
+  <text class="v-small" x="420" y="263" text-anchor="middle">CSS class preserves mixture</text>
+  <path class="v-line" d="M533 202 L598 202"/>
+  <rect class="v-good" x="601" y="122" rx="12" width="270" height="104"/>
+  <text class="v-text" x="736" y="153" text-anchor="middle">fixed validation IDs</text>
+  <text class="v-small" x="736" y="178" text-anchor="middle">same 714 transcripts in every run</text>
+  <text class="v-small" x="736" y="202" text-anchor="middle">all their selected-dataset rows → validation</text>
+  <path class="v-dash" d="M130 270 C300 305,570 305,736 228"/>
+  <text class="v-small" x="432" y="304" text-anchor="middle">everything in the union except those fixed IDs → training</text>
+</svg>
+<figcaption>Validation comes from the master intersection so every chosen validation
+transcript exists everywhere. Training uses the much larger union minus those IDs, so
+training row counts may differ across datasets without leaking validation transcripts.</figcaption>
+</figure>
+<h3>3.1 The split unit is a transcript, not a pair</h3>
+<p>The implementation is <code>fixed_common_validation_split()</code> in
+<code>main_ribounmix_multidataset.py</code>. It assigns the transcript ID
+\(t\), never an individual dataset–transcript row. Once \(t\) is assigned to validation,
+all of its rows in every selected experiment dataset are validation rows. The same
+transcript cannot be used for training in another dataset.</p>
+<p><code>split.master_dataset_universe: all</code> defines a fixed master collection. Let
+\(\mathcal D_{\mathrm{master}}\) be those 114 datasets and let the complete transcript pool
+be the sequence-overlapping union</p>
+<div class="equation">$$
+\mathcal U=
+\mathcal T_{\mathrm{sequence}}\cap
+\bigcup_{d\in\mathcal D_{\mathrm{master}}}
+\{t:(d,t)\text{ is retained}\}.
+$$</div>
+<p>Rows with zero codon coverage were physically removed during preprocessing. Therefore a
+retained row represents a real positive-coverage profile, and every retained weight is
+finite and strictly positive.</p>
+
+<h3>3.2 One fixed validation panel from the master intersection</h3>
+<p>The validation candidates are not recomputed from the datasets selected for an
+individual run. They are computed once from the intersection of the entire master
+collection:</p>
+<div class="equation">$$
+\mathcal C_{\mathrm{master}}=
+\mathcal T_{\mathrm{sequence}}
+\cap\bigcap_{d\in\mathcal D_{\mathrm{master}}}
+\{t:(d,t)\text{ is retained and }w_{dt}>0\}.
+$$</div>
+<p>Only IDs in \(\mathcal C_{\mathrm{master}}\) can enter validation. Consequently the same
+fixed validation IDs are available in any experiment-dataset subset drawn from the master
+collection. A missing weight column, duplicate transcript ID, or non-finite, zero, or
+negative weight is an explicit error; the split code does not impute it.</p>
+<div class="note"><strong>Why this is useful:</strong> a two-dataset run and a 114-dataset
+run evaluate the same biological transcripts. Changing <code>experiment.dataset</code>
+therefore changes the observations used for fitting, not the identity of the validation
+panel. The panel changes only when the master universe, source files, random seed, or split
+configuration changes.</div>
+
+<h3>3.3 Reliability and CSS jointly make validation representative</h3>
+<p><strong>CSS</strong> means a conserved stalling site: an annotated codon where ribosome
+stalling may be biologically interesting. CSS is used here only as a label for maintaining
+a similar mixture of transcripts with zero, one, a few, or many annotated sites.</p>
+<p>Each common candidate has one local reliability weight per master dataset. For split
+selection only, the code summarizes those 114 values by the ordinary median</p>
+<div class="equation">$$
+q_t=\operatorname{median}_{d\in\mathcal D_{\mathrm{master}}} w_{dt}.
+$$</div>
+<p>The candidates are ranked by \(q_t\) and divided into ten near-equal reliability bins.
+Independently, the CSS annotation in the sequence parquet is reduced to one of four count
+classes: no CSS, one CSS, two or three CSS, or at least four CSS sites. The actual
+stratification key is the pair</p>
+<div class="equation">$$
+s_t=(\text{reliability-decile}(q_t),\ \text{CSS-count-class}(t)).
+$$</div>
+<p>The requested validation total is distributed proportionally over these joint strata by
+largest remainder, and IDs are sampled uniformly within each stratum using
+<code>numpy.random.default_rng(experiment.seed)</code>. CSS is thus a suggestion about the
+composition of validation: it helps preserve the master candidate pool's CSS mixture. It
+does <strong>not</strong> create a CSS benchmark, reserve a CSS percentage, or make a
+CSS-positive transcript automatically enter validation.</p>
+<p>This is also stratification by reliability, not probability-proportional-to-weight
+sampling. Large \(q_t\) does not itself give a transcript a larger selection probability.
+The point of the deciles is to include weak, middle, and strong profiles rather than fill
+validation with only the most reliable profiles.</p>
+<p>The split score \(q_t\) is used only for choosing a representative validation set. It does
+not overwrite the pair weights. Later, the loss still uses each original \(w_{dt}\) to
+weight dataset observations inside the selected sample reducer. In the default
+transcript-balanced mode, those weights compare datasets only within the same transcript.</p>
+
+<h3>3.4 Validation size and the different training sizes</h3>
+<p>The configured fraction applies to the common candidate set, not separately to every
+dataset and not to the union:</p>
+<div class="equation">$$
+n_{\mathrm{val}}=\operatorname{round}
+\left(|\mathcal C_{\mathrm{master}}|\,f_{\mathrm{val}}\right),
+\qquad f_{\mathrm{val}}=0.10.
+$$</div>
+<p>After the fixed set \(\mathcal V\) is sampled, training is simply the rest of the master
+union:</p>
+<div class="equation">$$
+\mathcal T_{\mathrm{train}}=\mathcal U\setminus\mathcal V.
+$$</div>
+<p>For a selected dataset \(d\), the dataloader materializes only IDs for which that
+dataset actually has a row:</p>
+<div class="equation">$$
+\mathcal T^{\mathrm{train}}_d=
+\mathcal T_{\mathrm{train}}\cap\{t:(d,t)\text{ is retained}\},
+\qquad
+\mathcal T^{\mathrm{val}}_d=\mathcal V.
+$$</div>
+<p>This is how unequal dataset sizes are handled. Every selected dataset contributes the
+same 714 validation transcript IDs, while its training count is all of its own remaining
+rows <em>before grouped-sampler support filtering</em>. No transcript is discarded merely
+to force a small dataset's raw split size to match a larger dataset. For the multidataset
+training sampler, however, a training transcript must then have a positive eligible row in
+at least two selected datasets; singleton rows are excluded before packing. The default
+transcript-balanced loss prevents an admitted transcript from receiving more outer mass
+merely because more datasets contain it.</p>
+<p>Consequently, <code>validation_frac: 0.1</code> does <strong>not</strong> mean “ten percent
+of every selected dataset.” It means ten percent of the fixed master-common candidate
+panel. A selected dataset with 10,000 retained rows and one with 16,000 retained rows both
+validate on the same 714 transcript IDs, then use their own available non-validation rows
+for training.</p>
+
+<h3>3.5 Current 114-dataset snapshot</h3>
+<p>With the checked-in weighted files, seed 42, and
+<code>split.validation_frac: 0.1</code>:</p>
+<table>
+  <thead><tr><th>Quantity</th><th>Count</th><th>Interpretation</th></tr></thead>
+  <tbody>
+    <tr><td>Complete split universe</td><td>18,176</td><td>Sequence-overlapping IDs in the 114-dataset union.</td></tr>
+    <tr><td>Common validation candidates</td><td>7,142</td><td>Each has a retained row in all 114 datasets.</td></tr>
+    <tr><td>Fixed validation panel</td><td>714 transcripts</td><td>1,428 pairs for a two-dataset run; 81,396 pairs for all 114.</td></tr>
+    <tr><td>Training ID pool</td><td>17,462</td><td>Every union ID not in validation; per-dataset availability is retained.</td></tr>
+  </tbody>
+</table>
+<p>The ten reliability bins contribute 71 or 72 validation IDs each. The validation panel
+contains 607 transcripts with no CSS, 77 with one CSS, 27 with two or three CSS sites, and
+3 with at least four sites. Its master-median reliability ranges from 0.3018 to 2.3687,
+with median 1.3932. These figures verify that CSS annotations guide composition without a
+dedicated CSS holdout and that low-to-high reliability regions are represented. The split
+manifest records the master datasets, joint strata, seed, exact IDs, and realized counts.</p>
+<p>For the active two-dataset example, after sequence overlap,
+<code>martinez_2019</code> contributes 13,465 training pairs plus the 714 validation pairs,
+while <code>sharma_2021</code> contributes 14,650 training pairs plus the same 714
+validation pairs before the grouped support rule. Because the active multidataset sampler
+requires both selected datasets, their 13,276 shared positive training transcripts supply
+13,276 optimized rows from each dataset. The extra singleton training rows remain part of
+the split but do not enter this sampler. Validation remains directly comparable.</p>
+
+<div class="warning"><strong>Active sampler eligibility is positive and pair-specific.</strong>
+For selected datasets \(D\), define \(D_t^+=\{d\in D:(d,t)\text{ passes every profile and
+weight check}\}\) and \(K_t^+=|D_t^+|\). The active
+<code>transcript_grouped_multidataset_pairs</code> strategy admits a transcript only when
+<code>minimum_positive_datasets_per_transcript: 2</code> gives \(K_t^+\ge2\), and its atomic
+group is exactly \(G_t=\{(t,d):d\in D_t^+\}\). Replicas never count as datasets and a
+duplicate pair raises. The explicit <code>transcript_grouped_pairs</code> strategy remains
+available for positive singleton groups. Prediction loaders also permit singleton requests.</div>
+<p>For the current Martinez–Sharma training subset, the master training pool has 2,623 IDs
+with \(K^+=0\), 1,563 with \(K^+=1\), and 13,276 with \(K^+\ge2\). Thus 13,276 groups
+(26,552 positive pair rows) enter packing; the 4,186 insufficient-support IDs consume no
+physical batch capacity.</p>
+
+<h2 id="batching">4. Grouped logical batches, execution forwards, and optimizer updates</h2>
+<div class="plain"><strong>Plain language:</strong> imagine putting every measurement of
+one transcript into a folder. The sampler places several complete folders in a
+<em>logical batch</em>. If that logical batch is too large for memory, execution
+microbatching opens only a few complete folders at a time. Gradient accumulation then
+decides how many complete logical batches contribute before the optimizer changes the
+parameters. These are three different controls.</div>
+<h3>4.1 <code>data.batch_size</code> is a per-dataset quota</h3>
+<p>The basic in-memory row is \((t,d)\), not just transcript \(t\). For every sampler-eligible
+transcript define its complete group</p>
+<div class="equation">$$
+G_t=\{(t,d):d\in D_t^+\},
+\qquad K_t^+=|D_t^+|\ge2.
+$$</div>
+<p>The grouped sampler never splits \(G_t\). The configured value
+<code>data.batch_size = B_d</code> is now the maximum number of pair rows from
+<em>each represented dataset</em> in one logical grouped batch:</p>
+<div class="equation">$$
+\#\{(t,d)\text{ in one rank's logical batch}\}\leq B_d
+\quad\text{for every dataset }d.
+$$</div>
+<p>With \(D\) represented datasets, the nominal total pair-row ceiling on each GPU is</p>
+<div class="equation">$$
+B_{\mathrm{pair,max}}=B_dD.
+$$</div>
+<p>This does not assign one dataset to one GPU: every rank normally sees rows from all
+datasets. Atomic groups are packed greedily subject to every dataset quota. When support
+differs across transcripts, some quotas can be underfilled, so the actual row total may be
+less than \(B_dD\). A duplicate \((t,d)\) row is rejected because the data model expects
+exactly one row per transcript–dataset pair.</p>
+<p>The positive-support test and duplicate check happen before this packing and before the
+non-mutating accumulation preview. The planner therefore measures only groups that can
+actually train; excluded \(K^+=0\) and \(K^+=1\) transcripts occupy no quota.</p>
+
+<div class="warning"><strong>Important naming clarification.</strong>
+In the implementation, <code>data.batch_size</code> is not literally a global tensor
+batch-size field. It is a per-dataset limit on pair rows. If every admitted transcript has
+one row in every selected dataset, the number happens to equal the number of unique
+transcripts. With missing dataset observations, it is only a quota, and the actual number
+of unique transcripts is measured by the sampler rather than assumed.</div>
+
+<h3>4.1.1 Exact symbols for the five settings</h3>
+<p>The following notation is used only to make the configuration unambiguous. Keep the
+units in mind: a <em>transcript group</em> is one biological transcript, a
+<em>pair row</em> is one transcript observed in one dataset, a <em>logical batch</em> is
+what the sampler creates, and an <em>execution forward</em> is what is resident on the
+GPU at one time.</p>
+<table>
+  <thead><tr><th>Configuration entry</th><th>Symbol and exact definition</th><th>Unit</th><th>What it does not mean</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>data.batch_size:</code> (B)<br>(32 in the active 64-GB A100 profile)</td>
+      <td>For every selected dataset \(d\), the logical batch contains at most \(B\) rows \((t,d)\). In a complete \(D\)-dataset panel this gives \(G_{\mathrm{logical}}=B\) unique transcripts and \(P_{\mathrm{logical}}=BD\) pair rows.</td>
+      <td>pair rows per dataset; usually transcript groups when support is complete</td>
+      <td>It is not a direct GPU memory limit and is not guaranteed to equal unique transcripts with incomplete support.</td>
+    </tr>
+    <tr>
+      <td><code>target_unique_transcripts_per_optimizer_step:</code> (U)<br>(32)</td>
+      <td>The desired number of distinct transcript IDs contributing on one rank between two parameter updates. The planner chooses how many logical batches to accumulate so their measured transcript counts sum to approximately \(U\).</td>
+      <td>unique transcript IDs per optimizer update</td>
+      <td>It does not increase a logical batch, pair rows, GPU memory, or the number of datasets evaluated.</td>
+    </tr>
+    <tr>
+      <td><code>max_accumulate_grad_batches:</code> (A_{max})<br>(32)</td>
+      <td>The largest allowed integer number of logical batches accumulated before an optimizer update. The actual factor \(A\) is normally smaller and is resolved from the sampler preview.</td>
+      <td>logical batches per optimizer update</td>
+      <td>It is not a batch size and does not mean 32 batches are always accumulated.</td>
+    </tr>
+    <tr>
+      <td><code>max_pair_rows_per_forward:</code> (R_{max})<br>(512)</td>
+      <td>Before a logical batch is sent to the GPU, execution packing starts a new chunk when adding a complete transcript group would exceed \(R_{\max}\) pair rows.</td>
+      <td>pair rows in one GPU execution forward</td>
+      <td>It does not alter logical membership, accumulation, or the number of unique transcripts requested.</td>
+    </tr>
+    <tr>
+      <td><code>gamma_centering.reference.chunk_size:</code> (C_{gamma})<br>(32)</td>
+      <td>While centering one transcript, the fixed-reference gamma path evaluates at most \(C_{\gamma}\) reference datasets in one internal piece. If the reference panel has \(R\) datasets, it uses \(\lceil R/C_{\gamma}\rceil\) internal reference pieces.</td>
+      <td>reference datasets in one gamma-centering sub-computation</td>
+      <td>It is not transcripts, pair rows, logical batches, optimizer accumulation, or the training batch size.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>4.2 Concrete current example: two datasets</h3>
+<p>The active sampler requires at least two represented datasets. With exactly the current
+two selected datasets, every eligible training transcript therefore has one row in both:
+\(G_t=\{(t,d_1),(t,d_2)\}\). For the active <code>data.batch_size: 32</code>, a full logical batch on
+one GPU is exactly</p>
+<div class="equation">$$
+32\text{ rows from }d_1+32\text{ rows from }d_2
+=64\text{ pair rows}=32\text{ unique transcripts}.
+$$</div>
+
+<div class="batch-picture" role="img" aria-label="A full two-dataset logical batch with 32 complete transcript groups">
+  <div></div><div class="head">Dataset A rows</div><div class="head">Dataset B rows</div>
+  <div>folder 1</div><div class="chip">(A, t1)</div><div class="chip">(B, t1)</div>
+  <div>folder 2</div><div class="chip">(A, t2)</div><div class="chip">(B, t2)</div>
+  <div>⋮</div><div class="chip">⋮</div><div class="chip">⋮</div>
+  <div>folder 32</div><div class="chip">(A, t32)</div><div class="chip">(B, t32)</div>
+</div>
+<p class="meta">Each horizontal row is one indivisible transcript group. Thirty-two groups
+produce 64 pair rows because each group has one row from each selected
+dataset.</p>
+<p>The final logical batch of an epoch may be smaller. With more than two datasets and partial
+support, 32 remains a ceiling for every dataset, not a promise that every dataset will
+always reach 32. The planner previews each run's actual partially supported atomic groups
+and records the resulting unique-transcript and pair-row distributions before resolving
+accumulation.</p>
+
+<h3>4.3 What <code>target_unique_transcripts_per_optimizer_step</code> does</h3>
+<div class="plain"><strong>The short version:</strong>
+<code>batch_size: 32</code> says approximately how many different transcripts can be placed
+in one complete logical batch when dataset support is rectangular.
+<code>target_unique_transcripts_per_optimizer_step: 32</code> says “do not change the model
+parameters until approximately 32 different transcripts have contributed.” With 32
+transcripts per full logical batch, the typical accumulation factor is one.</div>
+
+<p>An <strong>optimizer update</strong> is the moment at which the optimizer finally changes
+the model parameters. A forward pass calculates predictions and a loss; a backward pass
+calculates gradients. Gradient accumulation can perform several forward/backward
+calculations, add their gradients together, and postpone the parameter change until all of
+them have contributed.</p>
+
+<p>The target counts <strong>unique transcript identities</strong>, not pair rows. If
+transcript <code>t1</code> has observations in 20 datasets, its 20 pair rows still count as
+one transcript toward the target. The purpose is to keep approximately the same amount of
+biological sequence diversity in an optimizer update when the number of selected datasets
+or the pattern of dataset support changes.</p>
+
+<p>The code cannot assume that <code>batch_size: 32</code> always produces exactly 32
+transcripts. Complete transcript groups have different numbers of dataset rows, and the
+last logical batch can be smaller. Before training, it therefore makes a non-mutating
+preview of the real grouped sampler and records the number of unique transcripts in every
+previewed logical batch. The configured <code>accumulation_statistic: median</code> selects
+the middle of those observed counts as the estimate of a typical logical batch. In plain
+terms:</p>
+<div class="equation">$$
+\text{typical transcripts per logical batch}
+=\operatorname{median}(\text{observed transcript counts}).
+$$</div>
+
+<p>It then divides the desired transcript target by that typical count and rounds upward,
+because the number of logical batches must be a whole number:</p>
+<div class="equation">$$
+\text{required logical batches per optimizer update}
+=
+\left\lceil
+\frac{\text{desired unique transcripts per optimizer update}}
+{\text{typical unique transcripts per logical batch}}
+\right\rceil.
+$$</div>
+
+<p>For the current one-GPU, two-dataset configuration, the preview median is 32 unique
+transcripts per logical batch and the desired target is 32. Therefore:</p>
+<div class="equation">$$
+\left\lceil\frac{32\text{ desired transcripts}}
+{32\text{ transcripts per logical batch}}\right\rceil
+=1\text{ logical batch per optimizer update}.
+$$</div>
+<p>That logical batch has 32 rows from each of the two datasets: 64 pair rows.
+The word “approximately” matters for partially supported panels because greedy packing
+can produce a different number of transcript groups.</p>
+
+<p><code>max_accumulate_grad_batches: 32</code> is merely a safety ceiling on the answer.
+It does not request 32 batches. The current calculation requests one, so the ceiling does
+nothing. If the calculation requested 40, the runtime would use 32 and warn that the
+desired transcript target cannot be reached.</p>
+
+<p><code>auto_accumulate_grad_batches: true</code> means the preview performs this calculation
+automatically. The resolved whole-number accumulation factor is saved in the grouped
+optimizer plan. When
+<code>execution_microbatching.enabled: false</code>, it becomes Lightning's
+<code>trainer.accumulate_grad_batches</code>. When execution microbatching is enabled, the
+Trainer value is deliberately set to 1 and the Lightning module manually counts the
+resolved number of <em>logical</em> batches. This distinction is necessary because Lightning sees execution
+chunks as loader batches, while the optimizer plan is defined in logical transcript
+groups.</p>
+<figure class="visual">
+<svg viewBox="0 0 900 180" role="img" aria-labelledby="accum-picture-title accum-picture-desc">
+  <title id="accum-picture-title">One full logical batch produces one optimizer update</title>
+  <desc id="accum-picture-desc">The full logical batch contains about 32 unique transcripts and 64 pair rows. It may be executed in smaller physical forwards before one optimizer update.</desc>
+  <rect class="v-soft" x="210" y="48" rx="10" width="250" height="78"/><text class="v-text" x="335" y="76" text-anchor="middle">one logical batch</text><text class="v-small" x="335" y="102" text-anchor="middle">≈32 t / 64 pairs at D=2</text>
+  <path class="v-line" d="M465 87 L610 87"/>
+  <rect class="v-good" x="615" y="34" rx="10" width="150" height="106"/><text class="v-text" x="690" y="67" text-anchor="middle">UPDATE</text><text class="v-small" x="690" y="93" text-anchor="middle">≈32 t</text><text class="v-small" x="690" y="114" text-anchor="middle">A = 1</text>
+</svg>
+<figcaption>The logical batch may require one or more smaller execution forwards, but
+parameters change only after all of its chunks have contributed.</figcaption>
+</figure>
+
+<h3 id="batch-execution-connection">4.4 How logical batching, execution chunks, accumulation, and gamma reference chunks connect</h3>
+<p>These settings answer different questions. Reading them from left to right prevents the
+word “batch” from hiding four different units:</p>
+<figure class="visual">
+<svg viewBox="0 0 980 250" role="img" aria-labelledby="batch-layers-title batch-layers-desc">
+  <title id="batch-layers-title">Four nested batching controls</title>
+  <desc id="batch-layers-desc">The grouped sampler creates a logical batch using the per-dataset quota. Execution microbatching divides it between complete groups for GPU forwards. The accumulation target combines several logical batches into one optimizer update. Gamma reference chunk size separately chunks internal reference-dataset evaluations and does not alter any of the preceding batch definitions.</desc>
+  <rect class="v-soft" x="20" y="55" rx="12" width="200" height="120"/><text class="v-text" x="120" y="84" text-anchor="middle">1. logical batch</text><text class="v-small" x="120" y="112" text-anchor="middle">batch_size = 32 per dataset</text><text class="v-small" x="120" y="137" text-anchor="middle">whole transcript groups</text><text class="v-small" x="120" y="158" text-anchor="middle">≤ 32D pair rows</text>
+  <path class="v-line" d="M225 115 L265 115"/>
+  <rect class="v-soft" x="270" y="55" rx="12" width="200" height="120"/><text class="v-text" x="370" y="84" text-anchor="middle">2. execution forwards</text><text class="v-small" x="370" y="112" text-anchor="middle">≤512 pair rows</text><text class="v-small" x="370" y="137" text-anchor="middle">≤256k padded codons</text><text class="v-small" x="370" y="158" text-anchor="middle">groups never split</text>
+  <path class="v-line" d="M475 115 L515 115"/>
+  <rect class="v-good" x="520" y="55" rx="12" width="200" height="120"/><text class="v-text" x="620" y="84" text-anchor="middle">3. optimizer window</text><text class="v-small" x="620" y="112" text-anchor="middle">target ≈32 transcripts</text><text class="v-small" x="620" y="137" text-anchor="middle">resolved logical batches</text><text class="v-small" x="620" y="158" text-anchor="middle">one clip + one update</text>
+  <rect class="v-soft" x="770" y="55" rx="12" width="190" height="120"/><text class="v-text" x="865" y="84" text-anchor="middle">independent side loop</text><text class="v-small" x="865" y="112" text-anchor="middle">gamma reference</text><text class="v-small" x="865" y="137" text-anchor="middle">chunk_size = 32 datasets</text><text class="v-small" x="865" y="158" text-anchor="middle">same exact center</text>
+  <path class="v-line" d="M770 193 L720 193"/><text class="v-small" x="745" y="220" text-anchor="middle">does not set batch or accumulation size</text>
+</svg>
+<figcaption>The first three layers determine which training observations contribute before
+one parameter update. Gamma's <code>reference.chunk_size</code> is only an internal memory
+chunk for evaluating the fixed reference panel.</figcaption>
+</figure>
+
+<p>For a logical batch containing transcript groups \(G_1,\ldots,G_G\), the execution
+packer greedily starts a new forward before adding the next complete group if any enabled
+limit would be exceeded:</p>
+<ul>
+  <li><code>max_pair_rows_per_forward: 512</code> limits pair rows;</li>
+  <li><code>max_padded_codon_tokens_per_forward: 256000</code> limits
+  <code>pair rows × longest CDS length</code>, an estimate of padding memory;</li>
+  <li><code>max_transcript_groups_per_forward: null</code> disables a separate group-count limit.</li>
+</ul>
+<p>The limits are soft for one indivisible group: if a single transcript has more than 512
+dataset rows, or its padded profile alone exceeds 256,000 tokens, that group is emitted
+intact. Gradient accumulation cannot repair a split transcript, so preserving group
+atomicity has priority over these memory budgets.</p>
+<p>For the next equation, \(G\) is the total number of transcript groups in the original
+logical batch, \(G_c\) is the number placed in the current execution chunk, \(L_c\) is
+that chunk's transcript-balanced mean loss, and \(A\) is the resolved number of logical
+batches accumulated per optimizer update. The manual backward pass uses</p>
+<div class="equation">$$
+L_c^{\mathrm{backward}}=L_c\frac{G_c}{G}\frac{1}{A}.
+$$</div>
+<p>Summing chunks reconstructs the exact transcript-balanced logical-batch loss; summing
+\(A\) logical batches reconstructs the configured accumulation window. Clipping with
+<code>gradient_clip_val: 1.0</code> and <code>gradient_clip_algorithm: norm</code> happens
+once, after all those gradients exist, immediately before the optimizer step. Trainer-level
+clipping is therefore <code>null</code>, avoiding partial-chunk or duplicate clipping.
+Execution microbatching currently requires
+<code>loss.sample_reduction: transcript_balanced</code>; the runtime rejects another mode
+because the \(G_c/G\) reconstruction would not be the correct weighting for it.</p>
+
+<div class="note"><strong>Numerical examples for complete support.</strong>
+With two datasets, <code>batch_size: 32</code> means 32 groups and 64 pair rows, so the
+512-row limit leaves the logical batch in one forward. With 20 datasets it means 32 groups
+and 640 rows; ignoring the token limit, the packer can emit 25 groups/500 rows and then
+7 groups/140 rows. With 114 datasets it means 32 groups and 3,648 rows; the 512-row limit
+normally fits four complete 114-row groups per forward. In every case the planner still
+sees 32 logical groups and resolves \(A=\lceil32/32\rceil=1\). Partial support and CDS
+lengths can change the actual chunking, which is why runtime statistics—not \(32D\)
+alone—are used.</div>
+
+<p><code>gamma_centering.reference.chunk_size: 32</code> is orthogonal to all of this. For
+each transcript in an execution forward, fixed-reference centering internally evaluates at
+most 32 reference dataset identities at a time, concatenates their differentiable raw
+log-gamma results, and computes the same weighted center. It does not mean 32 transcripts,
+32 pair rows, or 32 accumulated batches, and changing it must not change gamma or \(\mu\)
+beyond floating-point tolerance. Because fixed-reference centering uses the checkpointed
+panel rather than co-resident rows, subdividing a logical batch does not change its gauge.</p>
+<p>There is nevertheless a <em>compute</em> connection. If one execution chunk contains
+\(G_c\) distinct transcripts and the fixed panel contains \(R\) datasets, the reference
+path evaluates \(G_cR\) raw reference gamma profiles in total. With chunk size \(C=32\),
+the dataset dimension is processed in \(\lceil R/C\rceil\) internal pieces (the final piece
+may be smaller). Thus lowering the execution limits reduces how many transcripts are live
+at once; lowering reference <code>chunk_size</code> reduces how many reference datasets are
+live per internal evaluation. Neither changes the observations in the logical batch, the
+accumulation target, or the gamma equation.</p>
+<div class="plain"><strong>What happens when the selected dataset count grows?</strong>
+For complete support, changing from \(D=2\) to \(D=114\) increases a logical batch from
+\(32\times2=64\) to \(32\times114=3648\) requested pair rows and, because
+<code>reference.dataset_names: null</code>, increases the fixed reference panel from 2 to
+114 datasets. Execution microbatching controls the requested-row memory; reference
+<code>chunk_size: 32</code> controls the internal reference-panel memory. The target remains
+32 unique transcripts per optimizer update because it counts biological transcripts, not
+datasets or pair rows.</div>
+
+<h3>4.4.1 How to increase GPU work while keeping 32 transcript groups</h3>
+<p>Suppose you explicitly run with <code>data.batch_size: 32</code> and want the logical
+batch to contain 32 unique transcripts. For complete support in (D) selected datasets:</p>
+<div class="equation">$$
+G_{\mathrm{logical}}=32,
+\qquad
+P_{\mathrm{logical}}=32D.
+$$</div>
+<p>Here (G_{\mathrm{logical}}) is the number of transcript groups and
+(P_{\mathrm{logical}}) is the number of transcript–dataset pair rows. The GPU does not
+necessarily receive all (P_{\mathrm{logical}}) rows at once. With
+<code>max_pair_rows_per_forward: 512</code>, a conservative complete-support estimate is</p>
+<div class="equation">$$
+G_{\mathrm{groups\ per\ forward}}
+\lesssim
+\left\lfloor\frac{512}{D}\right\rfloor.
+$$</div>
+<table>
+  <thead><tr><th>Selected datasets (D)</th><th>Logical batch with (B=32)</th><th>Rows allowed per forward</th><th>Typical consequence</th></tr></thead>
+  <tbody>
+    <tr><td>2</td><td>32 groups, 64 pair rows</td><td>512</td><td>All 32 groups fit in one execution forward.</td></tr>
+    <tr><td>4</td><td>32 groups, 128 pair rows</td><td>512</td><td>All 32 groups fit, if the padded-token limit also fits.</td></tr>
+    <tr><td>20</td><td>32 groups, 640 pair rows</td><td>512</td><td>About 25 groups per forward; the logical batch is split into two or more forwards.</td></tr>
+    <tr><td>114</td><td>32 groups, 3,648 pair rows</td><td>512</td><td>About 4 groups per forward; the logical batch remains 32 groups in total.</td></tr>
+  </tbody>
+</table>
+<p>Therefore, if you want to keep exactly the logical target of 32 transcript groups but
+make each GPU forward process more rows, increase
+<code>max_pair_rows_per_forward</code> and, if necessary,
+<code>max_padded_codon_tokens_per_forward</code>. To fit the entire logical batch in one
+forward under complete support, the row limit must satisfy</p>
+<div class="equation">$$
+R_{\max}\geq 32D,
+$$</div>
+<p>and the padded-token limit must also exceed</p>
+<div class="equation">$$
+32D\,L_{\max},
+$$</div>
+<p>where (L_{\max}) is the longest CDS length in that logical batch. Increase these
+limits gradually while watching GPU memory. A single long transcript group can still exceed
+a soft limit because the implementation never splits a group.</p>
+<div class="warning"><strong>What cannot be increased independently:</strong>
+There is no setting that makes one forward contain more than 32 unique transcripts while
+leaving <code>data.batch_size: 32</code> unchanged. To process more than 32 transcript
+groups in one logical batch, increase <code>data.batch_size</code> itself. That also increases
+the logical pair-row budget and usually requires larger execution limits. Increasing
+<code>max_accumulate_grad_batches</code> does not make a GPU forward larger; it only allows
+more logical batches to be accumulated before an optimizer update.</div>
+<p>With (B=32) and (U=32), the typical accumulation factor is</p>
+<div class="equation">$$
+A=\left\lceil\frac{U}{G_{\mathrm{typical}}}\right\rceil
+=\left\lceil\frac{32}{32}\right\rceil=1.
+$$</div>
+<p>Thus the recommended speed-oriented starting point is: keep
+<code>data.batch_size: 32</code>, keep
+<code>target_unique_transcripts_per_optimizer_step: 32</code>, leave
+<code>max_accumulate_grad_batches: 32</code> as the safety ceiling, and raise
+<code>max_pair_rows_per_forward</code> plus the token limit until the desired number of
+complete groups fits safely on the GPU. The gamma
+<code>chunk_size: 32</code> can be increased separately to reduce reference-panel pieces,
+but it does not increase the number of training transcripts in a forward.</p>
+
+<h3>4.5 DDP: per-rank versus global targets</h3>
+<div class="warning"><strong>The two mechanisms do not currently run together.</strong>
+Grouped sampling and the accumulation planner support DDP, but
+<code>execution_microbatching.enabled: true</code> is currently single-process only. The
+runtime raises if the configured world size is greater than one. To launch DDP, explicitly
+set <code>training.execution_microbatching.enabled=false</code>; then Lightning performs the
+resolved accumulation automatically and each complete logical batch is one forward on its
+rank. The calculations below describe that DDP configuration.</div>
+<p>The sampler first constructs one deterministic global list of complete logical batches,
+then assigns whole logical batches round-robin to ranks. If necessary, it adds at most one
+fewer batches than the number of ranks so every rank executes the same number of DDP
+collectives. Transcript groups are never divided between ranks.</p>
+<p>Here a <strong>rank</strong> means one DDP training process, normally attached to one GPU,
+and the <strong>world size</strong> means the total number of those processes. For example,
+two GPUs normally give two ranks and a world size of two.</p>
+<p>With the active <code>target_scope: per_rank</code>, the configured value 32 applies
+separately to every rank. In the following equation,
+<code>local target</code> means the desired unique-transcript count on one rank, while
+<code>configured target</code> is the value written in the YAML:</p>
+<div class="equation">$$
+\text{local target on each rank}=\text{configured target}=32.
+$$</div>
+<p>Thus a two-rank job targets approximately 64 transcripts globally. This keeps local
+work per GPU stable but means changing the number of GPUs changes the global effective
+batch. The available <code>global</code> scope instead uses</p>
+<div class="equation">$$
+\text{local target on each rank}=
+\max\left(1,\left\lceil
+\frac{\text{configured target}}
+{\text{number of DDP ranks}}
+\right\rceil\right).
+$$</div>
+<p>This is preferable when the total optimizer batch should remain
+approximately invariant to GPU count. The scope does not affect group integrity.</p>
+
+<table>
+  <thead><tr><th>Current two-dataset example</th><th>One GPU</th><th>Two DDP ranks, <code>per_rank</code></th><th>Two DDP ranks, <code>global</code></th></tr></thead>
+  <tbody>
+    <tr><td>Rows per logical batch</td><td>16</td><td>16 per rank; 32 globally</td><td>16 per rank; 32 globally</td></tr>
+    <tr><td>Unique transcripts per logical batch</td><td>8</td><td>8 per rank; 16 globally</td><td>8 per rank; 16 globally</td></tr>
+    <tr><td>Effective local target</td><td>32</td><td>32 per rank</td><td>ceil(32/2) = 16 per rank</td></tr>
+    <tr><td>Resolved accumulation</td><td>4</td><td>4</td><td>2</td></tr>
+    <tr><td>Approximate transcripts per update</td><td>32 global</td><td>32 per rank; 64 global</td><td>16 per rank; 32 global</td></tr>
+    <tr><td>Approximate pair rows per update</td><td>64 global</td><td>64 per rank; 128 global</td><td>32 per rank; 64 global</td></tr>
+  </tbody>
+</table>
+<p>DDP averages gradients across ranks; it does not concatenate their tensors on one GPU.
+The “global” counts above describe the observations influencing the synchronized optimizer
+update across all ranks.</p>
+
+<h3>4.6 Configuration audit</h3>
+<table>
+  <thead><tr><th>Setting</th><th>Why it remains</th></tr></thead>
+  <tbody>
+    <tr><td><code>enabled</code></td><td>Allows a deliberate ablation with the explicit Trainer accumulation and no planner.</td></tr>
+    <tr><td><code>target_unique_transcripts_per_optimizer_step</code></td><td>Controls biological sequence diversity rather than pair-row count.</td></tr>
+    <tr><td><code>auto_accumulate_grad_batches</code></td><td>When false, the preview and provenance remain available while an explicit Trainer factor is retained.</td></tr>
+    <tr><td><code>accumulation_statistic</code></td><td>Chooses how variable logical-batch transcript counts are summarized; the active robust value is <code>median</code>.</td></tr>
+    <tr><td><code>max_accumulate_grad_batches</code></td><td>Upper bound on the automatically chosen factor, not the factor itself.</td></tr>
+    <tr><td><code>target_scope</code></td><td>Chooses stable per-GPU work or approximately GPU-invariant global batch size.</td></tr>
+    <tr><td><code>log_batch_structure</code></td><td>Controls the more expensive per-epoch structural diagnostics without disabling planning.</td></tr>
+  </tbody>
+</table>
+<table>
+  <thead><tr><th>Execution setting</th><th>Actual role</th></tr></thead>
+  <tbody>
+    <tr><td><code>enabled</code></td><td>Chooses memory-bounded, manual execution of a logical batch. It does not enable grouping or change logical membership.</td></tr>
+    <tr><td><code>gradient_clip_val</code> / <code>gradient_clip_algorithm</code></td><td>Clip the completed optimizer-window gradient once; they replace Trainer clipping only while manual execution is active.</td></tr>
+    <tr><td><code>max_pair_rows_per_forward</code></td><td>Soft GPU-forward row budget. It is unrelated to the per-dataset sampler quota.</td></tr>
+    <tr><td><code>max_padded_codon_tokens_per_forward</code></td><td>Soft padding-memory proxy based on row count times the longest sequence in a proposed chunk.</td></tr>
+    <tr><td><code>max_transcript_groups_per_forward</code></td><td>Optional hard-to-target group-count budget; <code>null</code> means no separate limit.</td></tr>
+  </tbody>
+</table>
+<p>Two entries were removed from the input configuration. The lower accumulation bound was
+always one, so <code>min_accumulate_grad_batches: 1</code> duplicated a mathematical
+invariant. Likewise, <code>resolved: null</code> was not an input: the runtime now adds the
+resolved subtree only after it has computed real values. The plan is saved both in the
+resolved Hydra configuration and in <code>grouped_optimizer_batch_plan.json</code>.</p>
+
+<h3>4.7 Exactness and diagnostics</h3>
+<p>The planner stabilizes the approximate number of transcripts per update; it does not
+in general construct a mathematically exact concatenated large batch. Each accumulated
+logical-batch mean gives one gradient contribution. If logical batches contain different numbers of transcripts,
+different represented datasets, or different reliability-weight sums, averaging their
+gradients is not identical to evaluating the loss once over their concatenated rows. The
+epoch-zero preview can also differ slightly from later shuffled epoch packings.</p>
+<p>For that reason the runtime records pair rows, unique transcripts, datasets per
+transcript, the coefficient of variation of transcript counts, the resolved accumulation
+factor, and estimated optimizer steps. These diagnostics reveal whether the target is a
+good approximation. The mechanism does not alter the loss equation, learning rates,
+weight decay, atomic grouped sampler, or validation split.</p>
+<p>For transcript-balanced loss, a complete transcript is exact inside one execution chunk
+because its group is atomic. The \(G_c/G\) scaling also makes multiple execution chunks
+exactly reconstruct their original logical batch. Across logical batches, however, each
+batch mean still receives equal accumulation weight. Therefore an optimizer window is an
+exact equal mean over all its transcripts only when its logical batches contain the same
+transcript count. The logged <code>unique_transcripts_per_microbatch</code> name is retained
+for compatibility; it refers to logical sampler batches in the grouped plan, and its epoch
+coefficient of variation quantifies this remaining approximation.</p>
+
+<h2 id="gamma-centering">5. What the model predicts and why gamma is centered</h2>
+<h3>5.1 The prediction in plain language</h3>
+<div class="plain"><strong>Think of two transparent layers.</strong> The blue layer,
+\(L^{\mathrm{bio}}\), is the sequence-driven ribosome pattern shared by every dataset. The
+orange layer, \(\gamma\), says how one particular dataset reshapes that shared pattern.
+The layers are multiplied directly and then multiplied by the observed mean read depth
+\(S\). There is no final normalization of \(\gamma L^{\mathrm{bio}}\). Consequently, the
+model can change both the codon-by-codon shape and the total predicted mass relative to its
+observed scale anchor.</div>
+
+<figure class="visual">
+<svg class="model-architecture" viewBox="0 0 1300 760" role="img" aria-labelledby="model-picture-title model-picture-desc">
+  <title id="model-picture-title">Complete mass-free RiboUnmix architecture</title>
+  <desc id="model-picture-desc">The upper green branch maps sequence encodings through a two-layer bidirectional GRU and a positive feed-forward head to the mean-one shared biological profile. The lower purple branch embeds dataset, codon, nucleotide, and amino-acid identities, applies a separate two-layer bidirectional GRU, concatenates position features, and predicts raw gamma and NB2 dispersion through separate heads. The dispersion head receives a detached copy of the shared bias context. Fixed-reference two-way gamma centering produces positive gamma. Gamma, L bio, and the target-derived scale are multiplied directly without mass normalization to produce mu. Raw replicas supervise NB2, while their consensus supervises raw and NB-VST Pearson losses.</desc>
+  <defs><marker id="model-arrowhead" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--accent)"/></marker></defs>
+  <style>.model-architecture .v-line{marker-end:url(#model-arrowhead)}</style>
+
+  <!-- Final objective -->
+  <rect class="v-bad" x="790" y="18" rx="14" width="465" height="102"/>
+  <text class="v-text" x="1022" y="47" text-anchor="middle">Optimized pair loss</text>
+  <text class="v-small" x="1022" y="73" text-anchor="middle">replica NB2 + 0.5 × consensus raw PCC loss</text>
+  <text class="v-small" x="1022" y="96" text-anchor="middle">+ 0.5 × consensus NB-VST PCC loss</text>
+
+  <!-- Biological branch -->
+  <rect class="v-good" x="18" y="142" rx="18" width="680" height="238"/>
+  <text class="v-text" x="358" y="169" text-anchor="middle">Shared sequence-dependent biological branch</text>
+  <rect class="v-box" x="42" y="190" rx="7" width="120" height="36"/><text class="v-small" x="102" y="213" text-anchor="middle">codon encoding</text>
+  <rect class="v-box" x="42" y="238" rx="7" width="120" height="36"/><text class="v-small" x="102" y="261" text-anchor="middle">NT encoding</text>
+  <rect class="v-box" x="42" y="286" rx="7" width="120" height="36"/><text class="v-small" x="102" y="309" text-anchor="middle">AA encoding</text>
+  <path class="v-line" d="M162 208 L205 238"/><path class="v-line" d="M162 256 L205 256"/><path class="v-line" d="M162 304 L205 274"/>
+  <rect class="v-soft" x="209" y="223" rx="9" width="72" height="66"/><text class="v-text" x="245" y="251" text-anchor="middle">concat</text><text class="v-small" x="245" y="272" text-anchor="middle">sequence</text>
+  <path class="v-line" d="M281 256 L320 256"/>
+  <rect class="v-box" x="324" y="207" rx="11" width="150" height="98"/>
+  <text class="v-text" x="399" y="238" text-anchor="middle">BiGRU</text><text class="v-small" x="399" y="263" text-anchor="middle">2 layers · bidirectional</text><text class="v-small" x="399" y="285" text-anchor="middle">hidden size 256</text>
+  <path class="v-line" d="M474 256 L505 256"/>
+  <rect class="v-box" x="509" y="223" rx="9" width="66" height="66"/><text class="v-text" x="542" y="251" text-anchor="middle">FF</text><text class="v-small" x="542" y="272" text-anchor="middle">softplus</text>
+  <path class="v-line" d="M575 256 L600 256"/>
+  <rect class="v-soft" x="604" y="198" rx="11" width="74" height="116"/>
+  <text class="v-text" x="641" y="225" text-anchor="middle">mean-one</text><text class="v-text" x="641" y="247" text-anchor="middle">Lᵇⁱᵒ</text><text class="v-small" x="641" y="273" text-anchor="middle">w / mean(w)</text><text class="v-small" x="641" y="296" text-anchor="middle">sequence only</text>
+
+  <!-- Mass-free composition -->
+  <rect class="v-good" x="790" y="145" rx="16" width="465" height="245"/>
+  <text class="v-text" x="1022" y="174" text-anchor="middle">Mass-free mean model</text>
+  <rect class="v-box" x="820" y="195" rx="9" width="125" height="62"/><text class="v-text" x="882" y="220" text-anchor="middle">scale S(d,t)</text><text class="v-small" x="882" y="242" text-anchor="middle">target mean</text>
+  <rect class="v-soft" x="974" y="195" rx="9" width="126" height="62"/><text class="v-text" x="1037" y="220" text-anchor="middle">h = γ × Lᵇⁱᵒ</text><text class="v-small" x="1037" y="242" text-anchor="middle">direct product</text>
+  <path class="v-line" d="M945 226 L974 226"/>
+  <path class="v-line" d="M1100 226 L1126 226"/>
+  <rect class="v-box" x="1130" y="195" rx="9" width="98" height="62"/><text class="v-text" x="1179" y="220" text-anchor="middle">μ = S × h</text><text class="v-small" x="1179" y="242" text-anchor="middle">NB2 mean</text>
+  <rect class="v-box" x="845" y="292" rx="10" width="355" height="67"/>
+  <text class="v-good-text" x="1022" y="319" text-anchor="middle">No division by mean(γ × Lᵇⁱᵒ)</text>
+  <text class="v-small" x="1022" y="343" text-anchor="middle">mean(μ) and total predicted reads are not fixed by construction</text>
+  <path class="v-line" d="M678 256 L790 256"/>
+  <path class="v-line" d="M1179 195 C1179 145,1100 145,1100 120"/>
+
+  <!-- Dataset-specific branch -->
+  <rect class="v-soft" x="18" y="414" rx="18" width="760" height="326"/>
+  <text class="v-text" x="398" y="442" text-anchor="middle">Dataset-specific bias and dispersion branch</text>
+  <rect class="v-box" x="38" y="468" rx="7" width="116" height="34"/><text class="v-small" x="96" y="490" text-anchor="middle">dataset ID</text>
+  <rect class="v-box" x="38" y="514" rx="7" width="116" height="34"/><text class="v-small" x="96" y="536" text-anchor="middle">codon IDs</text>
+  <rect class="v-box" x="38" y="560" rx="7" width="116" height="34"/><text class="v-small" x="96" y="582" text-anchor="middle">3 NT IDs</text>
+  <rect class="v-box" x="38" y="606" rx="7" width="116" height="34"/><text class="v-small" x="96" y="628" text-anchor="middle">AA IDs</text>
+  <rect class="v-box" x="184" y="468" rx="7" width="128" height="34"/><text class="v-small" x="248" y="490" text-anchor="middle">dataset embedding</text>
+  <rect class="v-box" x="184" y="514" rx="7" width="128" height="34"/><text class="v-small" x="248" y="536" text-anchor="middle">codon embedding</text>
+  <rect class="v-box" x="184" y="560" rx="7" width="128" height="34"/><text class="v-small" x="248" y="582" text-anchor="middle">NT embeddings</text>
+  <rect class="v-box" x="184" y="606" rx="7" width="128" height="34"/><text class="v-small" x="248" y="628" text-anchor="middle">AA embedding</text>
+  <path class="v-line" d="M154 485 L184 485"/><path class="v-line" d="M154 531 L184 531"/><path class="v-line" d="M154 577 L184 577"/><path class="v-line" d="M154 623 L184 623"/>
+  <path class="v-line" d="M312 485 L347 541"/><path class="v-line" d="M312 531 L347 548"/><path class="v-line" d="M312 577 L347 555"/><path class="v-line" d="M312 623 L347 562"/>
+  <rect class="v-box" x="351" y="515" rx="9" width="84" height="76"/><text class="v-text" x="393" y="545" text-anchor="middle">concat</text><text class="v-small" x="393" y="568" text-anchor="middle">context input</text>
+  <path class="v-line" d="M435 553 L462 553"/>
+  <rect class="v-box" x="466" y="504" rx="11" width="145" height="98"/>
+  <text class="v-text" x="538" y="535" text-anchor="middle">separate BiGRU</text><text class="v-small" x="538" y="560" text-anchor="middle">2 layers · bidirectional</text><text class="v-small" x="538" y="582" text-anchor="middle">hidden size 128</text>
+  <rect class="v-box" x="466" y="641" rx="8" width="145" height="46"/><text class="v-small" x="538" y="661" text-anchor="middle">position features</text><text class="v-small" x="538" y="680" text-anchor="middle">relative/start/stop</text>
+  <path class="v-line" d="M611 553 L638 568"/><path class="v-line" d="M611 664 L638 590"/>
+  <rect class="v-box" x="642" y="535" rx="9" width="110" height="78"/><text class="v-text" x="697" y="563" text-anchor="middle">shared x</text><text class="v-small" x="697" y="585" text-anchor="middle">context + dataset</text><text class="v-small" x="697" y="603" text-anchor="middle">+ position</text>
+  <path class="v-line" d="M752 555 L805 507"/>
+  <path d="M752 592 C790 625,790 666,825 666" style="stroke:var(--accent);stroke-width:2;stroke-dasharray:6 5;fill:none;marker-end:url(#model-arrowhead)"/>
+
+  <!-- Gamma centering -->
+  <rect class="v-bad" x="805" y="426" rx="16" width="450" height="255"/>
+  <text class="v-text" x="1030" y="455" text-anchor="middle">Fixed-reference two-way gamma centering</text>
+  <rect class="v-box" x="830" y="478" rx="9" width="155" height="62"/><text class="v-text" x="907" y="503" text-anchor="middle">gamma FF head</text><text class="v-small" x="907" y="525" text-anchor="middle">raw log-score a(d,t,i)</text>
+  <path class="v-line" d="M985 509 L1010 509"/>
+  <rect class="v-box" x="1014" y="474" rx="9" width="215" height="72"/>
+  <text class="v-small" x="1121" y="498" text-anchor="middle">g = a − c(t,i) − m(d,t) + ā(t)</text>
+  <text class="v-small" x="1121" y="521" text-anchor="middle">reference center + positional gauge</text>
+  <path class="v-line" d="M1121 546 L1121 573"/>
+  <rect class="v-good" x="1039" y="577" rx="9" width="164" height="58"/><text class="v-text" x="1121" y="602" text-anchor="middle">γ = exp(g)</text><text class="v-small" x="1121" y="623" text-anchor="middle">geometric mean = 1</text>
+  <path class="v-line" d="M1121 577 C1121 420,1037 420,1037 257"/>
+
+  <!-- Alpha branch and loss connection -->
+  <rect class="v-box" x="830" y="644" rx="9" width="155" height="66"/><text class="v-text" x="907" y="670" text-anchor="middle">alpha FF head</text><text class="v-small" x="907" y="692" text-anchor="middle">α = exp(log α)</text>
+  <text class="v-bad-text" x="775" y="646">detach x</text>
+  <path class="v-line" d="M985 677 C1270 677,1270 86,1255 86"/>
+</svg>
+<figcaption>The complete current architecture. Green is the dataset-blind shared branch;
+purple is the dataset-conditioned branch. The alpha head sees the same numerical context
+as gamma, but through <code>x.detach()</code>, so alpha cannot reshape the shared bias
+encoder during backpropagation. Gamma is centered before exponentiation. The final mean is
+the direct mass-free product <code>S * gamma * L_bio</code>; there is no mass-conservation
+block. Pair losses are subsequently combined by the configured transcript-balanced
+reducer.</figcaption>
+</figure>
+
+<div class="cards">
+  <div class="card"><h4>L<sup>bio</sup></h4><p>Shared relative ribosome load along the
+  transcript. Its valid-position mean is one.</p></div>
+  <div class="card"><h4>gamma (γ)</h4><p>Positive dataset-specific reshaping. One means
+  “leave the shared shape unchanged” at that position.</p></div>
+  <div class="card"><h4>scale (S)</h4><p>The observed average target count for this pair.
+  It is supplied, not learned.</p></div>
+  <div class="card"><h4>prediction (μ)</h4><p>The NB2 mean at every codon: the direct
+  product S × gamma × L<sup>bio</sup>, without forcing its mean back to S.</p></div>
+  <div class="card"><h4>dispersion (α)</h4><p>How much count noise NB2 allows beyond a
+  Poisson model. It changes uncertainty, not μ.</p></div>
+  <div class="card"><h4>rho (ρ)</h4><p>A bounded display of L<sup>bio</sup>, equal to
+  L<sup>bio</sup>/(1+L<sup>bio</sup>); high values mark high shared load.</p></div>
+</div>
+
+<p>More precisely, the biological branch produces a positive mean-one profile
+\(L^{\mathrm{bio}}_{ti}\). The centered dataset branch produces positive
+\(\gamma_{dti}\). With valid-position mean denoted by
+\(\operatorname{mean}_i\), the active mass-free prediction is</p>
+<div class="equation">$$
+S_{dt}=\operatorname{mean}_i(y_{dti}),\qquad
+h_{dti}=\gamma_{dti}L^{\mathrm{bio}}_{ti},\qquad
+\boxed{\mu_{dti}=S_{dt}\gamma_{dti}L^{\mathrm{bio}}_{ti}}.
+$$</div>
+<p class="equation-words">predicted counts = observed scale anchor × shared biology × dataset correction</p>
+<p>It follows that</p>
+<div class="equation">$$
+\operatorname{mean}_i(\mu_{dti})
+=S_{dt}\operatorname{mean}_i\!\left(\gamma_{dti}L^{\mathrm{bio}}_{ti}\right),
+$$</div>
+<p>and therefore the predicted-to-observed mass ratio over valid codons is</p>
+<div class="equation">$$
+\frac{\sum_i\mu_{dti}}{\sum_i y_{dti}}
+=\operatorname{mean}_i\!\left(\gamma_{dti}L^{\mathrm{bio}}_{ti}\right).
+$$</div>
+<div class="note"><strong>What “mass-free” means here:</strong> the prediction is no
+longer forced to have exactly the observed profile sum. The NB2 likelihood can penalize a
+prediction whose aggregate level is wrong, rather than receiving exact agreement by
+construction. However, \(S_{dt}\) still comes from the observed target, so this is not a
+fully independent transcript-abundance model. It is a target-derived scale anchor followed
+by a learned, unconserved multiplicative profile.</div>
+
+<h4>Why the strict normalization was removed</h4>
+<p>The former mass-conserving option used</p>
+<div class="equation">$$
+\mu^{\mathrm{conserved}}_{dti}
+=S_{dt}\frac{\gamma_{dti}L^{\mathrm{bio}}_{ti}}
+{\operatorname{mean}_j(\gamma_{dtj}L^{\mathrm{bio}}_{tj})}.
+$$</div>
+<p>This guaranteed \(\sum_i\mu_{dti}=\sum_i y_{dti}\) before the likelihood was
+evaluated. That is unnecessarily restrictive when experimental bias can change the number
+of reads assigned to a transcript—as it explicitly does in the synthetic bias data, whose
+counts are not renormalized after applying a bias. The active mass-free form lets the model
+be judged on both local allocation and aggregate magnitude. The conserved equation remains
+useful only as a controlled ablation.</p>
+
+<h3>5.2 Why a gamma gauge is needed</h3>
+<p>The prediction separates a transcript-shared biological profile
+<code>L_bio</code> from a dataset-specific positive correction <code>gamma</code>. Before
+the target-derived mean scale is applied, their product defines the position shape:</p>
+<div class="equation">$$
+h_{dti}=\gamma_{dti}L^{\mathrm{bio}}_{ti}.
+$$</div>
+<p>A position pattern common to every dataset could still be represented partly in
+\(L^{\mathrm{bio}}\) and partly in every dataset's \(\gamma\). The fixed-reference center
+removes this cross-dataset attribution ambiguity by making the weighted geometric mean of
+reference gamma equal one at every codon.</p>
+<p>The positional geometric-mean-one rule is also retained:</p>
+<div class="equation">$$
+\operatorname{mean}_i\log\gamma_{dti}=0
+\quad\Longleftrightarrow\quad
+\operatorname{geomean}_i\gamma_{dti}=1.
+$$</div>
+<div class="warning"><strong>Important change in interpretation:</strong> under the
+mass-free equation, multiplying a complete gamma profile by a constant would change
+\(\mu\). The positional rule is therefore no longer removing an invisible symmetry created
+by final mass normalization. It is now an explicit identification and interpretability
+constraint: gamma describes relative position-specific bias rather than becoming a free
+pair-wide abundance multiplier. This keeps “gamma = 1” as a meaningful neutral reference.</div>
+<p>This gauge does <em>not</em> secretly restore mass conservation. Even though
+\(\operatorname{geomean}_i(\gamma_{dti})=1\) and
+\(\operatorname{mean}_i(L^{\mathrm{bio}}_{ti})=1\), in general</p>
+<div class="equation">$$
+\operatorname{mean}_i\!\left(\gamma_{dti}L^{\mathrm{bio}}_{ti}\right)\ne1.
+$$</div>
+<p>The arithmetic mean of the product depends on gamma's variation and on where that
+variation aligns with the shared biological profile.</p>
+<p>The unconstrained dataset branch produces the raw log correction</p>
+<div class="equation">$$
+a^{\mathrm{raw}}_{dti}=q_{dti}+\log(\gamma_{\mathrm{init}}),
+\qquad \gamma_{\mathrm{init}}=1.
+$$</div>
+<p>The raw score is not clipped. Centering is applied to this log score before the
+exponential. The resulting \(\gamma L^{\mathrm{bio}}\) product is then used directly; it
+is not subsequently normalized.</p>
+
+<h3>5.3 The fixed reference panel</h3>
+<p>With <code>mode: fixed_reference</code>, the center is not estimated from the rows in
+the logical batch or execution forward. By default the reference panel \(\mathcal R\) contains every
+dataset in <code>experiment.dataset</code>. A non-null
+<code>reference.dataset_names</code> can select a duplicate-free subset, but every named
+reference must still be one of the experiment datasets.</p>
+<p>The resolved panel IDs, its weights, the selected-dataset IDs used to define the dataset
+embedding gauge, and a manifest hash are stored in the model state. Loading a compatible
+checkpoint therefore restores the training reference panel. Old checkpoints without these
+persistent reference buffers are rejected in fixed-reference mode rather than silently
+receiving a new gauge. The complete model state is loaded strictly as well: missing or
+unexpected parameter/buffer keys are an error, so there is no partial legacy load path.</p>
+<p>For every distinct transcript requested in a forward pass, the code takes one canonical
+set of transcript-invariant inputs—codon IDs, masks, positions, and sequence features—and
+internally evaluates the dataset branch once for every reference dataset. Repeated rows
+with the same transcript ID are checked to ensure those inputs are identical. The reference
+evaluation is part of the autograd graph during training; it is not a detached diagnostic.</p>
+
+<h3>5.4 Reference weights and the exact center</h3>
+<p>Reference weights are dataset-level constants and are unrelated to the local transcript
+reliability \(w_{dt}\) used by the loss. If \(r_d\) is a dataset's quality rank and \(R\)
+is the largest rank in the complete quality table, the configured base quality is</p>
+<div class="equation">$$
+q_d^{\mathrm{quality}}=\frac{R-r_d+1}{R}.
+$$</div>
+<p>For <code>weighting: quality_rank</code>, the gamma-reference weight is</p>
+<div class="equation">$$
+u_d=\left(q_d^{\mathrm{quality}}\right)^p,
+\qquad p=\texttt{quality\_rank\_power}=1.
+$$</div>
+<p>For <code>weighting: equal</code>, \(u_d=1\). Setting \(p=0\) also gives equal
+weights. These constants do not contain the current transcript's read density, coverage,
+target depth, or transcript reliability.</p>
+<p>Let \(a^{\mathrm{ref}}_{dti}\) be the raw log-gamma produced by evaluating transcript
+\(t\) as reference dataset \(d\in\mathcal R\), and normalize the positive reference
+weights as \(\pi_d=u_d/\sum_eu_e\). Using the same valid-position mask for every reference
+evaluation, define</p>
+<div class="equation">$$
+c_{ti}=\sum_{d\in\mathcal R}\pi_d a^{\mathrm{ref}}_{dti},\qquad
+m_{dt}=\operatorname{mean}_{i:\,m_{ti}=1}a^{\mathrm{ref}}_{dti},\qquad
+\bar a_t=\sum_{d\in\mathcal R}\pi_d m_{dt}.
+$$</div>
+<p>For any requested dataset \(d\)—inside or outside the panel—its own raw positional mean
+\(m^{\mathrm{req}}_{dt}\) is calculated and the final score is</p>
+<div class="equation">$$
+g_{dti}=a^{\mathrm{raw}}_{dti}-c_{ti}-m^{\mathrm{req}}_{dt}+\bar a_t,
+\qquad \gamma_{dti}=\exp(g_{dti}).
+$$</div>
+<p>For the reference panel this gives both
+\(\sum_d\pi_d g_{dti}=0\) at every position and
+\(\operatorname{mean}_i g_{dti}=0\) for every dataset–transcript pair. Equivalently, both
+corresponding geometric means of gamma equal one. Means and weighted sums accumulate in
+float32 under mixed precision. There is no post-centering clamp and the reference
+evaluations remain in the autograd graph. Raw gamma magnitude is no longer interpretable;
+the meaningful object is its position-dependent shape under these gauges.</p>
+
+<figure class="visual">
+<svg viewBox="0 0 900 330" role="img" aria-labelledby="gamma-picture-title gamma-picture-desc">
+  <title id="gamma-picture-title">The two gamma-centering directions</title>
+  <desc id="gamma-picture-desc">A matrix has datasets as rows and codon positions as columns. Vertical arrows show weighted centering across reference datasets at each codon. Horizontal arrows show centering across codons within every dataset-transcript profile.</desc>
+  <text class="v-text" x="405" y="28" text-anchor="middle">codon positions →</text>
+  <text class="v-text" x="34" y="170" text-anchor="middle" transform="rotate(-90 34 170)">reference datasets →</text>
+  <text class="v-small" x="104" y="79">dataset A</text><text class="v-small" x="104" y="139">dataset B</text><text class="v-small" x="104" y="199">dataset C</text>
+  <g>
+    <rect class="v-soft" x="190" y="50" width="80" height="45" rx="5"/><rect class="v-soft" x="280" y="50" width="80" height="45" rx="5"/><rect class="v-soft" x="370" y="50" width="80" height="45" rx="5"/><rect class="v-soft" x="460" y="50" width="80" height="45" rx="5"/><rect class="v-soft" x="550" y="50" width="80" height="45" rx="5"/>
+    <rect class="v-soft" x="190" y="110" width="80" height="45" rx="5"/><rect class="v-soft" x="280" y="110" width="80" height="45" rx="5"/><rect class="v-soft" x="370" y="110" width="80" height="45" rx="5"/><rect class="v-soft" x="460" y="110" width="80" height="45" rx="5"/><rect class="v-soft" x="550" y="110" width="80" height="45" rx="5"/>
+    <rect class="v-soft" x="190" y="170" width="80" height="45" rx="5"/><rect class="v-soft" x="280" y="170" width="80" height="45" rx="5"/><rect class="v-soft" x="370" y="170" width="80" height="45" rx="5"/><rect class="v-soft" x="460" y="170" width="80" height="45" rx="5"/><rect class="v-soft" x="550" y="170" width="80" height="45" rx="5"/>
+  </g>
+  <text class="v-small" x="230" y="78" text-anchor="middle">γA1</text><text class="v-small" x="320" y="78" text-anchor="middle">γA2</text><text class="v-small" x="410" y="78" text-anchor="middle">γA3</text><text class="v-small" x="500" y="78" text-anchor="middle">γA4</text><text class="v-small" x="590" y="78" text-anchor="middle">γA5</text>
+  <text class="v-small" x="230" y="138" text-anchor="middle">γB1</text><text class="v-small" x="320" y="138" text-anchor="middle">γB2</text><text class="v-small" x="410" y="138" text-anchor="middle">γB3</text><text class="v-small" x="500" y="138" text-anchor="middle">γB4</text><text class="v-small" x="590" y="138" text-anchor="middle">γB5</text>
+  <text class="v-small" x="230" y="198" text-anchor="middle">γC1</text><text class="v-small" x="320" y="198" text-anchor="middle">γC2</text><text class="v-small" x="410" y="198" text-anchor="middle">γC3</text><text class="v-small" x="500" y="198" text-anchor="middle">γC4</text><text class="v-small" x="590" y="198" text-anchor="middle">γC5</text>
+  <path class="v-line" d="M670 72 L735 72"/><path class="v-line" d="M670 132 L735 132"/><path class="v-line" d="M670 192 L735 192"/>
+  <rect class="v-good" x="740" y="45" rx="10" width="140" height="176"/>
+  <text class="v-text" x="810" y="78" text-anchor="middle">row rule</text><text class="v-small" x="810" y="107" text-anchor="middle">within each pair:</text><text class="v-small" x="810" y="132" text-anchor="middle">geometric mean</text><text class="v-good-text" x="810" y="158" text-anchor="middle">across codons = 1</text><text class="v-small" x="810" y="192" text-anchor="middle">fixes the neutral</text><text class="v-small" x="810" y="211" text-anchor="middle">gamma profile level</text>
+  <path class="v-line" d="M230 220 L230 259"/><path class="v-line" d="M320 220 L320 259"/><path class="v-line" d="M410 220 L410 259"/><path class="v-line" d="M500 220 L500 259"/><path class="v-line" d="M590 220 L590 259"/>
+  <rect class="v-good" x="190" y="263" rx="10" width="440" height="52"/>
+  <text class="v-text" x="410" y="286" text-anchor="middle">column rule: weighted geometric mean across reference datasets = 1</text>
+  <text class="v-small" x="410" y="306" text-anchor="middle">keeps shared biology out of the dataset correction</text>
+</svg>
+<figcaption>Gamma is a matrix for one transcript: rows are datasets and columns are codons.
+The two-way log-space centering pins both directions without clipping the final gamma.</figcaption>
+</figure>
+
+<h3>5.5 What happens when inference requests only one dataset</h3>
+<div class="note"><strong>A one-row or one-dataset inference batch is still centered.</strong>
+The model internally evaluates the complete checkpointed reference panel for that
+transcript. It does not need a second requested dataset row in the batch.</div>
+<p>Suppose a checkpoint was trained with ten reference datasets and inference requests only
+dataset \(A\). The model computes \(A\)'s requested raw log-gamma, separately evaluates all
+ten reference versions of the same transcript, calculates \(c_{ti}\), and returns
+\(\exp(a^{\mathrm{raw}}_{Ati}-c_{ti}-m_{At}+\bar a_t)\). The requested singleton therefore
+also has positional geometric mean one. The result is independent of batch size,
+row order, which partner datasets are requested, and how rows are partitioned over DDP
+ranks.</p>
+<p><code>minimum_datasets: 2</code> refers to the size of the checkpointed reference panel,
+not the number of requested inference rows. Centering is skipped only when the stored panel
+contains fewer than two datasets. Thus a model newly configured and trained with exactly one
+experiment dataset has a one-dataset panel and leaves raw gamma unchanged, whereas a
+multi-dataset checkpoint can center a singleton inference request.</p>
+<p>If an inference request uses a dataset outside the checkpoint's reference panel, the
+same fixed \(c_{ti}\) and \(\bar a_t\) are used while that requested dataset supplies its
+own \(m_{dt}\). The mathematical center is still well-defined and applied, but the diagnostic
+<code>gamma_all_requested_in_reference</code> becomes false. Such a result is an
+out-of-reference dataset extrapolation and should be interpreted accordingly.</p>
+
+<h3>5.6 Configuration audit and the batch-grouped alternative</h3>
+<table>
+  <thead><tr><th>Setting</th><th>Actual role</th></tr></thead>
+  <tbody>
+    <tr><td><code>model.mass_conservation</code></td><td><code>false</code> is the active mass-free model: use <code>S * gamma * L_bio</code> directly. <code>true</code> restores the former final mean normalization only for an explicit ablation.</td></tr>
+    <tr><td><code>mode</code></td><td><code>fixed_reference</code> is deterministic and checkpointed; <code>batch_grouped</code> uses only co-resident same-transcript rows; <code>disabled</code> applies no center.</td></tr>
+    <tr><td><code>dataset_constant_scale_gauge</code></td><td><code>geometric_mean_one</code> imposes mean valid log-gamma zero. In the mass-free model this is an explicit positional-bias convention, not removal of an unobservable multiplier.</td></tr>
+    <tr><td><code>reference.dataset_names</code></td><td><code>null</code> means all experiment datasets; a list freezes an explicit subset.</td></tr>
+    <tr><td><code>reference.weighting</code></td><td>Selects equal or dataset-quality-rank weights for the center. It never changes loss weights.</td></tr>
+    <tr><td><code>quality_rank_power</code></td><td>Controls how strongly quality ranks tilt the reference. It matters only with quality-rank weighting.</td></tr>
+    <tr><td><code>chunk_size</code></td><td>Fixed-reference memory/performance control only. It has no mathematical effect and is irrelevant when the panel is smaller than the chunk.</td></tr>
+    <tr><td><code>minimum_datasets</code></td><td>Minimum fixed-reference panel size required to apply centering; it is not a requested-batch threshold.</td></tr>
+  </tbody>
+</table>
+<p>These gamma settings never alter <code>data.batch_size</code>, execution limits, or the
+accumulation factor. Conversely, those batching controls never change the fixed panel or
+its normalized \(\pi_d\). With <code>reference.dataset_names: null</code>, selecting more
+experiment datasets enlarges both the observed pair groups and the reference panel, which
+increases work in both paths but does not couple their normalization equations. Dataset
+quality rank is used only to form the gamma-reference \(\pi_d\); it is not a multiplier in
+the NB2/PCC loss.</p>
+<p>Two redundant active entries were removed. <code>enabled: true</code> duplicated the
+already explicit <code>mode: fixed_reference</code>; <code>mode</code> is now the sole
+centering selector and there is no hidden legacy master switch. Likewise,
+<code>reference.source: selected_experiment_datasets</code> was the only supported source
+and already the default. The unused selected-dataset quality vector was also removed from
+model construction; only the resolved reference weights affect fixed-reference
+centering.</p>
+<p><code>batch_grouped</code> remains available for historical or explicit ablations. It
+computes a weighted center from the distinct datasets physically present for the same
+transcript and position, then applies the same joint positional gauge. It requires at least
+two such datasets; its documented singleton fallback leaves the raw score unchanged. It is therefore sensitive
+to sampler completeness, batch composition, and DDP partitioning. The nested
+<code>reference.chunk_size</code>, <code>reference.dataset_names</code>, and
+<code>reference.minimum_datasets</code> settings describe the fixed-reference path, not
+that alternative. The configured and recommended path is <code>fixed_reference</code>.</p>
+
+<h2 id="loss">6. Optimized loss</h2>
+<div class="plain"><strong>Plain language:</strong> the loss asks two complementary
+questions. <strong>NB2:</strong> “Are the predicted counts plausible for every raw
+replica?” <strong>PCC:</strong> “Does the predicted up-and-down shape match the arithmetic
+replica consensus?” Those answers become one score per transcript–dataset pair. Only then
+does transcript balancing combine pairs into a batch loss.</div>
+
+<figure class="visual">
+<svg viewBox="0 0 930 330" role="img" aria-labelledby="loss-picture-title loss-picture-desc">
+  <title id="loss-picture-title">Order of loss reductions</title>
+  <desc id="loss-picture-desc">Raw replicas feed an NB2 loss per codon, which is reduced over positions and replicas. Their arithmetic consensus feeds one raw PCC and one NB-VST PCC per pair. These terms make a pair loss. Pair losses are reliability-weighted within each transcript, and transcript means are averaged equally.</desc>
+  <rect class="v-box" x="20" y="28" rx="10" width="145" height="86"/><text class="v-text" x="92" y="57" text-anchor="middle">raw replicas</text><text class="v-small" x="92" y="82" text-anchor="middle">r1, r2, …</text><text class="v-small" x="92" y="102" text-anchor="middle">count profiles</text>
+  <path class="v-line" d="M165 71 L222 71"/>
+  <rect class="v-soft" x="226" y="28" rx="10" width="168" height="86"/><text class="v-text" x="310" y="57" text-anchor="middle">NB2 per codon</text><text class="v-small" x="310" y="82" text-anchor="middle">positions → replica</text><text class="v-small" x="310" y="102" text-anchor="middle">replicas → pair N</text>
+  <path class="v-line" d="M92 114 L92 172"/>
+  <rect class="v-box" x="20" y="176" rx="10" width="145" height="86"/><text class="v-text" x="92" y="205" text-anchor="middle">arithmetic</text><text class="v-text" x="92" y="226" text-anchor="middle">consensus</text><text class="v-small" x="92" y="249" text-anchor="middle">one average profile</text>
+  <path class="v-line" d="M165 219 L222 219"/>
+  <rect class="v-soft" x="226" y="176" rx="10" width="168" height="86"/><text class="v-text" x="310" y="205" text-anchor="middle">two PCC terms</text><text class="v-small" x="310" y="230" text-anchor="middle">raw + NB-VST</text><text class="v-small" x="310" y="250" text-anchor="middle">one each per pair</text>
+  <path class="v-line" d="M394 71 C430 71,430 132,465 132"/><path class="v-line" d="M394 219 C430 219,430 158,465 158"/>
+  <rect class="v-good" x="469" y="99" rx="10" width="145" height="92"/><text class="v-text" x="541" y="128" text-anchor="middle">pair loss z(d,t)</text><text class="v-small" x="541" y="153" text-anchor="middle">NB + 0.5 PCCraw</text><text class="v-small" x="541" y="174" text-anchor="middle">+ 0.5 PCCvst</text>
+  <path class="v-line" d="M614 145 L671 145"/>
+  <rect class="v-soft" x="675" y="83" rx="10" width="225" height="124"/><text class="v-text" x="787" y="113" text-anchor="middle">default outer reduction</text><text class="v-small" x="787" y="140" text-anchor="middle">1. weight datasets inside t</text><text class="v-small" x="787" y="165" text-anchor="middle">2. one mean for each t</text><text class="v-good-text" x="787" y="190" text-anchor="middle">3. average transcripts equally</text>
+  <text class="v-small" x="541" y="225" text-anchor="middle">one scalar per physical pair row</text>
+  <text class="v-small" x="787" y="244" text-anchor="middle">one scalar batch loss</text>
+</svg>
+<figcaption>The order matters. Codons are reduced first; replicas are reduced only for NB2;
+then the pair reducer sees exactly one value and one reliability weight per pair row.</figcaption>
+</figure>
+<h3>6.1 Consensus target and raw replica targets</h3>
+<p>The dataloader passes both the consensus target and a padded tensor of raw replicas. The
+consensus is the arithmetic mean</p>
+<div class="equation">$$
+y_{dti}=\frac{1}{R_{dt}}\sum_{r=1}^{R_{dt}}y_{dtri}.
+$$</div>
+<p>The model's ordinary prediction \(\mu_{dti}\) uses the consensus-derived mean scale
+\(S_{dt}\) and the direct positive profile \(h_{dti}=\gamma_{dti}L^{\mathrm{bio}}_{ti}\).
+The product is not normalized to have positional mean one. For the optimized replica
+terms, the same unnormalized profile is reused but each raw replica receives its own
+observed mean scale:</p>
+<div class="equation">$$
+S_{dtr}=\max\left(\varepsilon,\frac{\sum_i m_{dtri}y_{dtri}}
+{\max(\sum_i m_{dtri},1)}\right),
+\qquad
+\mu_{dtri}=S_{dtr}h_{dti}.
+$$</div>
+<div class="note"><strong>Legacy field name:</strong> model outputs still expose this
+profile under <code>extras["normalized_shape"]</code> for compatibility with the replica
+loss and saved artifacts. With <code>mass_conservation=false</code>, its value is simply
+\(h_{dti}=\gamma_{dti}L^{\mathrm{bio}}_{ti}\); the name does not imply that a final
+mean-one normalization occurred.</div>
+<p>Here \(\varepsilon=10^{-8}\) is the configured numerical floor. These two targets have
+deliberately different roles. NB2 is evaluated against every raw replica, preserving
+replicate-level count variation. Raw PCC and NB-VST PCC are shape terms and are evaluated
+once per pair against the arithmetic consensus \(y_{dti}\), using the ordinary
+consensus-scaled prediction \(\mu_{dti}=S_{dt}h_{dti}\). Neither the consensus prediction
+nor its replica-scaled versions are forced to conserve the corresponding target mass. A
+dataset with more replicas therefore does not receive more PCC terms.</p>
+
+<h3>6.2 Negative-binomial likelihood</h3>
+<p class="plain"><strong>Intuition:</strong> squared error assumes roughly constant noise.
+Ribosome counts are noisier when their mean is larger. NB2 explicitly allows that
+mean-dependent extra variation through \(\alpha\).</p>
+<p>The only likelihood is NB2. For each valid position, the model output
+\(\ell_{dti}\), exposed in code as <code>log_sigma</code>, is clipped to the configured
+interval \([-5,1]\) and interpreted as the log dispersion. The functions
+\(\log(\cdot)\) and \(\exp(\cdot)\) are the natural logarithm and exponential, and
+\(\Gamma(\cdot)\) is the Gamma function. Define</p>
+<div class="equation">$$
+\alpha_{dti}=\exp(\ell_{dti}),
+\qquad
+\kappa_{dti}=\frac{1}{\alpha_{dti}}=\exp(-\ell_{dti}).
+$$</div>
+<p>The NB2 variance is \(\operatorname{Var}(Y)=\mu+\alpha\mu^2\). For raw replica count
+\(y_{dtri}\) and prediction \(\mu_{dtri}\), the reported per-position negative
+log-likelihood is</p>
+<div class="equation">$$
+\begin{aligned}
+\ell^{\mathrm{NB}}_{dtri}={}&
+\log\Gamma(\kappa_{dti})-\log\Gamma(y_{dtri}+\kappa_{dti})
+ +\log\Gamma(y_{dtri}+1)\\
+&-\kappa_{dti}\log\kappa_{dti}
+ -y_{dtri}\log\mu_{dtri}
+ +(\kappa_{dti}+y_{dtri})\log(\kappa_{dti}+\mu_{dtri}).
+\end{aligned}
+$$</div>
+<p>The \(\log\Gamma(y+1)\) term is constant with respect to the model parameters but is
+retained in the reported NLL. Computation is forced to float32 with autocast disabled for
+this likelihood. Non-finite targets are masked; target counts are repaired to finite
+non-negative values before the formula, while invalid positions contribute zero.</p>
+
+<h3>6.3 Reduction across codon positions</h3>
+<p>For one raw replica, let \(V_{dtr}=\sum_i m_{dtri}\) be its number of valid positions.
+The active configuration uses <code>nb_sequence_reduction: length_tempered</code>,
+\(\gamma_L=0.75\), reference length \(L_0=1000\), and bounds \(0.5\) and \(2.0\). The
+sequence-level NB loss is</p>
+<div class="equation">$$
+\bar\ell^{\mathrm{NB}}_{dtr}
+=\frac{\sum_i m_{dtri}\ell^{\mathrm{NB}}_{dtri}}
+{\max(V_{dtr},1)},
+\qquad
+\tau_{dtr}=\operatorname{clip}\left[
+\left(\frac{V_{dtr}}{L_0}\right)^{1-\gamma_L},0.5,2.0\right],
+$$</div>
+<div class="equation">$$
+N_{dtr}=\bar\ell^{\mathrm{NB}}_{dtr}\tau_{dtr}.
+$$</div>
+<p>Thus the code first averages over valid positions and then applies a bounded length
+factor. The pair-level NB term is the arithmetic mean over its \(R_{dt}\) valid raw
+replicas:</p>
+<div class="equation">$$
+N_{dt}=\frac{1}{R_{dt}}\sum_{r=1}^{R_{dt}}N_{dtr}.
+$$</div>
+<p>A short transcript is not treated as a raw sum, and padding never increases its loss.</p>
+
+<h3>6.4 Consensus Pearson correlation terms</h3>
+<p class="plain"><strong>Intuition:</strong> PCC mostly judges shape. If prediction and
+target rise and fall together along the codons, PCC is high even when their vertical scale
+differs. That is why PCC is computed once against the cleaner replica consensus, while NB2
+still checks every raw count profile.</p>
+<p>Raw PCC compares the pair prediction \(x_{dti}=\mu_{dti}\) with the arithmetic replica
+consensus \(z_{dti}=y_{dti}\) over valid positions. In the following equation, \(m_i\)
+is shorthand for the consensus mask \(m_{dti}\), \(M=\sum_i m_i\), and \(\bar x\)
+and \(\bar z\) are mask-weighted means. The code evaluates a numerically stabilized
+Pearson correlation:</p>
+<div class="equation">$$
+\rho(x,z)=
+\frac{\operatorname{cov}_m(x,z)}
+{\sqrt{\left[\operatorname{var}_m(x)+\varepsilon\right]
+\left[\operatorname{var}_m(z)+\varepsilon\right]}},
+\qquad
+\operatorname{cov}_m(x,z)=\frac1M\sum_i m_i(x_i-\bar x)(z_i-\bar z),
+\qquad
+\operatorname{var}_m(x)=\frac1M\sum_i m_i(x_i-\bar x)^2.
+$$</div>
+<p>Adding \(\varepsilon\) to each variance keeps the derivative finite when a prediction
+is almost flat. For ordinary non-flat profiles it changes Pearson correlation only at
+numerical precision.</p>
+<p>A transcript–dataset pair is PCC-valid only when the consensus target variance exceeds
+<code>min_pcc_target_var: 1e-6</code>. For a valid pair, the loss is \(1-\rho\). If the
+consensus is effectively constant, that PCC component is zero for the pair. There is no
+PCC reduction over replicas: each pair contributes at most one raw-PCC value and one
+NB-VST-PCC value. The position mask, not \(w_{dt}\), is used inside the correlation.</p>
+<p>The NB-VST PCC applies the variance-stabilizing transform to both prediction and target.
+The \(\alpha\) in this branch is obtained from the same log-dispersion bounded to
+\([-5,1]\) as the NB likelihood; when
+<code>pcc_detach_alpha: true</code>, it is treated as a constant for gradients:</p>
+<div class="equation">$$
+T_{\alpha}(u)=\frac{2}{\sqrt{\alpha+\varepsilon}}
+\operatorname{asinh}\left(\sqrt{\alpha u+\varepsilon}\right),
+\qquad
+\rho_{\mathrm{VST}}=\rho\left(T_{\alpha}(\mu),T_{\alpha}(y)\right).
+$$</div>
+<p>The configured <code>pcc_detach_alpha: true</code> detaches \(\alpha\) from this PCC
+branch, so the NB-VST correlation does not train the dispersion output. The two pair-level
+PCC losses are therefore</p>
+<div class="equation">$$
+P^{\mathrm{raw}}_{dt}=1-\rho\left(\mu_{dt},y_{dt}\right),
+\qquad
+P^{\mathrm{VST}}_{dt}=1-\rho\left(
+T_{\alpha_{dt}}(\mu_{dt}),T_{\alpha_{dt}}(y_{dt})
+\right).
+$$</div>
+<p>If the relevant consensus variance check fails, that component is defined as zero.
+Replica count affects the consensus estimate and the replica-NB average, but never creates
+several PCC terms or several outer dataset votes.</p>
+
+<h3>6.5 Gamma regularization</h3>
+<p>The model exposes a positive multiplicative correction \(\gamma_{dti}\) and its log
+\(g_{dti}=\log\gamma_{dti}\). The regularizer is computed once per transcript–dataset
+pair, not once per raw replica:</p>
+<div class="equation">$$
+G_{dt}=\frac{\sum_i m_{dti}g_{dti}^{2}}
+{\max(\sum_i m_{dti},1)}.
+$$</div>
+<p>The active configuration sets <code>gamma_reg_weight: 0.0</code>. In that configuration
+the code skips the regularizer computation and its contribution is exactly zero. If the
+coefficient is later made positive, \(G_{dt}\) enters the same outer reduction as the data
+terms.</p>
+
+<h2 id="reduction">6.6 Pair loss and selectable sample reduction</h2>
+<p>After replica averaging for NB2 and one consensus evaluation for each PCC branch, one
+scalar is available for each retained pair. With the
+current coefficients \(c_N=1.0\), \(c_R=0.5\), \(c_V=0.5\), and \(c_G=0.0\), the exact
+pair loss is</p>
+<div class="equation">$$
+z_{dt}=c_N\,N_{dt}+c_R\,P^{\mathrm{raw}}_{dt}
++c_V\,P^{\mathrm{VST}}_{dt}+c_G\,G_{dt}.
+$$</div>
+<p><code>loss.sample_reduction</code> selects exactly one of three reducers. All require
+finite strictly positive \(w_{dt}\); weights such as 1.25 or 3.0 are preserved without an
+upper clamp. Dataset-quality rank \(u_d\) is absent from every loss equation.</p>
+<h3>Default: transcript-balanced</h3>
+<div class="equation">$$
+\boxed{
+L_{\mathrm{transcript}}=
+\frac{1}{|\mathcal T_B|}\sum_{t\in\mathcal T_B}
+\frac{\sum_{d:(t,d)\in B}w_{dt}z_{dt}}
+{\sum_{d:(t,d)\in B}w_{dt}}.
+}
+$$</div>
+<p>This is the recommended and checked-in mode. Local reliability decides how the positive
+dataset observations of one transcript divide that transcript's contribution. It does not
+multiply the transcript by support count, total weight, length, rank, or replica count.
+Every admitted transcript has one equal outer vote.</p>
+<h3>Ablation: dataset-balanced</h3>
+<div class="equation">$$
+L_{\mathrm{dataset}}=\frac{1}{|\mathcal D_B|}
+\sum_{d\in\mathcal D_B}
+\frac{\sum_{t:(t,d)\in B}w_{dt}z_{dt}}
+{\sum_{t:(t,d)\in B}w_{dt}}.
+$$</div>
+<p>Every represented dataset receives one equal outer vote; local reliability distributes
+that vote among its transcript rows. This preserves the previous active implementation as
+an ablation.</p>
+<h3>Ablation: global-weighted</h3>
+<div class="equation">$$
+L_{\mathrm{global}}=\frac{\sum_{(t,d)\in B}w_{dt}z_{dt}}
+{\sum_{(t,d)\in B}w_{dt}}.
+$$</div>
+<p>If \(S_t=\sum_d w_{dt}\) and
+\(\bar z_t=\sum_dw_{dt}z_{dt}/S_t\), then
+\(L_{\mathrm{global}}=\sum_t[S_t/\sum_uS_u]\bar z_t\). Global weighting therefore gives
+more outer mass to transcripts with more supporting datasets or larger total reliability.
+It equals transcript balancing when every transcript has the same total weight mass—for
+example, unit weights and exactly \(M\) datasets per transcript.</p>
+
+<div class="cards" aria-label="Comparison of the three loss reducers">
+  <div class="card vote-card"><h4>Transcript-balanced</h4><p><strong>Equal vote:</strong>
+  each transcript.</p><p>Weights compare datasets inside that transcript.</p><span class="badge-good">default</span></div>
+  <div class="card vote-card"><h4>Dataset-balanced</h4><p><strong>Equal vote:</strong>
+  each represented dataset.</p><p>Weights compare transcripts inside that dataset.</p></div>
+  <div class="card vote-card"><h4>Global-weighted</h4><p><strong>Equal vote:</strong>
+  none explicitly.</p><p>Every pair enters one large weighted pool.</p></div>
+</div>
+<div class="note"><strong>Toy example:</strong> transcript t1 has pair losses [1, 1] and
+weights [1.5, 1.5]; transcript t2 has losses [3, 3] and weights [0.5, 0.5]. Global weighting
+returns 1.5 because t1 has three times the total weight mass. Transcript balancing first
+gets means 1 and 3, then gives them equal votes, returning 2.0. This is the practical
+difference: reliability still chooses the mixture <em>inside</em> a transcript, but it does
+not decide how much that transcript matters compared with another transcript.</div>
+<p>The vectorized reducer uses the collate-time integer
+<code>transcript_group_index</code>; it never regroups transcript strings in the training
+step. The same configured reducer is applied to every optimized pair-level term, including
+replica NB2, consensus raw PCC, consensus NB-VST PCC, and gamma regularization when enabled.
+Codon reduction occurs first; only NB2 then has a replica-reduction stage. Global parameter
+regularizers and diagnostics without one value per pair are not transcript-balanced.</p>
+<div class="note"><strong>Batch versus epoch:</strong> the formula above is evaluated for each
+physical batch. The optimizer receives the resulting batch scalar. Lightning subsequently
+combines batch gradients according to its unchanged automatic accumulation settings. With
+complete atomic groups, transcript balancing is exact inside a microbatch. It is exact over
+an accumulation window only when every microbatch contributes the same number of transcript
+groups; the runtime logs that count and its epoch coefficient of variation.</div>
+
+<h2 id="objective">6.7 Complete current objective</h2>
+<p>Putting the definitions together, the default objective gives an equal outer vote to
+every admitted transcript. Within a transcript, its positive datasets are compared using
+the local median-normalized reliability weights. Every pair's NB2 term is averaged across
+its raw replicas, whereas both PCC terms are computed once from the replica consensus.</p>
+<div class="equation">$$
+\boxed{
+L_B=\frac{1}{|\mathcal T_B|}\sum_{t\in\mathcal T_B}
+\frac{\displaystyle\sum_{d:(t,d)\in B}w_{dt}
+\left[N_{dt}+0.5P^{\mathrm{raw}}_{dt}+0.5P^{\mathrm{VST}}_{dt}
+\right]}
+{\displaystyle\sum_{d:(t,d)\in B}w_{dt}}
+}
+$$</div>
+<p>The gamma term is omitted from this boxed expression because its current coefficient is
+zero. It is still part of the code path and becomes additive when
+<code>gamma_reg_weight</code> is positive. The raw and NB-VST consensus PCC terms are
+optimized; the additional unweighted <code>mu_pcc</code>, likelihood-PCC, and log1p-MSE
+values remain diagnostics.</p>
+<p>Validation uses the configured mode for <code>val_loss</code> and, from the same detached
+pair losses without another forward pass, logs
+<code>val/loss_global_weighted</code>, <code>val/loss_dataset_balanced</code>, and
+<code>val/loss_transcript_balanced</code>. This makes the three objectives directly
+comparable while keeping the checkpoint monitor aligned with the configured reducer.</p>
+<p>All metrics whose name contains <code>mu_pcc</code> are unweighted diagnostics. The
+global <code>val_mu_pcc</code> compatibility alias, explicit
+<code>val_mu_pcc_unweighted</code>, likelihood-mean variants, and per-dataset variants are
+ordinary arithmetic means over their contributing physical pairs; transcript reliability
+does not enter them. At validation-epoch end, pair PCC values are also averaged equally
+across the available datasets of each transcript. TensorBoard receives one compact
+histogram under <code>val/mu_pcc_unweighted_by_transcript/distribution</code>, plus count,
+mean, standard deviation, minimum, 5/25/50/75/95 percentiles, and maximum. This retains
+only one CPU float per validation transcript, performs no additional forward pass, and
+deduplicates the small number of validation batches that DDP may pad.</p>
+<pre><code>data:
+  train_sampling_strategy: transcript_grouped_multidataset_pairs
+  minimum_positive_datasets_per_transcript: 2
+model:
+  mass_conservation: false
+  gamma_centering:
+    mode: fixed_reference
+    dataset_constant_scale_gauge: geometric_mean_one
+loss:
+  sample_reduction: transcript_balanced</code></pre>
+<div class="note"><strong>No dataset-quality rank enters the training loss.</strong>
+Quality rank remains confined to the fixed-reference gamma gauge unless a future explicit
+experiment changes that boundary.</div>
+
+<h2 id="sources">Source map and boundaries</h2>
+<table>
+  <thead><tr><th>Topic</th><th>Current implementation</th><th>Relevant code</th></tr></thead>
+  <tbody>
+    <tr><td>Profile validation, filtering, coverage, density, median normalization</td><td>Pair-local preprocessing</td><td><code>weight_hek_riboseq_codon_replicas.py</code>: <code>_profile_statistics()</code>, <code>add_weights()</code></td></tr>
+    <tr><td>Flat pair construction and replica/consensus loading</td><td>Deterministic transcript–dataset rows</td><td><code>RiboUnmixMultiDatasetDataModule.py</code>: <code>setup()</code>; <code>RiboUnmixMultiDataset.py</code>: <code>__getitem__()</code>, <code>collate_fn()</code></td></tr>
+    <tr><td>Transcript split</td><td>Fixed master-common validation panel, jointly stratified by reliability and CSS count</td><td><code>main_ribounmix_multidataset.py</code>: <code>load_common_transcript_reliability()</code>, <code>fixed_common_validation_split()</code></td></tr>
+    <tr><td>Grouped optimizer batching</td><td>Atomic transcript groups plus data-backed automatic accumulation</td><td><code>RiboUnmixMultiDatasetDataModule.py</code>: <code>TranscriptGroupedMultiDatasetBatchSampler</code>, <code>resolve_grouped_optimizer_batch_plan()</code>; <code>main_ribounmix_multidataset.py</code>: <code>resolve_training_grouped_optimizer_batching()</code></td></tr>
+    <tr><td>Execution microbatching</td><td>Single-process, memory-bounded forwards that exactly reconstruct each transcript-balanced logical batch and perform one clip/update per planned optimizer window</td><td><code>RiboUnmixMultiDatasetDataModule.py</code>: <code>_split_logical_batches_for_execution()</code>; <code>RiboUnmixLightningModule.py</code>: <code>training_step()</code>, <code>_execution_optimizer_step()</code></td></tr>
+    <tr><td>Mass-free prediction and target-derived scale</td><td>Dataset-blind mean-one biological profile multiplied directly by centered dataset gamma and the observed target mean; no final product normalization</td><td><code>SharedProfileModel.py</code>: <code>forward()</code>; <code>RiboUnmixModel.py</code>: <code>_target_scale_dt()</code>, <code>forward()</code></td></tr>
+    <tr><td>Gamma centering</td><td>Checkpointed fixed reference panel plus joint cross-dataset and positional geometric gauges</td><td><code>RiboUnmixModel.py</code>: <code>_configure_gamma_centering()</code>, <code>_center_log_gamma_fixed_reference()</code>; <code>main_ribounmix_multidataset.py</code>: <code>resolve_gamma_reference_panel()</code></td></tr>
+    <tr><td>NB2 position and sequence reduction</td><td>Float32 NB2 NLL with length tempering</td><td><code>RiboUnmixLightningModule.py</code>: <code>NegativeBinomialProfileLoss</code>, <code>reduce_sequence_nll()</code></td></tr>
+    <tr><td>Replica NB2, consensus PCC, gamma regularization, and sample reduction</td><td>Replica NB2 is averaged within each pair; PCC and gamma regularization occur once per pair before the selected global/dataset/transcript reducer</td><td><code>RiboUnmixLightningModule.py</code>: <code>_compute_replica_loss_terms()</code>, <code>_compute_consensus_loss_terms()</code>, <code>_gamma_regularization_per_sample()</code>, <code>reduce_per_sample_quantity()</code></td></tr>
+    <tr><td>Outer loss reduction</td><td>Selectable global-, dataset-, or transcript-balanced reducer; transcript-balanced is the default</td><td><code>RiboUnmixLightningModule.py</code>: <code>reduce_per_sample_quantity()</code>, <code>_aggregate_per_sample()</code></td></tr>
+  </tbody>
+</table>
+<p class="footer"><span class="pill">Current scope</span> This page covers data analysis,
+transcript weighting, splitting, grouped optimizer batching, fixed-reference gamma
+centering, the essential two-branch prediction, and the optimized loss. It does not attempt
+to list every internal tensor, logging key, or operational detail of the training lifecycle.</p>
+</main>
+</div>
+<script>
+(() => {
+  const table = document.getElementById('dataset-count-table');
+  const host = document.getElementById('dataset-count-chart');
+  if (!table || !host) return;
+  const rows = [...table.querySelectorAll('tbody tr')].map(row => {
+    const cells = row.querySelectorAll('td');
+    return {
+      name: cells[0].textContent.trim(),
+      count: Number(cells[1].textContent.replaceAll(',', '').trim())
+    };
+  }).filter(item => Number.isFinite(item.count));
+  if (!rows.length) return;
+  const width = Math.max(1200, rows.length * 12 + 90);
+  const height = 330, left = 58, right = 20, top = 18, bottom = 42;
+  const plotWidth = width - left - right, plotHeight = height - top - bottom;
+  const maxValue = Math.ceil(Math.max(...rows.map(row => row.count)) / 2000) * 2000;
+  const y = value => top + plotHeight * (1 - value / maxValue);
+  const barSlot = plotWidth / rows.length;
+  const barWidth = Math.max(3, barSlot * 0.72);
+  const ticks = [0, 5000, 10000, 15000, maxValue]
+    .filter((value, index, all) => value <= maxValue && all.indexOf(value) === index);
+  const grid = ticks.map(value =>
+    `<line class="axis" x1="${left}" y1="${y(value)}" x2="${width-right}" y2="${y(value)}"/>` +
+    `<text x="${left-8}" y="${y(value)+4}" text-anchor="end">${value.toLocaleString()}</text>`
+  ).join('');
+  const bars = rows.map((row, index) => {
+    const x = left + index * barSlot + (barSlot - barWidth) / 2;
+    const barTop = y(row.count);
+    return `<rect class="bar" x="${x}" y="${barTop}" width="${barWidth}" height="${top+plotHeight-barTop}">` +
+      `<title>${row.name}: ${row.count.toLocaleString()} retained transcripts</title></rect>`;
+  }).join('');
+  const labels = rows.map((row, index) => {
+    if (index % 10 !== 0 && index !== rows.length - 1) return '';
+    const x = left + (index + 0.5) * barSlot;
+    return `<text x="${x}" y="${height-10}" text-anchor="end" transform="rotate(-35 ${x} ${height-10})">${row.name}</text>`;
+  }).join('');
+  host.innerHTML = `<svg viewBox="0 0 ${width} ${height}" aria-hidden="true">${grid}${bars}${labels}</svg>`;
+})();
+</script>
+</body>
+</html>

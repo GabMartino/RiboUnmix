@@ -1,0 +1,42 @@
+{
+  "alpha_mode": "learned",
+  "available_sample_reductions": [
+    "global_weighted",
+    "dataset_balanced",
+    "transcript_balanced"
+  ],
+  "checkpoint_monitors": {
+    "best_val_loss": {
+      "metric": "val_loss",
+      "mode": "min"
+    }
+  },
+  "dataset_quality_rank_in_loss": false,
+  "experiment_mode": "standard_nb",
+  "fixed_alpha": 0.1,
+  "nb_mean_gradient_beta": 0.0,
+  "pair_objective": {
+    "gamma_regularization_weight": 0.0,
+    "nb_vst_pcc": {
+      "target": "arithmetic_replica_consensus",
+      "weight": 0.5,
+      "within_pair_reduction": "once_per_pair"
+    },
+    "raw_pcc": {
+      "target": "arithmetic_replica_consensus",
+      "weight": 0.5,
+      "within_pair_reduction": "once_per_pair"
+    },
+    "replica_nb": {
+      "target": "raw_replicas",
+      "weight": 1.0,
+      "within_pair_reduction": "arithmetic_mean"
+    }
+  },
+  "prediction_checkpoint_variants": [
+    "best_val_loss"
+  ],
+  "sample_reduction": "transcript_balanced",
+  "train_sampling_strategy": "transcript_grouped_multidataset_pairs",
+  "val_loss_reduction": "transcript_balanced"
+}

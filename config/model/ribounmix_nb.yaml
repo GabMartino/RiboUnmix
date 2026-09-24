@@ -1,0 +1,97 @@
+# Synchronized reference snapshot of the active minimal queue-load model and
+# loss block. This file is documentation only; Hydra composes the runnable
+# values directly from config/config_ribounmix_multidataset.yaml.
+#
+#   mu[d,t,i] = S[d,t] * normalize_i(gamma[d,t,i] * L_bio[t,i])
+#   L_bio     = normalized biological load, so mean_valid(L_bio)=1
+#   loss      = replica-mean NB + consensus raw/NB-VST PCC + gamma penalty
+#
+# The runnable configuration lives in
+# config/config_ribounmix_multidataset.yaml (loaded by the Hydra entry
+# point); this file documents the canonical simple-model `model:`/`loss:`
+# blocks in isolation so they can be diffed/copied.
+model:
+  # Optional per-codon parquet features. Route each to `none`, `biological`,
+  # `dataset_bias`, or `both`; the baseline keeps all disabled.
+  additional_sequence_features:
+    exo: {dimension: 3, route: none, scale: 1.0}
+    gmp: {dimension: 3, route: none, scale: 1.0}
+    tmp: {dimension: 3, route: none, scale: 1.0}
+    openen: {dimension: 3, route: none, scale: 1.0}
+    tAI_profile_codon: {dimension: 1, route: none, scale: 1.0, missing_values: [-1000.0], fill_value: 0.0}
+    # Constant [1,0,0] in sequence_embeddings_with_css.parquet.
+    fra: {dimension: 3, route: none, scale: 1.0}
+
+  # Mean model: mu = S * normalize_i(gamma * L_bio)
+  init_gamma: 1.0
+  mass_conservation: true
+  gamma_centering:
+    mode: fixed_reference
+    dataset_constant_scale_gauge: geometric_mean_one
+    reference:
+      dataset_names: null
+      weighting: quality_rank
+      quality_rank_power: 1.0
+      chunk_size: 32
+      minimum_datasets: 2
+
+  biological_params:
+    # Base one-hot dimension; routed optional dimensions are added in code.
+    input_size: 97
+    hidden_size: 256
+    num_layers: 2
+    dropout: 0.0
+    # Direct-load queue: L_bio is already mean-one.
+    init_local_hazard_factor: 1.0
+    init_local_hazard_weight_std: 1.0e-2
+
+  dataset_bias_params:
+    position_features:
+      - rel_pos
+      - start_window
+      - stop_window
+
+    position_edge_tau: 100.0
+    position_scale: 5000.0
+
+    num_datasets: 131
+    dataset_embeddings_size: 32
+    num_codons: 64
+    codon_embeddings_size: 16
+    use_nucleotide_amino_acid_embeddings: true
+    nucleotide_embeddings_size: 4
+    amino_acid_embeddings_size: 8
+
+    context_gru_hidden_size: 128
+    context_gru_num_layers: 2
+    context_gru_dropout: 0.0
+    dataset_multiplicative_allocation_bias_submodule_params:
+      hidden_size: 128
+      dropout: 0.1
+
+    dataset_log_sigma_submodule_params:
+      dataset_embedding_size: 16
+      hidden_size: 128
+      dropout: 0.1
+      init_log_sigma: 0.2
+
+loss:
+  # NB2 uses raw replicas; both PCC terms use their arithmetic consensus once
+  # per transcript-dataset pair.
+  replica_nb_weight: 1.0
+  consensus_raw_pcc_weight: 0.5
+  consensus_nb_vst_pcc_weight: 0.5
+  gamma_reg_weight: 0.0
+  sample_reduction: transcript_balanced
+  eps: 1.0e-8
+  nb_log_alpha_min: -5.0
+  nb_log_alpha_max: 1.0
+  nb_sequence_reduction: length_tempered
+  nb_length_temper_gamma: 0.75
+  nb_length_temper_ref: 1000.0
+  nb_length_temper_min_weight: 0.5
+  nb_length_temper_max_weight: 2.0
+
+  min_pcc_target_var: 1.0e-6
+  pcc_detach_alpha: true
+  pcc_prediction_floor: 0.0

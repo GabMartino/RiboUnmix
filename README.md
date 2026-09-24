@@ -1,187 +1,237 @@
 # RiboUnmix
 
-## Overview
+**Learn a shared ribosome profile while accounting for dataset-specific effects.**
 
-RiboUnmix is a neural framework for decomposing heterogeneous ribosome
-profiling (Ribo-seq) signals into a dataset-invariant shared profile (`L_bio`)
-and dataset-specific multiplicative (`gamma`) corrections. Gamma is the
-exponential of its centered log-score, so it is strictly positive on valid
-positions and remains unbounded above. The dataset head uses
-dataset, codon-context, and position features; it does not consume `L_bio`.
-The recommended fixed-reference gamma centering uses one checkpointed dataset
-panel in every stage, while batch-grouped centering remains available for old
-experiments.
+Ribosome profiling experiments can give different signals for the same coding
+sequence. RiboUnmix models those observations with a shared, sequence-based
+profile and a positive correction for each dataset. It is a research framework
+built with PyTorch, Lightning, and Hydra.
 
-Training, validation, prediction, checkpointing, and logging use PyTorch
-Lightning. Hydra controls the model, data, split, optimizer, and runtime
-configuration.
+![RiboUnmix model overview: independent shared and dataset branches combine in a negative-binomial observation model.](Docs/assets/ribounmix_overview.svg)
 
-The public repository is
-[`GabMartino/RiboUnmix`](https://github.com/GabMartino/RiboUnmix). Historical
-Python import paths and entrypoint filenames containing `RiboAI`, `Queueing`,
-or `Queuing` are available only as deprecated compatibility adapters. Existing
-checkpoints and frozen experiment manifests refer to them directly. Historical
-artifact directories and run identifiers are immutable provenance and are
-therefore not renamed.
+[Try the notebook](notebooks/01_model_checks_and_predictions.ipynb) ·
+[Run the synthetic smoke experiment](examples/synthetic_smoke/README.md) ·
+[Explore the analyses](analyses/README.md) ·
+[Training configuration](config/config_ribounmix_multidataset.yaml) ·
+[Repository alignment](Docs/repository_alignment.md)
 
-## Model
+## Start here
 
-For transcript `t`, dataset `d`, and codon position `i`, the active mean model is
+| You want to… | Start with… | What you need |
+|---|---|---|
+| Train, validate, and replay a checkpoint | [Synthetic smoke experiment](examples/synthetic_smoke/README.md) | CPU, bundled data and checkpoint |
+| Understand the model and check that it runs | [CPU notebook](notebooks/01_model_checks_and_predictions.ipynb) | Python environment; no external data or checkpoint |
+| Inspect a trained prediction | Optional prediction section of the notebook | A saved prediction Parquet file |
+| Train across Ribo-seq datasets | `main_ribounmix_multidataset.py` | Prepared sequence and replica-profile tables |
+| Train a single-organism benchmark | `main_ribounmix_benchmarking.py` | The corresponding CDS and weighted profile tables |
+| Reproduce experiment figures | [Analysis index](analyses/README.md) | The experiment's saved outputs and manifests |
 
-```text
-shape[d,t,i] = mean_normalize(gamma[d,t,i] * L_bio[t,i])
-mu[d,t,i] = S[d,t] * shape[d,t,i]
-```
+## Run the reviewer smoke experiment
 
-- `S[d,t]` is the valid-position mean of the observed target profile.
-- `L_bio` is positive and normalized to mean one over valid positions.
-- `gamma` is positive and dataset-conditioned.
-- `rho_bio = L_bio / (1 + L_bio)` is the bounded occupancy representation.
-- The explicit active objective is consensus hybrid PCC plus raw-replica NB2.
-- NB2 uses learned
-  per-position log-dispersion, exposed as `log_sigma` for compatibility.
-
-Because `S[d,t]` is computed from the target, the current implementation models
-profile shape and relative allocation. It is not a target-free predictor of
-absolute transcript abundance.
-
-Further model notes, including gradients, diagnostics, invariances, and
-limitations, are in
-[Docs/ribounmix_model.md](Docs/ribounmix_model.md). A longer historical
-identifiability analysis is in
-[`memory documents/modeling_mathematical_analysis_and_identifiability.md`](memory%20documents/modeling_mathematical_analysis_and_identifiability.md).
-
-## Repository Layout
-
-```text
-main_ribounmix_multidataset.py   Hydra training entry point
-config/                                       Runtime and dataset configuration
-Dataloaders/RiboUnmixMultiDataset/         Parquet loading and batching
-Models/RiboUnmixModel/                       Biological and dataset branches
-Models/RiboUnmixLightningModule.py       Losses, metrics, and prediction IO
-Datasets/                                      Encodings and local data assets
-results/                                       Analysis scripts and generated results
-tests/                                         Model invariance and forward checks
-memory documents/                              Maintained modeling notes
-```
-
-## Setup
-
-The checked environment uses Python 3.12. Create an isolated environment and
-install the declared dependencies:
+The repository includes a deterministic two-dataset synthetic fixture, a
+reduced but otherwise production-path model, a selected validation checkpoint,
+and its prediction export. After installing the environment:
 
 ```bash
-python -m venv .venv
+# Check hashes, checkpoint tensors, predictions, normalization, and centering.
+python examples/synthetic_smoke/run.py verify
+
+# Replay validation inference from the committed checkpoint.
+python examples/synthetic_smoke/run.py replay
+
+# Train for two epochs from a fresh initialization and export validation rows.
+python examples/synthetic_smoke/run.py train
+```
+
+The fixture is an integration test, not a reported scientific experiment or a
+general pretrained model. See its [provenance and limitations](examples/synthetic_smoke/README.md).
+
+## Try the notebook on your laptop
+
+The core notebook uses a small instance of the real model and generated inputs.
+It checks normalization, masking, reference centering, target scaling, and finite
+gradients. Its random-weight predictions are explicitly labeled; they are not
+evidence of trained performance.
+
+Python **3.12** is the environment used for the checks in this checkout.
+From a complete source checkout:
+
+```bash
+git clone https://github.com/GabMartino/RiboUnmix.git
+cd RiboUnmix
+python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+
+# CPU build for the walkthrough. For GPU training, choose the matching wheel.
+python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -r requirements-notebooks.txt
+python -m ipykernel install --sys-prefix --name ribounmix --display-name "Python 3 (RiboUnmix)"
+jupyter lab notebooks/01_model_checks_and_predictions.ipynb
 ```
 
-Training defaults to GPU execution with mixed bfloat16 precision. Select CPU or
-a different precision through Hydra overrides when required by the local
-hardware.
+Select **Python 3 (RiboUnmix)**, then **Restart Kernel → Run All**. For saved
+results, set `PREDICTION_PATH` or `ABLATION_TABLE_DIR` near the top of the notebook.
+The default run skips those optional sections.
 
-## Data Configuration
+For CUDA or ROCm, use the appropriate build from the
+[PyTorch installation guide](https://pytorch.org/get-started/locally/), keeping
+the project version pinned. Jupyter's installation options are documented
+[here](https://jupyter.org/install). Training without notebook tools needs only
+`requirements.txt`.
 
-The default configuration is
-[`config/config_ribounmix_multidataset.yaml`](config/config_ribounmix_multidataset.yaml).
-It selects `weighted_hek_riboseq_codon_replicas` and expects:
+## What is being learned?
 
-- Sequence features at
-  `Datasets/data/sequence/MANE.selection.sequence_embeddings_with_css.parquet`.
-- Dataset-specific profiles registered under `config/dataset_config/`.
-- Encoding maps under `Datasets/encodings/`.
+For transcript `t`, dataset `d`, and valid codon `i`:
 
-The sequence parquet's CSS annotations guide joint validation stratification;
-there is no separate CSS benchmark split or CSS holdout percentage. Validation
-uses one deterministic transcript panel common to the configured master dataset
-universe, and every other available transcript is assigned to training.
+| Quantity | Meaning |
+|---|---|
+| `L_bio[t, i]` | Positive shared profile from sequence; normalized to mean one |
+| `gamma[d, t, i]` | Positive dataset-conditioned multiplicative correction |
+| `S[d, t]` | Mean of the **observed target** over valid positions |
+| `alpha[d, t, i]` | NB2 dispersion; variance is `mu + alpha * mu²` |
 
-Each sample represents a transcript-dataset pair. The dataset implementation
-precomputes sequence features and codon IDs, caches contiguous ribosome profiles,
-and can carry every biological replica as a padded `[replica, position]` tensor.
+The two branches have independent recurrent encoders. The dataset branch uses
+sequence, dataset identity, and position; it does not consume `L_bio`.
 
-## Training And Prediction
+```text
+shape = gamma * L_bio
 
-Run the two-dataset default experiment:
+mass_conservation = true:   mu = S * shape / mean_valid(shape)
+mass_conservation = false:  mu = S * shape
+```
+
+Fixed-reference centering anchors log-gamma to a specified dataset panel and
+removes its positional constant when the configured centering conditions hold.
+The choice of reference panel and weights is part of the model definition.
+`log_sigma` in existing exports is the historical name for **log(alpha)**.
+
+![An explicitly simulated example showing two count profiles, their generating shared profile, and dataset corrections. These are not fitted results.](Docs/assets/ribounmix_profiles.svg)
+
+*Illustrative simulation only. Regenerate both README figures with
+`python Docs/assets/create_readme_figures.py`.*
+
+**Interpretation matters.** `L_bio` is shared by construction; that does not prove
+that it is purely biological. Dataset-specific biology and technical effects can
+both enter `gamma`. The bounded transform `rho = L_bio / (1 + L_bio)` is a
+diagnostic representation, not a validated physical occupancy measurement.
+Because `mu` uses observed target scale, it is not an absolute-abundance
+prediction from sequence alone.
+
+## Train with your data
+
+Full experiments require local data assets. The complete real and synthetic
+training collections are intentionally excluded from `Datasets/data/`; only the
+small, explicitly documented reviewer fixture and its smoke checkpoint are
+committed.
+
+- **Multiple datasets:** register profile Parquets in
+  `config/dataset_config/` and set `paths.sequences_path`. Profiles include
+  `ribo_cds_replicas` with shape `[replicas, codons]`. Dataset IDs must agree with
+  the configured encoding and checkpoint reference panel.
+- **Benchmarks:** see [benchmark preprocessing](Datasets/benchmarking_data/README.md)
+  for the weighted profiles and aligned CDS files.
+- **Splits:** multidataset defaults use a common validation panel. Those
+  validation predictions are not an independent test set. Benchmark defaults
+  use transcript-level train/validation/test partitions.
+
+Inspect the resolved configuration before launching a run; this command does
+not train or load the datasets:
 
 ```bash
+python main_ribounmix_multidataset.py --cfg job --resolve
+```
+
+With the required assets available:
+
+```bash
+# Joint training on the datasets selected in the configuration.
 python main_ribounmix_multidataset.py
+
+# One independent organism benchmark.
+python main_ribounmix_benchmarking.py experiment.dataset=human_iwasaki_2014
+
+# Synthetic experiment using its own configuration and dataset mapping.
+python main_ribounmix_synthetic.py
 ```
 
-Run one registered dataset:
+The full configurations default to GPU execution. For a small CPU debugging run,
+set `trainer.accelerator=cpu trainer.devices=1 trainer.precision=32-true
+data.num_workers=0`; the data requirements still apply.
+
+Training and prediction write under `checkpoints/`, `logs/`, and `results/`.
+Keep the resolved configuration, transcript split, reference panel, and
+checkpoint-selection metadata together with each result. Changing these can
+change the scientific comparison even when the model class is unchanged.
+
+### Configurations are different experiments
+
+| Setting | Real-data default | Benchmark default | Synthetic default |
+|---|---|---|---|
+| Mass conservation | Enabled | Disabled | Disabled |
+| Gamma reference | Fixed panel | Batch-grouped; singleton fallback | Fixed panel |
+| NB formulation | Standard NB2 | Mean-gradient reweighted NB2 | Standard NB2 |
+| Sample reduction | Transcript balanced | Global weighted | Transcript balanced |
+
+The loss combines raw-replica NB2 with raw and NB-VST correlation terms on the
+replica consensus; their coefficients and the gamma penalty are configurable.
+Use each run's frozen config to describe its objective. One observed profile
+stored as one replica does not establish a benefit from biological replication.
+
+## Evaluate and reproduce
+
+Analysis code lives in **`analyses/`**. Training outputs stay in **`results/`**;
+derived tables and working figures go in **`analyses/artifacts/`**. See the
+[analysis index](analyses/README.md) for experiment-specific commands.
+
+For the matched four-organism loss ablation, explicitly include all completed
+training seeds:
 
 ```bash
-python main_ribounmix_multidataset.py \
-  experiment.dataset="['kutay_2021']" \
-  split.master_dataset_universe="['kutay_2021']" \
-  'trainer.devices=[0]'
+RIBOUNMIX_PLOT_TEX=0 python analyses/analyze_benchmark_loss_ablation.py \
+  --experiment-root results/riboai_benchmarking_experiments/loss_ablation_v1 \
+  --training-seeds 42,43,44 --require-complete
 ```
 
-Run prediction from a checkpoint without training:
+Use identical held-out transcripts and a common checkpoint rule when comparing
+objectives. Transcript-bootstrap intervals are conditional on fitted runs;
+show seed variability separately. For transformed-PCC comparisons, use a common
+transform such as `log1p`: the saved model-specific NB-VST transform changes
+with each model's predicted dispersion.
+
+## Project map
+
+```text
+notebooks/                        Interactive model checks and prediction inspection
+examples/synthetic_smoke/         Runnable data, checkpoint, replay, and verifier
+Models/RiboUnmixModel/            Shared and dataset-conditioned branches
+Models/RiboUnmixLightningModule.py Losses, training steps, and prediction export
+Dataloaders/RiboUnmix*/           Data loading, masks, replicas, and grouped batches
+config/                          Runnable configurations and experiment designs
+analyses/                        Analysis and figure-generation source
+Tests/                           Scientific and numerical regression checks
+Docs/                            Documentation, diagrams, and alignment notes
+Datasets/                        Preprocessing source and local data assets
+```
+
+Run the self-contained public test profile from the repository root:
 
 ```bash
-python main_ribounmix_multidataset.py \
-  experiment.from_checkpoint=true \
-  experiment.train=false \
-  experiment.predict=true
+python Tests/run_public_tests.py
 ```
 
-Runtime artifacts are written below `checkpoints/ribounmix`,
-`logs/ribounmix`, and `results/ribounmix` unless `paths.*` is
-overridden. Inspect logs with:
+The remaining test modules include integration checks for full experimental
+data and historical result trees that are intentionally not distributed in
+this lightweight repository. They are retained as executable specifications,
+but require the corresponding private or separately archived artifacts.
 
-```bash
-tensorboard --logdir logs/ribounmix
-```
+The project is named **RiboUnmix**. Earlier `RiboAI`, `Queuing`, and `Queueing`
+imports remain as compatibility adapters. Historical experiment paths retain
+their original names to preserve provenance; see the
+[naming migration](Docs/renaming_to_ribounmix.md).
 
-The Slurm launchers use the same nested Hydra keys as the main configuration.
-`run_parallel.sh` schedules the 30 active datasets across two visible GPUs.
+## Research status
 
-## Analysis
-
-Correlate exported model quantities with the supplied translation-efficiency
-measure. A directory input is searched recursively for `predictions*.parquet`:
-
-```bash
-python analyse_TE_correlation.py path/to/predictions.parquet \
-  --output results/te_correlations.csv
-```
-
-For the article's synthetic, benchmarking, Exp8 and four-panel experiments, use
-the [analysis index and regeneration commands](results/README.md). For example,
-generate the compact reproducibility figure from a completed four-panel run:
-
-```bash
-python analyses/create_four_panel_reproducibility_figure.py \
-  --run-root results/my_panels_a100_b32_20260906_114323
-```
-
-Legacy and superseded top-level analyses are preserved in
-`results/_archive/2026-09-11_article_cleanup/`, with an inventory and restore
-instructions. Experiment data and saved results remain in their original folders.
-
-## Verification
-
-The focused model checks are plain Python executables:
-
-```bash
-python tests/test_simple_queue_model.py
-python tests/test_gamma_centering.py
-```
-
-They cover forward constraints, masking, target scaling, gamma centering, and
-the main invariance properties. Hydra configuration can be checked without a
-training launch using `hydra.compose` from Python.
-
-## Current Identifiability Boundary
-
-Fixed-reference centering defines a deterministic cross-dataset gamma gauge,
-including for singleton requested inference. This algebraically fixes the
-weighted common gamma mode over the configured reference panel, but it does not
-prove that `L_bio` is purely biological or that gamma is purely technical:
-sequence-correlated technical effects and genuine dataset-specific biology are
-not labeled separately by the data. These conditions are detailed in
-`Docs/model_mathematics.html`.
-
-No license file is currently included.
+This is evolving research code. The repository currently has no license file
+or finalized citation metadata. Do not infer performance claims from the toy
+figures; use the corresponding experiment reports and frozen configurations.

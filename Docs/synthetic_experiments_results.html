@@ -1,0 +1,1387 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Complete results and conclusions for the RiboUnmix synthetic bias-recovery experiments.">
+  <title>RiboUnmix synthetic experiments — results and conclusions</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17212b;
+      --muted: #5d6875;
+      --paper: #f6f4ef;
+      --surface: #ffffff;
+      --line: #d8ddd9;
+      --navy: #16324f;
+      --teal: #087f74;
+      --teal-dark: #075e57;
+      --gold: #d69e2e;
+      --red: #b4433b;
+      --shadow: 0 16px 42px rgba(20, 39, 58, 0.10);
+      --radius: 18px;
+    }
+
+    * { box-sizing: border-box; }
+
+    html {
+      scroll-behavior: smooth;
+      scroll-padding-top: 5rem;
+    }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 10% 0%, rgba(8, 127, 116, 0.09), transparent 28rem),
+        var(--paper);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 17px;
+      line-height: 1.68;
+    }
+
+    a {
+      color: var(--teal-dark);
+      text-decoration-thickness: 1px;
+      text-underline-offset: 0.18em;
+    }
+
+    a:hover { color: var(--navy); }
+
+    code, .mono {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-size: 0.91em;
+    }
+
+    code {
+      padding: 0.1em 0.32em;
+      border: 1px solid #dbe3df;
+      border-radius: 5px;
+      background: #f4f7f5;
+    }
+
+    .skip-link {
+      position: fixed;
+      z-index: 100;
+      top: 0.75rem;
+      left: 0.75rem;
+      transform: translateY(-180%);
+      padding: 0.55rem 0.8rem;
+      border-radius: 8px;
+      color: white;
+      background: var(--navy);
+    }
+
+    .skip-link:focus { transform: translateY(0); }
+
+    .hero {
+      position: relative;
+      overflow: hidden;
+      color: white;
+      background:
+        linear-gradient(115deg, rgba(22, 50, 79, 0.98), rgba(8, 99, 92, 0.96)),
+        var(--navy);
+    }
+
+    .hero::after {
+      position: absolute;
+      right: -8rem;
+      bottom: -12rem;
+      width: 34rem;
+      height: 34rem;
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      border-radius: 50%;
+      box-shadow:
+        0 0 0 5rem rgba(255, 255, 255, 0.035),
+        0 0 0 10rem rgba(255, 255, 255, 0.025);
+      content: "";
+    }
+
+    .hero-inner,
+    .page,
+    .toc-inner,
+    footer {
+      width: min(1180px, calc(100% - 2.2rem));
+      margin-inline: auto;
+    }
+
+    .hero-inner {
+      position: relative;
+      z-index: 1;
+      padding: 5.5rem 0 4.2rem;
+    }
+
+    .eyebrow {
+      margin: 0 0 0.75rem;
+      color: #a7f3e8;
+      font-size: 0.78rem;
+      font-weight: 800;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+    }
+
+    h1, h2, h3, h4 {
+      color: var(--navy);
+      font-family: Georgia, "Times New Roman", serif;
+      line-height: 1.16;
+    }
+
+    h1 {
+      max-width: 930px;
+      margin: 0;
+      color: white;
+      font-size: clamp(2.55rem, 6vw, 5.25rem);
+      font-weight: 650;
+      letter-spacing: -0.045em;
+    }
+
+    .deck {
+      max-width: 850px;
+      margin: 1.25rem 0 0;
+      color: rgba(255, 255, 255, 0.86);
+      font-size: clamp(1.05rem, 2vw, 1.34rem);
+    }
+
+    .stamp-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.55rem;
+      margin-top: 1.5rem;
+    }
+
+    .stamp {
+      padding: 0.32rem 0.7rem;
+      border: 1px solid rgba(255, 255, 255, 0.22);
+      border-radius: 999px;
+      color: rgba(255, 255, 255, 0.9);
+      background: rgba(255, 255, 255, 0.08);
+      font-size: 0.78rem;
+      font-weight: 700;
+      letter-spacing: 0.025em;
+    }
+
+    .hero-stats {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 0.8rem;
+      margin-top: 2.5rem;
+    }
+
+    .hero-stat {
+      min-height: 115px;
+      padding: 1rem 1.1rem;
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.075);
+      backdrop-filter: blur(4px);
+    }
+
+    .hero-stat strong {
+      display: block;
+      color: white;
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: 2rem;
+      line-height: 1;
+    }
+
+    .hero-stat span {
+      display: block;
+      margin-top: 0.55rem;
+      color: rgba(255, 255, 255, 0.78);
+      font-size: 0.84rem;
+      line-height: 1.35;
+    }
+
+    .toc {
+      position: sticky;
+      z-index: 20;
+      top: 0;
+      border-bottom: 1px solid var(--line);
+      background: rgba(246, 244, 239, 0.94);
+      backdrop-filter: blur(12px);
+    }
+
+    .toc-inner {
+      display: flex;
+      gap: 1.15rem;
+      overflow-x: auto;
+      padding-block: 0.75rem;
+      scrollbar-width: thin;
+    }
+
+    .toc a {
+      flex: 0 0 auto;
+      color: var(--muted);
+      font-size: 0.78rem;
+      font-weight: 800;
+      letter-spacing: 0.045em;
+      text-decoration: none;
+      text-transform: uppercase;
+    }
+
+    .toc a:hover { color: var(--teal-dark); }
+
+    .page { padding: 3.4rem 0 5rem; }
+
+    section {
+      margin: 0 0 5rem;
+      scroll-margin-top: 5rem;
+    }
+
+    .section-head {
+      display: grid;
+      grid-template-columns: minmax(0, 0.33fr) minmax(0, 0.67fr);
+      gap: 2rem;
+      align-items: start;
+      margin-bottom: 1.6rem;
+    }
+
+    .section-no {
+      color: var(--teal);
+      font-size: 0.78rem;
+      font-weight: 900;
+      letter-spacing: 0.15em;
+      text-transform: uppercase;
+    }
+
+    h2 {
+      margin: 0;
+      font-size: clamp(2rem, 4vw, 3.3rem);
+      letter-spacing: -0.025em;
+    }
+
+    h3 {
+      margin: 2.2rem 0 0.7rem;
+      font-size: clamp(1.38rem, 2.5vw, 1.85rem);
+    }
+
+    h4 {
+      margin: 0 0 0.45rem;
+      font-size: 1.1rem;
+    }
+
+    .lead {
+      max-width: 810px;
+      margin: 0.75rem 0 0;
+      color: var(--muted);
+      font-size: 1.08rem;
+    }
+
+    .grid-2,
+    .grid-3,
+    .conclusion-grid {
+      display: grid;
+      gap: 1rem;
+    }
+
+    .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .conclusion-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+
+    .card {
+      padding: 1.25rem;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: 0 8px 28px rgba(20, 39, 58, 0.045);
+    }
+
+    .card p:last-child,
+    .callout p:last-child { margin-bottom: 0; }
+
+    .metric-card strong {
+      display: block;
+      margin: 0.25rem 0 0.45rem;
+      color: var(--teal-dark);
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: 1.8rem;
+      line-height: 1.08;
+    }
+
+    .metric-card span {
+      color: var(--muted);
+      font-size: 0.88rem;
+    }
+
+    .callout {
+      margin: 1.4rem 0;
+      padding: 1.2rem 1.3rem;
+      border: 1px solid #a9d6d1;
+      border-left: 5px solid var(--teal);
+      border-radius: 12px;
+      background: #edf8f6;
+    }
+
+    .callout.caution {
+      border-color: #e4c984;
+      border-left-color: var(--gold);
+      background: #fff9e8;
+    }
+
+    .callout.limit {
+      border-color: #e0b0aa;
+      border-left-color: var(--red);
+      background: #fff3f1;
+    }
+
+    .callout strong.label {
+      display: block;
+      margin-bottom: 0.25rem;
+      color: var(--navy);
+      font-size: 0.78rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 0.7rem;
+      align-items: stretch;
+      margin: 1.5rem 0;
+    }
+
+    .flow-step {
+      position: relative;
+      padding: 1rem;
+      border: 1px solid var(--line);
+      border-radius: 13px;
+      background: var(--surface);
+    }
+
+    .flow-step:not(:last-child)::after {
+      position: absolute;
+      z-index: 2;
+      top: 50%;
+      right: -0.66rem;
+      width: 0.62rem;
+      color: var(--teal);
+      background: var(--paper);
+      content: "→";
+      font-weight: 900;
+      line-height: 1;
+      transform: translateY(-50%);
+    }
+
+    .flow-step b {
+      display: block;
+      color: var(--navy);
+      font-size: 0.9rem;
+    }
+
+    .flow-step small {
+      display: block;
+      margin-top: 0.3rem;
+      color: var(--muted);
+      line-height: 1.4;
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+      margin: 1.15rem 0 1.5rem;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--surface);
+      box-shadow: 0 8px 24px rgba(20, 39, 58, 0.035);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-variant-numeric: tabular-nums;
+      font-size: 0.86rem;
+      line-height: 1.42;
+    }
+
+    caption {
+      padding: 0.9rem 1rem;
+      color: var(--muted);
+      text-align: left;
+      font-size: 0.82rem;
+    }
+
+    th, td {
+      padding: 0.67rem 0.78rem;
+      border-bottom: 1px solid #e7eae7;
+      text-align: right;
+      white-space: nowrap;
+    }
+
+    thead th {
+      color: white;
+      background: var(--navy);
+      font-weight: 750;
+      vertical-align: bottom;
+    }
+
+    thead tr.subhead th {
+      padding-block: 0.42rem;
+      color: #d9eee9;
+      background: #204a65;
+      font-size: 0.77rem;
+    }
+
+    th:first-child, td:first-child { text-align: left; }
+    tbody tr:nth-child(even) { background: #f8faf8; }
+    tbody tr:last-child th, tbody tr:last-child td { border-bottom: 0; }
+    tbody tr:hover { background: #eff7f5; }
+
+    .good { color: var(--teal-dark); font-weight: 800; }
+    .mixed { color: #8a5a00; font-weight: 800; }
+    .neutral { color: var(--muted); }
+
+    .figure {
+      margin: 1.6rem 0 2rem;
+      padding: 0.75rem;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    .figure img {
+      display: block;
+      width: 100%;
+      height: auto;
+      border-radius: 10px;
+    }
+
+    figcaption {
+      padding: 0.75rem 0.45rem 0.2rem;
+      color: var(--muted);
+      font-size: 0.82rem;
+      line-height: 1.5;
+    }
+
+    details {
+      margin: 1rem 0;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.72);
+    }
+
+    summary {
+      cursor: pointer;
+      padding: 0.9rem 1rem;
+      color: var(--navy);
+      font-weight: 800;
+    }
+
+    details > :not(summary) { margin-inline: 1rem; }
+
+    .equation {
+      overflow-x: auto;
+      padding: 1rem 1.1rem;
+      border: 1px solid #cbd8d4;
+      border-radius: 11px;
+      color: #103d39;
+      background: #f1f8f6;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-size: 0.91rem;
+      white-space: pre;
+    }
+
+    .plain-list {
+      margin: 0.65rem 0 0;
+      padding-left: 1.2rem;
+    }
+
+    .plain-list li { margin: 0.42rem 0; }
+
+    .verdict {
+      padding: 1.35rem;
+      border-radius: var(--radius);
+      color: white;
+      background: var(--navy);
+    }
+
+    .verdict h3 {
+      margin-top: 0;
+      color: white;
+    }
+
+    .verdict p { color: rgba(255, 255, 255, 0.84); }
+
+    .source-list {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 0.75rem;
+      padding: 0;
+      list-style: none;
+    }
+
+    .source-list li {
+      padding: 0.9rem 1rem;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: var(--surface);
+    }
+
+    .source-list small {
+      display: block;
+      margin-top: 0.2rem;
+      color: var(--muted);
+    }
+
+    footer {
+      padding: 2rem 0 3rem;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 0.84rem;
+    }
+
+    @media (max-width: 900px) {
+      .hero-stats,
+      .grid-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .section-head { grid-template-columns: 1fr; gap: 0.45rem; }
+      .flow { grid-template-columns: 1fr; }
+      .flow-step:not(:last-child)::after {
+        top: auto;
+        right: 50%;
+        bottom: -0.66rem;
+        content: "↓";
+        transform: translateX(50%);
+      }
+    }
+
+    @media (max-width: 640px) {
+      body { font-size: 16px; }
+      .hero-inner { padding: 3.7rem 0 3rem; }
+      .hero-stats,
+      .grid-2,
+      .grid-3,
+      .conclusion-grid,
+      .source-list { grid-template-columns: 1fr; }
+      .page { padding-top: 2.4rem; }
+      section { margin-bottom: 3.8rem; }
+      th, td { padding: 0.58rem 0.68rem; }
+    }
+
+    @media print {
+      body { background: white; font-size: 10pt; }
+      .toc, .skip-link { display: none; }
+      .hero { print-color-adjust: exact; -webkit-print-color-adjust: exact; }
+      .hero-inner { padding: 2rem 0; }
+      .hero-stats { grid-template-columns: repeat(4, 1fr); }
+      .page { width: 100%; padding: 1.5rem 0; }
+      section { break-before: page; margin-bottom: 2rem; }
+      section:first-child { break-before: auto; }
+      .card, .figure, .table-wrap, .callout { box-shadow: none; break-inside: avoid; }
+      details { break-inside: auto; }
+      details[open] > * { display: block; }
+      a { color: inherit; text-decoration: none; }
+    }
+  </style>
+</head>
+<body>
+<div style="padding:10px 18px;background:#eaf4fb;border-bottom:1px solid #bdd7e8;text-align:center;font:600 14px/1.4 system-ui,sans-serif">This is a results synthesis. For current operational guidance, read the <a href="project_model_onboarding.html">project onboarding and safe-handoff guide</a>.</div>
+  <a class="skip-link" href="#main">Skip to results</a>
+
+  <header class="hero" id="top">
+    <div class="hero-inner">
+      <p class="eyebrow">RiboUnmix · complete synthetic benchmark</p>
+      <h1>Synthetic experiments: results and conclusions</h1>
+      <p class="deck">
+        A consolidated account of every completed synthetic-data experiment: single-dataset
+        identifiability controls, within-depth cumulative panels, cross-depth panels, and the
+        equal-versus-quality-rank gamma-reference comparison.
+      </p>
+      <div class="stamp-row" aria-label="Analysis scope">
+        <span class="stamp">Results snapshot: 3 September 2026</span>
+        <span class="stamp">best_val_loss checkpoint</span>
+        <span class="stamp">main_val split</span>
+        <span class="stamp">seed 42</span>
+        <span class="stamp">mass-free</span>
+        <span class="stamp">CDS interior</span>
+      </div>
+      <div class="hero-stats">
+        <div class="hero-stat"><strong>77</strong><span>completed logical training experiments</span></div>
+        <div class="hero-stat"><strong>3</strong><span>read-depth regimes: 0.25, 2, and 20 reads/codon</span></div>
+        <div class="hero-stat"><strong>10</strong><span>programmed sequence-bias mechanisms</span></div>
+        <div class="hero-stat"><strong>1,920</strong><span>held-out transcripts evaluated per selected run</span></div>
+      </div>
+    </div>
+  </header>
+
+  <nav class="toc" aria-label="Report sections">
+    <div class="toc-inner">
+      <a href="#summary">Summary</a>
+      <a href="#inventory">Inventory</a>
+      <a href="#benchmark">Benchmark</a>
+      <a href="#evaluation">Evaluation</a>
+      <a href="#single">Single dataset</a>
+      <a href="#within">Within depth</a>
+      <a href="#inter">Cross depth</a>
+      <a href="#diagnostics">Diagnostics</a>
+      <a href="#conclusions">Conclusions</a>
+      <a href="#artifacts">Artifacts</a>
+    </div>
+  </nav>
+
+  <main class="page" id="main">
+    <section id="summary">
+      <div class="section-head">
+        <div class="section-no">Executive answer</div>
+        <div>
+          <h2>The factorization works when the model sees complementary datasets.</h2>
+          <p class="lead">
+            More independent bias views consistently improve recovery of the shared biological
+            profile. Gamma recovers the identifiable dataset-specific bias shapes with very high
+            fidelity. Sequencing depth improves reconstruction of observed counts, but depth alone
+            cannot resolve the shared-versus-bias ambiguity of a single dataset.
+          </p>
+        </div>
+      </div>
+
+      <div class="conclusion-grid">
+        <article class="card metric-card">
+          <span>Within-depth shared recovery, N=2 → N=10</span>
+          <strong>PCC ≈ 0.78 → 0.96</strong>
+          <p>All three read-depth curves improve strongly and almost overlap.</p>
+        </article>
+        <article class="card metric-card">
+          <span>Within-depth identifiable gamma recovery</span>
+          <strong>PCC 0.9960–0.9997</strong>
+          <p>Across all 27 cumulative panels; log-gamma RMSE is 0.0089–0.0265.</p>
+        </article>
+        <article class="card metric-card">
+          <span>Quality-rank versus equal reference</span>
+          <strong>8/9 gamma PCC wins</strong>
+          <p>Gamma generally improves; shared <i>L</i><sub>bio</sub> is effectively unchanged.</p>
+        </article>
+        <article class="card metric-card">
+          <span>Single-dataset control</span>
+          <strong>μ improves; factorization does not</strong>
+          <p>Mean μ PCC rises from 0.561 to 0.917 with depth, while mean <i>L</i><sub>bio</sub> PCC remains 0.574–0.634.</p>
+        </article>
+      </div>
+
+      <div class="callout">
+        <strong class="label">Central interpretation</strong>
+        Predicting a biased profile accurately is not the same as recovering biology. The
+        single-dataset controls can reconstruct their observed target increasingly well as reads
+        increase, yet their gamma is unidentifiable and the learned shared profile remains
+        bias-dependent. The multi-dataset experiments are what identify the decomposition.
+      </div>
+
+      <div class="callout caution">
+        <strong class="label">Scope of the evidence</strong>
+        These are descriptive results from one training seed, one cumulative bias order, the
+        mass-free model, and held-out validation predictions. They establish recovery on the
+        programmed synthetic mechanisms; they do not establish a seed-averaged causal law or
+        guarantee the same decomposition on real data.
+      </div>
+    </section>
+
+    <section id="inventory">
+      <div class="section-head">
+        <div class="section-no">01 · Experiment ledger</div>
+        <div>
+          <h2>Three experiment families cover 77 completed logical runs.</h2>
+          <p class="lead">
+            The current recovery inventory contains a best-validation-loss prediction artifact for
+            every selected logical run. Two failed cross-depth originals remain on disk for audit
+            purposes but are replaced by successful retries and are never counted as replicates.
+          </p>
+        </div>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <caption>Complete training matrix represented in the current shared-recovery inventory.</caption>
+          <thead>
+            <tr>
+              <th>Experiment family</th>
+              <th>Panel construction</th>
+              <th>Conditions</th>
+              <th>Policies</th>
+              <th>Logical runs</th>
+              <th>Question</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <th>Single-dataset controls</th>
+              <td>1 bias × 1 depth</td>
+              <td>10 biases × 3 depths</td>
+              <td>equal</td>
+              <td>30</td>
+              <td>What is identifiable from one observed view?</td>
+            </tr>
+            <tr>
+              <th>Within-depth cumulative</th>
+              <td>N=2,…,10 biases at one depth</td>
+              <td>9 panel sizes × 3 depths</td>
+              <td>equal</td>
+              <td>27</td>
+              <td>Does bias diversity recover shared biology?</td>
+            </tr>
+            <tr>
+              <th>Cross-depth cumulative</th>
+              <td>B=1,…,10 biases × 3 depths</td>
+              <td>N=3,6,…,30 datasets</td>
+              <td>equal + quality rank</td>
+              <td>20</td>
+              <td>Does reference weighting improve cross-depth recovery?</td>
+            </tr>
+            <tr>
+              <th>Total</th>
+              <td>—</td>
+              <td>—</td>
+              <td>—</td>
+              <td><strong>77</strong></td>
+              <td>All selected runs have <code>best_val_loss</code> predictions.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>
+        There are 79 physical run directories: the 77 selected runs plus two failed originals.
+        The excluded originals are cross-depth N=18/equal and N=21/quality-rank; their successful
+        <code>_retry1</code> attempts supply the analyzed artifacts. Run selection is performed by
+        logical identity, so retries cannot inflate sample size.
+      </p>
+
+      <div class="flow" aria-label="Synthetic experiment flow">
+        <div class="flow-step"><b>Latent K</b><small>Deterministic, mean-one kinetic profile</small></div>
+        <div class="flow-step"><b>Programmed b</b><small>One of ten sequence-dependent multipliers</small></div>
+        <div class="flow-step"><b>NB2 observations</b><small>Two replicas at three read depths</small></div>
+        <div class="flow-step"><b>RiboUnmix</b><small>Jointly learns shared and dataset-specific shapes</small></div>
+        <div class="flow-step"><b>Recovery audit</b><small><i>L</i><sub>bio</sub> ↔ K, gamma ↔ gauged b, μ ↔ target</small></div>
+      </div>
+    </section>
+
+    <section id="benchmark">
+      <div class="section-head">
+        <div class="section-no">02 · Synthetic benchmark</div>
+        <div>
+          <h2>One shared kinetic truth is observed through 30 biased datasets.</h2>
+          <p class="lead">
+            Ten systematic RPF-sequence bias mechanisms are crossed with three sampling depths.
+            This creates complementary observations of the same underlying transcript-specific
+            kinetic profile.
+          </p>
+        </div>
+      </div>
+
+      <div class="grid-3">
+        <article class="card">
+          <h4>Latent biological truth</h4>
+          <p><strong>19,290</strong> deterministic transcript profiles, each normalized to mean one. There is no finite-read sampling in K.</p>
+        </article>
+        <article class="card">
+          <h4>Biased observations</h4>
+          <p><strong>30</strong> bias/depth datasets. Each bias file has 57,870 rows: 19,290 transcripts × two NB2 replicas plus their derived mean.</p>
+        </article>
+        <article class="card">
+          <h4>Held-out evaluation</h4>
+          <p><strong>1,920</strong> validation transcripts per selected run in the current result tables. The latent truth is never used for checkpoint selection.</p>
+        </article>
+      </div>
+
+      <h3>Sampling regimes</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Label</th><th>Expected baseline depth</th><th>Interpretation</th></tr>
+          </thead>
+          <tbody>
+            <tr><th><code>0p25_per_codon</code></th><td>0.25 reads/codon</td><td>Sparse and sampling-noise dominated</td></tr>
+            <tr><th><code>2_per_codon</code></th><td>2 reads/codon</td><td>Intermediate coverage</td></tr>
+            <tr><th><code>20_per_codon</code></th><td>20 reads/codon</td><td>Dense observations</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        Replica counts follow NB2 sampling with dispersion α=0.1, so
+        <code>Var(Y)=μ+0.1μ²</code>. The bias annotation stores
+        <code>added_bias=b−1</code>; the actual count multiplier is <code>b</code>.
+      </p>
+
+      <details>
+        <summary>Programmed bias families and cumulative order</summary>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Order</th><th>Bias family</th><th>Programmed multiplier at selected sites</th><th>Feature type</th></tr></thead>
+            <tbody>
+              <tr><th>1</th><td>3′ AA</td><td>2.8–3.2×</td><td>RPF 3′ dinucleotide</td></tr>
+              <tr><th>2</th><td>3′ CC</td><td>5.0–6.0×</td><td>RPF 3′ dinucleotide</td></tr>
+              <tr><th>3</th><td>3′ GG</td><td>4.0–4.4×</td><td>RPF 3′ dinucleotide</td></tr>
+              <tr><th>4</th><td>3′ UU</td><td>5.8–6.2×</td><td>RPF 3′ dinucleotide</td></tr>
+              <tr><th>5</th><td>5′ AA</td><td>3.0–3.4×</td><td>RPF 5′ dinucleotide</td></tr>
+              <tr><th>6</th><td>5′ CC</td><td>5.2–5.6×</td><td>RPF 5′ dinucleotide</td></tr>
+              <tr><th>7</th><td>5′ GG</td><td>4.2–4.6×</td><td>RPF 5′ dinucleotide</td></tr>
+              <tr><th>8</th><td>5′ UU</td><td>5.6–6.0×</td><td>RPF 5′ dinucleotide</td></tr>
+              <tr><th>9</th><td>GC fraction &gt; 0.7</td><td>5.0–5.4×</td><td>RPF composition</td></tr>
+              <tr><th>10</th><td>AU fraction &gt; 0.7</td><td>7.0–7.4×</td><td>RPF composition</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </details>
+    </section>
+
+    <section id="evaluation">
+      <div class="section-head">
+        <div class="section-no">03 · Model and evaluation</div>
+        <div>
+          <h2>Recovery is evaluated component by component.</h2>
+          <p class="lead">
+            The observed-profile fit, shared biological recovery, and dataset-bias recovery answer
+            different questions. Treating μ as the biological output—or comparing raw bias directly
+            with gamma—would give the wrong scientific interpretation.
+          </p>
+        </div>
+      </div>
+
+      <div class="equation" role="img" aria-label="Model factorization equation">shape[d,t,i] = gamma[d,t,i] × L_bio[t,i]
+mu[d,t,i]    = S[d,t] × shape[d,t,i] / mean_i(shape[d,t,i])</div>
+
+      <div class="grid-3">
+        <article class="card">
+          <h4><i>L</i><sub>bio</sub>: shared shape</h4>
+          <p>Compared with deterministic K after independent mean-one normalization. This is the primary biological-recovery target.</p>
+        </article>
+        <article class="card">
+          <h4>gamma: dataset bias</h4>
+          <p>Compared in log space with the programmed multiplier after applying the same identifiable cross-dataset and positional gauge.</p>
+        </article>
+        <article class="card">
+          <h4>μ: observed reconstruction</h4>
+          <p>Compared with each biased finite-read target. High μ agreement confirms prediction, not necessarily correct factorization.</p>
+        </article>
+      </div>
+
+      <h3>Why gamma is gauge-fixed</h3>
+      <p>
+        A dataset-constant gamma multiplier disappears when the profile is normalized, and a
+        positional pattern shared across every dataset can be assigned to either gamma or
+        <i>L</i><sub>bio</sub>. The recovery analysis therefore removes both unidentifiable
+        components from learned and programmed log-gamma before comparing them. Gamma is expected
+        to recover the <em>identifiable relative shape</em>, not the raw multiplier <code>b</code>.
+      </p>
+
+      <div class="callout">
+        <strong class="label">Primary protocol</strong>
+        Current headline tables use <code>best_val_loss</code> predictions on <code>main_val</code>,
+        score the CDS-observable interior <code>5 ≤ i &lt; L−5</code>, and compare matched runs only.
+        PCC measures shape; RMSE measures amplitude error. All runs are mass-free and use seed 42.
+      </div>
+
+      <div class="callout caution">
+        <strong class="label">Two meanings of “quality”</strong>
+        Transcript reliability weights balance noisy observations inside the training objective.
+        Dataset quality rank is different: it is used only to choose the fixed gamma-reference
+        gauge in the cross-depth comparison. It is not multiplied into the training loss.
+      </div>
+    </section>
+
+    <section id="single">
+      <div class="section-head">
+        <div class="section-no">04 · Experiment I</div>
+        <div>
+          <h2>Single-dataset controls expose the identifiability limit.</h2>
+          <p class="lead">
+            Thirty runs train one bias at one read depth. With only one reference dataset, the
+            cross-dataset gamma gauge forces gamma to the neutral profile; the model has no
+            information that can uniquely separate programmed bias from shared biology.
+          </p>
+        </div>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <caption>Across-bias descriptive summary for the ten single-dataset runs at each depth.</caption>
+          <thead>
+            <tr><th>Read depth</th><th>Mean <i>L</i><sub>bio</sub>–K PCC</th><th>Range across biases</th><th>Mean μ–target PCC</th><th>Range across biases</th></tr>
+          </thead>
+          <tbody>
+            <tr><th>0.25 reads/codon</th><td>0.634</td><td>0.247–0.950</td><td>0.561</td><td>0.452–0.645</td></tr>
+            <tr><th>2 reads/codon</th><td>0.577</td><td>0.348–0.901</td><td>0.837</td><td>0.771–0.883</td></tr>
+            <tr><th>20 reads/codon</th><td>0.574</td><td>0.389–0.898</td><td>0.917</td><td>0.890–0.935</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout">
+        <strong class="label">Result</strong>
+        Increasing read depth makes μ much better at reconstructing the biased observation
+        (mean PCC 0.561 → 0.837 → 0.917), but it does not make the single-dataset
+        <i>L</i><sub>bio</sub> converge to K (mean PCC 0.634, 0.577, 0.574). This is the cleanest
+        evidence that coverage and identifiability are different problems.
+      </div>
+
+      <details>
+        <summary>All 30 single-dataset results</summary>
+        <div class="table-wrap">
+          <table>
+            <caption>Each pair of columns gives <i>L</i><sub>bio</sub>–K PCC and μ–target PCC for one run.</caption>
+            <thead>
+              <tr><th rowspan="2">Bias</th><th colspan="2">0.25 reads/codon</th><th colspan="2">2 reads/codon</th><th colspan="2">20 reads/codon</th></tr>
+              <tr class="subhead"><th><i>L</i><sub>bio</sub></th><th>μ</th><th><i>L</i><sub>bio</sub></th><th>μ</th><th><i>L</i><sub>bio</sub></th><th>μ</th></tr>
+            </thead>
+            <tbody>
+              <tr><th>3′ AA</th><td>0.904</td><td>0.452</td><td>0.901</td><td>0.771</td><td>0.898</td><td>0.890</td></tr>
+              <tr><th>3′ CC</th><td>0.247</td><td>0.645</td><td>0.348</td><td>0.883</td><td>0.405</td><td>0.935</td></tr>
+              <tr><th>3′ GG</th><td>0.305</td><td>0.513</td><td>0.493</td><td>0.819</td><td>0.511</td><td>0.913</td></tr>
+              <tr><th>3′ UU</th><td>0.950</td><td>0.631</td><td>0.702</td><td>0.873</td><td>0.527</td><td>0.934</td></tr>
+              <tr><th>5′ AA</th><td>0.491</td><td>0.509</td><td>0.566</td><td>0.813</td><td>0.587</td><td>0.907</td></tr>
+              <tr><th>5′ CC</th><td>0.311</td><td>0.618</td><td>0.382</td><td>0.871</td><td>0.399</td><td>0.934</td></tr>
+              <tr><th>5′ GG</th><td>0.402</td><td>0.562</td><td>0.420</td><td>0.846</td><td>0.460</td><td>0.924</td></tr>
+              <tr><th>5′ UU</th><td>0.930</td><td>0.624</td><td>0.413</td><td>0.874</td><td>0.389</td><td>0.934</td></tr>
+              <tr><th>GC &gt; 0.7</th><td>0.852</td><td>0.522</td><td>0.767</td><td>0.813</td><td>0.769</td><td>0.903</td></tr>
+              <tr><th>AU &gt; 0.7</th><td>0.944</td><td>0.532</td><td>0.779</td><td>0.807</td><td>0.792</td><td>0.902</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </details>
+    </section>
+
+    <section id="within">
+      <div class="section-head">
+        <div class="section-no">05 · Experiment II</div>
+        <div>
+          <h2>Within-depth cumulative panels recover the shared profile.</h2>
+          <p class="lead">
+            At each read depth, nine models jointly train on the first N=2,…,10 bias families.
+            These 27 experiments isolate the value of multiple complementary views while keeping
+            read depth fixed within a run.
+          </p>
+        </div>
+      </div>
+
+      <figure class="figure">
+        <img src="../analyses/artifacts/synthetic/gamma_ablation/iclr_figures/synthetic_recovery_overview.png" alt="Three-panel overview of shared biological recovery, gamma recovery, and single-dataset mu agreement across read depths" loading="lazy">
+        <figcaption>
+          Consolidated overview. (a) Shared <i>L</i><sub>bio</sub> recovery rises with dataset count
+          at every depth. (b) Identifiable gamma recovery is already extremely high. (c) The
+          single-dataset μ fit improves strongly with read depth. Panels (a–b) use the current
+          best-val-loss summaries; panel (c) uses the dedicated best-PCC single-dataset audit and
+          independently shows the same depth ordering. The primary single-dataset table above uses
+          best-val-loss throughout.
+        </figcaption>
+      </figure>
+
+      <div class="grid-3">
+        <article class="card metric-card">
+          <span>0.25 reads/codon, N=2 → N=10</span>
+          <strong>0.7770 → 0.9643</strong>
+          <p>PCC gain +0.1873; RMSE falls 65.4%.</p>
+        </article>
+        <article class="card metric-card">
+          <span>2 reads/codon, N=2 → N=10</span>
+          <strong>0.7968 → 0.9666</strong>
+          <p>PCC gain +0.1698; RMSE falls 63.7%.</p>
+        </article>
+        <article class="card metric-card">
+          <span>20 reads/codon, N=2 → N=10</span>
+          <strong>0.7832 → 0.9631</strong>
+          <p>PCC gain +0.1799; RMSE falls 63.3%.</p>
+        </article>
+      </div>
+
+      <h3>Shared biological profile</h3>
+      <div class="table-wrap">
+        <table>
+          <caption>Fisher-weighted transcript PCC and mean per-transcript shape RMSE against deterministic K, interior codons.</caption>
+          <thead>
+            <tr><th rowspan="2">N</th><th colspan="2">0.25 reads/codon</th><th colspan="2">2 reads/codon</th><th colspan="2">20 reads/codon</th></tr>
+            <tr class="subhead"><th>PCC</th><th>RMSE</th><th>PCC</th><th>RMSE</th><th>PCC</th><th>RMSE</th></tr>
+          </thead>
+          <tbody>
+            <tr><th>2</th><td>0.7770</td><td>0.3876</td><td>0.7968</td><td>0.3822</td><td>0.7832</td><td>0.4142</td></tr>
+            <tr><th>3</th><td>0.8746</td><td>0.2720</td><td>0.8827</td><td>0.2693</td><td>0.8838</td><td>0.2777</td></tr>
+            <tr><th>4</th><td>0.9114</td><td>0.2203</td><td>0.9195</td><td>0.2232</td><td>0.9165</td><td>0.2318</td></tr>
+            <tr><th>5</th><td>0.9251</td><td>0.1992</td><td>0.9354</td><td>0.1873</td><td>0.9303</td><td>0.2105</td></tr>
+            <tr><th>6</th><td>0.9330</td><td>0.1891</td><td>0.9421</td><td>0.1782</td><td>0.9403</td><td>0.1948</td></tr>
+            <tr><th>7</th><td>0.9486</td><td>0.1629</td><td>0.9507</td><td>0.1681</td><td>0.9507</td><td>0.1764</td></tr>
+            <tr><th>8</th><td>0.9541</td><td>0.1511</td><td>0.9580</td><td>0.1506</td><td>0.9576</td><td>0.1634</td></tr>
+            <tr><th>9</th><td>0.9599</td><td>0.1425</td><td>0.9643</td><td>0.1424</td><td>0.9600</td><td>0.1604</td></tr>
+            <tr><th>10</th><td class="good">0.9643</td><td class="good">0.1340</td><td class="good">0.9666</td><td class="good">0.1387</td><td class="good">0.9631</td><td class="good">0.1521</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout">
+        <strong class="label">Shared-signal conclusion</strong>
+        Every depth improves monotonically in PCC from N=2 to N=10. The largest gains occur early,
+        and the extra gain from N=8 to N=10 is only 0.0055–0.0102. The near-overlap of the three
+        curves shows that, for this benchmark, adding complementary bias views matters more for
+        disentanglement than increasing the count depth of the same view.
+      </div>
+
+      <h3>Dataset-specific gamma</h3>
+      <figure class="figure">
+        <img src="../analyses/artifacts/synthetic/gamma_ablation/gamma_recovery/plots_by_depth/gamma_recovery_main_val_by_read_depth__within__mass_free__rankp0p0.png" alt="Within-depth gamma recovery PCC and RMSE across dataset counts and read depths" loading="lazy">
+        <figcaption>
+          Gamma recovery after putting learned and programmed biases in the same joint
+          identifiability gauge. Shape recovery is uniformly high; amplitude error is lowest in the
+          deepest datasets and is not monotonic in cumulative panel size.
+        </figcaption>
+      </figure>
+
+      <details open>
+        <summary>All 27 within-depth gamma results</summary>
+        <div class="table-wrap">
+          <table>
+            <caption>Fisher-weighted transcript log-gamma PCC and mean per-profile log-gamma RMSE, interior codons.</caption>
+            <thead>
+              <tr><th rowspan="2">N</th><th colspan="2">0.25 reads/codon</th><th colspan="2">2 reads/codon</th><th colspan="2">20 reads/codon</th></tr>
+              <tr class="subhead"><th>PCC</th><th>RMSE</th><th>PCC</th><th>RMSE</th><th>PCC</th><th>RMSE</th></tr>
+            </thead>
+            <tbody>
+              <tr><th>2</th><td>0.9960</td><td>0.0265</td><td>0.9980</td><td>0.0181</td><td>0.9992</td><td>0.0112</td></tr>
+              <tr><th>3</th><td>0.9995</td><td>0.0114</td><td>0.9983</td><td>0.0239</td><td>0.9994</td><td>0.0122</td></tr>
+              <tr><th>4</th><td>0.9995</td><td>0.0136</td><td>0.9993</td><td>0.0170</td><td>0.9996</td><td>0.0092</td></tr>
+              <tr><th>5</th><td>0.9993</td><td>0.0167</td><td>0.9986</td><td>0.0198</td><td>0.9996</td><td>0.0097</td></tr>
+              <tr><th>6</th><td>0.9994</td><td>0.0138</td><td>0.9994</td><td>0.0137</td><td>0.9996</td><td>0.0097</td></tr>
+              <tr><th>7</th><td>0.9994</td><td>0.0153</td><td>0.9995</td><td>0.0140</td><td>0.9997</td><td>0.0103</td></tr>
+              <tr><th>8</th><td>0.9996</td><td>0.0120</td><td>0.9996</td><td>0.0144</td><td>0.9997</td><td>0.0089</td></tr>
+              <tr><th>9</th><td>0.9994</td><td>0.0185</td><td>0.9995</td><td>0.0205</td><td>0.9997</td><td>0.0095</td></tr>
+              <tr><th>10</th><td>0.9993</td><td>0.0165</td><td>0.9995</td><td>0.0153</td><td>0.9996</td><td>0.0107</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </details>
+
+      <p>
+        Across all 27 panels, gamma PCC ranges from 0.9960 to 0.9997 and log-RMSE from
+        0.0089 to 0.0265. Mean RMSE by depth is 0.0161, 0.0174, and 0.0102 for 0.25, 2,
+        and 20 reads/codon respectively. Thus depth improves gamma amplitude calibration on average,
+        while adding datasets primarily improves <i>L</i><sub>bio</sub> recovery.
+      </p>
+
+      <div class="callout caution">
+        <strong class="label">Cumulative-panel caveat</strong>
+        N is not randomized: each step adds the next named bias family. Dataset count and bias
+        composition are therefore confounded. The consistency across three depth regimes is strong
+        descriptive evidence, but multiple bias orders and training seeds are required for a causal
+        dataset-count curve.
+      </div>
+    </section>
+
+    <section id="inter">
+      <div class="section-head">
+        <div class="section-no">06 · Experiment III</div>
+        <div>
+          <h2>Cross-depth panels separate equal and quality-ranked gamma references.</h2>
+          <p class="lead">
+            Each cumulative step adds one bias family at all three depths, so B=1,…,10 corresponds
+            to N=3,6,…,30 training datasets. Every panel is run twice with identical data and seed;
+            only the fixed gamma-reference weighting changes.
+          </p>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <article class="card">
+          <h4>Equal reference</h4>
+          <p>Each selected dataset receives the same reference weight. Aggregated across bias families, each depth carries one third of the gauge reference.</p>
+        </article>
+        <article class="card">
+          <h4>Quality-rank reference</h4>
+          <p>Shallow, intermediate, and deep observations receive aggregate reference mass 1/6, 1/3, and 1/2. Training-loss weights are unchanged.</p>
+        </article>
+      </div>
+
+      <h3>Shared biological profile: no material weighting effect</h3>
+      <figure class="figure">
+        <img src="../analyses/artifacts/synthetic/inter_artificial_bias/shared_signal/inter_shared_signal_by_reference_weighting_mass_free.png" alt="Cross-depth shared-signal PCC and RMSE for equal and quality-rank gamma references" loading="lazy">
+        <figcaption>
+          The two weighting curves are nearly coincident. These policy-aware results read the
+          reference weighting from each resolved configuration and pair only runs with matching
+          data, seed, checkpoint, gauge, batch settings, and validation transcript hashes.
+        </figcaption>
+      </figure>
+
+      <div class="grid-2">
+        <article class="card metric-card">
+          <span>Quality-rank − equal, <i>L</i><sub>bio</sub> PCC</span>
+          <strong>mean −0.000446</strong>
+          <p>Median +0.000240; quality rank is higher in 5/10 panels.</p>
+        </article>
+        <article class="card metric-card">
+          <span>Quality-rank − equal, <i>L</i><sub>bio</sub> RMSE</span>
+          <strong>mean −0.000728</strong>
+          <p>Median −0.001025; quality rank is lower in 7/10 panels.</p>
+        </article>
+      </div>
+
+      <details>
+        <summary>All 10 paired cross-depth shared-signal results</summary>
+        <div class="table-wrap">
+          <table>
+            <caption>Mean per-transcript metrics. Every delta is quality_rank − equal; positive favors PCC, negative favors RMSE.</caption>
+            <thead>
+              <tr><th>Bias families</th><th>N datasets</th><th>Equal PCC</th><th>Quality PCC</th><th>Δ PCC</th><th>Equal RMSE</th><th>Quality RMSE</th><th>Δ RMSE</th></tr>
+            </thead>
+            <tbody>
+              <tr><th>1</th><td>3</td><td>0.7424</td><td>0.7424</td><td>−0.0000</td><td>0.4693</td><td>0.4689</td><td>−0.0004</td></tr>
+              <tr><th>2</th><td>6</td><td>0.7909</td><td>0.7863</td><td>−0.0046</td><td>0.4123</td><td>0.4046</td><td>−0.0077</td></tr>
+              <tr><th>3</th><td>9</td><td>0.8839</td><td>0.8846</td><td>+0.0007</td><td>0.2693</td><td>0.2677</td><td>−0.0016</td></tr>
+              <tr><th>4</th><td>12</td><td>0.9188</td><td>0.9174</td><td>−0.0014</td><td>0.2182</td><td>0.2198</td><td>+0.0016</td></tr>
+              <tr><th>5</th><td>15</td><td>0.9309</td><td>0.9314</td><td>+0.0005</td><td>0.2083</td><td>0.2030</td><td>−0.0054</td></tr>
+              <tr><th>6</th><td>18</td><td>0.9421</td><td>0.9402</td><td>−0.0018</td><td>0.1832</td><td>0.1865</td><td>+0.0033</td></tr>
+              <tr><th>7</th><td>21</td><td>0.9511</td><td>0.9531</td><td>+0.0020</td><td>0.1662</td><td>0.1647</td><td>−0.0015</td></tr>
+              <tr><th>8</th><td>24</td><td>0.9585</td><td>0.9598</td><td>+0.0013</td><td>0.1537</td><td>0.1519</td><td>−0.0018</td></tr>
+              <tr><th>9</th><td>27</td><td>0.9624</td><td>0.9601</td><td>−0.0023</td><td>0.1494</td><td>0.1561</td><td>+0.0067</td></tr>
+              <tr><th>10</th><td>30</td><td>0.9643</td><td>0.9655</td><td>+0.0012</td><td>0.1442</td><td>0.1437</td><td>−0.0005</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </details>
+
+      <p>
+        The cross-depth shared profile improves from PCC ≈0.742 at one bias family to ≈0.965 at
+        ten families, reproducing the within-depth diversity result. Equal and quality-rank
+        references do not materially change <i>L</i><sub>bio</sub>, which is expected because the
+        policy changes the gamma gauge rather than the training-loss mass.
+      </p>
+
+      <h3>Gamma recovery: quality rank is usually better</h3>
+      <figure class="figure">
+        <img src="../analyses/artifacts/synthetic/inter_artificial_bias/gamma/inter_gamma_recovery_by_reference_weighting_mass_free.png" alt="Cross-depth gamma recovery metrics for equal and quality-rank reference weighting" loading="lazy">
+        <figcaption>
+          Policy-aware pooled gamma metrics. The N=3 PCC point is omitted because a single bias
+          family observed at three depths has zero-variance programmed gamma after the cross-dataset
+          gauge; correlation is undefined there. Its well-defined error metrics remain in the table.
+        </figcaption>
+      </figure>
+
+      <div class="grid-2">
+        <article class="card metric-card">
+          <span>Pooled log-gamma PCC</span>
+          <strong>higher in 8/9</strong>
+          <p>Mean paired delta +0.002581; median +0.000243.</p>
+        </article>
+        <article class="card metric-card">
+          <span>Pooled log-gamma RMSE</span>
+          <strong>lower in 7/10</strong>
+          <p>Mean paired delta −0.006895; median −0.002674.</p>
+        </article>
+        <article class="card metric-card">
+          <span>Biased-site relative error</span>
+          <strong>lower in 7/10</strong>
+          <p>Mean delta −0.004970; median −0.003646.</p>
+        </article>
+        <article class="card metric-card">
+          <span>Biased sites within 10%</span>
+          <strong>higher in 7/10</strong>
+          <p>Mean +1.90 percentage points; median +0.99 points.</p>
+        </article>
+      </div>
+
+      <div class="callout">
+        <strong class="label">Largest practical gain</strong>
+        At two bias families (N=6), quality rank raises pooled gamma PCC from 0.9800 to 0.9988,
+        lowers log-RMSE from 0.0558 to 0.0148, and raises biased sites within 10% from 90.48% to
+        99.97%. Most later panels have smaller differences, and N=18 or N=24 worsens on some
+        metrics, so the effect is beneficial on average rather than uniform.
+      </div>
+
+      <details open>
+        <summary>All 10 paired cross-depth gamma results</summary>
+        <div class="table-wrap">
+          <table>
+            <caption>Pooled PCC/RMSE and programmed-site metrics. E=equal; Q=quality rank; Δ=Q−E.</caption>
+            <thead>
+              <tr>
+                <th>Bias families</th><th>N</th>
+                <th>E PCC</th><th>Q PCC</th><th>Δ PCC</th>
+                <th>E RMSE</th><th>Q RMSE</th><th>Δ RMSE</th>
+                <th>E site error</th><th>Q site error</th>
+                <th>E within 10%</th><th>Q within 10%</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><th>1</th><td>3</td><td>—</td><td>—</td><td>—</td><td>0.0000</td><td>0.0001</td><td>+0.0001</td><td>0.00%</td><td>0.00%</td><td>100.00%</td><td>100.00%</td></tr>
+              <tr><th>2</th><td>6</td><td>0.9800</td><td>0.9988</td><td class="good">+0.0188</td><td>0.0558</td><td>0.0148</td><td class="good">−0.0410</td><td>4.93%</td><td>2.61%</td><td>90.48%</td><td>99.97%</td></tr>
+              <tr><th>3</th><td>9</td><td>0.9986</td><td>0.9989</td><td>+0.0003</td><td>0.0164</td><td>0.0144</td><td>−0.0021</td><td>2.99%</td><td>2.77%</td><td>99.24%</td><td>99.88%</td></tr>
+              <tr><th>4</th><td>12</td><td>0.9987</td><td>0.9993</td><td>+0.0006</td><td>0.0178</td><td>0.0127</td><td>−0.0051</td><td>3.96%</td><td>3.19%</td><td>98.14%</td><td>99.02%</td></tr>
+              <tr><th>5</th><td>15</td><td>0.9962</td><td>0.9993</td><td>+0.0030</td><td>0.0290</td><td>0.0138</td><td>−0.0153</td><td>3.86%</td><td>3.47%</td><td>95.01%</td><td>98.91%</td></tr>
+              <tr><th>6</th><td>18</td><td>0.9993</td><td>0.9994</td><td>+0.0001</td><td>0.0144</td><td>0.0153</td><td>+0.0009</td><td>3.68%</td><td>3.84%</td><td>97.16%</td><td>96.65%</td></tr>
+              <tr><th>7</th><td>21</td><td>0.9993</td><td>0.9994</td><td>+0.0001</td><td>0.0140</td><td>0.0119</td><td>−0.0020</td><td>3.49%</td><td>3.15%</td><td>97.20%</td><td>98.79%</td></tr>
+              <tr><th>8</th><td>24</td><td>0.9995</td><td>0.9993</td><td>−0.0002</td><td>0.0121</td><td>0.0142</td><td>+0.0021</td><td>3.23%</td><td>3.30%</td><td>99.14%</td><td>98.06%</td></tr>
+              <tr><th>9</th><td>27</td><td>0.9992</td><td>0.9994</td><td>+0.0002</td><td>0.0156</td><td>0.0123</td><td>−0.0033</td><td>3.66%</td><td>3.17%</td><td>97.70%</td><td>98.79%</td></tr>
+              <tr><th>10</th><td>30</td><td>0.9991</td><td>0.9993</td><td>+0.0002</td><td>0.0169</td><td>0.0136</td><td>−0.0033</td><td>4.14%</td><td>3.47%</td><td>94.79%</td><td>97.83%</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </details>
+
+      <p>
+        The policy comparison uses 10/10 configured pairs: both artifacts are present, every
+        validation-ID hash matches, and each stored delta recomputes exactly as quality rank minus
+        equal. The conclusion is therefore specific: quality-ranked reference centering makes
+        cross-depth gamma recovery more robust without materially changing shared-profile recovery.
+      </p>
+    </section>
+
+    <section id="diagnostics">
+      <div class="section-head">
+        <div class="section-no">07 · Secondary diagnostics</div>
+        <div>
+          <h2>Interior failures are rare; boundary failures are a representation limit.</h2>
+          <p class="lead">
+            Additional analyses test biological structure, large gamma misses, boundary behavior,
+            and possible error absorption into <i>L</i><sub>bio</sub> or alpha. These diagnostics
+            refine the headline recovery result rather than replacing it.
+          </p>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <article class="card">
+          <h4>Strong interior gamma sites</h4>
+          <p>The sampled 0.25-depth failure analysis contains 342,732 strongly programmed positions and only 2 strong misses (0.00058%); both occur in the GC-composition family.</p>
+        </article>
+        <article class="card">
+          <h4>CDS boundaries</h4>
+          <p>A detailed within-panel audit reports a 39.65% strong-site miss rate over 10,374 boundary sites. These sites can depend on UTR sequence absent from the CDS-only model and are excluded from primary metrics.</p>
+        </article>
+        <article class="card">
+          <h4>Error compensation</h4>
+          <p>The best-val-loss compensation analysis finds insufficient evidence to attribute residual gamma misses consistently to <i>L</i><sub>bio</sub> leakage or alpha absorption.</p>
+        </article>
+        <article class="card">
+          <h4>Mass conservation</h4>
+          <p>No fair mass-conserved versus mass-free pair is available. Every completed experiment in the current inventory is mass-free, so no mass-mode conclusion is made.</p>
+        </article>
+      </div>
+
+      <h3>Biological-structure checks</h3>
+      <p>
+        The structural scorecard is a secondary snapshot covering 26 within-depth cumulative
+        conditions (the 20-read/codon N=10 run was not yet present when that report was generated).
+        It measures motif enrichment and terminal ramps in learned <i>L</i><sub>bio</sub>; these are
+        distinct diagnostics, not a composite model score.
+      </p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Depth</th><th>Conditions</th><th>P &gt;5%</th><th>PP &gt;5%</th><th>PPP &gt;5%</th><th>Positive 5′ ramp</th><th>Positive stop ramp</th><th>Mean <i>L</i><sub>bio</sub> 5′ / stop log₂ enrichment</th></tr>
+          </thead>
+          <tbody>
+            <tr><th>0.25</th><td>9</td><td>9/9</td><td>9/9</td><td>9/9</td><td>3/9</td><td>7/9</td><td>−0.0050 / +0.0080</td></tr>
+            <tr><th>2</th><td>9</td><td>9/9</td><td>9/9</td><td>9/9</td><td>3/9</td><td>7/9</td><td>−0.0006 / +0.0008</td></tr>
+            <tr><th>20</th><td>8</td><td>5/8</td><td>5/8</td><td>5/8</td><td>0/8</td><td>5/8</td><td>−0.0080 / +0.0282</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>
+        The near-zero mean terminal enrichment of shared <i>L</i><sub>bio</sub> is reassuring: strong
+        dataset-specific terminal structure is not systematically leaking into the shared profile.
+        Motif enrichment remains visible, although the high-depth structural snapshot is incomplete.
+        The current <code>css_recall_by_dataset.csv</code> is empty, so no CSS-recall conclusion is
+        reported here.
+      </p>
+
+      <div class="callout caution">
+        <strong class="label">Checkpoint-specific diagnostic</strong>
+        The older detailed within-panel site report uses best-PCC artifacts and covers 26/27 panels,
+        whereas the primary tables above use best-validation-loss artifacts and cover all 77 logical
+        runs. Its N=10, 2-read/codon panel reports pooled gamma PCC 0.9989, log-RMSE 0.0224,
+        and 88.04% of programmed sites within 10%. Those values support the same near-exact recovery
+        conclusion but are not mixed numerically into the primary best-val-loss comparisons.
+      </div>
+    </section>
+
+    <section id="conclusions">
+      <div class="section-head">
+        <div class="section-no">08 · Final conclusions</div>
+        <div>
+          <h2>What the synthetic program establishes—and what it does not.</h2>
+          <p class="lead">
+            The experiments validate the intended factorization under known synthetic truth. The
+            strongest result is multi-view identifiability: complementary datasets let the model
+            separate shared kinetics from systematic observation bias.
+          </p>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="verdict">
+          <h3>Supported by the results</h3>
+          <ul class="plain-list">
+            <li>Multiple differently biased datasets recover shared K far better than a single dataset.</li>
+            <li>The shared-profile gain with cumulative panel size repeats at all three read depths.</li>
+            <li>Gauge-identifiable gamma shapes are recovered with near-perfect correlation and small log error.</li>
+            <li>Greater read depth primarily improves μ reconstruction and gamma amplitude precision.</li>
+            <li>Quality-ranked cross-depth centering usually improves gamma while leaving <i>L</i><sub>bio</sub> essentially unchanged.</li>
+            <li>Interior strong gamma misses are extremely rare in the analyzed failure sample.</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>Not established</h3>
+          <ul class="plain-list">
+            <li>A pure causal effect of dataset count: panel size and added bias identity are confounded.</li>
+            <li>Training-seed uncertainty: all runs use seed 42.</li>
+            <li>A mass-conservation effect: no matched mass-conserved runs exist.</li>
+            <li>Recovery of raw, ungauged bias magnitude: that quantity is not identifiable.</li>
+            <li>Fair boundary recovery without the missing UTR sequence context.</li>
+            <li>CSS sensitivity in this result snapshot: the exported CSS table is empty.</li>
+            <li>Generalization of synthetic gamma semantics to real biological datasets.</li>
+          </ul>
+        </div>
+      </div>
+
+      <h3>Recommended next experiments</h3>
+      <div class="grid-3">
+        <article class="card"><h4>Randomize panel order</h4><p>Repeat several bias permutations so panel size can be separated from the identity of the newly added mechanism.</p></article>
+        <article class="card"><h4>Add training seeds</h4><p>Estimate between-run uncertainty and determine whether the small weighting differences are stable.</p></article>
+        <article class="card"><h4>Match mass modes</h4><p>Run identical data panels with and without mass conservation before making a mass-mode claim.</p></article>
+        <article class="card"><h4>Export held-out test artifacts</h4><p>Mirror the explicit best-val-loss validation artifact naming on a locked test split.</p></article>
+        <article class="card"><h4>Supply boundary context</h4><p>Add the UTR/RPF sequence context needed to evaluate terminal programmed biases fairly.</p></article>
+        <article class="card"><h4>Pre-register primary metrics</h4><p>Keep shared PCC/RMSE, gamma PCC/RMSE, and programmed-site tolerance distinct; avoid a composite score.</p></article>
+      </div>
+    </section>
+
+    <section id="artifacts">
+      <div class="section-head">
+        <div class="section-no">09 · Reproducibility</div>
+        <div>
+          <h2>Source artifacts for every claim.</h2>
+          <p class="lead">
+            The HTML summarizes generated tables rather than parsing experiment names as scientific
+            truth. Resolved configuration fields define depth, dataset panel, mass mode, checkpoint,
+            and gamma-reference weighting.
+          </p>
+        </div>
+      </div>
+
+      <ul class="source-list">
+        <li><a href="../analyses/artifacts/synthetic/gamma_ablation/recovery/run_inventory.csv">Complete selected-run inventory</a><small>79 physical attempts; 77 selected logical runs.</small></li>
+        <li><a href="../analyses/artifacts/synthetic/gamma_ablation/recovery/recovery_by_condition.csv">Shared and observed-profile results</a><small>All single, within-depth, and cross-depth conditions.</small></li>
+        <li><a href="../analyses/artifacts/synthetic/gamma_ablation/gamma_recovery/gamma_recovery_by_condition.csv">Gamma recovery by condition</a><small>All 47 multi-dataset panels; the N=3 cross-depth PCC is degenerate.</small></li>
+        <li><a href="../analyses/artifacts/synthetic/single_dataset_mu/single_20260830_205110/best_pcc/single_dataset_mu_pcc_summary.csv">Dedicated single-dataset μ audit</a><small>Best-PCC checkpoint corroboration with per-bias confidence intervals.</small></li>
+        <li><a href="../analyses/artifacts/synthetic/gamma_ablation/report/REPORT.md">Recovery and biological-quality report</a><small>Interpretation guardrails and structural scorecard.</small></li>
+        <li><a href="../analyses/artifacts/synthetic/inter_artificial_bias/INTER_ARTIFICIAL_BIAS_ANALYSIS.md">Cross-depth analysis index</a><small>Setup audit and policy-aware report links.</small></li>
+        <li><a href="../analyses/artifacts/synthetic/inter_artificial_bias/shared_signal/inter_shared_signal_equal_vs_quality_rank.tsv">Paired shared-signal weighting table</a><small>Ten hash-matched equal/quality-rank pairs.</small></li>
+        <li><a href="../analyses/artifacts/synthetic/inter_artificial_bias/gamma/inter_gamma_equal_vs_quality_rank.tsv">Paired gamma weighting table</a><small>Pooled and programmed-site metrics with metric-specific comparability.</small></li>
+        <li><a href="../analyses/artifacts/synthetic/shared_profile_recovery/GAMMA_RECOVERY.md">Detailed within-panel gamma report</a><small>Site-level, gauge, and boundary diagnostics for the best-PCC snapshot.</small></li>
+        <li><a href="../analyses/artifacts/synthetic/shared_profile_recovery/gamma_failure_analysis/GAMMA_FAILURE_ANALYSIS.md">Gamma failure-mode report</a><small>Strong-site evidence and read-support diagnostics.</small></li>
+        <li><a href="../analyses/artifacts/synthetic/shared_profile_recovery/gamma_compensation_analysis/GAMMA_COMPENSATION_REPORT.md">Gamma compensation report</a><small>Tests for leakage into shared signal or alpha.</small></li>
+        <li><a href="synthetic_experiment_setup.html">Synthetic experiment setup</a><small>Companion design and configuration document.</small></li>
+        <li><a href="../config/config_ribounmix_synthetic.yaml">Synthetic model configuration</a><small>Base data, model, loss, and training settings.</small></li>
+      </ul>
+
+      <h3>Analysis entry points</h3>
+      <ul class="plain-list">
+        <li><a href="../analyses/synthetic_gamma_ablation_lbio_recovery.py"><code>13_gamma_ablation_recovery.py</code></a> — all-run shared/observed recovery inventory.</li>
+        <li><a href="../analyses/synthetic_gamma_ablation_gamma_recovery.py"><code>20_gamma_ablation_gamma_recovery.py</code></a> — all-run identifiable gamma recovery.</li>
+        <li><a href="../analyses/synthetic_gamma_ablation_biological_quality.py"><code>14_gamma_ablation_biological_quality.py</code></a> — motif, ramp, and terminal diagnostics.</li>
+        <li><a href="../analyses/analyze_synthetic_inter_artificial_bias.py"><code>analyze_synthetic_inter_artificial_bias.py</code></a> — cross-depth setup and gamma-policy comparison.</li>
+        <li><a href="../analyses/analyze_synthetic_inter_shared_signal.py"><code>analyze_synthetic_inter_shared_signal.py</code></a> — cross-depth shared-signal pairing.</li>
+        <li><a href="../run_synthetic_bias_read_depth_local.sh"><code>run_synthetic_bias_read_depth_local.sh</code></a> and <a href="../run_synthetic_bias_read_depth_single_dataset_local.sh"><code>run_synthetic_bias_read_depth_single_dataset_local.sh</code></a> — experiment launchers.</li>
+      </ul>
+    </section>
+  </main>
+
+  <footer>
+    RiboUnmix synthetic experiment synthesis · Generated from local analysis artifacts ·
+    <a href="#top">Back to top</a>
+  </footer>
+</body>
+</html>

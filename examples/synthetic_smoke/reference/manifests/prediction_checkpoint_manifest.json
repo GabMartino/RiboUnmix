@@ -1,0 +1,13 @@
+{
+  "best_val_loss": {
+    "checkpoint_path": "outputs/synthetic_smoke/checkpoints/artificial_bias_3prime_cc_artificial_bias_5prime_aa/queueNB_DataN2_h0ca317_Loss-rNB1p0-cPCC0p5-cVSTPCC0p5-Gamma0p0-Reducetranscript_balanced-NBModestandard_nb-Alphalearned-Beta0p0_Sampling_transcript_grouped_multidataset_pairs_GammaRawB8p0-CDSMax240_GammaCtrFixedRefEqual_FeatPresetBaseline_SeqFeatBase/version_0/val-loss-epoch=1-val_loss=2.2098.ckpt",
+    "observation_dependent_dummy_outputs_are_scientific": false,
+    "output_path": "outputs/synthetic_smoke/results/artificial_bias_3prime_cc_artificial_bias_5prime_aa/queueNB_DataN2_h0ca317_Loss-rNB1p0-cPCC0p5-cVSTPCC0p5-Gamma0p0-Reducetranscript_balanced-NBModestandard_nb-Alphalearned-Beta0p0_Sampling_transcript_grouped_multidataset_pairs_GammaRawB8p0-CDSMax240_GammaCtrFixedRefEqual_FeatPresetBaseline_SeqFeatBase/predictions_main_val_best_val_loss_artificial_bias_3prime_cc_artificial_bias_5prime_aa.parquet",
+    "prediction_rows": 32,
+    "sequence_only_shared_profile_prediction": false,
+    "shared_profile_output_path": null,
+    "split_name": "val",
+    "transcript_count": 16,
+    "transcript_id_hash": "1f6de1faa9ddead3b3317ee8ddbca55f78462b3187a33afc1a8f8b19d5c6638b"
+  }
+}

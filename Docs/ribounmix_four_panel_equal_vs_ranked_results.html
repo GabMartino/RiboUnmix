@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Evidence-backed experimental rationale, completed four-panel results, partial quality-ranking sensitivity, limitations, and manuscript-ready text for RiboUnmix.">
+  <title>RiboUnmix · Four-panel reproducibility and reference-weight sensitivity</title>
+  <style>
+    :root{--paper:#fff;--canvas:#f3f5f7;--ink:#182536;--muted:#546575;--line:#dce3e9;--equal:#0072b2;--ranked:#bf4c00;--teal:#176858;--soft:#eef4f8;--warm:#fff6e9;--purple:#75528c;--serif:"Latin Modern Roman","CMU Serif",Georgia,"Times New Roman",serif;--sans:system-ui,-apple-system,"Segoe UI",sans-serif}
+    *{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:24px}body{margin:0;background:var(--canvas);color:var(--ink);font:18px/1.65 var(--serif)}a{color:#075d91;text-underline-offset:3px}a:hover{color:var(--ranked)}a:focus-visible,summary:focus-visible{outline:3px solid #d88435;outline-offset:5px}p{margin:.7em 0 1em}strong{font-weight:700}sub,sup{font-size:.74em;line-height:0}code,pre{font-family:ui-monospace,"DejaVu Sans Mono",monospace}code{font-size:.82em;overflow-wrap:anywhere}pre{font-size:13px;line-height:1.7;white-space:pre-wrap;overflow-wrap:anywhere;background:#f1f4f6;border:1px solid var(--line);padding:18px;border-radius:8px}ul,ol{padding-left:1.35em}li{margin:.4em 0}h1,h2,h3,h4{line-height:1.18}h1{font:500 clamp(2.5rem,4vw,4rem)/1.05 var(--serif);letter-spacing:-.035em;margin:18px 0 24px;max-width:960px}h2{font:650 1.6rem/1.2 var(--sans);letter-spacing:-.03em;margin:0 0 20px}h3{font:650 1.08rem/1.4 var(--sans);margin:28px 0 10px}h4{font:650 1rem/1.35 var(--sans);margin:16px 0 8px}.eyebrow,.step,.badge,.small,.source,.sidebar,.button,.kicker{font-family:var(--sans)}.eyebrow{font-size:12px;font-weight:700;letter-spacing:.13em;text-transform:uppercase;color:var(--teal)}.masthead{background:var(--paper);border-top:7px solid var(--teal);border-bottom:1px solid var(--line)}.hero{max-width:1240px;margin:auto;padding:54px 36px 38px}.subtitle{max-width:850px;font-size:1.24rem;color:var(--muted)}.hero-summary{max-width:920px;border-left:3px solid var(--teal);padding:4px 0 4px 22px;margin:26px 0}.badges{display:flex;gap:9px;flex-wrap:wrap;margin-top:24px}.badge{font-size:12px;font-weight:650;line-height:1.5;border:1px solid var(--line);border-radius:30px;padding:6px 12px;background:#f8fafb}.badge.done{background:#eef7f3;color:var(--teal);border-color:#cae4d8}.badge.pending{background:var(--warm);color:#895010;border-color:#ead3b2}.actions{display:flex;flex-wrap:wrap;gap:12px;margin-top:26px}.button{display:inline-block;border:1px solid #b8c9d6;border-radius:7px;padding:9px 14px;text-decoration:none;font-size:13px;font-weight:600;background:#fff}.button.primary{background:var(--ink);border-color:var(--ink);color:#fff}.layout{max-width:1300px;margin:auto;display:grid;grid-template-columns:235px minmax(0,1fr);gap:32px;padding:36px 30px 80px}.sidebar{font-size:12px;color:var(--muted);align-self:start;position:sticky;top:22px}.sidebar h2{font-size:11px;letter-spacing:.12em;text-transform:uppercase;margin:0 0 14px}.sidebar ol{padding:0;list-style:none;counter-reset:toc}.sidebar li{counter-increment:toc;margin:0}.sidebar a{display:block;padding:8px 0;color:var(--muted);text-decoration:none;border-bottom:1px solid #e1e7ed}.sidebar a:before{content:counter(toc,decimal-leading-zero) " ";font-variant-numeric:tabular-nums;color:#8a99a6;margin-right:5px}.sidebar a:hover{color:var(--equal)}.sidebar .meta{font-size:11px;margin-top:22px;line-height:1.7}.content{min-width:0}.section{background:var(--paper);border:1px solid var(--line);border-radius:12px;padding:34px 36px;margin-bottom:24px;scroll-margin-top:22px}.step{font-size:11px;letter-spacing:.1em;font-weight:750;text-transform:uppercase;color:var(--teal);margin-bottom:12px}.lead{font-size:1.12rem}.callout{background:var(--soft);border-left:3px solid var(--equal);padding:16px 20px;margin:20px 0;border-radius:0 7px 7px 0}.callout p:last-child{margin-bottom:0}.callout.warm{background:var(--warm);border-color:#b88028}.callout.green{background:#eff7f3;border-color:var(--teal)}.callout.purple{background:#f5f1f8;border-color:var(--purple)}.small{font-size:12px;line-height:1.65;color:var(--muted)}.source{font-size:12px;line-height:1.6;color:var(--muted);margin-top:12px;overflow-wrap:anywhere}.table-wrap{overflow-x:auto;margin:20px 0}table{border-collapse:collapse;width:100%;font:14px/1.5 var(--sans)}caption{text-align:left;font-weight:650;color:var(--ink);padding-bottom:12px}th,td{text-align:left;vertical-align:top;padding:12px 10px;border-bottom:1px solid var(--line)}thead th{font-size:12px;color:var(--muted);background:#f5f7f9;border-top:1px solid var(--line)}tbody th{font-weight:600}td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}.total{background:#eff6f3;font-weight:650}.equal{color:var(--equal)}.ranked{color:var(--ranked)}.status-done{color:var(--teal);font-weight:650}.status-pending{color:#936017;font-weight:650}.placeholder{display:inline-block;border:1px dashed #c39a5b;background:#fff9ed;padding:2px 8px;border-radius:4px;color:#84521b;font:12px/1.5 var(--sans)}.two-col{display:grid;grid-template-columns:1fr 1fr;gap:20px}.card{padding:20px 22px;background:#f7f9fb;border:1px solid var(--line);border-radius:8px}.card h3{margin-top:0}.card p:last-child{margin-bottom:0}.flow{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:22px 0}.flow .node{padding:18px;border:1px solid var(--line);border-radius:8px;background:#fafcfd;font:14px/1.55 var(--sans)}.node b{display:block;margin-bottom:5px;color:var(--teal)}.node .arms{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}.arms span{display:inline-block;padding:3px 7px;border-radius:4px;background:#eef5fa}.arms .ranked{background:#fff1e7}.equation{background:#f8fafc;border:1px solid var(--line);border-radius:8px;padding:18px;margin:20px 0;overflow-x:auto;text-align:center}.equation .words{display:block;font:12px/1.65 var(--sans);color:var(--muted);margin-top:10px}.equation-line{font-family:"Latin Modern Math","Cambria Math",var(--serif);font-size:21px;line-height:1.85}.equation-line + .equation-line{margin-top:7px}math{font-family:"Latin Modern Math","Cambria Math",serif;font-size:1.08em}math[display=block]{margin:8px 0}.formula-list{font-family:"Latin Modern Math","Cambria Math",var(--serif);font-size:19px}figure{margin:25px 0;border:1px solid var(--line);border-radius:9px;background:#fff;overflow:hidden}figure img{display:block;max-width:100%;height:auto;width:100%;background:#fff}figcaption{padding:16px 20px;border-top:1px solid var(--line);font:13px/1.65 var(--sans);color:var(--muted)}figcaption strong{color:var(--ink)}figure .downloads{display:block;margin-top:9px}details{margin:20px 0;border:1px solid var(--line);border-radius:8px;padding:0 18px;background:#fbfcfd}summary{cursor:pointer;padding:15px 0;font:650 14px/1.5 var(--sans)}details[open]{padding-bottom:18px}.draft{background:#fcfaf5;border:1px solid #e2d8c6;border-radius:8px;padding:24px 26px;margin:18px 0}.draft .kicker{font-size:11px;color:#8d6a37;font-weight:700;letter-spacing:.08em;text-transform:uppercase;margin-bottom:12px}.draft p:last-child{margin-bottom:0}.draft.pending{background:#fff9ed;border-style:dashed}.evidence-map td:first-child{width:24%}.intuition{counter-reset:intuition}.intuition article{margin:24px 0;padding-left:48px;position:relative}.intuition article:before{counter-increment:intuition;content:counter(intuition);position:absolute;left:0;top:0;width:29px;height:29px;text-align:center;line-height:29px;font:650 15px/29px var(--sans);color:var(--teal);background:#e9f3ee;border-radius:50%}.intuition h3{margin-top:0}.footer{font:12px/1.7 var(--sans);color:var(--muted);padding:15px 5px}.hash{word-break:break-all}.nowrap{white-space:nowrap}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+    @media(max-width:1000px){.layout{grid-template-columns:180px minmax(0,1fr);gap:20px;padding:24px 18px 50px}.section{padding:26px}.hero{padding:38px 28px}.two-col{grid-template-columns:1fr}}
+    @media(max-width:760px){body{font-size:17px}.layout{display:block;padding:18px 12px 40px}.sidebar{position:static;margin:0 8px 22px}.sidebar ol{display:grid;grid-template-columns:1fr 1fr;gap:0 18px}.sidebar .meta{display:none}.hero{padding:30px 22px}.section{padding:24px 20px}h1{font-size:2.6rem}h2{font-size:1.4rem}.flow{grid-template-columns:1fr}.equation-line{font-size:18px}.draft{padding:19px}.intuition article{padding-left:40px}}
+    @media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+    @media print{@page{size:A4;margin:17mm 16mm}body{background:#fff;font-size:12pt;line-height:1.48}.masthead{border-top:0}.hero{padding:0 0 18px}.hero h1{font-size:30pt}.layout{display:block;padding:0;max-width:none}.sidebar,.actions{display:none}.section{padding:22px 0;border:0;border-radius:0;border-top:1px solid #aaa;margin:0}.badge{font-size:9pt}.step,.small,.source{font-size:9pt}h2{font-size:18pt;break-after:avoid}h3{font-size:12pt;break-after:avoid}table{font-size:10pt}.table-wrap{overflow:visible}th,td{padding:8px 6px}tr,figure,.callout,.draft,.equation{break-inside:avoid}figure img{max-height:120mm;object-fit:contain}figcaption{font-size:9pt}.two-col{display:block}.card{margin-bottom:12px}a{color:#182536}pre{font-size:9pt}.section .lead{font-size:13pt}}
+  </style>
+</head>
+<body>
+<header class="masthead">
+  <div class="hero">
+    <div class="eyebrow">RiboUnmix · Experimental narrative · Evidence snapshot: 10 September 2026</div>
+    <h1>Does the shared profile survive<br>a change of experiments?</h1>
+    <p class="subtitle">The rationale, design and results of the four-panel experiment — and what equal versus quality-ranked reference weights tell us about the learned shared representation.</p>
+    <div class="hero-summary">
+      <p><strong>The result so far.</strong> Four source-disjoint, equal-reference models produce substantially concordant, but non-identical, shared profiles on held-out transcripts. The currently matched ranked comparison is mixed: a small improvement in full-CDS PCC accompanies higher inter-panel RMSE. Neither result establishes biological ground truth.</p>
+    </div>
+    <div class="badges" aria-label="Study status">
+      <span class="badge done">Primary equal-weight study: 4/4 panels</span>
+      <span class="badge pending">Ranked sensitivity: 2/4 panels</span>
+      <span class="badge">114 datasets · 85 source families</span>
+      <span class="badge">1,593 common test transcripts</span>
+    </div>
+    <div class="actions">
+      <a class="button primary" href="#origin">Read the experimental story</a>
+      <a class="button" href="#drafting">Go to manuscript-ready text</a>
+      <a class="button" href="#sources">Inspect sources and commands</a>
+    </div>
+  </div>
+</header>
+<div class="layout">
+  <nav class="sidebar" aria-label="Report sections">
+    <h2>From rationale to article</h2>
+    <ol>
+      <li><a href="#origin">Where the experiment comes from</a></li>
+      <li><a href="#objective">What we want to establish</a></li>
+      <li><a href="#weights">Why the reference weights matter</a></li>
+      <li><a href="#design">What was actually trained</a></li>
+      <li><a href="#measurement">How agreement is measured</a></li>
+      <li><a href="#equal-results">Completed four-panel results</a></li>
+      <li><a href="#ranked-results">Equal versus ranked results</a></li>
+      <li><a href="#intuition">Intuitions and explanations</a></li>
+      <li><a href="#robustness">Supporting robustness checks</a></li>
+      <li><a href="#unfinished">Unfinished work and claim limits</a></li>
+      <li><a href="#drafting">ICLR drafting blocks</a></li>
+      <li><a href="#sources">Evidence and reproducibility</a></li>
+    </ol>
+    <div class="meta">A drafting document, not a preregistration.<br>Observed results, mechanistic intuition and pending hypotheses are labeled separately.<br><br>The HTML and equations work offline. Figure and source links use the surrounding repository.</div>
+  </nav>
+  <main class="content">
+
+    <section class="section" id="origin">
+      <div class="step">01 · Origin</div>
+      <h2>Good reconstruction is not enough to validate the shared signal</h2>
+      <p class="lead">RiboUnmix is intended to distinguish a sequence-dependent shared profile from effects that vary between Ribo-seq datasets. A model can fit measured counts well without putting the scientifically relevant structure into the intended branch.</p>
+      <p>The original <a href="ribounmix_five_real_data_experiments.html#exp1">five-experiment real-data plan, Experiment 1</a>, therefore asks a different question from prediction accuracy: <em>if we change the entire collection of experiments used for training, do we still obtain a similar shared profile for the same previously held-out sequence?</em></p>
+      <p>This is the rationale for four panels. Each model sees a different collection of experimental observations. The test sequences are held fixed. Agreement is informative because it cannot be attributed to training on the same dataset or the same publication family in two panels.</p>
+      <div class="callout green">
+        <strong>The intended argument is convergence of evidence.</strong>
+        <p>Different experimental collections → separately fitted models → similar positional shared profiles on the same held-out transcripts. That supports a representation that is not specific to one collection of experiments.</p>
+      </div>
+      <p>It is not, by itself, an identification theorem. The models still share the architecture, sequence inputs and training procedure; broadly shared observation effects or model preferences could also be reproducible. This is why the original plan combines panel convergence with dataset-effect fingerprints, QC associations, biological motif analyses and dataset-diversity experiments. This report covers the panel experiment and its reference-weight sensitivity, not the completion of that wider program.</p>
+      <p class="source">Conceptual sources: <a href="ribounmix_five_real_data_experiments.html">original real-data validation plan</a>; <a href="model_mathematics.html">model mathematics</a>. Here, the exported name <code>L_bio</code> is denoted <i>L</i><sub>t</sub>; the variable name is not a biological-truth label.</p>
+    </section>
+
+    <section class="section" id="objective">
+      <div class="step">02 · Objective</div>
+      <h2>Separate the main hypothesis from the weighting question</h2>
+      <div class="table-wrap">
+        <table class="evidence-map">
+          <caption>Three distinct scientific questions</caption>
+          <thead><tr><th scope="col">Question</th><th scope="col">Comparison needed</th><th scope="col">What the present evidence provides</th></tr></thead>
+          <tbody>
+            <tr><th scope="row">Is the shared representation reproducible?</th><td>Models trained on disjoint experimental panels, evaluated on identical held-out transcripts.</td><td><span class="status-done">Completed for equal weights.</span> All four panels and six pairwise comparisons are available.</td></tr>
+            <tr><th scope="row">Does the decomposition improve reproducibility?</th><td>Full RiboUnmix versus a matched shared-only model with γ = 1, and the direct sequence-to-profile baseline proposed in the plan.</td><td><span class="status-pending">Not established by these two run roots.</span> Equal and ranked arms both retain the dataset-specific branch.</td></tr>
+            <tr><th scope="row">Does a quality-informed reference improve or change reproducibility?</th><td>The same panels, splits and training settings, with equal versus QC-ranked reference weights.</td><td><span class="status-pending">Partially evaluated.</span> Only pair 1–2 currently has results under both policies.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>The stronger hypothesis written in the original plan is that the full model should be more reproducible than its γ = 1 control. <strong>The equal-versus-ranked comparison does not replace that control.</strong> It asks how the chosen reference measure affects a decomposition that is already present in both arms.</p>
+      <div class="two-col">
+        <div class="card"><h3 class="equal">Primary: equal reference</h3><p>Test convergence without privileging a dataset through the gamma-reference weights. Quality-balanced panel construction and local transcript reliability weighting are still used.</p></div>
+        <div class="card"><h3 class="ranked">Secondary: quality-ranked reference</h3><p>Test the sensitivity of the shared representation to an observable-QC-based definition of the reference. A benefit is an empirical hypothesis, not a required outcome.</p></div>
+      </div>
+      <p class="source">This ordering is not chosen from the observed scores: uniform π is the primary policy in <a href="ribounmix_five_real_data_experiments.html#exp1">the original plan</a>, and the <a href="../results/my_panels_qrank_a100_b32_20260908_103510/panel_manifest.json">ranked run manifest</a> explicitly records “secondary sensitivity analysis.”</p>
+    </section>
+
+    <section class="section" id="weights">
+      <div class="step">03 · Mechanism</div>
+      <h2>π defines the reference for the decomposition, not a second loss weight</h2>
+      <p>The relevant model relationship is a multiplicative decomposition of the expected measured profile:</p>
+      <div class="equation">
+        <math display="block" xmlns="http://www.w3.org/1998/Math/MathML" aria-label="mu d t i equals S d t times L t i times gamma d t i">
+          <msub><mi>μ</mi><mrow><mi>d</mi><mi>t</mi><mi>i</mi></mrow></msub><mo>=</mo><msub><mi>S</mi><mrow><mi>d</mi><mi>t</mi></mrow></msub><msub><mi>L</mi><mrow><mi>t</mi><mi>i</mi></mrow></msub><msub><mi>γ</mi><mrow><mi>d</mi><mi>t</mi><mi>i</mi></mrow></msub>
+        </math>
+        <span class="words"><i>S</i>: dataset–transcript scale anchor · <i>L</i>: positive, mean-one shared profile · γ: positive dataset-specific effect.</span>
+      </div>
+      <p>Let <i>g</i><sub>dti</sub> = log γ<sub>dti</sub>. The fixed-reference constraints make the weighted mean of <i>g</i> across the reference datasets zero at each codon, and its positional mean zero within each dataset–transcript profile:</p>
+      <div class="equation">
+        <div class="equation-line">∑<sub>d ∈ D<sup>(k)</sup></sub> π<sub>d</sub><sup>(k)</sup> g<sub>dti</sub><sup>(k)</sup> = 0 &emsp; and &emsp; mean<sub>i</sub> g<sub>dti</sub><sup>(k)</sup> = 0.</div>
+        <span class="words">Equivalently, the corresponding geometric means of γ are one. In these runs the reference set is the complete selected panel.</span>
+      </div>
+      <p>Consequently, for the model’s <em>fitted means</em> within a reference panel,</p>
+      <div class="equation">
+        <math display="block" xmlns="http://www.w3.org/1998/Math/MathML" aria-label="log L t i equals the pi weighted sum across reference datasets of log mu d t i divided by S d t">
+          <mi mathvariant="normal">log</mi><msub><mi>L</mi><mrow><mi>t</mi><mi>i</mi></mrow></msub><mo>=</mo><munder><mo>∑</mo><mrow><mi>d</mi><mo>∈</mo><mi mathvariant="script">D</mi></mrow></munder><msub><mi>π</mi><mi>d</mi></msub><mi mathvariant="normal">log</mi><mo>(</mo><mfrac><msub><mi>μ</mi><mrow><mi>d</mi><mi>t</mi><mi>i</mi></mrow></msub><msub><mi>S</mi><mrow><mi>d</mi><mi>t</mi></mrow></msub></mfrac><mo>)</mo><mo>.</mo>
+        </math>
+        <span class="words">A consequence of the model constraints — not an estimator obtained by geometrically averaging measured counts.</span>
+      </div>
+      <p>This makes the role of π concrete: it determines which reference-weighted pattern cannot remain as a common effect in the centered gamma branch. Changing π changes the centering operation and the gradients through it during training, and can therefore change what the learned shared branch represents. The ranked outputs here come from separately trained models; we did not change π in a frozen checkpoint after training.</p>
+      <details>
+        <summary>The exact two-way centering operation</summary>
+        <p>For raw log-gamma scores <i>a</i><sub>dti</sub>, set <i>c</i><sub>ti</sub> = ∑<sub>d</sub> π<sub>d</sub><i>a</i><sub>dti</sub>, <i>m</i><sub>dt</sub> = mean<sub>i</sub><i>a</i><sub>dti</sub>, and ā<sub>t</sub> = ∑<sub>d</sub>π<sub>d</sub><i>m</i><sub>dt</sub>. For reference datasets the centered score is</p>
+        <div class="equation-line">g<sub>dti</sub> = a<sub>dti</sub> − c<sub>ti</sub> − m<sub>dt</sub> + ā<sub>t</sub>, &emsp; γ<sub>dti</sub> = exp(g<sub>dti</sub>).</div>
+        <p>This is a fixed, checkpointed reference, not the set of datasets accidentally co-occurring in a minibatch. Both arms use the mass-free output: the γ<i>L</i> product is not renormalized to conserve the measured count total. The positional gamma constraint is an explicit identification convention in that mass-free model.</p>
+        <p class="source">See <a href="model_mathematics.html">model mathematics, §§5.2–5.4</a>. This report does not infer that the constrained decomposition is uniquely biological.</p>
+      </details>
+      <h3>The two policies used in these runs</h3>
+      <div class="equation">
+        <div class="equation-line"><span class="equal">Equal:</span> &nbsp; π<sub>d</sub><sup>(k)</sup> = 1 / |D<sup>(k)</sup>|.</div>
+        <div class="equation-line"><span class="ranked">Ranked:</span> &nbsp; q<sub>d</sub> = (R − r<sub>d</sub> + 1) / R, &nbsp; π<sub>d</sub><sup>(k)</sup> = q<sub>d</sub> / ∑<sub>e ∈ D<sup>(k)</sup></sub>q<sub>e</sub>.</div>
+        <span class="words">Rank 1 is best; R = 115 is the largest rank in the frozen global table. Power p = 1. All π entries are positive and sum to one within each panel, in both policies.</span>
+      </div>
+      <p>The 115-entry ranking table and the 114 retained training datasets are different universes: the global ranks are <strong>not</strong> recomputed within the 28- or 29-dataset panels. Equal weights are therefore 1/29 or 1/28 here, not 1/3. The three-dataset synthetic π example is not this experiment.</p>
+      <p>The ranked run uses <a href="../Datasets/data/HEK_riboseq_profile_quality_rank.tsv"><code>HEK_riboseq_profile_quality_rank.tsv</code></a>. Its six ranked components are frame periodicity, CDS enrichment, read depth, detected-transcript support, RPF-length center and RPF-length spread. In the saved table, the aggregate score is the sum of these six component ranks. This is an observable-QC ranking, not a ranking derived from ground-truth <i>L</i> or from the test agreement scores.</p>
+      <div class="callout warm"><strong>Do not describe a different ranking in the article.</strong> The separate <a href="../Datasets/data/HEK_riboseq_profile_quality_rank_components.tsv"><code>…quality_rank_components.tsv</code></a> contains ten components, additionally including mapping, contamination and replicate-agreement ranks. That is <em>not</em> the file used for this four-panel ranked run.</div>
+      <div class="table-wrap">
+        <table>
+          <caption>Three quality-related mechanisms that must not be conflated</caption>
+          <thead><tr><th scope="col">Mechanism</th><th scope="col">Role</th><th scope="col">Equal versus ranked arms</th></tr></thead>
+          <tbody>
+            <tr><th scope="row">Quality-balanced panel construction</th><td>Distribute observed dataset properties across source-disjoint panels.</td><td>Identical saved membership.</td></tr>
+            <tr><th scope="row">Local reliability <i>w</i><sub>dt</sub></th><td>Weight dataset–transcript contributions to the training loss.</td><td>Identical train-fitted reliability references.</td></tr>
+            <tr><th scope="row">Reference measure π<sub>d</sub></th><td>Weight reference datasets when centering log-gamma.</td><td><strong>The intended changed factor.</strong> Equal versus frozen global QC ranks.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p><strong>Thus “equal reference” does not mean “ignore data reliability.”</strong> It means equal dataset influence on the gamma-reference definition while preserving the same reliability-aware loss.</p>
+    </section>
+
+    <section class="section" id="design">
+      <div class="step">04 · Execution</div>
+      <h2>One frozen design, two reference-weight policies</h2>
+      <div class="flow" aria-label="Study workflow">
+        <div class="node"><b>1 · Partition experiments</b>114 datasets from 85 inferred source families. Keep every family intact; balance observable quality across panels.</div>
+        <div class="node"><b>2 · Freeze the comparison</b>Four panel memberships; common validation and test IDs; train-only local reliability references.</div>
+        <div class="node"><b>3 · Fit models separately</b>Same saved model/training configuration and seed 42.<div class="arms"><span class="equal">4 equal-reference models</span><span class="ranked">4 planned ranked-reference models</span></div></div>
+        <div class="node"><b>4 · Compare frozen outputs</b>Best-validation-loss checkpoints → common held-out shared profiles → matched inter-panel PCC/RMSE.</div>
+      </div>
+      <p>“Disjoint” is stronger than different filenames. Conditions and replicates from the same inferred publication/source family are kept in exactly one panel. There are no shared dataset or source-family identities across panels. Training transcript identities, however, may overlap: these are independent <em>experimental collections</em>, not mutually exclusive sets of sequences.</p>
+      <div class="table-wrap">
+        <table>
+          <caption>Actual saved panel design and current completion</caption>
+          <thead><tr><th scope="col">Panel</th><th scope="col" class="num">Datasets</th><th scope="col" class="num">Sources</th><th scope="col" class="num">Train transcripts</th><th scope="col">Equal</th><th scope="col">Ranked</th></tr></thead>
+          <tbody>
+            <tr><th scope="row">1</th><td class="num">29</td><td class="num">20</td><td class="num">13,261</td><td class="status-done">Complete</td><td class="status-done">Complete</td></tr>
+            <tr><th scope="row">2</th><td class="num">29</td><td class="num">21</td><td class="num">13,613</td><td class="status-done">Complete</td><td class="status-done">Complete</td></tr>
+            <tr><th scope="row">3</th><td class="num">28</td><td class="num">22</td><td class="num">13,595</td><td class="status-done">Complete</td><td><span class="placeholder">Pending result</span></td></tr>
+            <tr><th scope="row">4</th><td class="num">28</td><td class="num">22</td><td class="num">13,340</td><td class="status-done">Complete</td><td><span class="placeholder">Pending result</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <h3>The common held-out cohort</h3>
+      <p>The evaluation universe contains 15,929 transcripts with at least two usable selected datasets in <em>every</em> panel. From this universe, the fixed split assigns 1,593 transcripts to validation and 1,593 to test. Both held-out sets are excluded from every panel’s training list. The ranked run reuses these exact memberships and IDs.</p>
+      <p>Panel-specific training lists include remaining sequence-eligible transcripts meeting the within-panel support rule; their sizes need not be identical. This support-based evaluation favors broadly observed transcripts, so the results should not be extrapolated unchanged to the sparsest transcripts.</p>
+      <h3>What is held fixed</h3>
+      <p>The saved configurations match apart from reference weighting/power and run/path metadata. Both use seed 42, batch size 32, BF16 mixed precision, transcript-grouped sampling, transcript-balanced loss reduction, standard NB, learned dispersion, and <code>mass_conservation=false</code>. Each panel selects its checkpoint by minimum validation loss, not by test PCC or RMSE.</p>
+      <p>For <i>w</i><sub>dt</sub>, dataset depth-scale and score-normalization references are fitted on that panel’s training transcripts and frozen for held-out use. The paired comparison verifies that these reliability-reference contents are unchanged between arms.</p>
+      <details>
+        <summary>Provenance limits that should survive into the Methods or supplement</summary>
+        <ul>
+          <li>The original training manifests did not record a git commit. Saved configuration agreement does not establish identical historical source code or bitwise training trajectories.</li>
+          <li>The global QC ranking was frozen as an input, but these artifacts do not establish that its component summaries were recomputed using training transcripts only. The verified “train-only” statement applies to local reliability references, not automatically to π. Verify the QC-generation cohort before making a broader leakage-free claim.</li>
+          <li>One panel partition and one training seed do not measure uncertainty across alternative dataset assignments or independent initializations.</li>
+          <li>These are observed-data-balanced panels, not randomly interchangeable biological populations; unrecorded protocol or condition differences can remain.</li>
+        </ul>
+      </details>
+      <p class="source">Sources: <a href="../results/my_panels_a100_b32_20260906_114323/panel_manifest.json">equal panel manifest</a>, <a href="../results/my_panels_qrank_a100_b32_20260908_103510/panel_manifest.json">ranked panel manifest</a>, <a href="../results/my_panels_a100_b32_20260906_114323/common_split_manifest.json">common split</a>, <a href="../results/panels_equal_vs_ranked_comparison/comparison_manifest.json">paired audit</a>, and <a href="../results/panels_equal_vs_ranked_comparison/configuration_differences.csv">configuration differences</a>.</p>
+    </section>
+
+    <section class="section" id="measurement">
+      <div class="step">05 · Measurement</div>
+      <h2>Compare the same positions, transcripts and model pairs</h2>
+      <p>We extract each panel’s frozen shared output from its best-validation-loss test export. Where raw exports repeat a transcript across dataset rows, those shared profiles must agree before a single compact profile is retained. There is no neural fitting in this comparison and no normalization, smoothing or transformation of the exported values.</p>
+      <div class="equation">
+        <div class="equation-line">ρ<sub>t</sub><sup>(a,b)</sup> = PCC(L<sub>t</sub><sup>(a)</sup>, L<sub>t</sub><sup>(b)</sup>)</div>
+        <math display="block" xmlns="http://www.w3.org/1998/Math/MathML" aria-label="RMSE for one transcript and panel pair is the square root of the mean squared difference across aligned codon positions">
+          <msub><mi mathvariant="normal">RMSE</mi><mi>t</mi></msub><mo>=</mo><msqrt><mfrac><mn>1</mn><msub><mi>n</mi><mi>t</mi></msub></mfrac><munderover><mo>∑</mo><mrow><mi>i</mi><mo>=</mo><mn>1</mn></mrow><msub><mi>n</mi><mi>t</mi></msub></munderover><msup><mrow><mo>(</mo><msubsup><mi>L</mi><mrow><mi>t</mi><mi>i</mi></mrow><mrow><mo>(</mo><mi>a</mi><mo>)</mo></mrow></msubsup><mo>−</mo><msubsup><mi>L</mi><mrow><mi>t</mi><mi>i</mi></mrow><mrow><mo>(</mo><mi>b</mi><mo>)</mo></mrow></msubsup><mo>)</mo></mrow><mn>2</mn></msup></msqrt><mo>.</mo>
+        </math>
+        <span class="words">Both compare predictions with predictions. There is no measured biological-ground-truth profile on the right-hand side.</span>
+      </div>
+      <ul>
+        <li><strong>PCC:</strong> agreement in the positional shape of the shared profile; higher means more concordant shape.</li>
+        <li><strong>Inter-panel RMSE:</strong> disagreement in the actual profile values, including peak magnitude; lower means closer values.</li>
+        <li><strong>CDS interior:</strong> repeat on the same transcripts after excluding exactly 20 codons from each end. Retain the original amplitudes: the interior need not have mean one.</li>
+      </ul>
+      <div class="callout warm"><strong>A crucial partial-run rule.</strong> Compare equal pair 1–2 with ranked pair 1–2, not the six-pair equal average with the sole available ranked pair. Otherwise the effect of panel identity is mixed with the effect of weighting.</div>
+      <h3>Aggregation and uncertainty</h3>
+      <p>The main equal-weight summary pools the 1,593 × 6 = 9,558 transcript–pair PCC values descriptively. The weighting comparison reports medians across the matched transcript–pair values; its change is <em>ranked median minus equal median</em>, not the median of individual transcript changes.</p>
+      <p>For the weighting comparison, 5,000 paired bootstrap replicates resample transcripts with replacement. Every selected transcript brings all its matched panel-pair values and both policies together. The reported intervals are percentile 95% intervals, using seed 20260910. They are conditional on these fitted models and this panel partition; the six pairs are not independent experimental replicates.</p>
+      <p>Positions are aligned without truncating mismatched sequences. A profile variance ≤ 10<sup>−12</sup> invalidates PCC; validity/reason codes are saved and finite cohorts are matched between policies. All 1,593 transcripts are valid for both domains and metrics in the current comparison.</p>
+      <p class="source">Implementation: <a href="../analyses/compare_real_panel_weighting.py">matched comparison script</a>; <a href="../results/panels_equal_vs_ranked_comparison/matched_bootstrap_summary.csv">bootstrap source table</a>; <a href="../results/panels_equal_vs_ranked_comparison/validity_counts.csv">validity counts</a>.</p>
+    </section>
+
+    <section class="section" id="equal-results">
+      <div class="step">06 · Completed primary result</div>
+      <h2>Four different collections recover a substantial common profile</h2>
+      <p class="lead">Under equal reference weights, the pooled median held-out PCC is <strong>0.7520</strong>, with an interquartile range from <strong>0.6873 to 0.7967</strong>. Pair-specific medians range from 0.7183 to 0.7784.</p>
+      <div class="table-wrap">
+        <table>
+          <caption>Equal weights · full CDS · 1,593 transcripts per pair</caption>
+          <thead><tr><th scope="col">Panel pair</th><th scope="col" class="num">Median PCC</th><th scope="col" class="num">Median Spearman</th><th scope="col" class="num">Median inter-panel RMSE</th></tr></thead>
+          <tbody>
+            <tr><th scope="row">1–2</th><td class="num">0.7183</td><td class="num">0.6953</td><td class="num">0.4374</td></tr>
+            <tr><th scope="row">1–3</th><td class="num">0.7784</td><td class="num">0.7899</td><td class="num">0.4362</td></tr>
+            <tr><th scope="row">1–4</th><td class="num">0.7357</td><td class="num">0.7480</td><td class="num">0.4407</td></tr>
+            <tr><th scope="row">2–3</th><td class="num">0.7513</td><td class="num">0.7539</td><td class="num">0.4529</td></tr>
+            <tr><th scope="row">2–4</th><td class="num">0.7554</td><td class="num">0.7617</td><td class="num">0.4055</td></tr>
+            <tr><th scope="row">3–4</th><td class="num">0.7750</td><td class="num">0.7914</td><td class="num">0.4391</td></tr>
+            <tr class="total"><th scope="row">Pooled, descriptive</th><td class="num">0.7520</td><td class="num">0.7586</td><td class="num">0.4366</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>The pooled mean PCC is 0.7199, below the median, indicating a lower-agreement tail rather than uniform convergence for every transcript. The models are not interchangeable. The appropriate conclusion is that these source-disjoint panels learn a substantial common sequence-dependent structure, with remaining sensitivity to the experimental collection.</p>
+      <figure>
+        <a href="../results/my_panels_a100_b32_20260906_114323/analysis/publication_figure/four_panel_reproducibility.png"><img src="../results/my_panels_a100_b32_20260906_114323/analysis/publication_figure/four_panel_reproducibility.png" alt="Equal-reference four-panel publication figure: six held-out PCC distributions and unmodified shared-profile overlays for a representative transcript." loading="lazy"></a>
+        <figcaption><strong>Figure 1 · Primary four-panel reproducibility.</strong> Six distributions of transcript-level PCC and a representative held-out profile overlay. The example is chosen closest to the median transcript-level agreement, not as a best-looking example. The original figure displays PCC from 0.4 to 1.0; uncropped values remain in the source table. This is reproducibility of shared predictions, not their accuracy against ground truth.<span class="downloads"><a href="../results/my_panels_a100_b32_20260906_114323/analysis/publication_figure/four_panel_reproducibility.pdf">PDF</a> · <a href="../results/my_panels_a100_b32_20260906_114323/analysis/cross_panel_L_agreement_summary.csv">Summary values</a> · <a href="../results/my_panels_a100_b32_20260906_114323/analysis/publication_figure/source_tables/example_selection.csv">Example-selection provenance</a></span></figcaption>
+      </figure>
+      <div class="callout green"><strong>What this establishes.</strong> Agreement does not require the same experimental datasets or publication families to appear in both training panels. <strong>What remains open:</strong> whether the agreement is greater than for matched no-decomposition controls, and which of the common structures are biologically rather than technically shared.</div>
+    </section>
+
+    <section class="section" id="ranked-results">
+      <div class="step">07 · Partial sensitivity result</div>
+      <h2>Ranking changes the answer, but does not improve every metric</h2>
+      <p><span class="badge pending">Partial result: matched panels 1–2 only</span></p>
+      <p>Both policies are compared on the same 1,593 transcripts and identical positions. The following intervals describe the paired weighting comparison, not uncertainty from repeated model training.</p>
+      <div class="table-wrap">
+        <table>
+          <caption>Identical pair 1–2 · medians and paired bootstrap intervals</caption>
+          <thead><tr><th scope="col">Domain / metric</th><th scope="col" class="num equal">Equal median</th><th scope="col" class="num ranked">Ranked median</th><th scope="col" class="num">Ranked − equal [95% CI]</th></tr></thead>
+          <tbody>
+            <tr><th scope="row">Full CDS · PCC</th><td class="num">0.7183</td><td class="num">0.7313</td><td class="num">+0.0130 [0.0084, 0.0187]</td></tr>
+            <tr><th scope="row">Full CDS · RMSE</th><td class="num">0.4374</td><td class="num">0.4646</td><td class="num">+0.0273 [0.0215, 0.0341]</td></tr>
+            <tr><th scope="row">Interior −20 · PCC</th><td class="num">0.7026</td><td class="num">0.7066</td><td class="num">+0.0040 [−0.0004, 0.0098]</td></tr>
+            <tr><th scope="row">Interior −20 · RMSE</th><td class="num">0.4077</td><td class="num">0.4334</td><td class="num">+0.0257 [0.0198, 0.0319]</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p><strong>Observed:</strong> ranked weighting has slightly higher full-CDS shape agreement, but larger disagreement in the profile values. In the interior, the PCC increase is smaller and its interval includes zero. The RMSE increase remains positive in both domains. This is a mixed result, not an across-the-board improvement.</p>
+      <figure>
+        <a href="../results/panels_equal_vs_ranked_comparison/equal_vs_ranked_panel_reproducibility.png"><img src="../results/panels_equal_vs_ranked_comparison/equal_vs_ranked_panel_reproducibility.png" alt="Matched equal versus ranked reference medians for full CDS and CDS interior: ranked PCC is slightly higher, while ranked RMSE is also higher." loading="lazy"></a>
+        <figcaption><strong>Figure 2 · Same pair, same transcripts, two policies.</strong> Points are medians and bars are 95% paired transcript-bootstrap intervals. Both vertical axes are zoomed to the median/interval range. The ranked result is not compared with the pooled six-pair equal result.<span class="downloads"><a href="../results/panels_equal_vs_ranked_comparison/equal_vs_ranked_panel_reproducibility.pdf">PDF</a> · <a href="../results/panels_equal_vs_ranked_comparison/matched_bootstrap_summary.csv">Source table</a></span></figcaption>
+      </figure>
+      <figure>
+        <a href="../results/panels_equal_vs_ranked_comparison/paired_weighting_effects.png"><img src="../results/panels_equal_vs_ranked_comparison/paired_weighting_effects.png" alt="Paired changes from equal to ranked weights. Full-CDS delta PCC is positive; the interior PCC interval crosses zero; delta RMSE is positive for both domains." loading="lazy"></a>
+        <figcaption><strong>Figure 3 · Interpret the sign separately for each metric.</strong> Positive ΔPCC means more similar shape; positive ΔRMSE means more dissimilar values. These paired-difference intervals directly address the comparison and are more informative than judging overlap between separate policy intervals.<span class="downloads"><a href="../results/panels_equal_vs_ranked_comparison/paired_weighting_effects.pdf">PDF</a> · <a href="../results/panels_equal_vs_ranked_comparison/matched_inter_panel_metrics.csv">Transcript-level metrics</a></span></figcaption>
+      </figure>
+      <h3>Does the weighting change an individual panel’s shared output?</h3>
+      <p>Yes, the separately trained equal and ranked models do not produce identical profiles even when dataset membership is fixed. Their same-panel, cross-policy median full-CDS PCC is <strong>0.8494 for panel 1</strong> and <strong>0.8560 for panel 2</strong>, with median RMSE 0.3561 and 0.3192, respectively. This describes sensitivity of the fitted outputs under the paired setup. It does not tell us which policy is closer to biology or separate the weighting effect from all possible optimization/code-version variation.</p>
+      <details>
+        <summary>View same-panel weighting sensitivity</summary>
+        <figure>
+          <img src="../results/panels_equal_vs_ranked_comparison/same_panel_weighting_sensitivity.png" alt="Same-panel equal-versus-ranked PCC distributions for panels 1 and 2, shown for full CDS and interior positions." loading="lazy">
+          <figcaption>Same-panel comparison changes the reference policy while retaining the same dataset collection. Boxes show medians/IQRs and whiskers extend to 1.5 IQR; this is not a biological-accuracy benchmark. <a href="../results/panels_equal_vs_ranked_comparison/same_panel_weighting_summary.csv">Source values</a> · <a href="../results/panels_equal_vs_ranked_comparison/same_panel_weighting_sensitivity.pdf">PDF</a>.</figcaption>
+        </figure>
+      </details>
+      <p class="source">Authoritative sources: <a href="../results/panels_equal_vs_ranked_comparison/matched_bootstrap_summary.csv">matched bootstrap summary</a>, <a href="../results/panels_equal_vs_ranked_comparison/same_panel_weighting_summary.csv">same-panel summary</a>, <a href="../results/panels_equal_vs_ranked_comparison/panel_availability.csv">panel availability</a>.</p>
+    </section>
+
+    <section class="section" id="intuition">
+      <div class="step">08 · Interpretation</div>
+      <h2>What we can learn without forcing a preferred outcome</h2>
+      <div class="intuition">
+        <article><h3>Equal weights already test something scientifically useful</h3><p>Balancing the panels makes a uniform reference a reasonable primary convention: no dataset is privileged in the gamma center simply because it has a better global rank. The reliability-aware loss still downweights less reliable dataset–transcript observations. Equal-reference convergence therefore does not mean that quality is irrelevant; it means this shared signal is reproducible under a deliberately unprivileged reference measure.</p></article>
+        <article><h3>QC can express trust, but is not a direct measurement of systematic bias</h3><p>A measured QC ranking provides an operational, ground-truth-free way to tilt the reference toward profiles considered more informative. Its strongest interpretation is a documented reference choice. Better periodicity, depth or other QC does not guarantee that a dataset’s positional systematic effects are closer to zero, nor that all highly ranked datasets lack a common distortion. A quality-weighted center can help, do little, or shift the shared profile in a different direction.</p><p><em>Mechanistic possibilities, not findings of this comparison:</em> equal weights may average heterogeneous distortions more evenly; ranked weights may suppress unreliable contributions, but may also concentrate influence on a smaller or more homogeneous set of reference datasets. We have not measured which mechanism explains the observed metric differences.</p></article>
+        <article><h3>A higher PCC and a higher RMSE are compatible</h3><p>PCC captures centered profile shape, whereas RMSE also responds to differences in variation and, for the cropped interior, differences in means. For two aligned profiles, using positional population variances,</p>
+          <div class="equation"><div class="equation-line">RMSE² = σ<sub>x</sub>² + σ<sub>y</sub>² − 2ρσ<sub>x</sub>σ<sub>y</sub> + (x̄ − ȳ)².</div><span class="words">The final term vanishes for full mean-one profiles, but their variances and peak amplitudes can still differ.</span></div>
+          <p><strong>Illustrative example, not an experimental result:</strong> (0.5, 1, 1.5) and (0.25, 1, 1.75) both average to one and have PCC = 1, yet RMSE ≈ 0.204. Agreement in where the profile rises is not agreement in how much it rises. This explains why the metrics can disagree, without proving that an amplitude change is the cause in these fitted models.</p></article>
+        <article><h3>The boundary analysis qualifies the apparent PCC benefit</h3><p>The ranked-minus-equal PCC difference is +0.0130 for the full CDS and +0.0040 for the interior. The latter interval spans zero. The measured full-CDS advantage should therefore not be described as an established improvement throughout the CDS interior. A formal test of the <em>difference between these two changes</em> has not been reported; comparing the two interval outcomes is not itself that test. Boundary-associated structure may be biological, technical, or both.</p></article>
+        <article><h3>“The reference matters” is a narrower claim than “ranking is better”</h3><p>The center has a real mathematical role, and the paired outputs differ. But this partial real-data comparison does not establish that quality ranking uniformly improves reproducibility, and it cannot establish more accurate biological recovery. Ranking can be justified in the article as an independently specified QC-informed sensitivity, with its mixed empirical result reported, rather than as a guaranteed correction.</p></article>
+      </div>
+      <details>
+        <summary>How much does ranking concentrate the reference?</summary>
+        <p>The descriptive concentration measure 1/∑<sub>d</sub>π<sub>d</sub>² equals the panel size under equal weights. Under the saved ranked weights it is 21.15, 21.91, 21.07 and 22.49 for panels 1–4, versus 29, 29, 28 and 28 under equal weights. These values follow from the planned weights, including panels whose training is unfinished.</p>
+        <p>This is not an estimate of statistically independent sample size and does not predict the neural model’s error. It simply shows that the ranked reference gives a more concentrated distribution of influence. <a href="../results/panels_equal_vs_ranked_comparison/reference_weights.csv">Inspect every dataset’s rank and π</a>.</p>
+      </details>
+    </section>
+
+    <section class="section" id="robustness">
+      <div class="step">09 · Supporting evidence, equal-weight run only</div>
+      <h2>Is the agreement just boundaries, large values, or simple codon effects?</h2>
+      <p>Completed post-hoc checks on the four equal-weight models address narrower alternative explanations. They do not change neural parameters or π, and they are <strong>not</strong> the γ = 1 ablation. No analogous ranked residual comparison is claimed here.</p>
+      <h3>A. Boundary and high-profile-position sensitivity</h3>
+      <p>On a fixed 1,476-transcript cohort valid for the combined boundary/removal conditions, the transcript-level median PCC is 0.7514 on the full CDS, 0.7490 after trimming 20 codons per end, and 0.7174 after additionally removing the union of each panel’s top-1% predicted positions. This supports agreement beyond boundaries, with a contribution from high-profile positions.</p>
+      <p>In the separately reported full-cohort extreme-removal analysis, the summary changes from 0.7499 to 0.7158 after the top-1% union removal and to 0.6699 after the top-5% union removal. Matched-count random removal gives 0.7502 and 0.7511, respectively. The union of four panels’ selected positions is not necessarily 1% or 5% of the CDS, and the selected positions are predicted high values, not experimentally validated stalls.</p>
+      <div class="callout"><strong>Interpretation:</strong> high-profile positions contribute disproportionately to agreement, but they do not account for all of it. Their contribution is not evidence that the original agreement is spurious.</div>
+      <p class="source">Source: <a href="../results/my_panels_a100_b32_20260906_114323/posthoc_robustness/streaming_position_sensitivity/full/interpretation.md">completed streaming positional sensitivity</a>; <a href="../results/my_panels_a100_b32_20260906_114323/posthoc_robustness/streaming_position_sensitivity/full/combined_condition_matched_transcript_summary.csv">matched combined-condition table</a>.</p>
+      <h3>B. Frozen codon/position diagnostic subtraction</h3>
+      <p>For each panel separately, weighted least squares fits that panel’s own frozen training predictions with a position-only additive baseline, then with codon identity plus position. The fit cohort is the 12,743-transcript intersection of all four training manifests after excluding every validation and test ID. Each transcript receives total fitting weight one.</p>
+      <p>Position is <i>u</i> = (<i>i</i> − 1)/(<i>n</i><sub>t</sub> − 1). The natural cubic spline has boundary knots 0 and 1 and fixed interior knots 0.2, 0.4, 0.6 and 0.8. Codon effects use 63 treatment contrasts with AAA as reference plus an intercept. The two designs have 6 and 69 columns, respectively. Their complexity was not selected to maximize residual agreement.</p>
+      <p>The frozen panel-specific fitted baseline is subtracted from held-out <i>L</i>. The residuals are signed and are neither rectified nor renormalized; the same fits are used on the interior. These are diagnostic residuals, not alternative biological profiles.</p>
+      <div class="table-wrap">
+        <table>
+          <caption>Equal-weight diagnostic agreement · 1,593 test transcripts · 95% bootstrap intervals</caption>
+          <thead><tr><th scope="col">Domain</th><th scope="col" class="num">Original</th><th scope="col" class="num">Position residual</th><th scope="col" class="num">Codon + position residual</th></tr></thead>
+          <tbody>
+            <tr><th scope="row">Full CDS</th><td class="num">0.7499<br><span class="small">[0.7465, 0.7543]</span></td><td class="num">0.7534<br><span class="small">[0.7501, 0.7570]</span></td><td class="num">0.7399<br><span class="small">[0.7364, 0.7443]</span></td></tr>
+            <tr><th scope="row">Interior −20</th><td class="num">0.7479<br><span class="small">[0.7435, 0.7514]</span></td><td class="num">0.7503<br><span class="small">[0.7457, 0.7529]</span></td><td class="num">0.7373<br><span class="small">[0.7343, 0.7413]</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="small"><strong>Different summary, not conflicting numbers:</strong> these post-hoc analyses first take the median across six panel pairs within each transcript, then the median across transcripts. The main figure pools all transcript–pair values before taking its median (0.7520). The residual table uses 2,000 transcript-cluster bootstrap replicates; the weighting comparison uses 5,000.</p>
+      <p>For the full CDS, the median across panel-level median residual/original variance ratios is approximately 0.997 for position-only and 0.931 for codon-plus-position subtraction. Neither baseline produces constant or nearly constant residuals among the 6,372 panel–transcript profiles in either domain. Thus the retained residual PCC is not being presented despite widespread degenerate residuals.</p>
+      <div class="callout purple"><strong>Supported inference:</strong> reproducible structure persists beyond these specified additive codon and broad-position baselines. <strong>Not supported:</strong> the removed effects are technical artifacts, the remainder is pure biology, or this is equivalent to retraining without γ. Codon effects and positional trends may themselves carry biology.</div>
+      <details>
+        <summary>View the supplementary residual comparison</summary>
+        <figure>
+          <img src="../results/my_panels_a100_b32_20260906_114323/analysis/posthoc_robustness_streaming/figures/cross_panel_agreement_adjusted.png" alt="Four-panel equal-reference agreement before subtraction and after panel-specific position-only or codon-plus-position baseline subtraction, for full CDS and interior." loading="lazy">
+          <figcaption>Previously completed frozen-output diagnostic; not recomputed to favor either weighting policy. <a href="../results/my_panels_a100_b32_20260906_114323/analysis/posthoc_robustness_streaming/figures/cross_panel_agreement_adjusted.pdf">PDF</a>.</figcaption>
+        </figure>
+      </details>
+      <p class="source">Sources: <a href="../results/my_panels_a100_b32_20260906_114323/analysis/posthoc_robustness_streaming/heldout_agreement_summary.csv">residual agreement table</a>, <a href="../results/my_panels_a100_b32_20260906_114323/analysis/posthoc_robustness_streaming/heldout_variance_summary.csv">variance validity</a>, <a href="../results/my_panels_a100_b32_20260906_114323/analysis/posthoc_robustness_streaming/design_specification.json">basis specification</a>, <a href="../results/my_panels_a100_b32_20260906_114323/analysis/posthoc_robustness_streaming/fit_provenance.json">fit and frozen replay provenance</a>.</p>
+    </section>
+
+    <section class="section" id="unfinished">
+      <div class="step">10 · Pending evidence and limits</div>
+      <h2>What still belongs in brackets, not in the conclusions</h2>
+      <p>Ranked panels 3 and 4 failed before training because <code>Utils.transcript_batch_metadata</code> was missing on the cluster. No checkpoint or prediction result was available for either panel in the inspected snapshot. The resume launcher prepares fresh starts with their saved settings and skips panels 1 and 2. A prepared resume command is not a completed experiment.</p>
+      <div class="table-wrap">
+        <table>
+          <caption>Completion ledger for the matched ranked comparison</caption>
+          <thead><tr><th scope="col">Panel pair</th><th scope="col">Equal results</th><th scope="col">Ranked results / article placeholder</th></tr></thead>
+          <tbody>
+            <tr><th scope="row">1–2</th><td>Available</td><td>Available; currently the only matched pair.</td></tr>
+            <tr><th scope="row">1–3</th><td>Available</td><td><span class="placeholder">[P1–P3 ranked PCC / RMSE / paired CI]</span></td></tr>
+            <tr><th scope="row">1–4</th><td>Available</td><td><span class="placeholder">[P1–P4 ranked PCC / RMSE / paired CI]</span></td></tr>
+            <tr><th scope="row">2–3</th><td>Available</td><td><span class="placeholder">[P2–P3 ranked PCC / RMSE / paired CI]</span></td></tr>
+            <tr><th scope="row">2–4</th><td>Available</td><td><span class="placeholder">[P2–P4 ranked PCC / RMSE / paired CI]</span></td></tr>
+            <tr><th scope="row">3–4</th><td>Available</td><td><span class="placeholder">[P3–P4 ranked PCC / RMSE / paired CI]</span></td></tr>
+            <tr><th scope="row">All six, matched</th><td>Available</td><td><span class="placeholder">[Final full-CDS and interior weighting contrast]</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>When both missing panels finish, repeat the same analysis on all six matched pairs. Do not replace the QC table, tune its power, change the panel assignment, or change the primary metric after inspecting which choice looks better. The current pair 1–2 is the lowest-median-PCC pair in the equal run; extrapolating its weighting difference to all six pairs is especially unwarranted.</p>
+      <h3>Other questions not settled by completing the ranked panels</h3>
+      <ul>
+        <li><strong>Contribution of the gamma branch:</strong> <span class="placeholder">[Matched γ = 1 and direct-baseline results]</span> These controls are proposed in the original plan but are not supplied by this equal/ranked comparison.</li>
+        <li><strong>Generalization across fitting and partition choices:</strong> <span class="placeholder">[Independent training seeds / source-family partitions]</span> Conditional transcript-bootstrap precision does not supply that evidence.</li>
+        <li><strong>Biological validity:</strong> <span class="placeholder">[Independent motif / protocol / biological validation]</span> These are complementary experiments, not conclusions to infer from PCC alone.</li>
+      </ul>
+      <div class="table-wrap">
+        <table>
+          <caption>How to interpret the eventual complete weighting result</caption>
+          <thead><tr><th scope="col">Outcome</th><th scope="col">Defensible wording</th><th scope="col">Still not demonstrated</th></tr></thead>
+          <tbody>
+            <tr><th scope="row">Higher PCC, lower RMSE under ranked π</th><td>QC-ranked references improve both measured aspects of reproducibility for this matched design.</td><td>Closer recovery of true biology; a universally optimal ranking.</td></tr>
+            <tr><th scope="row">Small or uncertain differences</th><td>Reproducibility is similar under these reference policies at the precision of this comparison.</td><td>π has no mathematical role; the policies are formally equivalent.</td></tr>
+            <tr><th scope="row">Metric-dependent or domain-dependent result</th><td>The policy changes shape and value agreement differently; report both dimensions.</td><td>A single uniformly superior policy.</td></tr>
+            <tr><th scope="row">Lower reproducibility under ranked π</th><td>This particular QC-informed reference does not improve the measured reproducibility criterion.</td><td>Quality assessment is useless, or equal π must be biologically correct.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p><strong>Recommended article position:</strong> retain equal-reference convergence as the primary result specified in the original plan, and present QC-ranked weighting as a transparent sensitivity analysis. If a later independent validation favors a policy, explain that criterion separately instead of retroactively calling reproducibility biological recovery.</p>
+    </section>
+
+    <section class="section" id="drafting">
+      <div class="step">11 · ICLR drafting material</div>
+      <h2>Paragraphs that can be adapted without changing the scientific claim</h2>
+      <p>Suggested subsection title: <strong>Shared-profile reproducibility across source-disjoint panels.</strong> The following text separates the completed primary result from the partial sensitivity. Bracketed fields are intentionally not estimates.</p>
+      <div class="draft">
+        <div class="kicker">Methods · completed design</div>
+        <p>To test whether the inferred shared profile depends on the experimental collection used for training, we partitioned 114 Ribo-seq datasets into four disjoint panels of 29, 29, 28 and 28 datasets. The partition kept all conditions and replicates from each of 85 inferred source families in one panel and balanced observable dataset-quality properties. We trained one RiboUnmix model per panel using the same training configuration and seed, with uniform fixed-reference gamma weights within each panel. Local dataset–transcript reliability references were fitted on training transcripts only. All models used the same 1,593 validation and 1,593 test transcript IDs, excluded from every training list. We selected checkpoints by validation loss and compared the frozen, mean-one shared profiles on aligned held-out CDS positions using per-transcript Pearson correlation and inter-panel RMSE.</p>
+      </div>
+      <div class="draft">
+        <div class="kicker">Results · completed equal-reference study</div>
+        <p>Models trained on source-disjoint panels produced substantially concordant shared profiles. Across the six panel pairs, median held-out PCC ranged from 0.718 to 0.778; pooling the 9,558 transcript–pair observations descriptively gave a median of 0.752 (interquartile range 0.687–0.797), with median Spearman correlation 0.759 and median inter-panel RMSE 0.437. Thus, the learned positional representation was reproducible across distinct experimental collections, although the non-identical predictions and lower-agreement tail indicate remaining panel sensitivity. These results establish cross-panel concordance, not accuracy against a known biological profile.</p>
+      </div>
+      <div class="draft">
+        <div class="kicker">Supplementary robustness · optional paragraph</div>
+        <p>Agreement persisted after accounting for fixed additive codon and broad-position effects. We fitted separate position-only and codon-plus-position diagnostic regressions to each panel’s frozen predictions on the common training-transcript intersection, excluding all validation and test transcripts. On the 1,593 common test transcripts, the median of the within-transcript six-pair median PCC was 0.750 for the original profiles, 0.753 after position-only subtraction and 0.740 after codon-plus-position subtraction; the corresponding interior-CDS values were 0.748, 0.750 and 0.737. These diagnostics support reproducible structure beyond the specified additive baselines, but do not classify removed or residual components as biological or technical and are not a shared-only model ablation.</p>
+      </div>
+      <div class="draft pending">
+        <div class="kicker">Quality-ranked sensitivity · provisional, two panels only</div>
+        <p>We additionally examined sensitivity to a frozen, six-component dataset-QC ranking, retaining the same panel memberships, transcript splits, local reliability references and saved training hyperparameters. For the currently completed matched pair, quality-ranked reference weights increased median full-CDS PCC from 0.7183 to 0.7313 (paired difference 0.0130; 95% transcript-bootstrap CI 0.0084–0.0187), but also increased median inter-panel RMSE from 0.4374 to 0.4646. After excluding 20 codons from each end, the PCC difference was 0.0040 (95% CI −0.0004–0.0098). This partial comparison indicates a metric- and domain-dependent effect of the reference policy, rather than uniform improvement in shared-profile reproducibility. Results from the remaining two ranked panels are pending.</p>
+      </div>
+      <div class="draft pending">
+        <div class="kicker">Replacement template · use only after all four ranked panels complete</div>
+        <p>Across all six matched panel pairs, equal and quality-ranked references yielded median full-CDS PCCs of <span class="placeholder">[EQUAL_MATCHED_PCC]</span> and <span class="placeholder">[RANKED_MATCHED_PCC]</span>, respectively, with a paired difference of <span class="placeholder">[DELTA_PCC; 95% CI]</span>. Median inter-panel RMSE was <span class="placeholder">[EQUAL_RMSE]</span> versus <span class="placeholder">[RANKED_RMSE]</span>; the corresponding interior-CDS comparison was <span class="placeholder">[INTERIOR_PCC, RMSE, PAIRED CIs]</span>. These results <span class="placeholder">[STATE THE OBSERVED DIRECTION, INCLUDING MIXED OR NULL FINDINGS]</span> under the fixed QC-informed reference policy. All uncertainty intervals are conditional on the fitted models and this panel partition.</p>
+      </div>
+      <div class="callout warm"><strong>Wording to avoid in the current draft:</strong> “quality ranking recovers the true biological profile,” “the decomposition outperforms γ = 1,” “the six pairs are six independent experimental replicates,” or “boundary/codon effects are artifacts.” None follows from the presently available comparison.</div>
+    </section>
+
+    <section class="section" id="sources">
+      <div class="step">12 · Evidence ledger</div>
+      <h2>Every result has a source, and every unfinished result stays unfinished</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th scope="col">Report component</th><th scope="col">Authoritative local source</th></tr></thead>
+          <tbody>
+            <tr><th scope="row">Original question and controls</th><td><a href="ribounmix_five_real_data_experiments.html#exp1">Five real-data experiments, Experiment 1</a></td></tr>
+            <tr><th scope="row">Reference mathematics</th><td><a href="model_mathematics.html">Model mathematics, §§5.2–5.4</a></td></tr>
+            <tr><th scope="row">Equal design and completion</th><td><a href="../results/my_panels_a100_b32_20260906_114323/panel_manifest.json">Panel manifest</a> · <a href="../results/my_panels_a100_b32_20260906_114323/analysis/analysis_manifest.json">Analysis manifest</a></td></tr>
+            <tr><th scope="row">Ranked design and completion</th><td><a href="../results/my_panels_qrank_a100_b32_20260908_103510/panel_manifest.json">Panel manifest</a> · <a href="../results/my_panels_qrank_a100_b32_20260908_103510/analysis/analysis_manifest.json">Partial analysis manifest</a></td></tr>
+            <tr><th scope="row">Six-pair equal results</th><td><a href="../results/my_panels_a100_b32_20260906_114323/analysis/cross_panel_L_agreement_summary.csv">Pairwise and pooled summary CSV</a></td></tr>
+            <tr><th scope="row">Matched weighting results</th><td><a href="../results/panels_equal_vs_ranked_comparison/matched_bootstrap_summary.csv">Bootstrap summary</a> · <a href="../results/panels_equal_vs_ranked_comparison/comparison_manifest.json">Cohort/configuration/artifact audit</a></td></tr>
+            <tr><th scope="row">Reference weights</th><td><a href="../results/panels_equal_vs_ranked_comparison/reference_weights.csv">Every dataset’s rank and normalized π</a> · <a href="../Datasets/data/HEK_riboseq_profile_quality_rank.tsv">Frozen six-component ranking input</a></td></tr>
+            <tr><th scope="row">Boundary / high-profile checks</th><td><a href="../results/my_panels_a100_b32_20260906_114323/posthoc_robustness/streaming_position_sensitivity/full/analysis_manifest.json">Full-run positional sensitivity provenance</a> · <a href="../results/my_panels_a100_b32_20260906_114323/posthoc_robustness/streaming_position_sensitivity/full/interpretation.md">Interpretation</a></td></tr>
+            <tr><th scope="row">Codon/position diagnostics</th><td><a href="../results/my_panels_a100_b32_20260906_114323/analysis/posthoc_robustness_streaming/execution_status.json">Completion status</a> · <a href="../results/my_panels_a100_b32_20260906_114323/analysis/posthoc_robustness_streaming/heldout_agreement_summary.csv">Agreement table</a> · <a href="../results/my_panels_a100_b32_20260906_114323/analysis/posthoc_robustness_streaming/fit_provenance.json">Fit provenance</a></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <details>
+        <summary>Identity hashes and numerical verification</summary>
+        <p class="small"><strong>Common test transcripts · 1,593 IDs</strong><br><code class="hash">2ce579fa766c31a3f3e07cc96e124ac2b7ce7732bc2eb9fc9aff451524b40777</code></p>
+        <p class="small"><strong>Frozen global six-component ranking · file SHA-256</strong><br><code class="hash">07f440ca13c9193f3814d8f529c1e50d8a09ec19fbc1c4a7aa91ecae860be125</code></p>
+        <p class="small"><strong>Diagnostic training intersection · 12,743 IDs</strong><br><code class="hash">f03596e8354de757d309f54fc16de3cb3e7778c77000652fddbe0f0f16915b03</code></p>
+        <p>The maximum absolute departure from mean(<i>L</i>) = 1 is 2.14 × 10<sup>−7</sup> in the equal run and 1.62 × 10<sup>−7</sup> in the available ranked run. No post-hoc correction was applied. All matched full/interior PCCs pass the saved variance-validity rule.</p>
+        <p>The completed residual diagnostic used frozen checkpoint replay for training targets. Its <a href="../results/my_panels_a100_b32_20260906_114323/analysis/posthoc_robustness_streaming/frozen_replay_verification.csv">replay verification</a> records numerical differences from stored test exports; do not describe replay as bitwise identical.</p>
+      </details>
+      <h3>Refresh plots after the missing ranked panels finish</h3>
+      <pre><code>bash analyses/run_real_panel_weighting_analysis.sh
+
+# Require all four matched panels before producing the final paper comparison:
+python analyses/compare_real_panel_weighting.py --require-all-panels</code></pre>
+      <p class="small">The workflow regenerates the same per-run plots and the matched comparison; it does not retrain models or refit the historical robustness analyses. This HTML is an authored snapshot: after refreshing the analysis, update the pending fields and results narrative from the new source tables.</p>
+      <h3>Resume training separately on Leonardo</h3>
+      <pre><code># Synchronize the missing utility and updated resume scripts first.
+sbatch resume_real_independent_panel_convergence_quality_rank.slurm</code></pre>
+      <p class="source">Original launchers: <a href="../run_real_independent_panel_convergence.slurm">equal-weight Slurm script</a> and <a href="../run_real_independent_panel_convergence_quality_rank.slurm">ranked Slurm script</a>. Analysis: <a href="../analyses/run_real_panel_weighting_analysis.sh">shared plotting workflow</a>, <a href="../analyses/analyze_real_panel_convergence.py">per-run analyzer</a>, <a href="../analyses/compare_real_panel_weighting.py">matched weighting analyzer</a>. Detailed operational instructions: <a href="panel_equal_ranked_resume_and_comparison.md">resume and comparison guide</a>.</p>
+    </section>
+    <footer class="footer">Prepared for later ICLR experimental-section drafting. All reported values are from the linked local result tables inspected on 10 September 2026; no unfinished result is imputed. Existing experiments, checkpoints, weights and source reports were not altered to prepare this document. Equations use native MathML/HTML; the linked plots retain the established LaTeX/Latin Modern typography.</footer>
+  </main>
+</div>
+</body>
+</html>

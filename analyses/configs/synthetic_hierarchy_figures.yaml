@@ -1,0 +1,129 @@
+schema_version: ribounmix.synthetic_hierarchy_figures.v1
+
+data:
+  kinetic_profile: Datasets/Synthetic_data/artificial_ground_truth_kinetics_target_mean_one.parquet
+  occupancy_replicates: Datasets/Synthetic_data/artificial_ground_truth_tasep_occupancy_replicates.parquet
+  sequence_annotations: Datasets/data/sequence/MANE.selection.sequence_embeddings_with_css.parquet
+  bias_annotation_template: Datasets/Synthetic_data/bias_profile/artificial_bias_{condition}_compendium_added_bias_only.parquet
+  count_template: Datasets/Synthetic_data/{depth_slug}/artificial_bias_{condition}_psite_counts_{depth_slug}.parquet
+
+depths:
+  - slug: 0p25_per_codon
+    value: 0.25
+    label: '0.25 reads/codon'
+  - slug: 2_per_codon
+    value: 2.0
+    label: '2 reads/codon'
+  - slug: 20_per_codon
+    value: 20.0
+    label: '20 reads/codon'
+
+conditions:
+  - key: 3prime_aa
+    label: "$3^\\prime$-AA"
+    row_label: "$3^\\prime$-AA"
+  - key: 3prime_cc
+    label: "$3^\\prime$-CC"
+    row_label: "$3^\\prime$-CC"
+  - key: 3prime_gg
+    label: "$3^\\prime$-GG"
+    row_label: "$3^\\prime$-GG"
+  - key: 3prime_uu
+    label: "$3^\\prime$-UU"
+    row_label: "$3^\\prime$-UU"
+  - key: 5prime_aa
+    label: "$5^\\prime$-AA"
+    row_label: "$5^\\prime$-AA"
+  - key: 5prime_cc
+    label: "$5^\\prime$-CC"
+    row_label: "$5^\\prime$-CC"
+  - key: 5prime_gg
+    label: "$5^\\prime$-GG"
+    row_label: "$5^\\prime$-GG"
+  - key: 5prime_uu
+    label: "$5^\\prime$-UU"
+    row_label: "$5^\\prime$-UU"
+  - key: gc_fraction_gt_0p7
+    label: "GC fraction $>0.7$"
+    row_label: "GC $>0.7$"
+  - key: au_fraction_gt_0p7
+    label: "AU fraction $>0.7$"
+    row_label: "AU $>0.7$"
+
+examples:
+  profile_layers:
+    transcript_id: ENST00000319974.6
+    condition: 3prime_cc
+    depth_slug: 20_per_codon
+    selection_rule: fixed manuscript example requested a priori
+  all_conditions:
+    transcript_id: ENST00000306954.5
+    minimum_sense_codons: 100
+    maximum_sense_codons_exclusive: 150
+    selection_rule: shortest transcript in the prespecified 100--149 sense-codon range with at least one annotated site for every condition; transcript ID breaks length ties
+
+colors:
+  black: '#000000'
+  gray: '#8C8C8C'
+  light_gray: '#B8B8B8'
+  blue: '#0072B2'
+  sky_blue: '#56B4E9'
+  orange: '#E69F00'
+  green: '#009E73'
+  vermillion: '#D55E00'
+  purple: '#CC79A7'
+
+comparison_styles:
+  q1_vs_q2:
+    label: "$q^{(1)}$ vs. $q^{(2)}$"
+    color: '#009E73'
+    linestyle: '-'
+  q1_vs_K:
+    label: "$q^{(1)}$ vs. $K$"
+    color: '#56B4E9'
+    linestyle: '-'
+  q2_vs_K:
+    label: "$q^{(2)}$ vs. $K$"
+    color: '#E69F00'
+    linestyle: '--'
+  qbar_vs_K:
+    label: "$\\overline q$ vs. $K$"
+    color: '#0072B2'
+    linestyle: '-.'
+
+outputs:
+  figure_directory: figures/appendix
+  results_directory: results
+  profile_layers_stem: synthetic_profile_layers_example
+  all_conditions_stem: synthetic_ten_biases_across_depths
+  cohort_stem: synthetic_K_q_stochasticity_summary
+  cohort_summary_csv: synthetic_K_q_stochasticity_summary.csv
+  cohort_per_transcript_parquet: synthetic_K_q_stochasticity_per_transcript.parquet
+  representative_metadata_csv: synthetic_K_q_representative_examples.csv
+  validation_json: synthetic_K_q_hierarchy_validation.json
+  captions_tex: synthetic_K_q_hierarchy_captions.tex
+  report_markdown: synthetic_K_q_hierarchy_report.md
+
+plot:
+  dpi: 400
+  font_size: 16.0
+  cohort_font_size: 10.5
+  cohort_legend_font_size: 9.5
+  # A separate right-hand column holds the legends at manuscript scale.
+  profile_layers_font_size: 17.5
+  profile_layers_size_inches: [11.2, 10.6]
+  all_conditions_size_inches: [7.25, 12.4]
+  cohort_size_inches: [7.25, 4.15]
+  thin_line_width: 0.9
+  standard_line_width: 1.4
+  emphasis_line_width: 2.2
+  stochastic_replica_alpha: 0.72
+  profile_affected_marker_size: 58
+  grid_affected_marker_size: 54
+  grid_legend_marker_size: 10.0
+
+validation:
+  mean_one_absolute_tolerance: 1.0e-12
+  identity_absolute_tolerance: 1.0e-12
+  extreme_tail_percentile: 5.0
+  permitted_terminal_codons: [TAA, TAG, TGA]

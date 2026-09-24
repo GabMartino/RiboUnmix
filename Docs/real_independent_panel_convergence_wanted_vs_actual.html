@@ -1,0 +1,545 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Independent real-data panel convergence: wanted experiment vs implementation</title>
+  <script>
+    window.MathJax = {
+      tex: {
+        inlineMath: [['\\(', '\\)']],
+        displayMath: [['\\[', '\\]']],
+        processEscapes: true
+      },
+      options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] }
+    };
+  </script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <style>
+    :root {
+      --ink: #18212f;
+      --muted: #5c6878;
+      --paper: #fbfcfe;
+      --panel: #ffffff;
+      --line: #dce3ec;
+      --blue: #1769aa;
+      --blue-soft: #eaf4fc;
+      --green: #16724a;
+      --green-soft: #e8f7ef;
+      --amber: #956000;
+      --amber-soft: #fff5da;
+      --red: #a13a3a;
+      --red-soft: #fff0f0;
+      --purple: #6647a8;
+      --purple-soft: #f3effc;
+      --shadow: 0 12px 34px rgba(25, 41, 62, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 10% 0%, #eaf4fc 0, transparent 30rem),
+        radial-gradient(circle at 100% 15%, #f3effc 0, transparent 26rem),
+        var(--paper);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", sans-serif;
+      line-height: 1.62;
+    }
+
+    main {
+      width: min(1180px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 42px 0 80px;
+    }
+
+    h1, h2, h3 { line-height: 1.18; letter-spacing: -0.025em; }
+    h1 { margin: 8px 0 16px; font-size: clamp(2.1rem, 5vw, 4.4rem); }
+    h2 { margin: 0 0 18px; font-size: clamp(1.55rem, 3vw, 2.25rem); }
+    h3 { margin: 24px 0 8px; font-size: 1.15rem; }
+    p { margin: 9px 0; }
+    code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
+    code { background: #edf1f6; border-radius: 5px; padding: 0.12em 0.38em; }
+    a { color: var(--blue); }
+
+    .eyebrow {
+      display: inline-flex;
+      padding: 6px 10px;
+      border: 1px solid #c5d9ea;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.78);
+      color: var(--blue);
+      font-size: 0.78rem;
+      font-weight: 750;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .lede {
+      max-width: 920px;
+      color: #3f4d5e;
+      font-size: clamp(1.05rem, 1.8vw, 1.27rem);
+    }
+
+    .hero-note {
+      margin: 26px 0 22px;
+      padding: 22px 24px;
+      border: 1px solid #a9d6bf;
+      border-left: 6px solid var(--green);
+      border-radius: 14px;
+      background: rgba(232, 247, 239, 0.92);
+      box-shadow: var(--shadow);
+    }
+
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 12px;
+      margin: 24px 0 38px;
+    }
+
+    .stat {
+      padding: 17px;
+      border: 1px solid var(--line);
+      border-radius: 13px;
+      background: rgba(255,255,255,0.88);
+      box-shadow: 0 7px 20px rgba(25, 41, 62, 0.05);
+    }
+
+    .stat strong { display: block; color: var(--blue); font-size: 1.72rem; line-height: 1; }
+    .stat span { display: block; margin-top: 7px; color: var(--muted); font-size: 0.84rem; }
+
+    nav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 20px 0 38px;
+    }
+    nav a {
+      padding: 7px 11px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: white;
+      color: #344357;
+      font-size: 0.85rem;
+      text-decoration: none;
+    }
+
+    section {
+      margin: 24px 0;
+      padding: clamp(20px, 3.5vw, 34px);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: rgba(255,255,255,0.93);
+      box-shadow: var(--shadow);
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 18px;
+      align-items: stretch;
+      margin: 24px 0 8px;
+    }
+    .flow-step {
+      position: relative;
+      min-height: 128px;
+      padding: 15px 12px;
+      border: 1px solid #cfd9e5;
+      border-radius: 12px;
+      background: #f8fafc;
+      text-align: center;
+    }
+    .flow-step:not(:last-child)::after {
+      content: "→";
+      position: absolute;
+      right: -18px;
+      top: 42%;
+      z-index: 2;
+      color: var(--blue);
+      font-size: 1.25rem;
+      font-weight: 800;
+    }
+    .flow-step b { display: block; margin-bottom: 7px; color: var(--blue); }
+    .flow-step small { color: var(--muted); }
+
+    .legend { display: flex; flex-wrap: wrap; gap: 9px; margin: 10px 0 18px; }
+    .badge {
+      display: inline-block;
+      padding: 4px 9px;
+      border-radius: 999px;
+      font-size: 0.76rem;
+      font-weight: 750;
+      white-space: nowrap;
+    }
+    .match { color: var(--green); background: var(--green-soft); }
+    .stronger { color: var(--purple); background: var(--purple-soft); }
+    .different { color: var(--amber); background: var(--amber-soft); }
+    .limitation { color: var(--red); background: var(--red-soft); }
+
+    .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 12px; }
+    table { width: 100%; border-collapse: collapse; background: white; font-size: 0.92rem; }
+    th, td { padding: 12px 13px; border-bottom: 1px solid var(--line); vertical-align: top; text-align: left; }
+    th { background: #f1f5f9; color: #334155; font-size: 0.78rem; letter-spacing: .025em; text-transform: uppercase; }
+    tr:last-child td { border-bottom: 0; }
+    td:first-child { font-weight: 680; }
+
+    .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .box { padding: 18px; border: 1px solid var(--line); border-radius: 12px; background: #fafcff; }
+    .box.wanted { border-top: 4px solid var(--blue); }
+    .box.actual { border-top: 4px solid var(--green); }
+    .box.caveat { border-left: 5px solid var(--amber); background: var(--amber-soft); }
+    .box.warning { border-left: 5px solid var(--red); background: var(--red-soft); }
+    .box h3 { margin-top: 0; }
+
+    .equation {
+      margin: 17px 0;
+      padding: 15px 18px;
+      overflow-x: auto;
+      border: 1px solid #d5e1eb;
+      border-radius: 11px;
+      background: #f8fbfe;
+      text-align: center;
+    }
+
+    .panel-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 17px 0; }
+    .panel-card { padding: 15px; border-radius: 12px; background: var(--blue-soft); border: 1px solid #c8deef; }
+    .panel-card strong { display: block; color: var(--blue); font-size: 1.1rem; }
+    .panel-card span { display: block; color: var(--muted); margin-top: 4px; font-size: 0.84rem; }
+
+    ul, ol { padding-left: 1.35rem; }
+    li { margin: 5px 0; }
+    .plain-list { list-style: none; padding: 0; }
+    .plain-list li { padding: 9px 0; border-bottom: 1px solid var(--line); }
+    .plain-list li:last-child { border-bottom: 0; }
+
+    pre {
+      overflow-x: auto;
+      margin: 14px 0 0;
+      padding: 16px;
+      border-radius: 11px;
+      background: #16202d;
+      color: #e7edf5;
+      font-size: 0.84rem;
+      line-height: 1.5;
+    }
+
+    .footnote { color: var(--muted); font-size: 0.84rem; }
+
+    @media (max-width: 920px) {
+      .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .flow { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .flow-step::after { display: none; }
+      .panel-grid { grid-template-columns: repeat(2, 1fr); }
+    }
+    @media (max-width: 640px) {
+      main { width: min(100% - 20px, 1180px); padding-top: 22px; }
+      .two-col, .stats, .flow, .panel-grid { grid-template-columns: 1fr; }
+      section { padding: 18px 14px; }
+      th, td { padding: 10px; }
+    }
+  </style>
+</head>
+<body>
+<div style="padding:10px 18px;background:#eaf4fb;border-bottom:1px solid #bdd7e8;text-align:center;font:600 14px/1.4 system-ui,sans-serif">Continuing the panel experiment? First read the <a href="project_model_onboarding.html">project onboarding and safe-handoff guide</a>.</div>
+<main>
+  <header>
+    <span class="eyebrow">Implementation audit · 1 September 2026</span>
+    <h1>Wanted experiment versus actual implementation</h1>
+    <p class="lede">This document compares the requested <em>independent real dataset-panel convergence</em> experiment with what the RiboUnmix repository now actually executes. It separates exact matches, intentional strengthening, implementation-specific choices, and remaining scientific limitations.</p>
+
+    <div class="hero-note">
+      <strong>Short answer.</strong> The implemented experiment matches the central scientific design. It trains four genuinely separate models on non-overlapping dataset panels and evaluates their learned shared profiles on the same held-out transcripts. The implementation is now stricter than the original request: datasets from the same inferred publication/source family cannot be split across panels. The largest remaining caveat is that source families are inferred from dataset names rather than read from a curated metadata table.
+    </div>
+
+    <div class="stats">
+      <div class="stat"><strong>114</strong><span>datasets retained</span></div>
+      <div class="stat"><strong>4</strong><span>independent models</span></div>
+      <div class="stat"><strong>85</strong><span>source families</span></div>
+      <div class="stat"><strong>0</strong><span>source-family crossings</span></div>
+      <div class="stat"><strong>1,593</strong><span>common test transcripts</span></div>
+    </div>
+
+    <nav>
+      <a href="#meaning">What independence means</a>
+      <a href="#pipeline">Actual pipeline</a>
+      <a href="#comparison">Requirement comparison</a>
+      <a href="#panels">Panel construction</a>
+      <a href="#split">Transcript split</a>
+      <a href="#training">Training contract</a>
+      <a href="#differences">Real differences</a>
+      <a href="#verification">Verification</a>
+    </nav>
+  </header>
+
+  <section id="meaning">
+    <h2>1. First: which things are independent, and which are shared?</h2>
+    <div class="two-col">
+      <div class="box wanted">
+        <h3>Independent across models</h3>
+        <ul>
+          <li>Selected Ribo-seq datasets</li>
+          <li>Source/publication families</li>
+          <li>Model parameters and optimizer states</li>
+          <li>Panel-specific gamma reference sets</li>
+          <li>Panel-specific eligible training transcript lists</li>
+        </ul>
+      </div>
+      <div class="box actual">
+        <h3>Intentionally shared across models</h3>
+        <ul>
+          <li>Sequence encoder architecture and hyperparameters</li>
+          <li>Random seed and split-generation rule</li>
+          <li>The exact validation transcript IDs</li>
+          <li>The exact test transcript IDs</li>
+          <li>The evaluation and checkpoint-selection rules</li>
+        </ul>
+      </div>
+    </div>
+    <p>This distinction is essential. <strong>The dataset panels must be disjoint; the held-out transcript IDs must be identical.</strong> Sharing test transcripts is not data-panel leakage—it is what makes (L_t^{(1)},ldots,L_t^{(4)}) directly comparable for the same biological sequences.</p>
+
+    <div class="equation">
+      \[
+      \mathcal D^{(a)}\cap\mathcal D^{(b)}=\varnothing\quad(a\ne b),
+      \qquad
+      \mathcal T_{\mathrm{test}}^{(1)}=\cdots=\mathcal T_{\mathrm{test}}^{(4)}.
+      \]
+    </div>
+
+    <p>The implementation adds a second independence constraint. If (s(d)) is the inferred source family of dataset (d), then:</p>
+    <div class="equation">
+      \[
+      s(d)=s(d')\;\Longrightarrow\;p(d)=p(d'),
+      \]
+    </div>
+    <p>so two conditions or replicates associated with the same publication are never placed in different panels.</p>
+  </section>
+
+  <section id="pipeline">
+    <h2>2. What the implemented orchestrator actually does</h2>
+    <div class="flow" aria-label="Experiment pipeline">
+      <div class="flow-step"><b>1 · Audit</b><small>Validate all 114 weighted, replica-aware parquet files.</small></div>
+      <div class="flow-step"><b>2 · Summarize</b><small>Compute depth, coverage, support and replica-agreement statistics.</small></div>
+      <div class="flow-step"><b>3 · Partition</b><small>Assign complete source families to four balanced panels.</small></div>
+      <div class="flow-step"><b>4 · Split</b><small>Create one common validation/test transcript split.</small></div>
+      <div class="flow-step"><b>5 · Train</b><small>Launch four independent model processes, one per available GPU slot.</small></div>
+      <div class="flow-step"><b>6 · Compare</b><small>Analyze (L_t) from minimum-validation-loss checkpoints.</small></div>
+    </div>
+    <p class="footnote">The orchestrator reuses the normal multidataset entrypoint. It does not duplicate the model, sampler, loss, gamma centering, optimizer, or prediction implementation.</p>
+  </section>
+
+  <section id="comparison">
+    <h2>3. Requirement-by-requirement comparison</h2>
+    <div class="legend">
+      <span class="badge match">Exact match</span>
+      <span class="badge stronger">Stronger than requested</span>
+      <span class="badge different">Implementation-specific choice</span>
+      <span class="badge limitation">Remaining limitation</span>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Topic</th><th>Wanted experiment</th><th>Actual implementation</th><th>Status</th></tr></thead>
+        <tbody>
+          <tr><td>Dataset partition</td><td>Four mutually exclusive panels whose union is every retained real dataset.</td><td>Every dataset appears exactly once; all 114 configured datasets were retained in the verified dry run.</td><td><span class="badge match">Exact match</span></td></tr>
+          <tr><td>Publication independence</td><td>Not originally stated as a hard mathematical constraint.</td><td>All datasets with the same <code>source_identifier</code> are assigned atomically to one panel.</td><td><span class="badge stronger">Stronger</span></td></tr>
+          <tr><td>Panel sizes</td><td>For 114 datasets: (29,29,28,28).</td><td>Exactly (29,29,28,28), despite source-family atomicity.</td><td><span class="badge match">Exact match</span></td></tr>
+          <tr><td>Quality table</td><td>Observed depth, coverage, transcript count, and replica PCC where available.</td><td>Computed from positive, sequence-eligible rows and arithmetic raw-replica consensus; also stores zero fraction, profile length, reads, replica count range and provenance.</td><td><span class="badge stronger">Superset</span></td></tr>
+          <tr><td>Panel balancing</td><td>Quantile strata and deterministic round-robin/greedy fallback.</td><td>Rank-quantile strata plus capacity-aware source-group assignment and equal-size source-group swaps.</td><td><span class="badge different">Adapted</span></td></tr>
+          <tr><td>Common evaluation universe</td><td>A transcript needs at least two usable datasets in every panel.</td><td>Uses exactly that criterion after sequence, positive-weight and positive-information filtering.</td><td><span class="badge match">Exact match</span></td></tr>
+          <tr><td>Validation/test identity</td><td>One deterministic validation list and one deterministic test list for all panels.</td><td>One common manifest is generated before training and hard-checked in every panel.</td><td><span class="badge match">Exact match</span></td></tr>
+          <tr><td>Split stratification</td><td>Reuse established reliability/CSS/length stratification where appropriate.</td><td>Uses median stored positive reliability rank bin × CSS bin. Transcript length is eligibility metadata but is not a split stratum.</td><td><span class="badge different">Partial choice</span></td></tr>
+          <tr><td>Training transcripts</td><td>Panel-specific remaining transcripts with at least two usable panel datasets.</td><td>Exactly so; every held-out ID is excluded from all panel training lists.</td><td><span class="badge match">Exact match</span></td></tr>
+          <tr><td>Reliability references</td><td>Prefer fitting (	au_d) and normalization medians on training IDs only.</td><td><code>train-only-snr</code> is the default; references are frozen for validation/test and report zero held-out fitting rows.</td><td><span class="badge match">Implemented</span></td></tr>
+          <tr><td>Gamma reference</td><td>Fixed reference, all datasets in the panel, uniform (pi_d).</td><td>Exactly that; dataset quality rank is disabled for gamma reference weighting in this experiment.</td><td><span class="badge match">Exact match</span></td></tr>
+          <tr><td>Loss and sampling</td><td>Grouped multidataset sampler, (K_t\ge2), transcript-balanced loss, raw-replica NB2.</td><td>The production settings are forced into every resolved panel configuration.</td><td><span class="badge match">Exact match</span></td></tr>
+          <tr><td>Mass handling</td><td>Current mass-free model.</td><td><code>model.mass_conservation=false</code> is forced and contract-checked.</td><td><span class="badge match">Exact match</span></td></tr>
+          <tr><td>Checkpoint</td><td>Only minimum overall validation loss for scientific comparison.</td><td>Only <code>best_val_loss</code> is predicted; the launcher rejects any other prediction manifest.</td><td><span class="badge match">Exact match</span></td></tr>
+          <tr><td>GPU execution</td><td>One independent process per physical GPU; queue if fewer than four GPUs.</td><td>Panels are sorted and assigned round-robin to GPU queues; failures are isolated and reported.</td><td><span class="badge match">Exact match</span></td></tr>
+          <tr><td>Post-training analysis</td><td>Six panel-pair PCC/Spearman/RMSE comparisons plus figures and tables.</td><td>Implemented automatically, including identity checks, representative transcripts and the 4×4 median-PCC matrix.</td><td><span class="badge match">Exact match</span></td></tr>
+          <tr><td>Source metadata</td><td>Use source/publication/lab metadata if readily available.</td><td>Uses an explicit source field when supplied; otherwise infers <code>author_year</code> from the dataset name. No curated lab identity is used.</td><td><span class="badge limitation">Caveat</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="panels">
+    <h2>4. How the actual dataset panels are built</h2>
+    <ol>
+      <li><strong>Validate each artifact.</strong> It must be a weighted replica-aware parquet with transcript ID, consensus profile, raw replicas, and a strictly positive retained weight.</li>
+      <li><strong>Apply sequence eligibility.</strong> Dataset statistics include only transcripts in the eligible sequence universe, including the configured CDS-length rule.</li>
+      <li><strong>Calculate observed statistics.</strong> For every dataset, the code measures median read density, median positive-codon coverage, eligible-transcript count and replica PCC.</li>
+      <li><strong>Construct source families.</strong> An explicit non-empty <code>source_identifier</code> is respected. Otherwise, the dataset-name <code>author_year</code> prefix is used.</li>
+      <li><strong>Keep the family atomic.</strong> The algorithm moves the complete source group, not individual conditions.</li>
+      <li><strong>Balance under exact capacities.</strong> It uses four rank bins for depth and coverage, a replica-quality category, standardized observed features, and exact panel capacities.</li>
+      <li><strong>Improve balance safely.</strong> Only equal-size source groups can be swapped after initial assignment, so neither panel size nor source atomicity can be broken.</li>
+    </ol>
+
+    <div class="panel-grid">
+      <div class="panel-card"><strong>Panel 01</strong><span>29 datasets · 20 sources</span></div>
+      <div class="panel-card"><strong>Panel 02</strong><span>29 datasets · 21 sources</span></div>
+      <div class="panel-card"><strong>Panel 03</strong><span>28 datasets · 22 sources</span></div>
+      <div class="panel-card"><strong>Panel 04</strong><span>28 datasets · 22 sources</span></div>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Verified panel</th><th>Mean median density</th><th>Mean median coverage</th><th>Mean median replica PCC</th><th>Mean eligible transcripts</th></tr></thead>
+        <tbody>
+          <tr><td>Panel 01</td><td>0.20943</td><td>0.17265</td><td>0.25048</td><td>13,657</td></tr>
+          <tr><td>Panel 02</td><td>0.19107</td><td>0.17373</td><td>0.24769</td><td>13,660</td></tr>
+          <tr><td>Panel 03</td><td>0.19635</td><td>0.17427</td><td>0.24091</td><td>13,676</td></tr>
+          <tr><td>Panel 04</td><td>0.18938</td><td>0.17190</td><td>0.23561</td><td>13,667</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="footnote">These values come from the clean 114-dataset dry run on 1 September 2026. They describe the design, not trained-model results.</p>
+
+    <div class="box caveat">
+      <strong>Why the algorithm is not simple round-robin anymore.</strong> Once a nine-dataset publication family must remain intact, assigning one dataset at a time could violate independence. The implementation therefore assigns source groups under capacity constraints. This is an intentional difference from the simplest algorithm proposed in the original prompt.
+    </div>
+  </section>
+
+  <section id="split">
+    <h2>5. Wanted transcript split versus actual transcript split</h2>
+    <p>Let (K_t^{(p)}) be the number of positive eligible dataset observations for transcript (t) inside panel (p). The common evaluation universe is:</p>
+    <div class="equation">
+      \[
+      \mathcal T_{\mathrm{common}}
+      =\left\{t:\min_{p\in\{1,2,3,4\}}K_t^{(p)}\ge2\right\}.
+      \]
+    </div>
+    <p>The actual clean dry run found <strong>15,929</strong> transcripts satisfying this rule. The split generator then selected:</p>
+    <ul>
+      <li><strong>1,593 validation transcripts</strong> (approximately 10%);</li>
+      <li><strong>1,593 test transcripts</strong> (approximately 10%);</li>
+      <li>panel-specific training lists from all remaining sequence-eligible transcripts with (K_t^{(p)}\ge2).</li>
+    </ul>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Panel</th><th>Training-eligible transcripts</th><th>Minimum support</th><th>Validation IDs</th><th>Test IDs</th></tr></thead>
+        <tbody>
+          <tr><td>Panel 01</td><td>13,261</td><td>2</td><td>same 1,593</td><td>same 1,593</td></tr>
+          <tr><td>Panel 02</td><td>13,613</td><td>2</td><td>same 1,593</td><td>same 1,593</td></tr>
+          <tr><td>Panel 03</td><td>13,595</td><td>2</td><td>same 1,593</td><td>same 1,593</td></tr>
+          <tr><td>Panel 04</td><td>13,340</td><td>2</td><td>same 1,593</td><td>same 1,593</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>How held-out transcripts are sampled</h3>
+    <p>For each common transcript, the implementation computes the median of its stored positive local reliability weights across all selected datasets. It converts this score into one of ten rank bins and crosses it with the established CSS-count category. Validation is sampled proportionally from these strata; test is sampled from the remaining transcripts using the same strata.</p>
+    <div class="box caveat">
+      <strong>Important implementation-specific detail.</strong> Transcript length is checked for sequence eligibility and recorded, but it is not currently an additional split stratum. The actual stratification is <code>reliability rank bin × CSS bin</code>. This is acceptable under the original “reuse established stratification where possible” wording, but it is not identical to a hypothetical reliability × CSS × length design.
+    </div>
+  </section>
+
+  <section id="training">
+    <h2>6. Training and evaluation contract</h2>
+    <div class="two-col">
+      <div class="box wanted">
+        <h3>Forced training settings</h3>
+        <ul>
+          <li><code>transcript_grouped_multidataset_pairs</code></li>
+          <li><code>minimum_positive_datasets_per_transcript=2</code></li>
+          <li><code>loss.sample_reduction=transcript_balanced</code></li>
+          <li><code>model.mass_conservation=false</code></li>
+          <li>learned alpha using the current production configuration</li>
+          <li>raw replicas retained for NB2</li>
+        </ul>
+      </div>
+      <div class="box actual">
+        <h3>Forced comparison settings</h3>
+        <ul>
+          <li>fixed-reference gamma centering</li>
+          <li>reference set = exactly that panel</li>
+          <li>uniform (pi_d=1/|\mathcal D^{(p)}|)</li>
+          <li>prediction only from <code>best_val_loss</code></li>
+          <li>prediction split = common test transcripts</li>
+          <li>no analysis-time renormalization of (L_t)</li>
+        </ul>
+      </div>
+    </div>
+
+    <h3>Reliability weights are train-only calibrated</h3>
+    <p>The default experiment mode fits each dataset's depth reference (	au_d) and raw-weight normalization median only from that panel's training transcript IDs. These references are frozen for validation and test. The manifest explicitly verifies:</p>
+    <div class="equation">
+      \[
+      N_{\mathrm{heldout\ rows\ used\ for\ fitting}}=0.
+      \]
+    </div>
+    <p>The historical precomputed <code>weight</code> column remains available only through the explicit <code>--reliability-weight-mode=stored</code> compatibility option. It is no longer the default for this experiment.</p>
+
+    <h3>What happens after training</h3>
+    <ol>
+      <li>Each panel must produce exactly one prediction manifest for <code>best_val_loss</code>.</li>
+      <li>The launcher verifies that it is a test-split artifact and that its transcript-ID hash equals the common test hash.</li>
+      <li>The analysis verifies identical transcript sets and identical (L_t) values across duplicate dataset rows within a panel.</li>
+      <li>For every transcript and all six panel pairs, it computes PCC, Spearman correlation and mean-one RMSE.</li>
+      <li>It writes long-form tables, summary quantiles, representative profiles, agreement distributions and a 4×4 median-agreement matrix.</li>
+    </ol>
+  </section>
+
+  <section id="differences">
+    <h2>7. The differences that matter scientifically</h2>
+    <ul class="plain-list">
+      <li><span class="badge stronger">Stronger</span> <strong>Publication families are atomic.</strong> The original core equation only required dataset-name disjointness. The current code also prevents conditions/replicates from an inferred common source from crossing panels.</li>
+      <li><span class="badge different">Different</span> <strong>Greedy source-group balancing replaces simple per-dataset round-robin.</strong> This is required to preserve source independence while still achieving exact capacities.</li>
+      <li><span class="badge different">Different</span> <strong>The source unit is inferred.</strong> The fallback takes the <code>author_year</code> prefix from the dataset name. This is reproducible, but not equivalent to curated publication/laboratory metadata.</li>
+      <li><span class="badge different">Different</span> <strong>Split reliability uses stored weights only for stratification.</strong> These scores choose a diverse held-out set; train-only fitted references are separately used to construct loss weights during the experiment.</li>
+      <li><span class="badge different">Different</span> <strong>Length is not a split stratum.</strong> It remains an eligibility rule and an analysis field.</li>
+      <li><span class="badge stronger">Stronger</span> <strong>Cached quality summaries carry provenance.</strong> A cache is rejected if weighted artifacts, the sequence file, or maximum-CDS eligibility changed.</li>
+      <li><span class="badge match">Intentional scope</span> <strong>No architectural control models are launched.</strong> This agrees with the original instruction not to implement the gamma fingerprint, saturation series, or additional architecture baselines in this task.</li>
+    </ul>
+
+    <div class="box warning">
+      <strong>Remaining independence limitation.</strong> Zero source-family crossings does not prove zero shared laboratory, protocol, sample, or consortium origin when those relationships are not encoded in dataset names. A publication-curated metadata table would be required to enforce those stronger notions of independence. The present code should therefore claim <em>dataset-disjoint and inferred-source-family-disjoint panels</em>, not universally metadata-independent panels.
+    </div>
+
+    <div class="box caveat" style="margin-top:14px">
+      <strong>No scientific convergence result exists from the dry run.</strong> The verified numbers above concern panel construction and split integrity. PCC, Spearman and RMSE between learned (L_t) profiles only exist after all four GPU trainings finish successfully.
+    </div>
+  </section>
+
+  <section id="verification">
+    <h2>8. What has actually been verified</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Check</th><th>Result</th></tr></thead>
+        <tbody>
+          <tr><td>Weighted artifact preflight</td><td>PASS for 114/114 datasets</td></tr>
+          <tr><td>Dataset-name crossings</td><td>0</td></tr>
+          <tr><td>Inferred source-family crossings</td><td>0</td></tr>
+          <tr><td>Panel capacities</td><td>29, 29, 28, 28</td></tr>
+          <tr><td>Common split overlap assertions</td><td>PASS</td></tr>
+          <tr><td>Minimum training support</td><td>At least two datasets in every panel</td></tr>
+          <tr><td>Train-only reliability fitting</td><td>Zero held-out fitting rows</td></tr>
+          <tr><td>Generated Hydra configuration</td><td>4/4 panel commands compose successfully</td></tr>
+          <tr><td>Focused unit tests</td><td>11/11 passed</td></tr>
+          <tr><td>Clean and cached dry runs</td><td>Both passed</td></tr>
+          <tr><td>Full GPU training</td><td>Not launched by this verification</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Relevant implementation files</h3>
+    <ul>
+      <li><a href="../run_real_independent_panel_convergence.py"><code>run_real_independent_panel_convergence.py</code></a> — design, contracts, manifests, GPU queues and post-training dispatch.</li>
+      <li><a href="../Utils/real_panel_convergence.py"><code>Utils/real_panel_convergence.py</code></a> — quality summaries, source-atomic panel assignment, split and reliability references.</li>
+      <li><a href="../Utils/external_transcript_split.py"><code>Utils/external_transcript_split.py</code></a> — loading and validating the common split during training.</li>
+      <li><a href="../analyses/analyze_real_panel_convergence.py"><code>analyses/analyze_real_panel_convergence.py</code></a> — six-pair shared-profile convergence analysis.</li>
+      <li><a href="../Tests/test_real_panel_convergence.py"><code>Tests/test_real_panel_convergence.py</code></a> — partition, split, source, reliability and propagation checks.</li>
+    </ul>
+
+    <h3>Recommended inspection command</h3>
+    <pre>.venv/bin/python run_real_independent_panel_convergence.py \
+  --dry-run \
+  --seed 42 \
+  --run-id panel_convergence_source_disjoint_seed42</pre>
+    <p class="footnote">Use a new run identifier for the scientific run. Previously generated panel manifests are historical and are not silently rewritten by the source-atomic implementation.</p>
+  </section>
+</main>
+</body>
+</html>

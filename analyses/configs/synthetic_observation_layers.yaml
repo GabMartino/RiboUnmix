@@ -1,0 +1,104 @@
+schema_version: ribounmix.synthetic_observation_layer_audit.v1
+
+data:
+  kinetic_profile: Datasets/Synthetic_data/artificial_ground_truth_kinetics_target_mean_one.parquet
+  occupancy_replicates: Datasets/Synthetic_data/artificial_ground_truth_tasep_occupancy_replicates.parquet
+  sequence_annotations: Datasets/data/sequence/MANE.selection.sequence_embeddings_with_css.parquet
+  bias_annotation_template: Datasets/Synthetic_data/bias_profile/artificial_bias_{condition}_compendium_added_bias_only.parquet
+  count_template: Datasets/Synthetic_data/{depth_slug}/artificial_bias_{condition}_psite_counts_{depth_slug}.parquet
+
+# This is the established order in analyze_synthetic_individual_datasets.py.
+# It is intentionally not alphabetized.
+conditions:
+  - key: 5prime_aa
+    dataset: artificial_bias_5prime_aa
+    label: "$5^\\prime$ AA"
+    plain_label: "5-prime AA"
+    color: "#0072B2"
+  - key: 5prime_cc
+    dataset: artificial_bias_5prime_cc
+    label: "$5^\\prime$ CC"
+    plain_label: "5-prime CC"
+    color: "#E69F00"
+  - key: 5prime_gg
+    dataset: artificial_bias_5prime_gg
+    label: "$5^\\prime$ GG"
+    plain_label: "5-prime GG"
+    color: "#009E73"
+  - key: 5prime_uu
+    dataset: artificial_bias_5prime_uu
+    label: "$5^\\prime$ UU"
+    plain_label: "5-prime UU"
+    color: "#CC79A7"
+  - key: 3prime_aa
+    dataset: artificial_bias_3prime_aa
+    label: "$3^\\prime$ AA"
+    plain_label: "3-prime AA"
+    color: "#56B4E9"
+  - key: 3prime_cc
+    dataset: artificial_bias_3prime_cc
+    label: "$3^\\prime$ CC"
+    plain_label: "3-prime CC"
+    color: "#D55E00"
+  - key: 3prime_gg
+    dataset: artificial_bias_3prime_gg
+    label: "$3^\\prime$ GG"
+    plain_label: "3-prime GG"
+    color: "#B79F00"
+  - key: 3prime_uu
+    dataset: artificial_bias_3prime_uu
+    label: "$3^\\prime$ UU"
+    plain_label: "3-prime UU"
+    color: "#000000"
+  - key: au_fraction_gt_0p7
+    dataset: artificial_bias_au_fraction_gt_0p7
+    label: "AU $>0.7$"
+    plain_label: "AU fraction > 0.7"
+    color: "#7A5195"
+  - key: gc_fraction_gt_0p7
+    dataset: artificial_bias_gc_fraction_gt_0p7
+    label: "GC $>0.7$"
+    plain_label: "GC fraction > 0.7"
+    color: "#6B6B6B"
+
+depths:
+  - slug: 0p25_per_codon
+    value: 0.25
+    label: "$C=0.25$"
+    plain_label: "0.25 reads/codon"
+  - slug: 2_per_codon
+    value: 2.0
+    label: "$C=2$"
+    plain_label: "2 reads/codon"
+  - slug: 20_per_codon
+    value: 20.0
+    label: "$C=20$"
+    plain_label: "20 reads/codon"
+
+outputs:
+  results_directory: analyses/artifacts/synthetic/individual_dataset
+  figure_directory: figures/synthetic_appendix
+  observation_figure_stem: observation_layer_agreement_by_dataset_and_depth
+  deterministic_figure_stem: deterministic_bias_effects_by_dataset
+  cross_condition_figure_stem: cross_dataset_consensus_correlation_by_depth
+
+plot:
+  dpi: 400
+  # These canvases are reduced to manuscript text width.  The deliberately
+  # large source sizes keep condition labels and panel headings at roughly
+  # 9--11 pt after LaTeX scaling rather than the unreadable 6--8 pt of the
+  # earlier dense boxplot layout.
+  font_size: 23.0
+  tick_font_size: 20.5
+  small_font_size: 17.5
+  observation_size_inches: [15.8, 7.2]
+  deterministic_size_inches: [14.8, 6.6]
+  matrix_size_inches: [14.2, 13.2]
+
+validation:
+  expected_transcripts: 19283
+  mean_one_absolute_tolerance: 1.0e-12
+  identity_absolute_tolerance: 1.0e-12
+  permitted_terminal_codons: [TAA, TAG, TGA]
+  nb2_dispersion_alpha: 0.1
+  common_random_excess_threshold: 0.02

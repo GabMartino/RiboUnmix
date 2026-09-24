@@ -1,0 +1,425 @@
+\begin{figure*}[!t]
+    \centering
+    \includegraphics[width=\textwidth]{figures/assets_5_real_datasets_4_panels/appendix_reliability_weight_example.pdf}
+    \caption{
+    \textbf{Dataset-relative reliability weighting preserves
+    observation-level variation.}
+    \textbf{(A--D)}
+    Each point represents an eligible transcript--dataset observation,
+    positioned by positive-codon coverage $C_{dt}$ and
+    log-transformed read density $\log(1+D_{dt})$.
+    Background colors and contours indicate the normalized weight
+    computed using the dataset's frozen training references
+    $\tau_d$ and $m_d$.
+    Examples were selected deterministically near the 12.5th,
+    37.5th, 62.5th, and 87.5th percentiles of $\tau_d$ across
+    the collection.
+    \textbf{(E)}
+    The dark-blue curve averages the 114 dataset-specific probability
+    densities, assigning equal mass to each dataset regardless of
+    transcript count.
+    The blue envelope shows their pointwise 10th--90th percentiles,
+    not a confidence interval; the pale vertical band marks the
+    mixture interquartile range.
+    Dashed red and dotted blue lines denote the normalization
+    reference $w_{dt}=1$ and the mixture median, respectively;
+    rug marks indicate dataset-specific medians.
+    Equal dataset mass applies only to this descriptive visualization:
+    training remains transcript-balanced.
+    No model predictions or gamma-reference weights $\pi_d$
+    enter the figure.
+    }
+    \label{fig:reliability_weight_example}
+\end{figure*}
+
+\subsection{Profile preprocessing and reliability weighting}
+\label{sec:real_preprocessing}
+
+Within each dataset, we retain nonempty, finite, nonnegative profiles
+with positive total counts. All-zero profiles are excluded, while
+sparse profiles and their zero-count codons are preserved.
+Raw replicates remain separate for the NB2 loss.
+For each transcript--dataset pair, the arithmetic replicate consensus
+defines read density
+$D_{dt}=n_t^{-1}\sum_i\overline Y_{dti}$
+and positive-codon coverage
+$C_{dt}=n_t^{-1}\sum_i\mathbf 1[\overline Y_{dti}>0]$,
+where $n_t$ is the number of modeled codons.
+
+The weighting is motivated by counting precision.
+Under NB2, the mean-to-standard-deviation ratio is
+$\mu/\sqrt{\mu+\alpha\mu^2}$: it grows approximately as
+$\sqrt{\mu}$ at low counts and saturates at high counts for fixed
+$\alpha>0$.
+We therefore use a bounded square-root depth score, supplemented
+by coverage to distinguish broad positional support from counts
+concentrated at a few positions.
+Let $\mathcal T_d^{\mathrm{train}}$ denote the retained training
+transcripts in dataset $d$ and
+$\tau_d=\operatorname{median}_{u\in\mathcal T_d^{\mathrm{train}}}D_{du}$.
+We define
+\begin{equation}
+    \begin{aligned}
+        w^{\mathrm{raw}}_{dt}
+        &=
+        0.70\,
+        \frac{\sqrt{D_{dt}}}
+             {\sqrt{D_{dt}}+\sqrt{\tau_d}}
+        +0.30\,C_{dt},\\
+        w_{dt}
+        &=
+        \frac{w^{\mathrm{raw}}_{dt}}{m_d},
+        \qquad
+        m_d=
+        \operatorname{median}_{u\in\mathcal T_d^{\mathrm{train}}}
+        w^{\mathrm{raw}}_{du}.
+    \end{aligned}
+    \label{eq:real_reliability}
+\end{equation}
+The depth component equals one-half at $D_{dt}=\tau_d$ and gives
+diminishing returns to additional reads.
+The mixture is an SNR-inspired reliability heuristic, not a
+calibrated SNR or inverse-variance estimate.
+
+Median normalization expresses each observation's reliability
+relative to the typical training observation in its own dataset.
+It preserves within-dataset differences while setting each dataset's
+median training weight to one: weights above or below one indicate
+above- or below-median sampling support within that dataset,
+rather than absolute quality across experiments.
+This removes differences in median raw scores as an additional
+dataset-wide loss multiplier, but does not enforce equal total
+dataset contributions.
+Both $\tau_d$ and $m_d$ are fitted on training transcripts and frozen
+for evaluation.
+The resulting weights enter the transcript-balanced objective in
+Equation~\ref{eq:transcript_balanced_objective}; they do not modify
+the count profiles.
+Their role is distinct from $\pi_d$, which defines the reference
+priorities used to center the dataset-specific corrections.
+
+Figure~\ref{fig:reliability_weight_example} illustrates this
+dataset-relative interpretation.
+Panels A--D show how the weighting rule adapts to datasets with
+different reference densities, while panel E summarizes the
+resulting distributions across all 114 datasets.
+The displayed dataset medians lie between $0.996$ and $1.011$,
+but substantial observation-level variation remains: the
+equal-dataset mixture has an interquartile range of
+$0.620$--$1.394$.
+All eligible observations are displayed, including held-out rows
+transformed without refitting the training references.
+The near-unit medians are primarily a consequence of normalization,
+not evidence of equal dataset quality or independent validation
+of held-out reliability.
+
+\subsection{Real-data stability experiments}
+\label{sec:real_stability_experiments}
+
+The real-data experiments study Ribo-seq collections with heterogeneous read
+depth and unknown dataset-specific bias.  Without a known biological profile,
+two claims remain identifiable.  First, independently fitted, source-disjoint
+dataset panels should recover concordant $\mathbf{L}_t$ profiles for the
+same held-out transcripts.  Second, a quality-ranked gamma reference should
+reduce the displacement of $\mathbf{L}_t$ as progressively lower-ranked
+datasets are added.  These are reproducibility and stability claims; real data
+alone cannot establish recovery of the unknown true $\mathbf{L}_t$ or
+$\gamma_{dt}$.
+
+All experiments use 114 HEK Ribo-seq datasets aligned to the same MANE CDS
+representation.  Replicates from one condition remain separate count profiles
+within a transcript--dataset observation.  For dataset $d$, transcript $t$, and
+codon $i$, the modeled mean is
+\begin{equation}
+    \mu_{dti}=S_{dt}\,[\mathbf{L}_t]_i\,\gamma_{dti},
+    \qquad
+    \frac{1}{n_t}\sum_i [\mathbf{L}_t]_i=1,
+    \label{eq:real_mean_decomposition}
+\end{equation}
+where $S_{dt}$ is the target-derived abundance scale,
+$\mathbf{L}_t$ is shared across datasets, and $\gamma_{dt}$ is the
+positional dataset correction.
+
+\subsubsection{Frozen dataset-quality ranking and gamma reference}
+\label{sec:real_quality_ranking}
+
+The dataset ordering is frozen before training.  It aggregates ten
+prespecified QC indicators covering periodicity, CDS enrichment, depth and
+transcript support, footprint-length quality, mapping and contamination, and
+replicate agreement.  Rank $r_d=1$ denotes the best QC profile.  The ranking
+table contains $R=115$ entries; 114 are active because global rank 110 is not
+configured.  Ranks are never recomputed within a panel or cumulative subset.
+
+For an active collection $\mathcal D$, the rank score and normalized reference
+weight are
+\begin{equation}
+    q_d=\frac{R-r_d+1}{R},
+    \qquad
+    \pi_d^{(p)}=\frac{q_d^p}{\sum_{e\in\mathcal D}q_e^p}.
+    \label{eq:real_gamma_reference}
+\end{equation}
+We use equal reference weights ($p=0$), ranked weights with $p=1$, and a
+stronger $p=3$ sensitivity analysis.  Reversed controls attach the same
+multiset of $q_d^p$ values to datasets in the opposite rank order.  They
+therefore preserve weight concentration while reversing which datasets define
+the reference.
+
+The weights impose the gamma-identifiability constraint
+\begin{equation}
+    \sum_{d\in\mathcal D}\pi_d\log\gamma_{dti}=0
+    \quad\text{for every }(t,i).
+    \label{eq:real_gamma_centering}
+\end{equation}
+Thus $\pi_d$ changes how a fitted mean is divided between the shared profile and
+the dataset-specific correction.  It does not remove low-ranked observations
+or reweight their likelihood contributions; those contributions use the local
+reliability weights $w_{dt}$ in Equation~\ref{eq:real_reliability}.
+
+\subsubsection{Common training and comparison protocol}
+\label{sec:real_stability_metrics}
+
+Each model is initialized independently with seed 42 and selected by minimum
+validation loss.  For transcript $t$, a batch group contains all usable
+observations from the selected datasets; missing transcript--dataset pairs are
+not fabricated.  Raw replicates enter the NB2 likelihood separately, whereas
+their arithmetic consensus enters the profile-correlation terms.  Dataset
+losses are combined within transcript using $w_{dt}$ and then averaged across
+transcripts, so transcripts observed in more datasets do not automatically
+receive greater outer weight.
+
+The selected checkpoint exports a sequence-derived, full-CDS, mean-one
+$\mathbf{L}_t$ profile.  After matching transcript IDs, CDS coordinates,
+and valid-position masks, two models $A$ and $B$ are compared transcript by
+transcript:
+\begin{equation}
+    \operatorname{PCC}_t(A,B)
+    =\operatorname{corr}_{i}\!\left(
+      [\mathbf{L}^{A}_t]_i,[\mathbf{L}^{B}_t]_i\right).
+    \label{eq:real_profile_agreement}
+\end{equation}
+The distributions of these PCC values measure positional shape agreement.  We
+also verify that the exported profiles retain within-transcript variation, so a
+high PCC cannot be attributed to constant profiles.
+
+\subsubsection{Four source-disjoint panels}
+\label{sec:real_four_panel_design}
+
+The first experiment partitions the 114 datasets once into four disjoint
+panels.  Datasets inferred to share a publication or source family remain in
+the same panel.  A seed-42, capacity-aware assignment balances quantile strata
+of median read density, positive-codon coverage, eligible-transcript count, and
+median replicate PCC, followed by size-preserving source-family swaps.  The
+scalar QC rank is not used to construct the panels; it is used only to define
+$\pi_d$ after membership is fixed.
+
+\begin{table*}[!t]
+    \centering
+    \small
+    \caption{Composition and training-cohort sizes of the four fixed
+    source-disjoint panels.  All panels share 1,593 validation and 1,593 test
+    transcript IDs.}
+    \label{tab:real_four_panel_design}
+    \begin{tabular}{lrrrrr}
+        \toprule
+        Panel & Datasets & Source families & Global-rank range & Mean rank & Training transcripts \\
+        \midrule
+        1 & 29 & 20 & 7--106 & 54.66 & 13,261 \\
+        2 & 29 & 21 & 2--114 & 59.17 & 13,613 \\
+        3 & 28 & 22 & 1--115 & 57.79 & 13,595 \\
+        4 & 28 & 22 & 6--113 & 58.61 & 13,340 \\
+        \bottomrule
+    \end{tabular}
+\end{table*}
+
+A common evaluation pool contains transcripts with usable observations in at
+least two datasets from every panel.  From 15,929 eligible transcripts, we draw
+1,593 validation and 1,593 test IDs without replacement, stratified by
+reliability decile and conserved-stalling-site category.  Both sets are removed
+from every training fold.  Training eligibility then remains panel-specific,
+as reported in Table~\ref{tab:real_four_panel_design}.  All five reference
+policies reuse the same folds within a panel.
+
+The comparison was audited at the exported-prediction level.  All 20 fits use
+the same validation IDs for checkpoint selection and the same disjoint test IDs
+for evaluation.  Every pairwise PCC uses identical test transcripts, CDS
+coordinates, and masks.  The validation objectives still differ across panels
+because their observed datasets differ, and the six panel pairs share four
+fitted models; they are not six independent replications.
+
+\begin{figure*}[!t]
+    \centering
+    \includegraphics[width=\textwidth]{figures/assets_5_real_datasets_4_panels/appendix_four_panel_rank_and_cross_panel_pcc.pdf}
+    \caption{
+    \textbf{Panel QC-rank balance and transcript-level concordance of the
+    shared profile.}
+    \textbf{(A)} Frozen global QC ranks in the four source-disjoint panels;
+    points are datasets, boxes show the interquartile range and median, white
+    diamonds show the mean, and the dashed line marks the active-collection
+    mean.
+    \textbf{(B--F)} PCC distributions for the same 1,593 test transcripts in
+    each of the six panel pairs.  From left to right, the first row contains
+    panel balance, ranked $p=1$, and ranked $p=3$; the second row contains equal
+    reference, reversed $p=1$, and reversed $p=3$.  Embedded
+    boxes show the median and interquartile range.  All PCC panels share
+    adaptive limits computed from the pooled 0.5th and 99.5th percentiles with
+    four-percent padding; the printed percentage gives the fraction outside
+    those display limits, while all values remain in the summaries.
+    }
+    \label{fig:real_four_panel_overview}
+\end{figure*}
+
+Figure~\ref{fig:real_four_panel_overview} shows strong cross-panel concordance
+under equal and mildly ranked centering, with no near-constant exported
+profiles.  Agreement remains positive across all reference policies, although
+strong $p=3$ centering---especially when reversed---reduces reproducibility.
+The experiment therefore supports a shared, reproducible signal across
+source-disjoint collections, while also showing that the latent decomposition
+is not fully invariant to an aggressive gamma reference.  Because the panels
+were balanced rather than ordered from best to worst, this experiment is not a
+test that the QC ranking improves recovery.
+
+\subsubsection{Controlled cumulative addition of lower-ranked datasets}
+\label{sec:real_cumulative_design}
+
+The cumulative experiment uses nested prefixes of the frozen ordering,
+\begin{equation}
+    N\in\{2,5,10,20,40,80,114\},
+    \qquad
+    \mathcal D_N=\{d_{(1)},\ldots,d_{(N)}\},
+    \label{eq:real_cumulative_prefix}
+\end{equation}
+so each step retains the preceding datasets and adds the next lower-ranked
+block.  Every size and reference policy is trained from a fresh initialization;
+``cumulative'' refers only to membership.
+
+Two deterministic diagnostics quantify how different the reference policies
+actually are at each $N$:
+\begin{equation}
+    \frac{N_{\mathrm{eff}}}{N}
+    =\frac{1}{N\sum_{d\in\mathcal D_N}\pi_d^2},
+    \qquad
+    \overline r_{\pi}=\sum_{d\in\mathcal D_N}\pi_d r_d.
+    \label{eq:real_reference_diagnostics}
+\end{equation}
+The first measures concentration relative to equal weighting; the second shows
+which end of the ranking receives that mass.  These quantities diagnose the
+strength and direction of the intervention and are not model-performance
+metrics.
+
+\begin{figure*}[!t]
+    \centering
+    \includegraphics[width=\textwidth]{figures/assets_5_real_datasets_4_panels/appendix_cumulative_reference_concentration.pdf}
+    \caption{
+    \textbf{The cumulative ranking intervention becomes appreciable only for
+    larger dataset collections.}
+    \textbf{(A)} Effective reference fraction $N_{\mathrm{eff}}/N$ for each
+    nested best-$N$ collection.  Ranked and reversed policies coincide because
+    they contain the same weights.
+    \textbf{(B)} Reference-weighted mean global rank, which separates their
+    direction: ranked policies favor the best datasets and reversed policies
+    favor the worst members of the same collection.  The shaded region marks
+    $N\leq20$.  Both panels are fixed properties of the experimental design.
+    }
+    \label{fig:real_cumulative_reference_concentration}
+\end{figure*}
+
+Figure~\ref{fig:real_cumulative_reference_concentration} sets the expected
+scale of the best-first result.  Through $N=20$, even the ranked references
+within these top-ranked prefixes remain close to equal, so large early
+differences in $\mathbf{L}_t$ would be surprising.  The intervention separates
+mainly at the larger collections; those endpoints carry the strongest test of
+whether reference direction stabilizes the shared profile.
+
+The original best-first run evaluates every model on 1,771 common test
+transcripts, although its training and validation cohorts vary with $N$.  A
+second experiment fixes the cohort before training.  The intersection across
+all 114 datasets yields 7,142 complete-case transcripts, split once into 5,714
+training, 714 validation, and 714 test IDs.  Transcript membership, CDS
+coordinates, observation availability, and training-fitted reliability
+references are fixed across its collection sizes and policies.  This isolates
+dataset addition, at the cost of restricting the analysis to transcripts
+observed in every dataset.
+
+\subsubsection{Bidirectional dataset-selection control}
+\label{sec:real_selection_controls}
+
+We combine the available best-first trajectory with the completed worst-first
+branch of the fixed-cohort experiment.  The best-first path starts from the two
+highest-ranked datasets and adds progressively lower-ranked datasets; the
+worst-first path starts from the two lowest-ranked datasets and adds
+progressively higher-ranked datasets.  Within each path, every model is
+compared with one common equal-reference $N=2$ fit.  This shared anchor prevents
+separately trained policy-specific anchors from entering the within-panel
+ranking contrast.  It is a drift reference, not biological ground truth.
+
+\begin{figure*}[!t]
+    \centering
+    \includegraphics[width=\textwidth]{figures/assets_5_real_datasets_4_panels/appendix_cumulative_ranking_direction_L_PCC.pdf}
+    \caption{
+    \textbf{Dataset-quality ranking moves the shared profile in the direction
+    defined by the gamma reference.}
+    \textbf{(A)} Best-first collections add progressively lower-ranked
+    datasets.  Each point is the mean transcript-level PCC of
+    $\mathbf{L}_t$ to the common equal-reference best-$N=2$ fit over the same
+    1,771 test transcripts and CDS coordinates.  Ranked and reversed policies
+    use the same selected datasets; at a fixed exponent they also have identical
+    weight concentration and differ only in which end of the selected ranking
+    receives that weight.  The shaded region marks $N\leq20$, where the ranked
+    $p=3$ effective reference fraction remains at least $0.97$.  At $N=114$,
+    equal and reversed $p=1$ were still unavailable and are not imputed.
+    \textbf{(B)} Worst-first collections add progressively higher-ranked
+    datasets.  PCC is measured to the common equal-reference worst-$N=2$ fit on
+    the fixed cohort of 714 test transcripts.  Here $p=3$ is already
+    concentrated at $N=2$ because the two lowest-ranked datasets have small,
+    strongly separated quality scores.  In both panels, the equal $N=2$ point
+    is the identity comparison; the other $N=2$ points compare their fitted
+    policies with that same equal-reference anchor.  Bands are 95\% percentile
+    intervals from a joint bootstrap over held-out transcripts within each
+    panel and do not include optimization-seed uncertainty.  The two panels use
+    adaptive vertical limits and different transcript cohorts, so their absolute
+    slopes should not be compared quantitatively.
+    }
+    \label{fig:real_cumulative_ranking_direction}
+\end{figure*}
+
+Figure~\ref{fig:real_cumulative_ranking_direction} supports a directional
+effect of the gamma reference.  Along the best-first path, ranked and reversed
+$p=3$ remain close while the weights are nearly uniform.  After the collection
+expands, ranked $p=3$ is consistently closer to the best-two anchor than its
+concentration-matched reversed control, with the largest separation at
+$N=114$.  The comparison isolates which datasets define the reference more
+cleanly than ranked-versus-equal, whose difference remains modest and
+non-monotonic.
+
+The worst-first path provides the complementary check.  A quality-ranked
+reference should not preserve a solution defined by the two worst datasets:
+as better datasets enter, it assigns them greater reference mass and moves
+$\mathbf{L}_t$ away from that poor anchor faster than equal weighting.  The
+lower ranked-$p=3$ curve in panel B is therefore the expected directional
+response, rather than evidence of worse stability.  Together, the two paths
+show that $\pi_d$ controls where the model places the boundary between the
+shared $\mathbf{L}_t$ profile and dataset-specific $\gamma_{dt}$ corrections in
+a manner consistent with the QC ordering.
+
+\subsubsection{Scope of the current evidence}
+
+The completed four-panel experiment supports reproducibility of structured
+shared profiles across source-disjoint real-data collections.  Conditional on
+these fitted models, the cumulative results show a substantial,
+direction-consistent effect of ranking on the latent decomposition; they do not
+establish that the resulting $\mathbf{L}_t$ is closer to the unknown biological
+truth.  That stronger claim requires known-signal recovery or an external
+biological endpoint.  The best-first and worst-first panels also use different
+cohorts and training protocols, and all runs use one optimization seed;
+bootstrap intervals therefore do not measure optimization variability.
+
+% Implementation provenance for this manuscript fragment:
+% - four-panel design: results/four_panel_stability_seed42/experiment_manifest.json
+% - controlled cumulative design: results/cumulative_stability_fixed_cohort_seed42/experiment_manifest.json
+% - best/worst control: results/cumulative_selection_direction_seed42/experiment_manifest.json
+% - quality-stratum control: results/four_quality_strata_seed42/experiment_manifest.json
+% - four-panel result tables: analyses/artifacts/real_data/four_panel_stability/
+% - exploratory cumulative tables: analyses/artifacts/real_data/cumulative_stability/
+% - manuscript stability figures: analyses/create_iclr_real_data_stability_figures.py
+% - cumulative direction figure: analyses/create_iclr_cumulative_ranking_direction_figure.py
+% - frozen ranking SHA-256: 5811cadf68c56740e83b232b2990299d527630326205db9cba8bc7024d3cf1f8

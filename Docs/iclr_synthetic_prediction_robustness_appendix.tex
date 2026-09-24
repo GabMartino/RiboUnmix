@@ -1,0 +1,262 @@
+% ICLR appendix fragment: synthetic observation reconstruction and robustness.
+% Required packages in the parent document: amsmath, graphicx.
+% Paths assume compilation from the repository root and may be redefined.
+% The two single-dataset audit PDFs are copied into the robustness directory
+% so that this appendix section has one self-contained figure bundle.
+\providecommand{\syntheticindividualauditfigdir}{analyses/artifacts/synthetic/prediction_robustness}
+\providecommand{\syntheticpredictionrobustnessfigdir}{analyses/artifacts/synthetic/prediction_robustness}
+
+\subsection{Observation reconstruction under single- and multi-dataset training}
+\label{app:synthetic_prediction_robustness}
+
+This section asks a deliberately narrower question than recovery of the
+programmed kinetic profile $K_t$: does joint training on increasingly many
+biased observations preserve the model's ability to reconstruct each
+dataset-specific observed profile?  This distinction is essential.  The
+fitted mean factorizes as
+\begin{equation}
+    \mu_{dti}=S_{dt}L_{ti}\gamma_{dti},
+    \label{eq:appendix_mu_factorization}
+\end{equation}
+so an accurate $\mu_{dt}$ can coexist with an incorrect allocation of
+structure between the shared profile $L_t$ and the dataset correction
+$\gamma_{dt}$.  Observation reconstruction is therefore a capacity and
+robustness diagnostic, not evidence by itself for successful disentanglement.
+
+\paragraph{Notation and evaluation target.}
+Let $d$ index one of the ten programmed bias conditions, $t$ a held-out
+transcript, $r\in\{1,2\}$ a sampled replica, and $i$ a model-valid exported
+profile position.  The observed target supplied to the model is the arithmetic
+two-replica consensus
+\begin{equation}
+    \overline{Y}_{dti}=\frac{1}{2}
+       \left(Y^{(1)}_{dti}+Y^{(2)}_{dti}\right).
+    \label{eq:appendix_replica_consensus}
+\end{equation}
+For a cumulative model trained on the ordered panel $\mathcal D_N$ of $N$
+conditions, we calculate a Pearson correlation separately within every
+transcript--dataset profile,
+\begin{equation}
+    r^{(N)}_{dt}
+      =\operatorname{PCC}_{i\in\mathcal M_{dt}}
+         \!\left(\mu^{(N)}_{dti},\overline{Y}_{dti}\right),
+    \qquad d\in\mathcal D_N,
+    \label{eq:appendix_mu_observation_pcc}
+\end{equation}
+where $\mathcal M_{dt}$ is the finite exported model mask.  Correlations are
+not pooled across codons or transcripts, and no Fisher transform, smoothing,
+zero filtering, or reliability weighting is applied during evaluation.
+Undefined correlations from constant profiles remain missing rather than
+being set to zero.  To match the raw validation diagnostic and the existing
+single-dataset audit exactly, the exported mask retains the validated appended
+zero terminal position; no additional boundary crop is introduced here.
+
+All comparisons below use training seed 42, uniform reference weights
+$\pi_d=1/N$, and the frozen checkpoint minimizing validation loss.  Selecting
+this checkpoint rather than the checkpoint maximizing validation PCC avoids
+directly selecting on the displayed statistic.  The same 1,920 validation
+transcripts are used by every bias and every $N$ within a read depth.  No
+profile is undefined in the complete grid, so the fixed complete cohort
+contains all 1,920 transcripts at each depth.  The cohorts differ across
+depths and have SHA-256 prefixes \texttt{7f02618d4975},
+\texttt{361ae47698c2}, and \texttt{1a508cab4970} at 0.25, 2, and 20 reads per
+codon, respectively.  Consequently, the three depths are presented as
+parallel sensitivity analyses rather than silently treated as if they used
+identical transcripts.
+
+\paragraph{Single-dataset prediction and empirical repeatability.}
+For the independently trained single-dataset models, we compare
+$r^{(1)}_{dt}$ with the within-dataset replica correlation
+\begin{equation}
+    a_{dt}=\operatorname{PCC}_{i\in\mathcal M_{dt}}
+       \!\left(Y^{(1)}_{dti},Y^{(2)}_{dti}\right).
+    \label{eq:appendix_replica_pcc}
+\end{equation}
+Figure~\ref{fig:synthetic_single_prediction_replica_boxes} shows the full
+matched transcript distributions.  Across the ten biases, the median of the
+condition-level median replica PCCs increases from 0.171 to 0.535 and 0.736
+with read depth.  The corresponding medians for
+$\operatorname{PCC}(\mu,\overline Y)$ are 0.538, 0.831, and 0.917.  The latter
+quantity may exceed replica--replica agreement because the target averages
+the same two replicas and the sequence model shares statistical strength
+across training transcripts.  Replica agreement is therefore not a formal
+upper bound or an independent noise ceiling for model--consensus agreement.
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=0.94\textwidth]
+      {\syntheticindividualauditfigdir/single_dataset_prediction_vs_replica_agreement_boxplots.pdf}
+    \caption{\textbf{Single-dataset prediction versus replica agreement.}
+    Gray boxes show the transcript-level distribution of
+    $\operatorname{PCC}(Y^{(1)}_{dt},Y^{(2)}_{dt})$; purple boxes show
+    $\operatorname{PCC}(\mu^{(1)}_{dt},\overline Y_{dt})$ for the matching
+    depth, bias, and held-out transcript.  Boxes span the interquartile range,
+    central lines are medians, and whiskers span the 5th--95th percentiles.
+    Each condition contains 1,920 transcripts.  These are dependent
+    comparisons because $\overline Y$ is formed from the same two replicas.}
+    \label{fig:synthetic_single_prediction_replica_boxes}
+\end{figure*}
+
+The condition ordering is nevertheless highly consistent.  Define
+\begin{equation}
+    \rho_C
+      =\operatorname{Spearman}_{d}
+       \left(
+          \operatorname{median}_{t}a_{dt},
+          \operatorname{median}_{t}r^{(1)}_{dt}
+       \right).
+    \label{eq:appendix_condition_spearman}
+\end{equation}
+Across the ten bias conditions, $\rho_C$ is 0.976, 1.000, and 0.952 at 0.25,
+2, and 20 reads per codon (Figure~\ref{fig:synthetic_single_prediction_spearman}).
+Thus conditions whose two sampled replicas are easier to reconcile also tend
+to be those whose consensus is easier for the single-dataset model to predict.
+This is a descriptive association across ten engineered conditions, not a
+transcript-level correlation or an inferential estimate for experimental
+Ribo-seq datasets.
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=\textwidth]
+      {\syntheticindividualauditfigdir/single_dataset_prediction_vs_replica_agreement_scatter.pdf}
+    \caption{\textbf{Condition-level association between repeatability and
+    single-dataset prediction.}  Each point is one programmed bias condition.
+    The horizontal coordinate is its median transcript replica PCC and the
+    vertical coordinate is its median transcript
+    $\operatorname{PCC}(\mu,\overline Y)$.  The dashed line denotes equality;
+    the reported Spearman coefficient ranks the ten condition medians.  It
+    does not test independence between the two axes and should not be read as
+    a noise-ceiling analysis.}
+    \label{fig:synthetic_single_prediction_spearman}
+\end{figure*}
+
+\paragraph{Matched single-versus-cumulative comparison.}
+The cumulative panels use the fixed order $3'$-AA, $3'$-CC, $3'$-GG,
+$3'$-UU, $5'$-AA, $5'$-CC, $5'$-GG, $5'$-UU, GC-rich, and AU-rich.  A raw
+panel average at $N$ is confounded by this changing composition.  We therefore
+pair every cumulative score with the independently fitted single-dataset model
+for the same depth, named bias, and transcript,
+\begin{equation}
+    \Delta^{(N)}_{dt}=r^{(N)}_{dt}-r^{(1,d)}_{dt},
+    \qquad d\in\mathcal D_N,
+    \label{eq:appendix_paired_mu_delta}
+\end{equation}
+and summarize both models on the same prefix $\mathcal D_N$:
+\begin{align}
+    R^{(N)}
+      &=\frac{1}{|\mathcal T_C|}\sum_{t\in\mathcal T_C}
+        \frac{1}{N}\sum_{d\in\mathcal D_N}r^{(N)}_{dt},\\
+    R^{(1\mid N)}
+      &=\frac{1}{|\mathcal T_C|}\sum_{t\in\mathcal T_C}
+        \frac{1}{N}\sum_{d\in\mathcal D_N}r^{(1,d)}_{dt}.
+    \label{eq:appendix_panel_reconstruction_means}
+\end{align}
+Here $R^{(1\mid N)}$ changes slightly with $N$ because it is the matched mean
+of the first $N$ bias-specific fits, not one privileged $N=1$ model.  This
+construction prevents an easy or difficult newly added bias from being
+misreported as a benefit or failure of joint training.
+
+Figure~\ref{fig:synthetic_mu_robustness_aggregate} shows that joint training
+preserves observation reconstruction.  At the two endpoints $N=2$ and
+$N=10$, respectively, cumulative mean PCC is 0.541 and 0.547 at 0.25
+reads/codon, 0.819 and 0.822 at 2 reads/codon, and 0.908 and 0.909 at 20
+reads/codon.  At $N=10$, the paired cumulative-minus-single
+differences are $+0.00162$ (95\% transcript-bootstrap interval
+$[+0.00140,+0.00183]$), $+0.00041$ ($[+0.00028,+0.00054]$), and $-0.00014$
+($[-0.00026,-0.00002]$), respectively.  Their small magnitude is more
+important than their sign: there is no practically meaningful observation-fit
+penalty from fitting the ten conditions jointly in this realization.
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=\textwidth]
+      {\syntheticpredictionrobustnessfigdir/synthetic_mu_robustness_aggregate.pdf}
+    \caption{\textbf{Observed-profile reconstruction is stable under
+    cumulative multi-dataset training.}  \textbf{(A)} Solid curves show
+    $R^{(N)}$ for the cumulative model.  Dashed curves show the matched
+    $R^{(1\mid N)}$ average from the same first $N$ bias-specific
+    single-dataset models.  \textbf{(B)} Mean paired difference
+    $R^{(N)}-R^{(1\mid N)}$; the horizontal line denotes no change.  Error bars
+    are pointwise 95\% percentile intervals from 2,000 paired transcript
+    bootstrap draws.  The same 1,920-transcript cohort is retained across all
+    $N$ within each depth.  Intervals condition on one set of seed-42 fitted
+    models and do not represent training-seed uncertainty.}
+    \label{fig:synthetic_mu_robustness_aggregate}
+\end{figure*}
+
+\paragraph{Condition-resolved audit.}
+The aggregate comparison can conceal a condition-specific failure.  We
+therefore retain every valid cell of the triangular design: the $d$th bias is
+shown only from the first cumulative panel that contains it.  In
+Figure~\ref{fig:synthetic_mu_condition_absolute}, the $N=1$ column contains the
+ten independently fitted bias-specific models, whereas columns $N\geq2$
+contain the corresponding rows from the cumulative model.  The absolute
+scores expose the dominant depth and bias effects: cell means range from
+0.443--0.641, 0.762--0.874, and 0.881--0.930 across the three depths.
+
+\begin{figure*}[p]
+    \centering
+    \includegraphics[height=0.89\textheight]
+      {\syntheticpredictionrobustnessfigdir/synthetic_mu_pcc_condition_resolved.pdf}
+    \caption{\textbf{Condition-resolved observation reconstruction for every
+    available training configuration.}  Rows are programmed bias conditions,
+    columns are training configurations, and cells report the mean of 1,920
+    transcript-level $\operatorname{PCC}(\mu_{dt},\overline Y_{dt})$ values.
+    The first column consists of ten distinct single-dataset fits; each later
+    column is one cumulative fit and therefore has entries only for its first
+    $N$ included conditions.  Gray cells were not trained and are not missing
+    measurements.  A common color scale is used across read depths.}
+    \label{fig:synthetic_mu_condition_absolute}
+\end{figure*}
+
+Figure~\ref{fig:synthetic_mu_condition_delta} removes the large depth and bias
+main effects by displaying the matched difference in
+\cref{eq:appendix_paired_mu_delta}.  Across every displayed condition and
+panel size, mean differences range from $+0.00041$ to $+0.00453$ at depth
+0.25, from $-0.00053$ to $+0.00167$ at depth 2, and from $-0.00094$ to
+$+0.00082$ at depth 20.  Hence the aggregate stability is not produced by a
+large gain in some conditions cancelling a large loss in others.  The largest
+cellwise changes remain below 0.005 PCC.
+
+\begin{figure*}[p]
+    \centering
+    \includegraphics[height=0.89\textheight]
+      {\syntheticpredictionrobustnessfigdir/synthetic_mu_pcc_delta_from_single.pdf}
+    \caption{\textbf{Condition-resolved change relative to matched
+    single-dataset fits.}  Each cell reports the mean paired difference
+    $\Delta^{(N)}_{dt}$ after matching read depth, named bias, transcript, and
+    observed target.  Positive values favor the cumulative model and negative
+    values favor the separately trained single-dataset model.  The diverging
+    scale is centered at zero and shared across depths.  These values quantify
+    preservation of $\mu$ reconstruction; they do not compare $L_t$ with
+    $K_t$ or $\gamma_{dt}$ with the injected bias.}
+    \label{fig:synthetic_mu_condition_delta}
+\end{figure*}
+
+\paragraph{Interpretation and limitations.}
+The two analyses support complementary conclusions.  Single-dataset
+prediction quality tracks how reproducibly a condition was sampled, while
+joint training preserves essentially the same condition-specific observation
+fit as ten separate models.  This is the desired robustness property for the
+full fitted mean: adding heterogeneous datasets does not force a trade-off in
+which one observed profile is reconstructed at the expense of another.
+
+The result should not be overstated.  First, the validation profiles are used
+both for checkpoint selection through validation loss and for this diagnostic;
+they are not an independent test set.  Second, there is one training seed, so
+the narrow transcript-bootstrap intervals quantify transcript variation
+conditional on the fitted models rather than optimization variability.
+Third, increasing $N$ simultaneously increases the amount of training data
+and changes the bias composition.  Finally, because only the product in
+\cref{eq:appendix_mu_factorization} is evaluated, the near-zero deltas cannot
+show that $L_t$ recovered the programmed kinetic target or that
+$\gamma_{dt}$ recovered the injected multiplier.  Those claims require the
+separate gauge-matched recovery analyses.
+
+% Reproducible sources:
+% analyses/analyze_synthetic_prediction_robustness.py
+% analyses/artifacts/synthetic/prediction_robustness/condition_resolved_summary.csv
+% analyses/artifacts/synthetic/prediction_robustness/panel_aggregate_summary.csv
+% analyses/artifacts/synthetic/prediction_robustness/per_transcript_paired_metrics.parquet
+% analyses/artifacts/synthetic/prediction_robustness/fixed_cohort_ids.csv
+% analyses/artifacts/synthetic/prediction_robustness/provenance.json

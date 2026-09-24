@@ -1,0 +1,4 @@
+_name_: synthetic_smoke
+dataset_path:
+  artificial_bias_5prime_aa: "examples/synthetic_smoke/data/artificial_bias_5prime_aa.parquet"
+  artificial_bias_3prime_cc: "examples/synthetic_smoke/data/artificial_bias_3prime_cc.parquet"

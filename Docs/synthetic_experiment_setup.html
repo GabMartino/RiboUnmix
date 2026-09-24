@@ -1,0 +1,505 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RiboUnmix — synthetic experiment setup</title>
+  <script>
+    window.MathJax = {
+      tex: {inlineMath: [['\\(', '\\)']], displayMath: [['$$', '$$']]},
+      options: {skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code']}
+    };
+  </script>
+  <script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <style>
+    :root {
+      --ink:#192334; --muted:#5d6b7e; --paper:#fff; --page:#f4f7fb;
+      --line:#dce4ee; --blue:#245f9f; --blue-soft:#edf4fc;
+      --green:#21765a; --green-soft:#ecf8f2; --amber:#a36313;
+      --amber-soft:#fff6e7; --red:#ae4148; --red-soft:#fff0f1;
+      --violet:#6d52a0; --violet-soft:#f3f0fa; --code:#f1f4f8;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --ink:#e8edf5; --muted:#a9b4c4; --paper:#171d27; --page:#0e1219;
+        --line:#2d3747; --blue:#92c5ff; --blue-soft:#172d45;
+        --green:#5ed39e; --green-soft:#132c23; --amber:#ffd08c;
+        --amber-soft:#382b18; --red:#ffadb0; --red-soft:#3b2025;
+        --violet:#c9b3ff; --violet-soft:#29223a; --code:#202938;
+      }
+    }
+    * { box-sizing:border-box; }
+    html { scroll-behavior:smooth; }
+    body {
+      margin:0; color:var(--ink); background:var(--page);
+      font:16px/1.63 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    }
+    .layout { display:grid; grid-template-columns:255px minmax(0,1050px); max-width:1330px; margin:auto; background:var(--paper); box-shadow:0 18px 55px rgba(20,35,55,.08); }
+    nav { position:sticky; top:0; height:100vh; overflow:auto; padding:27px 16px; border-right:1px solid var(--line); background:color-mix(in srgb,var(--paper) 92%,var(--page)); font-size:13px; }
+    nav strong { display:block; margin-bottom:17px; color:var(--blue); font-size:16px; }
+    nav a { display:block; padding:5px 8px; border-radius:6px; color:var(--muted); text-decoration:none; }
+    nav a:hover { color:var(--ink); background:var(--blue-soft); }
+    nav .group { margin:17px 7px 5px; color:var(--ink); font-size:11px; font-weight:750; letter-spacing:.08em; text-transform:uppercase; }
+    main { min-height:100vh; padding:0 52px 90px; overflow:hidden; }
+    header { margin:0 -52px 40px; padding:56px 52px 48px; color:white; background:linear-gradient(125deg,#153960,#236d58); }
+    h1 { max-width:930px; margin:0; font-size:clamp(2.1rem,4.8vw,3.5rem); line-height:1.08; }
+    header p { max-width:850px; margin:14px 0 0; color:#e7f1f8; font-size:1.13rem; }
+    h2 { margin:51px 0 14px; padding-top:15px; border-top:1px solid var(--line); font-size:1.72rem; line-height:1.25; }
+    h3 { margin:31px 0 9px; font-size:1.17rem; }
+    h4 { margin:22px 0 6px; font-size:1rem; }
+    p { max-width:90ch; margin:10px 0 16px; }
+    li { max-width:87ch; margin:5px 0; }
+    a { color:var(--blue); }
+    code { padding:.1em .35em; border-radius:5px; background:var(--code); font:.9em ui-monospace,SFMono-Regular,Consolas,monospace; }
+    pre { overflow:auto; margin:16px 0; padding:15px 17px; border-radius:9px; background:var(--code); font:13px/1.52 ui-monospace,SFMono-Regular,Consolas,monospace; }
+    .lede { font-size:1.14rem; }
+    .meta { color:var(--muted); font-size:.89rem; }
+    .kicker { display:inline-block; margin-bottom:13px; padding:3px 9px; border:1px solid rgba(255,255,255,.36); border-radius:99px; color:#edf7ff; font-size:.75rem; font-weight:700; letter-spacing:.08em; text-transform:uppercase; }
+    .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:13px; margin:22px 0; }
+    .card { padding:17px; border:1px solid var(--line); border-radius:12px; background:color-mix(in srgb,var(--paper) 92%,var(--page)); }
+    .card strong { display:block; color:var(--blue); font-size:1.4rem; line-height:1.15; }
+    .card span { display:block; margin-top:5px; color:var(--muted); font-size:.9rem; }
+    .note,.warning,.risk,.definition,.conclusion { margin:20px 0; padding:17px 19px; border-radius:10px; }
+    .note { border-left:4px solid var(--blue); background:var(--blue-soft); }
+    .warning { border-left:4px solid var(--amber); background:var(--amber-soft); }
+    .risk { border-left:4px solid var(--red); background:var(--red-soft); }
+    .definition { border-left:4px solid var(--violet); background:var(--violet-soft); }
+    .conclusion { border-left:4px solid var(--green); background:var(--green-soft); }
+    .note p,.warning p,.risk p,.definition p,.conclusion p { margin:0; }
+    .note strong,.warning strong,.risk strong,.definition strong,.conclusion strong { display:block; margin-bottom:4px; }
+    .math { margin:18px 0; padding:14px 18px; overflow-x:auto; border-left:4px solid var(--blue); background:color-mix(in srgb,var(--blue-soft) 72%,var(--paper)); }
+    .math mjx-container { font-size:108%; }
+    .table-wrap { overflow-x:auto; margin:17px 0 28px; }
+    table { width:100%; min-width:690px; border-collapse:collapse; font-size:.9rem; }
+    th,td { padding:9px 11px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }
+    th { color:var(--muted); background:color-mix(in srgb,var(--page) 78%,var(--paper)); font-size:.77rem; font-weight:750; letter-spacing:.04em; text-transform:uppercase; }
+    td.num { text-align:right; white-space:nowrap; font-variant-numeric:tabular-nums; }
+    .flow { display:grid; grid-template-columns:1fr auto 1fr auto 1fr auto 1fr; align-items:stretch; gap:8px; margin:24px 0; }
+    .flow .step { min-height:100px; display:grid; place-items:center; padding:13px; border:1px solid #bdd0e7; border-radius:11px; background:var(--blue-soft); text-align:center; font-size:.92rem; }
+    .flow .step b { display:block; margin-bottom:4px; color:var(--blue); }
+    .flow .arrow { align-self:center; color:var(--blue); font-size:1.45rem; }
+    .two { display:grid; grid-template-columns:1fr 1fr; gap:18px; }
+    .path { overflow-wrap:anywhere; }
+    .tag { display:inline-block; padding:2px 7px; border-radius:99px; background:var(--blue-soft); color:var(--blue); font-size:.77rem; font-weight:700; letter-spacing:.03em; }
+    .matrix { display:grid; grid-template-columns:120px repeat(3,1fr); gap:1px; overflow:auto; margin:18px 0; border:1px solid var(--line); border-radius:10px; background:var(--line); }
+    .matrix div { min-width:116px; padding:10px; background:var(--paper); font-size:.86rem; }
+    .matrix .head { color:var(--muted); background:var(--page); font-weight:750; }
+    .matrix .yes { background:var(--green-soft); }
+    .matrix .no { background:var(--red-soft); }
+    .matrix .partial { background:var(--amber-soft); }
+    .small { color:var(--muted); font-size:.89rem; }
+    details { margin:15px 0; padding:0 15px; border:1px solid var(--line); border-radius:9px; background:color-mix(in srgb,var(--paper) 95%,var(--page)); }
+    summary { padding:13px 0; cursor:pointer; font-weight:700; }
+    details > div { padding-bottom:15px; }
+    .source-list li { margin:9px 0; }
+    footer { margin-top:60px; padding-top:20px; border-top:1px solid var(--line); color:var(--muted); font-size:.88rem; }
+    @media (max-width:880px) { .layout { display:block; } nav { position:static; height:auto; border-right:0; border-bottom:1px solid var(--line); } main { padding:0 24px 70px; } header { margin:0 -24px 34px; padding:42px 24px; } .flow { grid-template-columns:1fr; } .flow .arrow { transform:rotate(90deg); justify-self:center; } .two { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+<div style="padding:10px 18px;background:#eaf4fb;border-bottom:1px solid #bdd7e8;text-align:center;font:600 14px/1.4 system-ui,sans-serif">Continuing synthetic work? First read the <a href="project_model_onboarding.html">project onboarding and safe-handoff guide</a>.</div>
+<div class="layout">
+  <nav>
+    <strong>Synthetic experiments</strong>
+    <div class="group">Overview</div>
+    <a href="#purpose">Purpose and source of truth</a>
+    <a href="#map">End-to-end map</a>
+    <a href="#data">Synthetic data</a>
+    <div class="group">Preparation</div>
+    <a href="#preprocess">Processed pair tables</a>
+    <a href="#weights">Reliability weights</a>
+    <a href="#coordinates">Coordinates and length policy</a>
+    <a href="#split">Train/validation split</a>
+    <div class="group">Training matrix</div>
+    <a href="#within">Within-depth panels</a>
+    <a href="#inter">Inter-depth panels</a>
+    <a href="#launchers">Local versus Slurm launcher</a>
+    <a href="#batching">Batching and execution chunks</a>
+    <div class="group">Model and objective</div>
+    <a href="#model">Factorization and gamma gauge</a>
+    <a href="#loss">NB2/PCC objective</a>
+    <a href="#optimization">Optimization and checkpoints</a>
+    <div class="group">Evaluation</div>
+    <a href="#evaluation">Recovery measurements</a>
+    <a href="#alpha">Alpha-causality suite</a>
+    <a href="#caveats">Interpretation safeguards</a>
+    <a href="#commands">Commands and outputs</a>
+  </nav>
+
+  <main>
+    <header>
+      <span class="kicker">Code-retraced setup document</span>
+      <h1>RiboUnmix synthetic bias and read-depth experiments</h1>
+      <p>What the data contain, how they are prepared, how the training panels are assembled, what is optimized, and how shared-profile, gamma, and dispersion recovery are evaluated.</p>
+    </header>
+
+    <section id="purpose">
+      <h2>Purpose and source of truth</h2>
+      <p class="lede">The synthetic suite asks whether a model can separate one shared, deterministic biological profile from dataset-specific, programmed sequence biases while the observations become more or less noisy with read depth.</p>
+      <div class="cards">
+        <div class="card"><strong>1 shared truth</strong><span>Mean-one latent kinetic profile \(K_{ti}\), one profile per transcript.</span></div>
+        <div class="card"><strong>10 programmed biases</strong><span>Eight dinucleotide contexts plus AU-rich and GC-rich window conditions.</span></div>
+        <div class="card"><strong>3 read depths</strong><span>0.25, 2, and 20 expected unbiased reads per codon.</span></div>
+        <div class="card"><strong>2 raw replicas</strong><span>NB2 count targets, with a consensus used for PCC diagnostics and terms.</span></div>
+      </div>
+      <div class="note"><strong>Scope of this page.</strong><p>This is a setup and provenance guide reconstructed from the checked-out code and files on branch <code>master</code> at commit <code>a853fd2</code>, reviewed 29 August 2026. It deliberately distinguishes current executable behavior from older reports. The upstream synthetic-data generator is not checked into this repository; generator details below come only from the Parquet metadata and the code that consumes the files.</p></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Role</th><th>Current source</th><th>What it controls</th></tr></thead>
+          <tbody>
+            <tr><td>Entrypoint</td><td><code>main_ribounmix_synthetic.py</code></td><td>Reuses the multi-dataset trainer with the synthetic Hydra configuration.</td></tr>
+            <tr><td>Base configuration</td><td><code>config/config_ribounmix_synthetic.yaml</code></td><td>Model, loss, split, execution limits, paths, and synthetic validation references.</td></tr>
+            <tr><td>Input maps</td><td><code>config/dataset_config/synthetic_datasets_paths_*_per_codon.yaml</code></td><td>Depth-specific processed parquet paths.</td></tr>
+            <tr><td>Preparation</td><td><code>Datasets/data/weight_synthetic_riboseq_codon_replicas.py</code></td><td>Long-to-wide replicas, terminal padding, validation, zero-information filtering, and weights.</td></tr>
+            <tr><td>Recommended matrix launcher</td><td><code>run_synthetic_bias_read_depth_local.sh</code></td><td>One independent experiment per physical GPU; no DDP.</td></tr>
+            <tr><td>Primary modern shared-L report</td><td><code>analyses/synthetic_gamma_ablation_lbio_recovery.py</code></td><td>Best-validation-loss \(L_{bio}\) versus latent \(K\), on the CDS interior.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="map">
+      <h2>End-to-end experiment map</h2>
+      <div class="flow" aria-label="Synthetic experiment pipeline">
+        <div class="step"><b>1. Synthetic artifacts</b>latent kinetics, raw counts, and bias annotations</div><div class="arrow">→</div>
+        <div class="step"><b>2. Pair preparation</b>two replicas + consensus + local reliability weight</div><div class="arrow">→</div>
+        <div class="step"><b>3. Fixed split</b>common validation panel; other eligible IDs train</div><div class="arrow">→</div>
+        <div class="step"><b>4. Train and predict</b>\(L_{bio}\), gauge-fixed \(\gamma\), \(\mu\), and \(\alpha\)</div>
+      </div>
+      <div class="flow" aria-label="Synthetic evaluation pipeline">
+        <div class="step"><b>5. Select checkpoint</b>minimum validation loss for scientific recovery analyses</div><div class="arrow">→</div>
+        <div class="step"><b>6. Align coordinates</b>drop padded stop; exclude five codons at each physical boundary</div><div class="arrow">→</div>
+        <div class="step"><b>7. Compare truth</b>\(L_{bio}\leftrightarrow K\), gauge-fixed \(\log\gamma\leftrightarrow\log b\), and \(\alpha\)</div><div class="arrow">→</div>
+        <div class="step"><b>8. Diagnose failure</b>gamma-to-\(L\) leakage, alpha absorption, and bias-specific misses</div>
+      </div>
+      <p class="small">The deterministic kinetic truth and programmed bias annotations are validation/post-hoc references only. They are neither fed to the model nor used to select a checkpoint.</p>
+    </section>
+
+    <section id="data">
+      <h2>Synthetic data: what was generated</h2>
+      <h3>Shared kinetic reference</h3>
+      <p><code>Datasets/Synthetic_data/artificial_ground_truth_kinetics_target_mean_one.parquet</code> has 19,290 long-format rows with columns <code>sample</code>, <code>transcript_id</code>, and <code>rib_profile</code>. Its metadata says that the values are programmed P-site residence times divided by the within-transcript mean; finite-read sampling, Gillespie sampling, and TASEP exclusion are all false.</p>
+      <div class="math">$$K_{ti}=\frac{k_{ti}}{\frac{1}{n_t}\sum_{j=1}^{n_t}k_{tj}},\qquad \frac{1}{n_t}\sum_i K_{ti}=1.$$</div>
+      <p>Thus \(K\) is the only direct reference for recovery of the shared mean-one biological profile \(L_{bio}\). It is not an observation target in the loss.</p>
+
+      <h3>Read-depth regimes and NB2 observations</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Directory suffix</th><th>Unbiased baseline</th><th>Raw files</th><th>Use</th></tr></thead>
+          <tbody>
+            <tr><td><code>0p25_per_codon</code></td><td class="num">0.25 reads/codon</td><td><code>Datasets/Synthetic_data/0p25_per_codon/</code></td><td>Sparse/noisy setting.</td></tr>
+            <tr><td><code>2_per_codon</code></td><td class="num">2 reads/codon</td><td><code>Datasets/Synthetic_data/2_per_codon/</code></td><td>Intermediate setting.</td></tr>
+            <tr><td><code>20_per_codon</code></td><td class="num">20 reads/codon</td><td><code>Datasets/Synthetic_data/20_per_codon/</code></td><td>Deep/count-precise setting.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Each bias/count parquet contains 57,870 rows: 19,290 transcripts × <code>rep1</code>, <code>rep2</code>, and a source-provided <code>mean</code> row. Metadata identifies the count distribution as NB2 with true dispersion \(\alpha=0.1\), equivalently:</p>
+      <div class="math">$$\operatorname{Var}(Y_{dti})=\mu_{dti}+0.1\,\mu_{dti}^{2}.$$</div>
+      <p>The source <code>mean</code> is a stable integerization of the arithmetic mean of the two replicas; it is not a third independent NB draw.</p>
+
+      <h3>The ten programmed sequence biases</h3>
+      <p>Each depth contains these ten biased observations plus an unbiased finite-count <code>artificial_ground_truth</code> observation. Bias profiles live in <code>Datasets/Synthetic_data/bias_profile/</code> and store <code>added_bias</code>. The physical expected-count multiplier is \(b=1+\texttt{added\_bias}\), and annotations are explicitly marked systematic across replicas and depths.</p>
+      <div class="math">$$\mu^{\mathrm{biased}}_{dti}=\mu^{\mathrm{unbiased}}_{ti}\,b_{dti},\qquad b_{dti}=1+\operatorname{added\_bias}_{dti}.$$</div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Launcher name</th><th>Programmed feature</th><th>Multiplier range at selected sites</th><th>Panel order</th></tr></thead>
+          <tbody>
+            <tr><td><code>artificial_bias_3prime_aa</code></td><td>3′ AA</td><td class="num">2.8–3.2</td><td class="num">1</td></tr>
+            <tr><td><code>artificial_bias_3prime_cc</code></td><td>3′ CC</td><td class="num">5.0–6.0</td><td class="num">2</td></tr>
+            <tr><td><code>artificial_bias_3prime_gg</code></td><td>3′ GG</td><td class="num">4.0–4.4</td><td class="num">3</td></tr>
+            <tr><td><code>artificial_bias_3prime_uu</code></td><td>3′ UU</td><td class="num">5.8–6.2</td><td class="num">4</td></tr>
+            <tr><td><code>artificial_bias_5prime_aa</code></td><td>5′ AA</td><td class="num">3.0–3.4</td><td class="num">5</td></tr>
+            <tr><td><code>artificial_bias_5prime_cc</code></td><td>5′ CC</td><td class="num">5.2–5.6</td><td class="num">6</td></tr>
+            <tr><td><code>artificial_bias_5prime_gg</code></td><td>5′ GG</td><td class="num">4.2–4.6</td><td class="num">7</td></tr>
+            <tr><td><code>artificial_bias_5prime_uu</code></td><td>5′ UU</td><td class="num">5.6–6.0</td><td class="num">8</td></tr>
+            <tr><td><code>artificial_bias_gc_fraction_gt_0p7</code></td><td>GC fraction &gt; 0.7</td><td class="num">5.0–5.4</td><td class="num">9</td></tr>
+            <tr><td><code>artificial_bias_au_fraction_gt_0p7</code></td><td>AU fraction &gt; 0.7</td><td class="num">7.0–7.4</td><td class="num">10</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="warning"><strong>Bias multipliers are not renormalized.</strong><p>A bias can alter both within-transcript shape and total expected read mass. In the model, the target-derived pair scale \(S_{dt}\) absorbs this overall mass; gamma recovery therefore compares only the identifiable, gauge-fixed positional part of the bias.</p></div>
+    </section>
+
+    <section id="preprocess">
+      <h2>From raw files to replica-aware training pairs</h2>
+      <p>The executable preparation script is <code>Datasets/data/weight_synthetic_riboseq_codon_replicas.py</code>. For every depth and observation it reads a raw long-format count parquet, pivots the three sample rows into one transcript–dataset row, aligns it to the MANE sequence table, and delegates filtering/weighting to <code>weight_hek_riboseq_codon_replicas.py</code>.</p>
+      <div class="flow">
+        <div class="step"><b>Raw long table</b><code>rep1</code>, <code>rep2</code>, <code>mean</code></div><div class="arrow">→</div>
+        <div class="step"><b>Wide row</b><code>id</code>, <code>ribo</code>, <code>ribo_cds_replicas</code>, <code>replica_ids</code></div><div class="arrow">→</div>
+        <div class="step"><b>Align and pad</b>intersect MANE IDs; append terminal zero</div><div class="arrow">→</div>
+        <div class="step"><b>Filter and weight</b>physically remove zero-information rows; write weight columns</div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Processed field</th><th>Meaning</th><th>How it is used by the active dataloader</th></tr></thead>
+          <tbody>
+            <tr><td><code>id</code></td><td>Versioned transcript ID.</td><td>Split membership, grouped sampling, prediction alignment.</td></tr>
+            <tr><td><code>ribo</code></td><td>Source-provided integerized mean profile, padded at the terminal stop.</td><td>Validated for eligibility. It is not the final active consensus target.</td></tr>
+            <tr><td><code>ribo_cds_replicas</code></td><td>Two raw profiles, each padded at the terminal stop.</td><td>NB2 targets; their arithmetic mean is reconstructed as the active consensus for PCC.</td></tr>
+            <tr><td><code>replica_ids</code></td><td><code>[rep1, rep2]</code>.</td><td>Replica bookkeeping and diagnostics.</td></tr>
+            <tr><td><code>weight</code></td><td>Positive local reliability score, median-normalized within a dataset.</td><td>Within-transcript weighting for the transcript-balanced loss.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>The current MANE sequence parquet has 19,283 transcripts. The raw synthetic truth has 19,290, so seven raw IDs are absent from the sequence table. A representative weighted 0.25-depth bias parquet has 19,283 rows, two replicas per row, no retained zero-sum consensus rows, and a median stored weight of one.</p>
+      <div class="note"><strong>Subtle but important consensus fact.</strong><p>The preprocessing script stores the source <code>mean</code> row in <code>ribo</code>. The datamodule checks that stored consensus for eligibility, then builds its active <code>ribo_profiles</code> as the arithmetic mean of <code>rep1</code> and <code>rep2</code>. Consequently NB2 sees the raw replicas, while both PCC terms see the arithmetic replica consensus—not a third independent draw and not necessarily the source's integerized mean cell.</p></div>
+    </section>
+
+    <section id="weights">
+      <h2>Pair-local filtering and transcript reliability weights</h2>
+      <p>Filtering is transcript–dataset local. A row is retained only when the stored consensus profile is non-empty, finite, non-negative, has positive total reads, and has positive codon coverage. Ineligible rows are physically absent from the weighted parquet; a zero-weight retained row is not supported.</p>
+      <p>For retained pair \((d,t)\), let \(n_{dt}\) be its aligned profile length, \(D_{dt}\) its read density, and \(C_{dt}\) its positive-codon coverage:</p>
+      <div class="math">$$D_{dt}=\frac{\sum_i y_{dti}}{n_{dt}},\qquad C_{dt}=\frac{\#\{i:y_{dti}>0\}}{n_{dt}},\qquad \tau_d=\operatorname{median}_{t:\,\mathrm{eligible}}D_{dt}.$$</div>
+      <p>The currently default <code>snr_depth_coverage</code> weighting mode is:</p>
+      <div class="math">$$q_{dt}=\frac{\sqrt{D_{dt}}}{\sqrt{D_{dt}}+\sqrt{\tau_d}},\qquad r_{dt}=0.70\,q_{dt}+0.30\,C_{dt},\qquad w_{dt}=\frac{r_{dt}}{\operatorname{median}_{t:\,\mathrm{eligible}}r_{dt}}.$$</div>
+      <p>The final \(w_{dt}\) is stored as float32 and is deliberately <em>not</em> clipped to one. It is a local observation reliability measure, not a global dataset-quality score. The legacy coverage/density percentile formula remains available in the generic HEK weighting code, but it is not the default synthetic preprocessing mode.</p>
+      <div class="risk"><strong>Methodological caveat for final locked studies.</strong><p>Both \(\tau_d\) and the median normalizer are currently fitted over the full eligible processed parquet before train/validation assignment. They therefore use validation observations. This does not insert latent truth into training, but a strict final protocol should fit these references on training IDs only and freeze them for validation.</p></div>
+    </section>
+
+    <section id="coordinates">
+      <h2>Coordinates, terminal padding, and long transcripts</h2>
+      <p>Raw synthetic profiles use 0-based P-site codon coordinates and exclude the terminal boundary. The MANE sequence table includes the terminal codon. During preprocessing one zero is appended to every synthetic consensus and replica profile to match the sequence length. This makes batch shapes consistent, but it means the terminal padded entry is not an observed synthetic count.</p>
+      <div class="math">$$\text{raw synthetic coordinates: }0,\ldots,L-1\quad\longrightarrow\quad\text{model profile: }0,\ldots,L-1,L_{\mathrm{terminal}}.$$
+      </div>
+      <p>To avoid extremely long padded batches, the current synthetic configuration sets <code>data.max_cds_codons=4000</code>. It removes a whole transcript before split assignment; it never crops one. On the current MANE table this removes 79 of 19,283 transcripts, leaving 19,204 eligible sequences with longest retained CDS length 3,998 codons. This policy preserves the start/stop alignment and the transcript-wide gamma gauge.</p>
+      <div class="definition"><strong>Recovery domain.</strong><p>Modern shared-L and gamma recovery scripts compare only the physical CDS interior, \(5\le i&lt;L-5\). The final padded stop is absent after alignment to the raw latent/bias profiles, and the first/last five physical codons are excluded because boundary RPF features can depend on sequence outside the CDS-only model input.</p></div>
+    </section>
+
+    <section id="split">
+      <h2>Train/validation split</h2>
+      <p>There is no independent test partition in the current synthetic configuration. It creates one transcript-level training partition and one fixed transcript-level validation partition.</p>
+      <div class="math">$$\mathcal{V}_{\mathrm{candidate}}=\left\{t:\ t\text{ is sequence-eligible and has one retained positive-weight row in every master-universe dataset}\right\}.$$</div>
+      <p>For a within-depth panel, <code>split.master_dataset_universe=all</code> resolves to all 11 processed observations for that depth: the ten biased datasets plus the unbiased finite-count <code>artificial_ground_truth</code>. The unbiased observation helps define the fixed validation eligibility panel but is not included in the ten-bias training panels.</p>
+      <p>For every common candidate, the split-only score is the ordinary median across local weights. Candidate IDs are sorted by this score, assigned rank-quantile bins, jointly stratified with the CSS-count category from the sequence table, and sampled with NumPy's seeded generator. The exact split is saved in a <code>split_manifest_*.json</code> beside each run.</p>
+      <div class="math">$$s_t=\operatorname{median}_{d\in\mathrm{master}}w_{dt},\qquad |\mathcal{V}|=\operatorname{round}\!\left(0.10\,|\mathcal{V}_{\mathrm{candidate}}|\right).$$</div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Resolved local-launcher behavior</th><th>Current value</th></tr></thead>
+          <tbody>
+            <tr><td>Seed</td><td class="num">42 by default</td></tr>
+            <tr><td>Validation fraction</td><td class="num">0.10</td></tr>
+            <tr><td>Reliability bins in base YAML</td><td class="num">10</td></tr>
+            <tr><td>Reliability bins from local launcher default</td><td class="num">2</td></tr>
+            <tr><td>Current 0.25-depth common candidates after 4,000-codon filter</td><td class="num">19,204</td></tr>
+            <tr><td>Current 0.25-depth validation IDs with two bins</td><td class="num">1,920</td></tr>
+            <tr><td>Current 0.25-depth training IDs with two bins</td><td class="num">17,284</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="note"><strong>What is held fixed.</strong><p>Within one depth, all cumulative panels use the same 11-dataset master universe, seed, length filter, and therefore the same validation transcript IDs. Across depths, validation IDs can change because read depth changes the local reliability ordering. The local cross-depth series instead makes all 30 aliases its master universe, so its cumulative cross-depth panels share one different validation panel.</p></div>
+    </section>
+
+    <section id="within">
+      <h2>Experiment family A: within-depth cumulative panels</h2>
+      <p>The recommended local launcher defines 27 within-depth tasks: nine panels at each of three depths. A panel of size \(N\) uses the first \(N\) conditions in the fixed order below, for \(N=2,\ldots,10\).</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Tasks</th><th>Depth</th><th>Panels</th><th>Training datasets</th><th>Gamma reference</th></tr></thead>
+          <tbody>
+            <tr><td class="num">0–8</td><td><code>0p25_per_codon</code></td><td>2 through 10 biases</td><td>Cumulative prefix of the fixed ten-bias order</td><td>All selected panel datasets, equal weights</td></tr>
+            <tr><td class="num">9–17</td><td><code>2_per_codon</code></td><td>2 through 10 biases</td><td>Cumulative prefix of the fixed ten-bias order</td><td>All selected panel datasets, equal weights</td></tr>
+            <tr><td class="num">18–26</td><td><code>20_per_codon</code></td><td>2 through 10 biases</td><td>Cumulative prefix of the fixed ten-bias order</td><td>All selected panel datasets, equal weights</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>The quantity varied is both the number of observations and the identity of the newly added bias. Therefore these are useful recovery curves, but they do not estimate a pure causal “number of datasets only” effect unless the ordering is replicated or randomized in a later experiment.</p>
+      <div class="warning"><strong>Why the panels begin at two datasets.</strong><p><code>data.minimum_positive_datasets_per_transcript=2</code> and <code>train_sampling_strategy=transcript_grouped_multidataset_pairs</code> require every training transcript group to contain at least two selected, positive observations. This is needed for the shared/decomposition setting and avoids singleton groups in the training objective.</p></div>
+    </section>
+
+    <section id="inter">
+      <h2>Experiment family B: inter-depth comparisons and gamma reference weighting</h2>
+      <p>The intended comparison combines the same bias at shallow, intermediate, and deep read depth, then asks whether equal gamma-centering weights differ from a depth-quality-ranked reference. The three aliases for a bias are, for example, <code>artificial_bias_3prime_aa_0p25_per_codon</code>, <code>..._2_per_codon</code>, and <code>..._20_per_codon</code>.</p>
+      <p>For ranked centering, temporary per-task metadata assigns ranks 3, 2, and 1 to 0.25, 2, and 20 reads/codon respectively. The dataloader converts rank to a positive quality score then the model normalizes it over the reference panel:</p>
+      <div class="math">$$u_d=\frac{R_{\max}-R_d+1}{R_{\max}},\qquad \pi_d=\frac{u_d^{p}}{\sum_{r\in\mathrm{reference}}u_r^{p}}.$$</div>
+      <p>At power \(p=1\), the raw quality scores are \((1/3,2/3,1)\), and the normalized gamma-reference weights are \((1/6,1/3,1/2)\) for shallow, intermediate, and deep observations. The equal condition ignores quality ranks and uses \((1/3,1/3,1/3)\).</p>
+      <div class="note"><strong>Rank affects gamma centering only.</strong><p>It does not multiply the likelihood, PCC loss, local transcript reliability weight, or outer transcript-balanced loss. This is intentional: rank supplies the reference gauge, while \(w_{dt}\) describes local observation reliability inside the loss.</p></div>
+    </section>
+
+    <section id="launchers">
+      <h2>Local and Slurm launchers are currently different experiments</h2>
+      <p>The repository contains two 47-task launchers. Their within-depth tasks match, but their inter-depth tasks do not. Treat their output as separate experiment families unless this difference is intentionally reconciled.</p>
+      <div class="matrix" aria-label="Launcher comparison">
+        <div class="head"></div><div class="head">Local launcher</div><div class="head">Slurm launcher</div>
+        <div class="head">File</div><div class="yes"><code>run_synthetic_bias_read_depth_local.sh</code></div><div class="partial"><code>run_synthetic_bias_read_depth.slurm</code></div>
+        <div class="head">Within tasks 0–26</div><div class="yes">Three depths × cumulative panels 2–10.</div><div class="yes">Three depths × cumulative panels 2–10.</div>
+        <div class="head">Inter tasks 27–46</div><div class="yes">Ten <em>cumulative bias-family</em> panels: 3, 6, …, 30 aliases; equal/ranked alternate.</div><div class="partial">Ten <em>single-bias triplets</em>; one triplet per bias; equal/ranked alternate.</div>
+        <div class="head">Split universe for inter tasks</div><div class="yes">All 30 aliases, so local cumulative panels share one split.</div><div class="partial">Only that task's three aliases, so each bias triplet can have a different split.</div>
+        <div class="head">GPU execution</div><div class="yes">One single-GPU process per physical GPU; queues run in parallel.</div><div class="no">Requests two devices/DDP by default, incompatible with enabled execution microbatching.</div>
+        <div class="head">Observed finite-count reference</div><div class="yes">Within-depth path is overridden to match depth; inter-depth sets it to null.</div><div class="no">Does not override base YAML's 20-depth observed path.</div>
+      </div>
+      <div class="risk"><strong>Recommended reproducible path: the local launcher.</strong><p>The current base synthetic configuration has execution microbatching enabled, and the trainer resolves this as single-process only. The local launcher correctly exposes each physical GPU as device 0 and runs one independent experiment per GPU. The current Slurm launcher requests two devices by default, so it will conflict with <code>training.execution_microbatching.enabled=true</code> before training. In addition, its 0.25 and 2-depth <code>observed_*</code> validation diagnostics would point at the base 20-depth observed table unless it is amended. Latent \(K\) diagnostics remain depth-independent and valid.</p></div>
+      <p>For the local inter-depth series, tasks \(27+2(k-1)\) and \(28+2(k-1)\) correspond to the first \(k\) bias families at all three depths with equal and ranked gamma references respectively. Thus task 27/28 is the intended one-bias triplet; task 45/46 contains all ten biases at three depths (30 selected aliases).</p>
+    </section>
+
+    <section id="batching">
+      <h2>Grouped batches, accumulation, and memory-safe execution</h2>
+      <p>The sampler builds an atomic transcript group \(G_t=\{(t,d):\text{selected positive pair exists}\}\). A group is admitted only if it has at least two distinct selected datasets. It is never split by the logical batch planner.</p>
+      <div class="math">$$\texttt{data.batch\_size}=32\quad\text{means at most 32 pair rows per represented dataset in one logical batch, not 32 pair rows total.}$$</div>
+      <p>With \(D\) complete datasets, a typical full logical batch has 32 transcript groups and up to \(32D\) transcript–dataset rows. It is packed by descending sequence length, shuffled at the batch level, and uses one deterministic epoch plan per seed/epoch.</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Configuration</th><th>Current synthetic value</th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td><code>data.batch_size</code></td><td class="num">32</td><td>Per-dataset logical pair-row quota.</td></tr>
+            <tr><td><code>max_pair_rows_per_forward</code></td><td class="num">1,024</td><td>Execution-forward soft cap; does not alter logical membership.</td></tr>
+            <tr><td><code>max_padded_codon_tokens_per_forward</code></td><td class="num">250,000</td><td>Soft cap based on chunk pair rows × longest CDS.</td></tr>
+            <tr><td><code>max_transcript_groups_per_forward</code></td><td class="num">16</td><td>Additional forward-chunk cap.</td></tr>
+            <tr><td><code>target_unique_transcripts_per_optimizer_step</code></td><td class="num">32</td><td>Automatic logical gradient-accumulation target.</td></tr>
+            <tr><td><code>max_accumulate_grad_batches</code></td><td class="num">32</td><td>Safety cap for the resolved logical accumulation factor.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Execution microbatching splits a logical batch only between whole transcript groups. The model backpropagates each execution chunk immediately, scaling its transcript-balanced loss by its fraction of logical groups (and the logical accumulation factor). As a result, when all chunks are completed, their gradient sum equals the original logical transcript-balanced objective. It changes memory use and the number of forwards, not the intended gamma center or logical loss membership.</p>
+      <div class="math">$$\nabla\mathcal{L}_{\mathrm{logical}}=\sum_{c\in\mathrm{chunks}}\frac{|G_c|}{|G_{\mathrm{logical}}|}\nabla\mathcal{L}_c.$$</div>
+      <div class="warning"><strong>Single-process restriction.</strong><p>With execution microbatching enabled, <code>trainer.accumulate_grad_batches</code> is set to one because manual logical accumulation is performed in the Lightning module. It is explicitly incompatible with DDP/multi-process training. To use multiple GPUs, run independent experiments on different GPUs through <code>GPU_DEVICES=0,1,...</code>, not one DDP experiment.</p></div>
+    </section>
+
+    <section id="model">
+      <h2>What the model factorizes</h2>
+      <p>The biological branch is a two-layer bidirectional GRU with hidden size 256. It produces a positive mean-one shared profile \(L_{ti}\). The separate dataset-bias branch is a two-layer bidirectional GRU with hidden size 128, dataset and codon embeddings, nucleotide/amino-acid embeddings, relative/start/stop positional features, and a gamma head. It also has a separate dispersion head.</p>
+      <p>For pair \((d,t)\), the scale \(S_{dt}\) is the mean of the current consensus target. In the current baseline, mass conservation is disabled, so the mean prediction is:</p>
+      <div class="math">$$S_{dt}=\frac{1}{n_t}\sum_i\bar{Y}_{dti},\qquad \mu_{dti}=S_{dt}\,\gamma_{dti}\,L_{ti},\qquad \frac{1}{n_t}\sum_iL_{ti}=1.$$</div>
+      <p>Therefore \(\mu\) is intentionally an observation-level, bias-containing prediction; it should not be compared directly with the unbiased kinetic truth. The special <code>mass_conservation=true</code> ablation would divide \(\gamma L\) by its valid-position mean before multiplication by \(S\), but the main local synthetic matrix explicitly locks <code>model.mass_conservation=false</code>.</p>
+
+      <h3>Fixed-reference gamma centering</h3>
+      <p>Raw dataset scores \(a_{dti}\) are bounded before centering by <code>raw_log_gamma_bound=8.0</code>. The model then applies a two-axis log-space gauge. Let \(\pi_d\) be equal or quality-ranked normalized reference weights, \(c_{ti}\) their position-wise reference mean, \(m_{dt}\) the raw score's valid-position mean, and \(\bar a_t\) the weighted mean of those pair means:</p>
+      <div class="math">$$c_{ti}=\sum_{d\in R}\pi_d a_{dti},\qquad m_{dt}=\frac{1}{n_t}\sum_i a_{dti},\qquad \bar a_t=\sum_{d\in R}\pi_d m_{dt},$$
+      $$g_{dti}=a_{dti}-c_{ti}-m_{dt}+\bar a_t,\qquad \gamma_{dti}=\exp(g_{dti}).$$</div>
+      <p>For the active geometric-mean gauge this satisfies:</p>
+      <div class="math">$$\sum_{d\in R}\pi_d g_{dti}=0\quad\forall(t,i),\qquad \frac{1}{n_t}\sum_i g_{dti}=0\quad\forall(d,t).$$</div>
+      <p>Fixed-reference centering evaluates every reference dataset deterministically for each transcript. It is therefore invariant to the requested row order and to execution chunking. Recovery analysis must apply exactly this same two-axis gauge to the programmed multiplier \(b\); raw \(b\) and raw \(\gamma\) are not directly comparable.</p>
+    </section>
+
+    <section id="loss">
+      <h2>Current NB2 and PCC objective</h2>
+      <p>The current synthetic baseline is <code>loss.experiment_mode=standard_nb</code>, <code>model.alpha_mode=learned</code>, and <code>loss.nb_mean_gradient_beta=0.0</code>. Dispersion is position-specific:</p>
+      <div class="math">$$\alpha_{dti}=\exp\!\left(\operatorname{clip}(\ell_{dti},-5,1)\right),\qquad \operatorname{Var}(Y_{dti})=\mu_{dti}+\alpha_{dti}\mu_{dti}^{2}.$$</div>
+      <p>The alpha head receives a detached version of the dataset-conditioned context: alpha gradients train the alpha head but do not reshape the gamma encoder through that route. The gamma/NB mean path remains attached. The configured alpha learning-rate scale is 0.1 times <code>lr_rest</code>.</p>
+      <p>For pair \((d,t)\), with raw replicas \(Y_{dtr}\), arithmetic replica consensus \(\bar{Y}_{dt}\), valid-position NB sequence loss \(\ell^{NB}_{dtr}\), and valid-position gamma regularizer \(R^{\gamma}_{dt}\), the active pair loss is:</p>
+      <div class="math">$$z_{dt}=1.0\left[\frac{1}{2}\sum_{r=1}^{2}\ell^{NB}_{dtr}\right]+0.5\,[1-\operatorname{PCC}(\mu_{dt},\bar Y_{dt})]+0.5\,[1-\operatorname{PCC}(T_\alpha(\mu_{dt}),T_\alpha(\bar Y_{dt}))]+0.0\,R^\gamma_{dt}.$$</div>
+      <p>The transform used by the second PCC term is the NB variance-stabilizing transform:</p>
+      <div class="math">$$T_\alpha(x)=\frac{2}{\sqrt{\alpha+\varepsilon}}\operatorname{asinh}\!\left(\sqrt{\alpha x+\varepsilon}\right).$$</div>
+      <p>NB2 is first reduced within a sequence using the active length-tempered factor:</p>
+      <div class="math">$$\ell^{NB}_{dtr}=\overline{\ell}^{NB}_{dtr}\;\operatorname{clip}\!\left[\left(\frac{n_t}{1000}\right)^{1-0.75},\,0.5,\,2.0\right].$$</div>
+      <p>A zero coefficient skips computation of its corresponding term. The baseline uses raw replica NB2 plus raw and NB-VST consensus PCC, while gamma regularization is off.</p>
+
+      <h3>Transcript-balanced outer reduction</h3>
+      <p>The active reducer is <code>sample_reduction=transcript_balanced</code>. It uses reliability weights only to divide one transcript's vote among its available datasets, then gives every transcript equal outer mass:</p>
+      <div class="math">$$\mathcal{L}_t=\frac{\sum_{d\in G_t}w_{dt}z_{dt}}{\sum_{d\in G_t}w_{dt}},\qquad \mathcal{L}_{\mathrm{batch}}=\frac{1}{|\mathcal{T}_{\mathrm{batch}}|}\sum_{t\in\mathcal{T}_{\mathrm{batch}}}\mathcal{L}_t.$$</div>
+      <p>Thus an observation's local weight changes its share <em>within</em> a transcript, but neither high-depth transcripts nor transcripts available in more selected datasets receive more total outer loss mass. Dataset quality ranks do not enter this reduction.</p>
+    </section>
+
+    <section id="optimization">
+      <h2>Optimization, validation, and checkpoint variants</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Item</th><th>Current synthetic configuration</th></tr></thead>
+          <tbody>
+            <tr><td>Biological learning rate / weight decay</td><td><code>5e-4</code> / <code>1e-2</code></td></tr>
+            <tr><td>Other learning rate / weight decay</td><td><code>1e-3</code> / <code>1e-2</code></td></tr>
+            <tr><td>Precision</td><td><code>bf16-mixed</code> by default</td></tr>
+            <tr><td>Maximum epochs / early stopping</td><td><code>150</code> / patience <code>10</code></td></tr>
+            <tr><td>Scheduler</td><td>Reduce-on-plateau, monitor <code>val_loss</code>, factor 0.99, patience 5, minimum LR <code>1e-6</code></td></tr>
+            <tr><td>Gradient clipping</td><td>Manual norm clipping at 1.0 once per completed logical optimizer window</td></tr>
+            <tr><td>Sanity validation</td><td><code>num_sanity_val_steps=0</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Training creates a best-loss checkpoint monitored by minimum <code>val_loss</code>. It can additionally create a PCC-best checkpoint monitored by maximum <code>val_mu_pcc</code>. The base synthetic configuration predicts both variants and records their exact checkpoint and output paths in <code>prediction_checkpoint_manifest.json</code>.</p>
+      <div class="math">$$\texttt{best\_val\_loss}=\arg\min_{\mathrm{epoch}}\,\texttt{val\_loss},\qquad \texttt{best\_pcc}=\arg\max_{\mathrm{epoch}}\,\texttt{val\_mu\_pcc}.$$</div>
+      <div class="risk"><strong>Use the checkpoint manifest, not filename guesses.</strong><p>The pipeline has historical checkpoint formats. The manifest explicitly maps each variant to the checkpoint and its prediction parquet. Scientific recovery/causality conclusions should use <code>best_val_loss</code> only. PCC-best predictions are useful as a separately selected diagnostic, but changing the selection criterion changes the scientific comparison.</p></div>
+    </section>
+
+    <section id="evaluation">
+      <h2>Recovery evaluation and which scripts to use</h2>
+      <h3>Shared biological profile</h3>
+      <p>The modern ablation-recovery script, <code>analyses/synthetic_gamma_ablation_lbio_recovery.py</code>, evaluates \(L_{bio}\) against deterministic \(K\) over the CDS interior. It reports per-transcript Pearson correlation, Spearman correlation, and shape RMSE after mean-one normalization. Observed consensus comparisons are secondary diagnostics only: they contain both finite-count noise and the programmed dataset bias.</p>
+      <div class="math">$$e^L_{ti}=\log(L_{ti}+\varepsilon)-\log(K_{ti}+\varepsilon),\qquad 5\le i&lt;L-5.$$</div>
+      <h3>Gamma recovery</h3>
+      <p><code>analyses/analyze_synthetic_gamma_recovery.py</code> reads <code>added_bias</code>, forms \(b=1+\texttt{added\_bias}\), and applies the same joint reference/positional log gauge to the truth and learned score. It must be invoked with <code>--checkpoint-variant best_val_loss</code> for the scientific selection rule; its historical default is <code>best_pcc</code>.</p>
+      <h3>Gamma compensation and alpha absorption</h3>
+      <p><code>analyses/analyze_synthetic_gamma_compensation.py</code> accepts only explicit <code>predictions_main_val_best_val_loss_*.parquet</code> artifacts. It evaluates whether missed systematic gamma is accompanied by positive \(L\) error, increased learned alpha, both, or neither, and uses the raw replicas to distinguish empirical replica disagreement from apparent alpha inflation. It reuses the gamma-recovery gauge implementation rather than independently redefining the coordinate/gauge system.</p>
+      <div class="warning"><strong>Two older defaults need an explicit override.</strong><p><code>analyses/analyze_synthetic_recovery.py</code> defaults to selecting <code>val_mu_pcc</code>; pass <code>--selection-metric val_loss</code> for minimum-loss evidence. <code>analyses/analyze_synthetic_gamma_recovery.py</code> defaults to <code>best_pcc</code>; pass <code>--checkpoint-variant best_val_loss</code>. The numbered <code>13_gamma_ablation_recovery.py</code> and compensation workflow are the safer current choices for the stated best-loss policy.</p></div>
+      <p>The in-training synthetic validation metrics under <code>val/synthetic_ground_truth/...</code> are diagnostic only. They never contribute to the loss or checkpoint monitor. They are intentionally skipped when a distributed process group is initialized to avoid a second potentially misordered collective stream.</p>
+    </section>
+
+    <section id="alpha">
+      <h2>Separate alpha-causality suite</h2>
+      <p><code>run_synthetic_alpha_causality_local.sh</code> is a controlled A/B/C suite, separate from the main 47-task matrix. Its default panel is 0.25 reads/codon with five biases: 3′ AA, 3′ CC, 3′ GG, GC&gt;0.7, and AU&gt;0.7. It uses only the minimum-validation-loss prediction checkpoint.</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Condition</th><th>Alpha mode</th><th>NB mean-gradient setting</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td>A — <code>standard_nb</code></td><td>Learned</td><td>\(\beta=0\)</td><td>Main baseline.</td></tr>
+            <tr><td>B — <code>decoupled_nb_mean_gradient</code></td><td>Learned</td><td>\(\beta=1\)</td><td>Test a detached mean-gradient reweighting intervention.</td></tr>
+            <tr><td>C — <code>fixed_alpha</code></td><td>Fixed at 0.1</td><td>\(\beta=0\)</td><td>Oracle-dispersion reference.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>The runner validates that the three resolved configurations differ only in the allowed causal fields and output paths, then calls <code>analyses/analyze_synthetic_alpha_causality.py</code>, which in turn requests best-loss shared-L, gamma, and compensation analyses.</p>
+    </section>
+
+    <section id="caveats">
+      <h2>Interpretation safeguards and known limitations</h2>
+      <ol>
+        <li><strong>Do not read \(\mu\) as recovery of \(K\).</strong> \(\mu\) should retain the programmed bias; \(L_{bio}\) is the shared-profile output to compare with \(K\).</li>
+        <li><strong>Do not compare raw gamma with raw bias multiplier.</strong> Both must be placed in the same fixed-reference and positional log gauge.</li>
+        <li><strong>Use the interior domain.</strong> The raw profiles exclude the terminal boundary and the first/last five codons are excluded from modern recovery metrics.</li>
+        <li><strong>Do not conflate data count with bias identity.</strong> Cumulative panels add a particular new bias each time.</li>
+        <li><strong>Do not compare local and Slurm inter-depth results as if they were the same design.</strong> Their selected sets, split universe, and current execution compatibility differ.</li>
+        <li><strong>Weight fitting is pre-split.</strong> It uses full eligible data and should be made train-only for a final leakage-controlled protocol.</li>
+        <li><strong>Current synthetic evaluation is validation-only.</strong> A test split is not currently created.</li>
+      </ol>
+    </section>
+
+    <section id="commands">
+      <h2>Reproducible commands and output locations</h2>
+      <h3>Prepare/refresh processed synthetic parquet files</h3>
+      <p>This rewrites generated processed data when <code>--overwrite</code> is supplied, so use it only when rebuilding is intended.</p>
+      <pre>.venv/bin/python Datasets/data/weight_synthetic_riboseq_codon_replicas.py --depths 0p25_per_codon 2_per_codon 20_per_codon --overwrite</pre>
+
+      <h3>Inspect the local task matrix without training</h3>
+      <pre>DRY_RUN=1 TASK_RANGE=0-46 GPU_INDEX=0 ./run_synthetic_bias_read_depth_local.sh</pre>
+
+      <h3>Run one within-depth panel</h3>
+      <pre>GPU_INDEX=0 TASKS="0" RUN_ID="synthetic_$(date +%Y%m%d_%H%M%S)" ./run_synthetic_bias_read_depth_local.sh</pre>
+      <p>Task 0 is the 0.25 reads/codon, two-bias within-depth panel. To schedule independent experiments on two physical GPUs, use <code>GPU_DEVICES=0,1</code>; each task still runs as a one-GPU process.</p>
+
+      <h3>Run the intended single-bias cross-depth comparison</h3>
+      <pre>GPU_INDEX=0 TASKS="27 28" RUN_ID="synthetic_cross_$(date +%Y%m%d_%H%M%S)" ./run_synthetic_bias_read_depth_local.sh</pre>
+      <p>Local task 27 is the equal-reference triplet for the first bias family (3′ AA); task 28 is the ranked-reference counterpart.</p>
+
+      <h3>Generate best-loss recovery reports</h3>
+      <pre>.venv/bin/python analyses/synthetic_gamma_ablation_lbio_recovery.py
+.venv/bin/python analyses/analyze_synthetic_gamma_recovery.py --checkpoint-variant best_val_loss
+.venv/bin/python analyses/analyze_synthetic_gamma_compensation.py --workers 2</pre>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Artifact</th><th>Location</th></tr></thead>
+          <tbody>
+            <tr><td>Per-run checkpoints</td><td class="path"><code>results/riboai_synthetic_experiments/&lt;run&gt;/checkpoints/</code></td></tr>
+            <tr><td>Predictions and manifests</td><td class="path"><code>results/riboai_synthetic_experiments/&lt;run&gt;/results/.../prediction_checkpoint_manifest.json</code></td></tr>
+            <tr><td>Split provenance</td><td class="path"><code>.../results/.../split_manifest_*.json</code></td></tr>
+            <tr><td>Shared-L ablation report</td><td class="path"><code>analyses/artifacts/synthetic/gamma_ablation/recovery/</code></td></tr>
+            <tr><td>Gamma compensation report</td><td class="path"><code>analyses/artifacts/synthetic/shared_profile_recovery/gamma_compensation_analysis/</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>Compact experimental contract</h2>
+      <div class="conclusion"><strong>The current intended baseline, in one sentence.</strong><p>For each depth and selected cumulative bias panel, train a one-GPU mass-free model with two raw NB2 replicas, two consensus shape-PCC terms, learned bounded dispersion, fixed-reference equal gamma centering, and transcript-balanced local-reliability aggregation; select the minimum-validation-loss checkpoint, then evaluate the CDS-interior mean-one \(L_{bio}\) against deterministic \(K\) and gauge-fixed gamma against the correspondingly gauge-fixed programmed bias.</p></div>
+    </section>
+
+    <footer>
+      Related documents: <a href="model_mathematics.html">model mathematics</a>,
+      <a href="synthetic_bias_read_depth_experiments.md">earlier synthetic plan</a>, and
+      <a href="synthetic_data_analysis_report.md">earlier synthetic analysis report</a>.
+      This page intentionally supersedes their stale details where the checked-out code differs, especially the mass-free default, 4,000-codon exclusion, current execution limits, best-loss scientific checkpoint rule, and local-versus-Slurm inter-depth behavior.
+    </footer>
+  </main>
+</div>
+</body>
+</html>

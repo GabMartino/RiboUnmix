@@ -1,0 +1,92 @@
+{
+  "checkpoint_epoch": 1,
+  "checkpoint_global_step": 12,
+  "checkpoint_path": "reference/checkpoints/artificial_bias_3prime_cc_artificial_bias_5prime_aa/queueNB_DataN2_h0ca317_Loss-rNB1p0-cPCC0p5-cVSTPCC0p5-Gamma0p0-Reducetranscript_balanced-NBModestandard_nb-Alphalearned-Beta0p0_Sampling_transcript_grouped_multidataset_pairs_GammaRawB8p0-CDSMax240_GammaCtrFixedRefEqual_FeatPresetBaseline_SeqFeatBase/version_0/val-loss-epoch=1-val_loss=2.2098.ckpt",
+  "environment": {
+    "lightning": "2.6.1",
+    "numpy": "2.4.3",
+    "pandas": "3.0.1",
+    "platform": "Linux-7.0.0-31-generic-x86_64-with-glibc2.39",
+    "pyarrow": "23.0.1",
+    "python": "3.12.3",
+    "torch": "2.10.0+cu128"
+  },
+  "expected_validation": {
+    "defined_row_pcc": 32,
+    "maximum_alpha": 1.2222472025918927,
+    "maximum_equal_reference_constraint_error": 6.984919309616089e-10,
+    "maximum_gamma_position_gauge_error": 5.886167957541648e-10,
+    "maximum_shared_duplicate_error": 0.0,
+    "maximum_shared_mean_one_error": 4.0166012871267753e-07,
+    "mean_row_pcc": 0.10269292014262979,
+    "mean_row_rmse": 2.7167752817295057,
+    "median_row_pcc": 0.10585469019357252,
+    "minimum_alpha": 1.210616367868329,
+    "prediction_rows": 32,
+    "validation_transcripts": 16
+  },
+  "files": {
+    "reference/checkpoints/artificial_bias_3prime_cc_artificial_bias_5prime_aa/queueNB_DataN2_h0ca317_Loss-rNB1p0-cPCC0p5-cVSTPCC0p5-Gamma0p0-Reducetranscript_balanced-NBModestandard_nb-Alphalearned-Beta0p0_Sampling_transcript_grouped_multidataset_pairs_GammaRawB8p0-CDSMax240_GammaCtrFixedRefEqual_FeatPresetBaseline_SeqFeatBase/version_0/val-loss-epoch=1-val_loss=2.2098.ckpt": {
+      "bytes": 242065,
+      "sha256": "e10a04719ec2156225d9f088de6314fa741d5085b665ee50442220e8e2114c8b"
+    },
+    "reference/manifests/gamma_reference_manifest.json": {
+      "bytes": 713,
+      "sha256": "6d23fe8c6ede362bca87f522923ac807132e52477feb79238bf86309cc05cc2a"
+    },
+    "reference/manifests/grouped_optimizer_batch_plan.json": {
+      "bytes": 2824,
+      "sha256": "ea5c817a1b795d4f46cd29d053dd859ec0d458de9bec93f261623c9395914a23"
+    },
+    "reference/manifests/loss_reduction_manifest.json": {
+      "bytes": 1085,
+      "sha256": "5b6b440b2cc6531102707e60fe678ec562d7a4772c30f202f226be8283625b47"
+    },
+    "reference/manifests/prediction_checkpoint_manifest.json": {
+      "bytes": 1225,
+      "sha256": "ff60b17d3a9f17edb230d323d6865102be312353a5c5c75ac3728d04e354d52c"
+    },
+    "reference/manifests/split_manifest_experiment_artificial_bias_3prime_cc_artificial_bias_5prime_aa_universe_artificial_bias_3prime_cc_artificial_bias_5prime_aa.json": {
+      "bytes": 4854,
+      "sha256": "747fdeaa4ddc380e165a6faf7c064374e6938a25dd09f570e49355760e0a4c39"
+    },
+    "reference/predictions_main_val_best_val_loss_artificial_bias_3prime_cc_artificial_bias_5prime_aa.parquet": {
+      "bytes": 372382,
+      "sha256": "5c0a3995d11acb7c4c3ba10c9924d3811788d8b455deaecda15af2ca43c54e96"
+    },
+    "reference/resolved_config.yaml": {
+      "bytes": 8072,
+      "sha256": "82818d59804d168e97eb387e92125e3805e127d2af525eec3ce512a86b5405df"
+    }
+  },
+  "prediction_path": "reference/predictions_main_val_best_val_loss_artificial_bias_3prime_cc_artificial_bias_5prime_aa.parquet",
+  "purpose": "CPU integration fixture; not an article-scale trained model",
+  "schema_version": 1,
+  "training": {
+    "checkpoint_selection": {
+      "metric": "val_loss",
+      "mode": "min",
+      "selected_epoch": 1
+    },
+    "datasets": [
+      "artificial_bias_5prime_aa",
+      "artificial_bias_3prime_cc"
+    ],
+    "epochs": 2,
+    "model_trainable_parameters": 15335,
+    "objective": {
+      "consensus_nb_vst_pcc_weight": 0.5,
+      "consensus_raw_pcc_weight": 0.5,
+      "replica_nb_weight": 1.0,
+      "sample_reduction": "transcript_balanced"
+    },
+    "reference": {
+      "dataset_count": 2,
+      "mode": "fixed_reference",
+      "weighting": "equal"
+    },
+    "train_transcripts": 48,
+    "training_seed": 42,
+    "validation_transcripts": 16
+  }
+}

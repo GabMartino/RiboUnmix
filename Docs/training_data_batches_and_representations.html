@@ -1,0 +1,470 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RiboUnmix: how data becomes a training update</title>
+<style>
+:root{--ink:#182b38;--muted:#546777;--line:#d7e2e8;--paper:#fff;--bg:#f2f6f8;--blue:#176b91;--green:#237258;--gold:#966316}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.7 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}a{color:var(--blue);text-underline-offset:3px}header{background:#163545;color:white;padding:54px max(24px,calc((100vw - 1100px)/2)) 44px}header p{max-width:900px;color:#d1e4ec}h1{font-size:clamp(2rem,4vw,3.1rem);line-height:1.16;letter-spacing:-.035em;max-width:900px;margin:12px 0 22px}h2{font-size:1.7rem;line-height:1.25;margin:0 0 22px}h3{font-size:1.15rem;line-height:1.4;margin:26px 0 10px}p{margin:10px 0 16px}main{max-width:1150px;margin:auto;padding:26px 24px 70px}section,nav{background:var(--paper);border:1px solid var(--line);border-radius:13px;padding:30px;margin:22px 0;scroll-margin-top:20px}nav ol{columns:2;column-gap:36px;margin:0;padding-left:22px}nav li{break-inside:avoid;padding:4px 0}.eyebrow{text-transform:uppercase;letter-spacing:.12em;font-size:.78rem;font-weight:700}.tag{display:inline-block;border:1px solid #6b909e;border-radius:20px;padding:3px 11px;font-size:.8rem;margin:3px 5px 0 0}.lead{font-size:1.12rem}.note,.issue,.equation{padding:16px 20px;border-radius:8px;margin:18px 0}.note{background:#eaf5f9;border-left:4px solid var(--blue)}.issue{background:#fff5e3;border-left:4px solid var(--gold)}.equation{background:#edf5f1;border:1px solid #cde1d6;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.94rem;overflow-x:auto;line-height:1.9}.small,.source{color:var(--muted);font-size:.87rem}.source{border-top:1px solid var(--line);padding-top:12px;margin-top:24px}code{font-size:.87em;background:#edf2f5;padding:2px 5px;border-radius:4px;overflow-wrap:anywhere}pre{background:#182e3a;color:#e8f2f5;padding:20px;border-radius:8px;overflow:auto;font-size:.85rem;line-height:1.65}pre code{background:none;padding:0;color:inherit}.table-wrap{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:.92rem;margin:16px 0}th,td{text-align:left;border-bottom:1px solid var(--line);padding:11px 12px;vertical-align:top}th{background:#edf3f6;font-weight:650}ul,ol{padding-left:24px}li{margin:5px 0}.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:15px}.card{padding:18px;border:1px solid var(--line);border-radius:8px}.card h3{margin:0 0 10px}.flow{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.flow div{padding:15px;border-radius:8px;background:#edf3f6;border-top:4px solid var(--blue)}.flow strong{display:block}.controls{display:flex;gap:24px;flex-wrap:wrap;margin:20px 0}select,button{font:inherit;padding:5px 10px;border:1px solid #8aa4b3;border-radius:5px;background:white;color:var(--ink)}button{cursor:pointer}.batch{border:1px solid #bad3dd;border-radius:8px;padding:14px 18px;margin:14px 0}.chunk{background:#f0f6f8;padding:10px;margin:8px 0;border-radius:6px}.pill{display:inline-block;padding:2px 8px;margin:2px;border-radius:4px;background:#dcebf1;font-size:.9rem}.two{display:grid;grid-template-columns:1fr 1fr;gap:20px}.hash{font-size:.74rem;word-break:break-all}footer{text-align:center;color:var(--muted);font-size:.87rem;margin-top:36px}@media(max-width:750px){section,nav{padding:21px}main{padding:12px}nav ol{columns:1}.cards,.flow,.two{grid-template-columns:1fr}header{padding:36px 23px}th,td{padding:9px}}@media print{body{background:white;font-size:10pt}header{background:white;color:var(--ink);padding:15px}header p{color:var(--muted)}main{padding:0}section,nav{border:0;padding:12px 0;margin:12px 0}h2,h3{break-after:avoid}tr,.note,.issue,.card{break-inside:avoid}.controls,button{display:none}.equation,pre{white-space:pre-wrap}a{color:inherit}html{scroll-behavior:auto}}
+</style>
+</head>
+<body>
+<header>
+<div class="eyebrow">Research methods · implementation audit · 15 September 2026</div>
+<h1>How data becomes<br>a training update</h1>
+<p class="lead">An implementation-grounded explanation of transcripts, dataset observations, raw replicates, sequence representations, batch construction, gamma centering, losses, and optimization in RiboUnmix.</p>
+<span class="tag">Current real-data default</span><span class="tag">Worked batch examples</span><span class="tag">Scientific qualifications</span><span class="tag">Offline HTML</span>
+</header>
+<main>
+<section id="scope">
+<h2>1. Scope and the central idea</h2>
+<p><strong>Training learns a shared sequence-dependent profile and dataset-specific corrections to it.</strong> Raw replicate counts supervise their product through a negative-binomial loss; the mean replicate profile supplies two correlation losses. The sequence encoder sees each unique transcript once per forward. Dataset-conditioned observations retain their own rows, counts, reliability weights, and replicate axis.</p>
+<div class="equation">sequence x<sub>t</sub> → shared load L<sub>ti</sub><br>
+(sequence x<sub>t</sub>, dataset d) → correction γ<sub>dti</sub> and dispersion α<sub>dti</sub><br>
+h<sub>dti</sub> = γ<sub>dti</sub>L<sub>ti</sub> / mean<sub>i valid</sub>(γ<sub>dti</sub>L<sub>ti</sub>)<br>
+replicate mean prediction μ<sub>dtri</sub> = observed replicate scale Ŝ<sub>dtr</sub> × h<sub>dti</sub></div>
+<p>This document starts from the existing <code>Docs</code> explanations, then checks their claims against the working-tree source and current YAML. It describes a <strong>fresh invocation of the real-data entry point without overrides</strong>. A historical run is defined by its saved resolved configuration, split/reference manifests, checkpoint, and source version. The current checkout already contains changes; this report is not a reconstruction of every past experiment.</p>
+<div class="note"><strong>Scientific target:</strong> relative allocation along a coding sequence (CDS), conditional on observed transcript depth. Neither a transcript ID nor a target profile enters the biological encoder. The final count prediction does use the target-derived scale. Accurate count-profile prediction therefore does not demonstrate prediction of absolute abundance.</div>
+<nav aria-label="Contents"><ol start="2">
+<li><a href="#snapshot">Current configuration and older documents</a></li><li><a href="#entities">What is a dataset, transcript, pair, or replicate?</a></li><li><a href="#disk">Disk formats and preprocessing</a></li><li><a href="#split">Split construction and eligibility</a></li><li><a href="#sampler">Logical batch construction</a></li><li><a href="#explorer">Interactive batch example</a></li><li><a href="#collate">Collation and tensor dimensions</a></li><li><a href="#representations">Sequence and dataset representations</a></li><li><a href="#forward">Biological and bias forward passes</a></li><li><a href="#reference">Internal reference panel and gamma gauges</a></li><li><a href="#replicates">Replicate scales and consensus</a></li><li><a href="#loss">The objective, from codons to transcripts</a></li><li><a href="#update">Execution chunks and optimizer updates</a></li><li><a href="#validation">Validation, checkpoints, and prediction</a></li><li><a href="#variants">Synthetic and organism benchmark paths</a></li><li><a href="#critique">Research concerns and useful experiments</a></li><li><a href="#sources">Source map and verification</a></li>
+</ol></nav>
+</section>
+
+<section id="snapshot">
+<h2>2. Current configuration: use values, not stale comments</h2>
+<div class="table-wrap"><table><thead><tr><th>Item</th><th>Current real-data default</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>Dataset configuration</td><td><code>weighted_hek_riboseq_codon_replicas</code></td><td>114 registered datasets in the master mapping.</td></tr>
+<tr><td>Selected datasets</td><td><code>martinez_2019</code>, <code>sharma_2021</code></td><td>Two observed dataset types in this model run; global IDs 15 and 96.</td></tr>
+<tr><td>Dataset vocabulary</td><td>131 IDs, 0–130</td><td>Embedding-table capacity, not the number of selected or reference datasets.</td></tr>
+<tr><td>Sequence channels</td><td>97 biological; no optional features</td><td>Every optional <code>route</code> is <code>none</code>.</td></tr>
+<tr><td>Bias sequence features</td><td>Codon, three nucleotide embeddings, amino-acid embedding</td><td>68 channels entering the bias GRU, including the dataset embedding.</td></tr>
+<tr><td>Both GRUs</td><td>2 layers, bidirectional, hidden size 256 per direction</td><td>512 contextual output channels per codon in each independent branch.</td></tr>
+<tr><td>Batch and loss</td><td>Per-dataset quota 32; transcript-balanced loss</td><td>Two fully paired datasets give 32 transcripts and 64 pair rows.</td></tr>
+<tr><td>Gamma reference</td><td>Both selected datasets; quality-rank weights, power 1</td><td>Fixed membership; internal reference chunk size 32.</td></tr>
+<tr><td>Mean normalization</td><td><code>mass_conservation: true</code></td><td>Adapted shape has mean one over valid codons.</td></tr>
+<tr><td>Objective</td><td>1 × replica NB + 0.5 × raw PCC loss + 0.5 × NB-VST PCC loss</td><td>Gamma regularization 0; ordinary NB gradients, β = 0.</td></tr>
+<tr><td>Execution</td><td>One GPU, BF16 mixed; both GRUs protected in FP32</td><td>Full backpropagation through the CDS; bias TBPTT window 0.</td></tr>
+</tbody></table></div>
+<div class="issue"><strong>Documentation drift:</strong> <a href="current_configured_model.md">current_configured_model.md</a> describes older selected datasets, a 33-row vocabulary, 13 active optional channels, and a smaller bias GRU. The current YAML also retains a comment saying “13 currently” beside the biological input size, despite disabling those features. The executable settings above take precedence. The biological model's docstring still mentions an additive term; the current forward uses the multiplicative model shown here.</div>
+<p class="source">Source: <a href="../config/config_ribounmix_multidataset.yaml">real-data configuration</a>, <a href="../config/dataset_config/weighted_hek_riboseq_codon_replicas.yaml">114-dataset mapping</a>, <a href="../Datasets/encodings/dataset_encoding.yaml">dataset IDs</a>.</p>
+</section>
+
+<section id="entities">
+<h2>3. Five distinct objects that must not be confused</h2>
+<table><thead><tr><th>Object</th><th>Notation</th><th>What is shared or different?</th></tr></thead><tbody>
+<tr><td>Transcript</td><td>t, length T<sub>t</sub></td><td>A biological sequence, with one codon at each modeled position. Same sequence across its dataset rows.</td></tr>
+<tr><td>Dataset</td><td>d</td><td>A named artifact/condition with a global categorical ID. Names can themselves contain “rep1”; the configured artifact identity defines d.</td></tr>
+<tr><td>Observed pair</td><td>(t,d)</td><td>One retained transcript row in one selected dataset. This is the flat dataset's <code>__getitem__</code> unit.</td></tr>
+<tr><td>Raw replicate</td><td>r = 1,…,R<sub>dt</sub></td><td>A count vector inside a pair, not another pair row and not another supporting dataset. No replicate embedding is learned.</td></tr>
+<tr><td>Reference evaluation</td><td>(t,k), k ∈ D<sub>ref</sub></td><td>A bias-network evaluation used to define gamma's reference. It can exist without a measured row for that transcript in dataset k. It does not create a target or a loss observation.</td></tr>
+</tbody></table>
+<p>There are also <strong>four different dataset sets</strong>: the 131-ID vocabulary, the 114-dataset split universe, the two selected training datasets, and the gamma reference panel (by default the selected datasets). Increasing one does not automatically increase the others.</p>
+<p>A missing dataset observation is absent. A measured zero at a valid codon is a genuine NB target. A padded zero is excluded by masks. These have different meanings even though two of them may be stored numerically as zero.</p>
+</section>
+
+<section id="disk">
+<h2>4. Disk → shared sequence table → flat observed pairs</h2>
+<div class="flow"><div><strong>1 · Shared sequences</strong>One sequence record per transcript, with codons and CSS annotations.</div><div><strong>2 · Dataset parquets</strong>Profiles, raw replicate arrays, and pair reliability weights.</div><div><strong>3 · Join by ID</strong>Keep sequence/profile matches and assign transcript split roles.</div><div><strong>4 · Flat index</strong>One index per retained (transcript, dataset) pair.</div></div>
+<h3>Sequence storage</h3>
+<p>The configured MANE parquet has <strong>19,283 rows</strong> locally. The loader prefers its <code>codons</code> column; if unavailable it uses <code>ref</code>, the historical nucleotide-one-hot representation. Both become the same integer codon IDs. CSS comes from <code>conserved_stalling_sites</code> or the compatibility name <code>css</code>. Optional feature columns are read only when their route is enabled.</p>
+<h3>Observation storage</h3>
+<table><thead><tr><th>Column</th><th>Per-row content</th><th>Training use</th></tr></thead><tbody>
+<tr><td><code>id</code></td><td>Transcript identifier</td><td>Sequence join, split membership, grouping.</td></tr>
+<tr><td><code>ribo</code></td><td>Stored consensus vector [T]</td><td>Eligibility and alignment checks. Runtime consensus is rebuilt from raw replicates.</td></tr>
+<tr><td><code>ribo_cds_replicas</code></td><td>Raw nonnegative profiles [R,T]</td><td>Mandatory. All real replicates enter NB; their arithmetic mean enters PCC.</td></tr>
+<tr><td><code>weight</code></td><td>Positive scalar w<sub>dt</sub></td><td>Local reliability weight in loss aggregation.</td></tr>
+<tr><td><code>replica_ids</code></td><td>Replicate provenance</td><td>Stored in artifacts; no identity input to the current model.</td></tr>
+<tr><td>Coverage/depth audit columns</td><td>Per-pair preprocessing statistics</td><td>Explain weight provenance; required for frozen-reference reweighting.</td></tr>
+</tbody></table>
+<p>Local parquet metadata reports <strong>14,560 rows for martinez_2019</strong> and <strong>15,767 for sharma_2021</strong>. These are physical file row counts, not training counts or a measured sampler preview. Sequence intersection, split assignment, exclusions, and multi-dataset support still apply.</p>
+<h3>Reliability preprocessing</h3>
+<p>The current preprocessing script's default is:</p>
+<div class="equation">density D<sub>dt</sub> = mean counts per codon; coverage C<sub>dt</sub> = fraction of positive codons<br>
+τ<sub>d</sub> = median positive density among eligible rows<br>
+depth_score<sub>dt</sub> = √D<sub>dt</sub> / (√D<sub>dt</sub> + √τ<sub>d</sub>)<br>
+raw_weight<sub>dt</sub> = 0.70 × depth_score<sub>dt</sub> + 0.30 × C<sub>dt</sub><br>
+w<sub>dt</sub> = raw_weight<sub>dt</sub> / median<sub>eligible t</sub>(raw_weight<sub>dt</sub>)</div>
+<p>Weights may exceed one. Runtime normally uses the stored positive values exactly, so the script's current default alone does not establish how an older artifact was generated. An optional <code>reliability_reference_manifest</code> applies references fitted on explicit training IDs; it is null in the base configuration.</p>
+<p>Duplicate pairs are rejected. Negative/nonfinite weights and malformed profiles are rejected. Historical weight-zero rows are excluded; the weighted loader also excludes positive-weight stored profiles with no counts. Replicates must be finite, nonnegative, nonempty and aligned in length; a zero-count replicate is allowed when its pair has positive information overall. Stored consensus and replicas must agree in length, but the loader does not require equality between stored <code>ribo</code> and their mean: it replaces the runtime target with that mean.</p>
+<p class="source">Source: <a href="../Dataloaders/RiboUnmixMultiDataset/RiboUnmixMultiDatasetDataModule.py">datamodule: setup</a>, <a href="../Dataloaders/RiboUnmixMultiDataset/RiboUnmixMultiDataset.py">dataset and codon lookup</a>, <a href="../Datasets/data/weight_hek_riboseq_codon_replicas.py">weight preprocessing</a>.</p>
+</section>
+
+<section id="split">
+<h2>5. Transcript splits precede sampler eligibility</h2>
+<ol>
+<li>Build transcript metadata from the sequence table and the configured master dataset union.</li>
+<li>Find validation candidates with a retained positive-weight row in <strong>every master dataset</strong>. The default master universe is the entire 114-entry mapping, independent of the selected training pair.</li>
+<li>Assign each common transcript a split-only reliability score: the median of its dataset-specific weights. Combine a reliability quantile bin (10 configured bins) with a CSS-count class: 0, 1, 2–3, or 4+ conserved stalling sites.</li>
+<li>With seed 42, select <code>round(0.1 × common_candidate_count)</code> transcripts using joint stratification. This is 10% of the common pool, not 10% of the master union.</li>
+<li>Assign every other master-union transcript to training. The selected datasets then contribute the observations they actually contain.</li>
+<li>The training sampler further requires at least two distinct selected datasets with eligible rows for that transcript. With the default two datasets, only their shared eligible training transcripts enter updates.</li>
+</ol>
+<div class="note"><strong>Split role is not the same as exposure to optimization.</strong> A transcript can be labeled training in the manifest and still be excluded from the sampler because only one selected dataset contains it. Replicate count does not rescue that transcript.</div>
+<p>The default has training and validation only; prediction uses validation IDs. External experiment manifests can supply panel-specific training IDs plus disjoint validation/test IDs. Validation and prediction samplers allow one observed dataset per transcript, whereas the default training sampler requires two.</p>
+<p>CSS guides split composition and remains available for diagnostics. It is neither an input channel to the active networks nor a supervised loss term. The split helper discovers common membership from IDs and positive weights; profile-value checks occur later in the datamodule. Legacy positive-weight all-zero rows can therefore make advertised common membership differ from actual usable support.</p>
+<h3 id="measured-split">Measured on the current local data</h3>
+<p>The repository's actual split helper, datamodule setup, and sampler were executed on 15 September 2026 with the default two datasets and seed 42. These counts include runtime profile validation and sequence alignment. This was a data-path audit, without training a model.</p>
+<table><thead><tr><th>Population</th><th>Unique transcripts</th><th>Interpretation</th></tr></thead><tbody>
+<tr><td>Sequence-matched master union</td><td>18,176</td><td>Transcript universe obtained from all 114 mapped datasets.</td></tr>
+<tr><td>Common validation candidates</td><td>7,142</td><td>Positive-weight membership in every master dataset.</td></tr>
+<tr><td>Selected validation panel</td><td>714</td><td>Both selected datasets provide an eligible row: 1,428 validation pairs.</td></tr>
+<tr><td>Assigned training IDs</td><td>17,462</td><td>Master union minus validation IDs.</td></tr>
+<tr><td>Training IDs with zero selected observations</td><td>2,623</td><td>No usable pair in either selected dataset.</td></tr>
+<tr><td>Training IDs with exactly one selected observation</td><td>1,563</td><td>Available to the flat dataset, but excluded by the ≥2-dataset training sampler.</td></tr>
+<tr><td><strong>Actually trained transcript groups</strong></td><td><strong>13,276</strong></td><td>One eligible row in each selected dataset: <strong>26,552 training pairs</strong>.</td></tr>
+</tbody></table>
+<p>Before the sampler's support filter, martinez contributes 13,465 training pairs and sharma contributes 14,650. Their selected training union is 14,839 transcripts; their shared eligible training set is 13,276. The remaining singleton counts are 189 martinez-only and 1,374 sharma-only. Thus 4,186 master training IDs do not contribute to this run's updates.</p>
+<div class="note"><strong>The replicate axis is real:</strong> every admitted martinez pair carries two raw replicates; every admitted sharma pair carries three. One complete training epoch therefore visits 13,276 × (2+3) = <strong>66,380 raw replicate profiles</strong>, reduced to 26,552 pair losses and then 13,276 transcript losses.</div>
+<p class="source">Source: <a href="../main_ribounmix_multidataset.py">fixed_common_validation_split, load_common_transcript_reliability</a>, <a href="../Utils/external_transcript_split.py">external split loader</a>, <a href="../Dataloaders/RiboUnmixMultiDataset/RiboUnmixMultiDatasetDataModule.py">training/validation/prediction samplers</a>.</p>
+</section>
+
+<section id="sampler">
+<h2>6. What does “batch size 32” actually mean?</h2>
+<p>For an eligible transcript, form the complete group G<sub>t</sub> = {(t,d): d has an eligible selected observation}. The sampler keeps this group atomic. It never randomly chooses just one of that transcript's available datasets.</p>
+<h3>Actual packing algorithm</h3>
+<ol>
+<li>Construct groups in deterministic transcript-ID order; retain groups meeting the support threshold.</li>
+<li>Sort by decreasing CDS length, with deterministic group ordering for ties.</li>
+<li>Append a complete group unless it would make any dataset exceed its quota of 32 rows. If it would, close the current logical batch and start the next.</li>
+<li>Keep the final partial batch (<code>drop_last=False</code>).</li>
+<li>Randomize the order of complete packed batches across epochs. <strong>Current group membership within batches remains fixed</strong>; this avoids changing the number of execution chunks between epochs.</li>
+<li>Split a logical batch into smaller execution chunks only between complete transcript groups.</li>
+</ol>
+<div class="cards"><div class="card"><h3>Logical batch</h3><p>Defines the loss population. Each represented dataset has at most 32 observed rows. With D datasets, B ≤ 32D.</p></div><div class="card"><h3>Execution chunk</h3><p>A subset of whole groups materialized in one forward/backward. Memory limits control its size.</p></div><div class="card"><h3>Optimizer window</h3><p>A logical batch or A accumulated logical batches. AdamW updates once after their chunks contribute.</p></div></div>
+<p>With complete support across D datasets, a full logical batch contains exactly 32 transcripts and 32D rows. With incomplete support, the transcript count can be <strong>greater than 32</strong>, and some dataset quotas can remain underfilled. Quota is not a command to oversample missing observations or equalize dataset counts.</p>
+<p>Length sorting is for efficient padding, not random cropping. In the active real-data configuration, full retained CDSs enter the model; no maximum-length cutoff is configured. One unusually long transcript can exceed the nominal execution memory limit because groups are atomic.</p>
+<h3>Measured epoch plan</h3>
+<table><thead><tr><th>Unit</th><th>Observed count</th><th>Composition</th></tr></thead><tbody>
+<tr><td>Logical batches</td><td>415</td><td>414 batches of 32 transcripts; one partial batch of 28 transcripts.</td></tr>
+<tr><td>Execution chunks</td><td>417</td><td>413 logical batches execute whole; two split into two chunks each.</td></tr>
+<tr><td>Chunk group sizes</td><td>412 × 32, plus 28, 27, 18, 14, and 5</td><td>The two split logical batches have 18+14 and 27+5 transcripts.</td></tr>
+<tr><td>Resolved accumulation A</td><td>1</td><td>The preview median is 32 groups; target 32 is already met.</td></tr>
+<tr><td>AdamW updates per complete epoch</td><td>415</td><td>One per logical batch; not one per execution chunk.</td></tr>
+</tbody></table>
+<p>The partial 28-transcript logical batch is shuffled along with the other batches, so “partial batch” does not necessarily mean the last update of the epoch. Each of its transcript losses has coefficient 1/28 in its update, versus 1/32 in a full batch; epoch-level validation logging is a separate aggregation.</p>
+<p class="source">Source: <a href="../Dataloaders/RiboUnmixMultiDataset/RiboUnmixMultiDatasetDataModule.py">TranscriptGroupedMultiDatasetBatchSampler: _select_groups, _build_epoch_plan, _split_logical_batches_for_execution</a>; <a href="grouped_optimizer_batching.md">batching design note</a>.</p>
+</section>
+
+<section id="explorer">
+<h2>7. Interactive example: incomplete dataset support</h2>
+<p>This small illustrative dataset uses three selected datasets, A/B/C. It follows the source's decreasing-length greedy packing and complete-group execution splitting. Batch order is left unshuffled so the example is easy to follow. It is not a sample of the real parquets.</p>
+<table><thead><tr><th>Transcript</th><th>Codons</th><th>Observed datasets</th><th>Training eligibility</th></tr></thead><tbody>
+<tr><td>t1</td><td>9</td><td>A, B</td><td>Yes</td></tr><tr><td>t2</td><td>7</td><td>A, C</td><td>Yes</td></tr><tr><td>t3</td><td>5</td><td>B, C</td><td>Yes</td></tr><tr><td>t4</td><td>4</td><td>A, B, C</td><td>Yes</td></tr><tr><td>t5</td><td>3</td><td>A (even if many replicates)</td><td>No: only one dataset</td></tr>
+</tbody></table>
+<div class="controls"><label>Per-dataset quota <select id="quota"><option>1</option><option selected>2</option><option>3</option></select></label><label>Execution pair-row limit <select id="cap"><option>2</option><option selected>4</option><option>6</option><option>12</option></select></label></div>
+<div id="batch-results" aria-live="polite"></div>
+<noscript><p>At quota 2, the first logical batch contains t1/t2/t3: 3 transcripts and 6 pair rows, with A=2, B=2, C=2. The second contains t4: 1 transcript and 3 rows. With execution row cap 4, the first splits into [t1,t2] and [t3], contributing 2/3 and 1/3 of its logical loss.</p></noscript>
+<div class="note">At quota 2, three unique transcripts fit even though the quota is two. At row cap 2, t4 still executes as three rows because a transcript group cannot be split. A memory limit is therefore soft, whereas the per-dataset logical quota is enforced.</div>
+</section>
+
+<section id="collate">
+<h2>8. Collation: exactly what is passed to the model</h2>
+<p>Let B be observed pair rows in one execution chunk, U its unique transcripts, T<sub>max</sub> its longest CDS, and R<sub>max</sub> its largest replicate count. Collation sorts all pair rows by decreasing length and applies the same permutation to IDs, targets, weights, replicas, and annotations.</p>
+<table><thead><tr><th>Batch field</th><th>Shape/type</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>ids_datasets_sorted</code></td><td>[B], int64</td><td>Global dataset embedding lookup.</td></tr>
+<tr><td><code>ids_sorted</code></td><td>B transcript strings</td><td>Identity metadata; not learned transcript embeddings.</td></tr>
+<tr><td><code>seq_packed</code></td><td>PackedSequence; data [Σ<sub>unique t</sub>T<sub>t</sub>,97]</td><td>Exactly one dense biological input per unique transcript.</td></tr>
+<tr><td><code>prof_pad</code></td><td>[B,T<sub>max</sub>], float32</td><td>Arithmetic raw-replicate consensus; padding zero.</td></tr>
+<tr><td><code>lengths_sorted</code></td><td>[B], int64</td><td>Valid codon counts.</td></tr>
+<tr><td><code>mask_pad</code></td><td>[B,T<sub>max</sub>], bool</td><td>True exactly where position &lt; row length.</td></tr>
+<tr><td><code>codon_ids_pad</code></td><td>[B,T<sub>max</sub>], int64</td><td>Pair-level compact sequence for the bias branch.</td></tr>
+<tr><td><code>css_sorted</code></td><td>B annotation lists</td><td>Metadata/diagnostics.</td></tr>
+<tr><td><code>sample_weights_sorted</code></td><td>[B], float32</td><td>w<sub>dt</sub>, used inside each transcript's reduction.</td></tr>
+<tr><td>Dataset quality ranks/weights</td><td>Two [B] float32 tensors</td><td>Dataset-level information; separate from w<sub>dt</sub>.</td></tr>
+<tr><td><code>transcript_group_index</code></td><td>[B], int64, values 0…U−1</td><td>Gather biological outputs to pairs and reduce pair losses by transcript.</td></tr>
+<tr><td>Optional bias features</td><td>[B,T<sub>max</sub>,F<sub>bias</sub>]</td><td>Field only present if configured; absent in active default.</td></tr>
+<tr><td><code>replica_pad</code></td><td>[B,R<sub>max</sub>,T<sub>max</sub>], float32</td><td>Raw counts with zero padding on both replica and codon axes.</td></tr>
+<tr><td><code>replica_mask</code></td><td>[B,R<sub>max</sub>], bool</td><td>Marks actual replicates; padded replica slots are excluded.</td></tr>
+<tr><td>Transcript metadata</td><td>Validated host object</td><td>Canonical rows, row lists by transcript, and CPU lengths.</td></tr>
+<tr><td>Execution metadata</td><td>Dictionary</td><td>Logical batch ID, chunk index/count, logical group/pair counts, chunk group count.</td></tr>
+</tbody></table>
+<h3>Concrete dimensions</h3>
+<p>For t1/t2 above: U=2, B=4, lengths [9,9,7,7]. The padded biological array before packing is [2,9,97], but packed data is <strong>[16,97]</strong>. Targets and codons are [4,9]. If the four pairs carry [2,1,3,2] replicates, <code>replica_pad</code> is [4,3,9] and <code>replica_mask</code> is [4,3]. Group IDs are [0,0,1,1].</p>
+<p>The loader checks that same-transcript rows have identical codons and any active extra features before selecting a canonical sequence. The biological forward then gathers its unique outputs back to the pair axis. Thus equal L<sub>t</sub> across dataset rows is structural, rather than something the optimizer must learn.</p>
+<p>Padded codon ID 0 is not an unknown-codon token; it is a valid codon ID used as a placeholder behind a mask. Packed bidirectional recurrence prevents the backward GRU from incorporating artificial padding. Genuine zero counts at valid positions stay in the loss.</p>
+<h3>Actual collated tensors from epoch zero</h3>
+<table><thead><tr><th>Tensor or count</th><th>First shuffled execution chunk</th><th>Chunk containing the longest CDS</th></tr></thead><tbody>
+<tr><td>Unique transcripts / pair rows</td><td>32 / 64</td><td>18 / 36</td></tr>
+<tr><td>Longest CDS</td><td>346 codons</td><td>6,908 codons</td></tr>
+<tr><td>Packed biological data</td><td>[11,029, 97]</td><td>[100,170, 97]</td></tr>
+<tr><td>Consensus target and position mask</td><td>[64, 346]</td><td>[36, 6,908]</td></tr>
+<tr><td>Raw replicate tensor</td><td>[64, 3, 346]</td><td>[36, 3, 6,908]</td></tr>
+<tr><td>Replicate mask</td><td>[64, 3]</td><td>[36, 3]</td></tr>
+<tr><td>Fraction of logical loss used in backward</td><td>32/32 = 1</td><td>18/32; the companion chunk contributes 14/32</td></tr>
+</tbody></table>
+<p>The long chunk has 36 × 6,908 = 248,688 padded pair-codon tokens. Adding another two-row transcript would exceed 256,000 at that length, explaining the split. The third replica slot in every martinez row is padding; sharma uses all three slots. Equal-length sorting can interleave rows of different transcripts, so the explicit group IDs—not row adjacency—define transcript membership after collation.</p>
+<h3>A concrete sparse transcript: ENST00000424728.6</h3>
+<p>This admitted transcript has 6,908 codons. Its raw replicate totals, reconstructed from the collated profiles, are:</p>
+<table><thead><tr><th>Dataset</th><th>Counts per raw replicate</th><th>Stored pair weight</th><th>Normalized within-transcript loss weight</th></tr></thead><tbody>
+<tr><td>martinez_2019</td><td>3 and 0</td><td>0.05832</td><td>≈0.555</td></tr>
+<tr><td>sharma_2021</td><td>2, 8, and 5</td><td>0.04677</td><td>≈0.445</td></tr>
+</tbody></table>
+<p>Its consensus scales are 1.5/6,908≈0.000217 and 5/6,908≈0.000724 counts/codon. The zero-count martinez replicate receives the epsilon scale and remains a valid replicate in the NB average. The small absolute reliability weights do not suppress this transcript's outer vote because they are normalized within its group.</p>
+<div class="issue"><strong>This makes the weighting concern concrete:</strong> admission only requires positive pair information in two datasets. It does not require substantial read depth. This sparse transcript receives the same outer averaging coefficient as other transcripts in its logical batch, while its NB term also has length factor (6,908/1,000)<sup>0.25</sup>≈1.62. Equal coefficients do not imply equal numerical loss or gradient, but the current weighting has no separate absolute transcript-confidence factor.</div>
+<p class="source">Source: <a href="../Dataloaders/RiboUnmixMultiDataset/RiboUnmixMultiDataset.py">collate_fn</a>, <a href="../Utils/transcript_batch_metadata.py">ValidatedTranscriptMetadata</a>, <a href="../Models/RiboUnmixModel/RiboUnmixModel.py">_forward_biological_unique_transcripts</a>.</p>
+</section>
+
+<section id="representations">
+<h2>9. Representations: the same sequence, two independent encoders</h2>
+<div class="two"><div><h3>Biological input: 97 fixed channels</h3><div class="equation">3 nucleotide positions × 4 one-hot channels = 12<br>64-codon one-hot = 64<br>21 amino-acid/stop categories = 21<br>Total = 97</div><p>The 64×97 lookup table reconstructs these features from codon IDs. It is fixed, not a learned embedding. Compact sequence caches use uint8 codon IDs; dense channels are built only for the unique transcripts in the current chunk.</p></div><div><h3>Bias GRU input: 68 learned channels</h3><div class="equation">dataset embedding = 32<br>codon embedding = 16<br>3 nucleotide positions × embedding size 4 = 12<br>amino-acid embedding = 8<br>Total = 68</div><p>Nucleotide and amino-acid IDs are derived from the same codon encoding. These features contain no additional sequence information beyond codon identity, but provide a different parameterization and inductive bias.</p></div></div>
+<p>In fixed-reference mode, dataset embedding vectors are centered by the <strong>unweighted mean over selected experiment IDs</strong>, not over all 131 vocabulary rows and not by the quality weights. The centered 32-dimensional vector is repeated at each codon. The same model parameters process all datasets; a run does not create one whole model per dataset.</p>
+<h3>Optional sequence features</h3>
+<p><code>exo</code>, <code>gmp</code>, <code>tmp</code>, <code>openen</code>, and <code>fra</code> each declare 3 channels; <code>tAI_profile_codon</code> declares 1. Routes are <code>none</code>, <code>biological</code>, <code>dataset_bias</code>, or <code>both</code>. Missing sentinels and nonfinite values are replaced before multiplying by the configured scale. These are observed features, with no fitted normalization implied by that scale.</p>
+<p>All routes are off in the current real-data default. Enabling exo/gmp/tmp/openen/tAI for both branches adds 13 channels: biological input becomes 110 and current bias input becomes 81. It does not share GRU weights or connect the two branches.</p>
+</section>
+
+<section id="forward">
+<h2>10. Forward computation and gradient paths</h2>
+<pre><code>Unique transcript sequences [U, variable T, 97]
+  → biological BiGRU: 2 layers, 256 per direction
+  → Linear(512,512) → GELU → Dropout(0) → Linear(512,1) → Softplus
+  → normalize over valid codons → L_bio [U,Tmax]
+  → gather by transcript_group_index → L_bio [B,Tmax]
+
+Pair codons + dataset IDs [B, variable T]
+  → concatenate learned embeddings [B,Tmax,68]
+  → independent bias BiGRU: 2 layers, 256 per direction
+  → channel LayerNorm → context [B,Tmax,512]
+  → concatenate dataset embedding (32) + position features (3)
+  → assembled features [B,Tmax,547]
+       ├─ gamma MLP: 547 → 128 → 128 → 1, GELU + dropout 0.1
+       │    → clamp raw score to [−8,8] → reference centering → exp → gamma
+       └─ stop-gradient → alpha MLP: 547 → 128 → 1, GELU + dropout 0.1
+            → log_sigma (the public name for log-alpha)</code></pre>
+<p>The three position features are i/max(T−1,1), exp(−i/100), and exp(−(T−1−i)/100), with i starting at zero. They encode relative position and distance from the CDS start/stop.</p>
+<div class="equation">L<sub>ti</sub> = softplus(z<sub>ti</sub>) / mean<sub>valid i</sub> softplus(z<sub>ti</sub>)<br>
+ρ<sub>ti</sub> = L<sub>ti</sub> / (1 + L<sub>ti</sub>)<br>
+λ<sub>ti</sub> = log(1 + L<sub>ti</sub>), J<sub>t</sub> = mean<sub>valid i</sub> λ<sub>ti</sub></div>
+<p>The last three quantities are derived diagnostics. There is no learned flux head, additive bias, queue simulator, or supervised “true biology” target in the active forward. “Biological” names the intended interpretation of a shared normalized latent profile.</p>
+<p>Gamma starts at one because its final linear layer is initialized to zero. Biological load starts near, but not exactly, flat because its output weights have a small random initialization. The dispersion head starts with <code>log_sigma=0.2</code>, corresponding to α≈1.221 before learning.</p>
+<div class="note"><strong>Attached versus detached paths:</strong> NB and both PCC losses train the mean through L and gamma. NB trains the alpha head too, but alpha's input context is detached, so that path cannot train the bias GRU or its embeddings. NB-VST PCC also detaches alpha. These restrictions prevent alpha gradients from changing the shared bias representation, but they do not make the numerical values of alpha irrelevant to mean optimization.</div>
+<p>Both branches train jointly from the first update. There is no alternating biological/bias fitting stage or pretraining schedule in this default.</p>
+<p class="source">Source: <a href="../Models/RiboUnmixModel/SharedProfileModel.py">biological model</a>, <a href="../Models/RiboUnmixModel/DatasetBiasSubmodel.py">bias encoder and detached alpha context</a>, <a href="../Models/RiboUnmixModel/submodels/DatasetLogSigmaHead.py">alpha head</a>.</p>
+</section>
+
+<section id="reference">
+<h2>11. The reference panel is an internal model computation</h2>
+<p>Before model creation, the entry point resolves the selected and reference IDs and their quality weights. Reference IDs default to the selected datasets; an explicit reference must be a subset of them. IDs and weights are checkpointed. They are not re-estimated from each batch or from the transcript's observed counts.</p>
+<h3>Quality-rank weighting</h3>
+<div class="equation">q<sub>d</sub> = (R<sub>rank,max</sub> − rank<sub>d</sub> + 1) / R<sub>rank,max</sub><br>
+π<sub>d</sub> = q<sub>d</sub><sup>p</sup> / Σ<sub>k ∈ reference</sub> q<sub>k</sub><sup>p</sup>; default p = 1</div>
+<p>The maximum is taken from the full configured rank table, not reranked inside the selected subset. In the local components table, maximum rank is 115; martinez has rank 63 and sharma rank 17. Hence q values are 53/115 and 99/115, and the normalized reference weights are <strong>π<sub>martinez</sub>=53/152≈0.349</strong> and <strong>π<sub>sharma</sub>=99/152≈0.651</strong>. These are reference weights, not coefficients multiplying the observed losses.</p>
+<h3>Joint centering across datasets and positions</h3>
+<p>At deterministic evaluation, let a<sub>dti</sub> be the bounded raw log-gamma score (including log(init_gamma), zero here). Define:</p>
+<div class="equation">c<sub>ti</sub> = Σ<sub>k ∈ reference</sub> π<sub>k</sub>a<sub>kti</sub><br>
+m<sub>dt</sub> = mean<sub>valid i</sub> a<sub>dti</sub>; m̄<sub>t</sub> = Σ<sub>k ∈ reference</sub> π<sub>k</sub>m<sub>kt</sub><br>
+g<sub>dti</sub> = a<sub>dti</sub> − c<sub>ti</sub> − m<sub>dt</sub> + m̄<sub>t</sub><br>
+γ<sub>dti</sub> = exp(g<sub>dti</sub>)<br><br>
+Σ<sub>d ∈ reference</sub> π<sub>d</sub>g<sub>dti</sub> = 0 ⇒ ∏<sub>d ∈ reference</sub> γ<sub>dti</sub><sup>πd</sup> = 1<br>
+mean<sub>valid i</sub> g<sub>dti</sub> = 0 ⇒ geometric_mean<sub>i</sub>(γ<sub>dti</sub>) = 1</div>
+<p>A gauge is a convention that fixes an otherwise ambiguous reference or scale. These gauges do not set the arithmetic mean of gamma to one. Final mass conservation is a separate normalization of <em>gamma × L</em>.</p>
+<p>For each unique transcript, the model repeats its codons under every reference ID and evaluates the bias branch, in reference chunks of at most 32 dataset IDs. No reference target, replicate, or reliability w<sub>dt</sub> is needed. A reference-only score still receives gradient through the center even when that transcript has no observed loss row in that reference dataset. All reference chunks remain connected to autograd.</p>
+<p>Training computes requested scores and reference scores separately. At evaluation, complete requested reference groups can reuse their existing scores, because dropout is off. Otherwise an internal reference forward supplies missing scores. Reference chunking and execution chunking are different controls.</p>
+<div class="issue"><strong>Exactness qualification under dropout:</strong> during training, the actual formula is g<sup>req</sup> = a<sup>req</sup> − c<sup>ref</sup> − m<sup>req</sup> + m̄<sup>ref</sup>. Independent 0.1 head-dropout draws make requested and reference scores differ. The positional mean-zero identity still follows algebraically, but the weighted cross-dataset mean of the <em>requested</em> g values need not be zero on that stochastic forward. The reported fixed-reference constraint residual is built from the internal reference sums, so a small residual does not by itself verify the requested training rows. Exact deterministic identities apply at evaluation, up to floating-point error.</div>
+<p>Raw-score clipping at ±8 occurs before centering. It does not bound the final centered score to ±8: subtraction can expand its range. Conversely, with this finite raw bound, the final gamma is not mathematically unbounded. Clipped raw scores have zero derivative outside the bound.</p>
+<p class="source">Source: <a href="../main_ribounmix_multidataset.py">resolve_gamma_reference_panel</a>, <a href="../Models/RiboUnmixModel/RiboUnmixModel.py">_center_log_gamma_fixed_reference</a>, <a href="../Datasets/data/HEK_riboseq_profile_quality_rank_components.tsv">rank table</a>, <a href="gamma_centering.md">gamma background</a>.</p>
+</section>
+
+<section id="replicates">
+<h2>12. Replicate counts and consensus play different roles</h2>
+<div class="equation">ȳ<sub>dti</sub> = (1/R<sub>dt</sub>) Σ<sub>r</sub> y<sub>dtri</sub><br>
+Ŝ<sub>dt</sub> = max(mean<sub>valid i</sub> ȳ<sub>dti</sub>, ε)<br>
+Ŝ<sub>dtr</sub> = max(mean<sub>valid i</sub> y<sub>dtri</sub>, ε)<br>
+μ<sub>dti</sub> = Ŝ<sub>dt</sub> h<sub>dti</sub> → consensus PCC and exported prediction<br>
+μ<sub>dtri</sub> = Ŝ<sub>dtr</sub> h<sub>dti</sub> → raw-replicate NB</div>
+<p>The forward exports one shape for each observed pair. The loss broadcasts that same shape and the same positional dispersion across its real replicates. It computes a separate scale from each replicate, so replicate means differ even though their normalized shape and alpha are shared.</p>
+<h3>Numerical illustration</h3>
+<p>Suppose two raw replicates are [0,2,4] and [0,6,12]. Their consensus is [0,4,8]; their scales are 2 and 6, while the consensus scale is 4. If the learned mean-one shape is [0.25,0.75,2], the predicted replicate means are [0.5,1.5,4] and [1.5,4.5,12]. The consensus prediction is [1,3,8]. NB sees both raw vectors with their respective means; PCC sees the consensus once.</p>
+<p>At fixed α=0.2, the two predicted variances at the last codon are 4+0.2×4²=7.2 and 12+0.2×12²=40.8. Thus <strong>shared dispersion does not mean identical count distributions or identical numerical variance</strong>.</p>
+<p>With mean conservation, each replicate's predicted total equals its observed total, apart from the epsilon floor and numerical precision. If <code>mass_conservation=false</code>, h=gamma×L without final normalization, so its mean is not necessarily one; the observed scale remains an anchor, not an exactly conserved predicted mean.</p>
+<p class="source">Source: <a href="../Models/RiboUnmixLightningModule.py">_compute_replica_loss_terms</a>, <a href="replicate_scaling_rationale_and_alternatives.md">replicate-scaling statistical analysis</a>.</p>
+</section>
+
+<section id="loss">
+<h2>13. The complete objective: codons → replicates → datasets → transcripts</h2>
+<h3>13.1 Per-codon NB2 loss</h3>
+<p>For a raw count y with mean μ and dispersion α, NB2 has variance μ+αμ². The code calls the head output <code>log_sigma</code>, but its likelihood meaning is log α, not log standard deviation.</p>
+<div class="equation">log α = clamp(log_sigma, −5, 1); α ∈ [0.00674, 2.71828]<br>
+κ = 1/α<br>
+NLL(y;μ,α) = log Γ(κ) − log Γ(y+κ) + log Γ(y+1)<br>
+&nbsp;&nbsp;&nbsp;&nbsp;− κ log κ − y log μ + (κ+y) log(κ+μ)</div>
+<p>The implementation evaluates this in log space with mixed-precision autocast disabled for the loss, floors the likelihood mean at ε=10<sup>−8</sup>, and excludes padded codons/replicas. There is no active zero-inflation gate. A valid zero contributes an NB term.</p>
+<h3>13.2 Codon and replicate reductions</h3>
+<div class="equation">f(T) = clamp((T/1000)<sup>0.25</sup>, 0.5, 2)<br>
+NB<sub>dtr</sub> = f(T<sub>t</sub>) × (1/T<sub>t</sub>) Σ<sub>i valid</sub> NLL(y<sub>dtri</sub>; μ<sub>dtri</sub>, α<sub>dti</sub>)<br>
+NB<sub>dt</sub> = (1/R<sub>dt</sub>) Σ<sub>r real</sub> NB<sub>dtr</sub></div>
+<p>The length factor comes from <code>nb_sequence_reduction=length_tempered</code>, gamma=0.75. It affects NB only. Replicates are averaged, not summed: an extra replicate does not automatically add another full pair-level vote. Longer transcripts receive a tempered NB emphasis rather than strict equality of NB scaling.</p>
+<h3>13.3 Two pair-level PCC losses</h3>
+<div class="equation">P<sub>raw,dt</sub> = 1 − PCC<sub>valid i</sub>(μ<sub>dti</sub>, ȳ<sub>dti</sub>)<br>
+V(x;α) = 2 / √(α+ε) × asinh(√(αx+ε))<br>
+P<sub>VST,dt</sub> = 1 − PCC<sub>valid i</sub>(V(μ<sub>dti</sub>;α<sub>dti</sub>), V(ȳ<sub>dti</sub>;α<sub>dti</sub>))<br>
+ℓ<sub>dt</sub> = NB<sub>dt</sub> + 0.5 P<sub>raw,dt</sub> + 0.5 P<sub>VST,dt</sub></div>
+<p>PCC is epsilon-stabilized Pearson correlation. A PCC component is set to zero loss when its target profile, after that component's transformation, has variance ≤10<sup>−6</sup>. It is not removed from the outer pair-weight denominator. Alpha in the VST is detached: the alpha head cannot directly lower this loss by changing the transform. Prediction flooring is off. Gamma regularization is off; if enabled it adds its coefficient times the valid-position mean of log(gamma)².</p>
+<h3>13.4 Reliability within a transcript; equal transcript votes</h3>
+<div class="equation">p<sub>dt</sub> = w<sub>dt</sub> / Σ<sub>k ∈ observed D(t)</sub> w<sub>kt</sub><br>
+ℓ<sub>t</sub> = Σ<sub>d ∈ observed D(t)</sub> p<sub>dt</sub> ℓ<sub>dt</sub><br>
+L<sub>logical batch</sub> = (1/U) Σ<sub>t in batch</sub> ℓ<sub>t</sub></div>
+<p>Example: t1 has pair losses 2 and 6 with weights 1 and 3, so its loss is 5. t2 has losses 3 and 9 with weights 2 and 2, so its loss is 6. The two-transcript batch loss is <strong>5.5</strong>. Multiplying every weight of t1 by 100 changes nothing.</p>
+<div class="issue"><strong>Consequential interpretation:</strong> w<sub>dt</sub> determines which dataset to trust <em>for the same transcript</em>. It does not lower a transcript's outer vote when all its datasets have low weights. Nor does a transcript seen in 100 datasets receive 100 times the outer weight of one seen in two. This is a deliberate estimand choice, not equivalent to maximizing the unweighted joint likelihood of all counts.</div>
+<p>Two alternatives exist in the reducer: <code>global_weighted</code> takes one weighted mean over all pairs; <code>dataset_balanced</code> first averages by weight inside each represented dataset, then gives datasets equal votes. Execution microbatching explicitly requires <code>transcript_balanced</code> and rejects the other reductions while enabled. Implementation detail: grouped denominators ≤ε are omitted by the reducer, so the ideal formulas assume group weight sums above that threshold.</p>
+<p class="source">Source: <a href="../Models/RiboUnmixLightningModule.py">NegativeBinomialProfileLoss, masked_pcc, reduce_sequence_nll, reduce_per_sample_quantity, _compute_loss_and_metrics</a>, <a href="../Models/utils/stable_numerics.py">stable NB/VST functions</a>.</p>
+</section>
+
+<section id="update">
+<h2>14. From execution chunks to one AdamW update</h2>
+<h3>Memory controls do not redefine logical membership</h3>
+<p>The active execution limits are 512 pair rows and 256,000 padded codon tokens per forward; the group-count cap is null. Padded-token cost is approximated as B<sub>chunk</sub>×T<sub>max,chunk</sub>. It is not an exact memory estimator: replicate count, reference evaluations, hidden states, and autograd storage also consume memory.</p>
+<p>The sampler preview measures unique transcripts in the actual logical packing before training. It resolves accumulation A from the median group count, without advancing the sampler:</p>
+<div class="equation">A = clamp(ceil(32 / max(median logical U, 1)), 1, 32)<br>
+For ordinary fully paired 32-transcript logical batches: A = 1.<br>
+backward_loss<sub>chunk</sub> = L<sub>chunk</sub> × U<sub>chunk</sub>/U<sub>logical</sub> × 1/A</div>
+<p>For a 32-transcript logical batch split into 12/12/8 transcripts, backward weights are 12/32, 12/32, and 8/32. Do not average the three chunk means equally. Summing these scaled losses reconstructs the logical mean for fixed per-transcript evaluations. Dropout draws and floating-point ordering mean chunked and monolithic runs need not follow an identical stochastic trajectory.</p>
+<h3>One training cycle</h3>
+<pre><code>Build split → load eligible pairs → preview packing → resolve A
+Initialize model, checkpointed reference, AdamW groups, scheduler
+For each epoch:
+    shuffle order of deterministic logical batches
+    For each logical batch:
+        For each execution chunk of complete transcript groups:
+            collate unique sequences + observed pair rows + raw replicates
+            run biology once per unique transcript
+            run dataset branch and internal fixed reference
+            form consensus mu and replica-specific means
+            compute NB + consensus PCC, reduce to transcript-balanced chunk loss
+            backward(chunk_loss × chunk_groups / logical_groups / A)
+        when A logical batches have contributed:
+            clip the complete gradient norm to 1.0
+            AdamW.step(); zero gradients
+    validate; step plateau scheduler; select checkpoints; check early stopping</code></pre>
+<table><thead><tr><th>AdamW group</th><th>Initial learning rate</th><th>Weight decay</th><th>Scheduler minimum LR</th></tr></thead><tbody>
+<tr><td>Biological model</td><td>0.0005</td><td>0.01</td><td>0.000001</td></tr><tr><td>Remaining trainable bias/embedding parameters</td><td>0.001</td><td>0.01</td><td>0.000001</td></tr><tr><td>Alpha head</td><td>0.0001 (= rest × 0.1)</td><td>0.01</td><td>0.0000001</td></tr>
+</tbody></table>
+<p>This is one AdamW optimizer with three parameter groups, not three alternating optimizers. Manual optimization handles execution chunks; Lightning accumulation stays at one while the module manages logical accumulation. Clipping and weight decay happen at the full optimizer boundary, not separately for each chunk.</p>
+<p><strong>Accumulation qualifications:</strong> if A&gt;1, logical-batch means receive equal 1/A weight. Individual transcripts therefore have equal weight across the window only when those logical batches contain equal group counts. A final incomplete accumulation window retains 1/A scaling. In single-process mode its flush is in <code>on_train_epoch_end</code>, after validation; the opt-in global mode flushes it before validation. The ordinary A=1 default avoids that remainder-timing issue.</p>
+<h3>One model across several GPUs</h3>
+<p><code>distributed_mode=global_batch</code> preserves the same global logical groups and A, assigning whole transcript groups to workers. It sums gradients across workers at the optimizer boundary, then clips once. There is no extra world-size multiplier in the local loss. This is a custom strategy, distinct from ordinary averaged-gradient DDP and from running independent experiments on separate GPUs. Default execution remains single-process.</p>
+<p>CUDA mixed precision runs both GRUs in FP32; other eligible neural operations use BF16. Products and normalizations use stable log-space expressions. <code>context_gru_tbptt_window=0</code> means full backpropagation; a positive window changes the training gradient by detaching recurrent state across windows, even if the forward sees the full CDS.</p>
+<p class="source">Source: <a href="../Models/RiboUnmixLightningModule.py">training_step, _execution_optimizer_step, configure_optimizers</a>, <a href="../Utils/global_batch_strategy.py">global gradient strategy</a>, <a href="global_batch_multigpu.md">multi-GPU design</a>, <a href="fp32_cuda_gru_policy.md">GRU precision</a>.</p>
+</section>
+
+<section id="validation">
+<h2>15. Validation, model selection, and prediction</h2>
+<ul>
+<li><strong>Validation:</strong> same masks, replica-scale rule, reference panel, and hybrid objective, without gradients or dropout. Current β=0 uses ordinary NB in both training and validation.</li>
+<li><strong>Epoch loss:</strong> transcript-balanced chunk means are logged with unique-transcript counts so unequal chunk sizes do not receive equal weight.</li>
+<li><strong>Metric distinction:</strong> <code>val_mu_pcc</code> is an unweighted consensus-profile PCC mean over observed pairs. It is not the transcript-reliability-weighted objective and does not directly measure recovery of true L.</li>
+<li><strong>Scheduler:</strong> ReduceLROnPlateau monitors <code>val_loss</code>, mode min, factor 0.99, patience 5 validation epochs.</li>
+<li><strong>Stopping:</strong> maximum 200 epochs, early-stopping patience 10 on val_loss; two sanity-validation steps are configured before training.</li>
+<li><strong>Checkpoints:</strong> best val-loss and last checkpoints retain training state. A separate best-PCC checkpoint is selected by maximum val_mu_pcc and stores weights only.</li>
+<li><strong>Prediction:</strong> the default exports separately labeled results from best-val-loss and best-PCC checkpoints, on validation IDs. An external manifest can provide a separate test set.</li>
+</ul>
+<p>Sequence-only shared-profile export is available to experiment orchestrators but disabled in the base configuration. L is sequence-only; ordinary exported μ remains conditioned on observed depth. Resuming from a full-state checkpoint preserves optimizer/scheduler state; loading weights alone does not reconstruct Adam moments.</p>
+<div class="issue"><strong>Validation is a selection set.</strong> Reusing it for stopping, architecture choices, and final performance reporting does not yield an untouched test estimate. Moreover, the common-to-114-datasets panel measures generalization to a selected overlap population, not to every transcript in the training union.</div>
+<p class="source">Source: <a href="../main_ribounmix_multidataset.py">callbacks and checkpoint-variant prediction</a>, <a href="../Models/RiboUnmixLightningModule.py">validation_step and _log_stage</a>, <a href="prediction_outputs_reference.html">prediction field reference</a>.</p>
+</section>
+
+<section id="variants">
+<h2>16. Other dataset paths are different experiments</h2>
+<p>The shared model/loss infrastructure does not imply identical configuration across entry points. The following summarizes current checked-in defaults, not every launcher override.</p>
+<div class="table-wrap"><table><thead><tr><th>Aspect</th><th>Real multi-dataset</th><th>Synthetic</th><th>Organism benchmark</th></tr></thead><tbody>
+<tr><td>Input</td><td>Shared MANE codons + HEK replica parquets</td><td>Shared MANE sequences + synthetic bias-condition replica parquets</td><td>Dataset-specific <code>cds_seq</code> codon arrays + weighted observed profiles</td></tr>
+<tr><td>Datasets per default run</td><td>martinez + sharma</td><td>artificial_bias_5prime_aa + artificial_bias_5prime_cc; default depth mapping 20 reads/codon</td><td>Exactly one of human, yeast, C. elegans, E. coli datasets; default human_iwasaki_2014</td></tr>
+<tr><td>Replicates</td><td>Raw profiles inside each pair</td><td>Replica-aware synthetic artifacts</td><td>The one source profile is explicitly stored as one replica during preprocessing; no runtime fabrication</td></tr>
+<tr><td>Split</td><td>Fixed common validation panel</td><td>Common-panel strategy within synthetic master mapping; full transcripts &gt;4000 codons excluded</td><td>Independent within-dataset 80/10/10 train/validation/test</td></tr>
+<tr><td>Training support</td><td>At least two datasets</td><td>At least two datasets</td><td>Singleton transcript groups admitted</td></tr>
+<tr><td>Gamma / mean</td><td>Fixed quality-rank reference; mass conservation on</td><td>Fixed equal reference; mass conservation off</td><td>Batch-grouped singleton fallback; mass conservation off</td></tr>
+<tr><td>NB optimization</td><td>Standard NB, β=0</td><td>Standard NB, β=0</td><td>Mean-gradient-reweighted NB, β=0.5</td></tr>
+<tr><td>Pair reduction</td><td>Transcript balanced</td><td>Transcript balanced</td><td>Global weighted</td></tr>
+<tr><td>Bias GRU hidden size/direction</td><td>256</td><td>128</td><td>128</td></tr>
+</tbody></table></div>
+<p>Benchmark weights use the shared preprocessing rule, but global-weighted reduction means reliability affects transcript influence even in a single-dataset run. Its NB training multiplies each position's NLL by detached (1+αμ)<sup>0.5</sup>; validation uses ordinary NB. This is a changed gradient objective, not just a different file format.</p>
+<p>In the singleton gamma fallback, cross-dataset centering is skipped and the raw log score is retained. The configured positional gauge is also not applied through that fallback. Consequently the single-dataset benchmark cannot identify shared biology versus a sequence-dependent gamma correction from cross-dataset evidence.</p>
+<p>Real experiment launchers and saved Exp8 configurations can also override mass conservation, reference weighting, selected datasets, and split manifests. Read a saved run's resolved configuration before interpreting it using this page.</p>
+<p class="source">Source: <a href="../config/config_ribounmix_synthetic.yaml">synthetic defaults</a>, <a href="../config/config_ribounmix_benchmarking.yaml">benchmark defaults</a>, <a href="../Dataloaders/RiboUnmixBenchmarking/RiboUnmixBenchmarkingDataModule.py">benchmark adapter</a>, <a href="../Datasets/benchmarking_data/README.md">benchmark preprocessing</a>.</p>
+</section>
+
+<section id="critique">
+<h2>17. Research concerns and useful experiments</h2>
+<p>These are implications of the implementation and proposals for testing its assumptions. They are not measured failures or changes made by this report.</p>
+<table><thead><tr><th>Concern</th><th>Why it matters here</th><th>Useful response</th></tr></thead><tbody>
+<tr><td>Panel changes alter training support</td><td>The ≥2-dataset eligibility condition depends on selected datasets. Larger panels can admit different transcripts as well as more measurements of old transcripts.</td><td>Use matched transcript manifests for panel-size comparisons; report eligible transcript counts and support distributions alongside dataset counts.</td></tr>
+<tr><td>Shared biology remains reference-dependent</td><td>Gamma centering imposes a reference convention. A shared sequence-associated artifact can enter L. Independent encoders and good μ fit do not establish causal biological recovery.</td><td>Compare L across fixed-support reference panels and weights; test recovery against known synthetic L; use external biological validation independent of fitting counts.</td></tr>
+<tr><td>Stochastic requested gamma is not exactly centered</td><td>Requested/reference dropout draws differ in training, while diagnostics inspect internal reference algebra.</td><td>Measure the requested-row residual explicitly on complete reference groups. If exact training centering is intended, compare a shared-evaluation implementation or gamma-head dropout=0, with matched runs.</td></tr>
+<tr><td>Transcript weights lose absolute reliability</td><td>Multiplying all of a transcript's w values by the same constant cancels. A transcript weak in every dataset retains one outer vote.</td><td>If scientific goals require transcript confidence, define a separate outer reliability factor and compare it explicitly against equal transcript votes.</td></tr>
+<tr><td>Plug-in scale uncertainty is ignored</td><td>Each replicate's own mean sets its amplitude, absorbing depth, abundance variation, and sampling fluctuation. Alpha describes residual variation around fitted scales.</td><td>Compare library-level exposure with a shared transcript amplitude; or, for explicitly conditional allocation, test a count-vector model. Hold shape normalization fixed so only the scale assumption changes.</td></tr>
+<tr><td>Replicate averaging changes statistical weighting</td><td>Two and ten replicates each yield one averaged NB term per pair; higher-depth counts still affect NB numerically, but there is no automatic replicate-count multiplier.</td><td>Compare this robust pair-level weighting to a predeclared information-based scheme using synthetic truth and held-out replicate calibration.</td></tr>
+<tr><td>Preprocessing references may use held-out profiles</td><td>The base run uses stored weights; their depth and median references need not have been fitted on training IDs only.</td><td>For strict evaluation, fit/freeze references on training IDs via the supported manifest path; separately audit the dataset-quality ranking's provenance.</td></tr>
+<tr><td>Fixed length-bucket companions</td><td>Batch order changes, but transcripts retain the same batch partners. With AdamW and per-step means, this is not equivalent to uniformly reshuffling transcripts each epoch.</td><td>First test stability across seeds; if needed, compare an epoch-varying grouping plan that exposes the correct number of chunks and preserves whole groups.</td></tr>
+<tr><td>Hybrid loss and clipping complicate dispersion interpretation</td><td>PCC penalties shape μ; alpha is bounded and learns through a restricted gradient path. It is not a direct empirical replicate-variance estimate.</td><td>Report alpha-bound occupancy, raw NB diagnostics, calibration on held-out replicates, and shape accuracy separately.</td></tr>
+<tr><td>No untouched test set in the base real run</td><td>Validation is used for scheduler, stopping, checkpoint choice, and default prediction. Transcript-ID separation also does not guarantee gene/family separation.</td><td>Use a disjoint external test manifest for final reporting; audit gene/homology overlap if sequence transfer is the scientific claim.</td></tr>
+</tbody></table>
+<div class="note"><strong>Recommended interpretation:</strong> this is a jointly trained, reference-anchored model of relative ribosome-profile shape using a hybrid replica-NB/consensus-correlation objective. It should not be described as an unconstrained recovery of uniquely identified biology, an identical-distribution model across raw replicates, or a predictor of unobserved transcript totals.</div>
+</section>
+
+<section id="sources">
+<h2>18. Source map and verification</h2>
+<p>The analysis began with <a href="current_configured_model.md">current configured model</a>, <a href="grouped_optimizer_batching.md">grouped optimizer batching</a>, <a href="global_batch_multigpu.md">global multi-GPU batches</a>, <a href="project_model_onboarding.html">model onboarding</a>, <a href="ribounmix_model_core_concepts.html">core concepts</a>, and <a href="replicate_scaling_rationale_and_alternatives.md">replicate-scale rationale</a>. Current executable code resolved conflicts between those snapshots.</p>
+<table><thead><tr><th>Question</th><th>Primary implementation to inspect</th></tr></thead><tbody>
+<tr><td>How is a run constructed?</td><td><a href="../main_ribounmix_multidataset.py">Entry point</a>: split, reference, accumulation plan, callbacks, prediction.</td></tr>
+<tr><td>What rows are usable and how are they packed?</td><td><a href="../Dataloaders/RiboUnmixMultiDataset/RiboUnmixMultiDatasetDataModule.py">Datamodule</a>: setup and TranscriptGroupedMultiDatasetBatchSampler.</td></tr>
+<tr><td>What exactly is in a batch?</td><td><a href="../Dataloaders/RiboUnmixMultiDataset/RiboUnmixMultiDataset.py">Dataset</a>: flat index, encoding lookup, __getitem__, collate_fn.</td></tr>
+<tr><td>How do biology, gamma, and scale combine?</td><td><a href="../Models/RiboUnmixModel/RiboUnmixModel.py">Model forward and reference centering</a>.</td></tr>
+<tr><td>Which loss trains which parameters?</td><td><a href="../Models/RiboUnmixLightningModule.py">Lightning module</a>: loss reducers, replica scales, training_step, configure_optimizers.</td></tr>
+</tbody></table>
+<p id="verification"><strong>Verification completed:</strong> current YAML, encoding counts, selected parquet schemas/row counts, and ranking values were inspected locally. Nineteen existing unittest checks covering compact collation, unique biological forwards, gamma centering, and alpha optimization passed; five standalone execution-microbatch tests also passed, including loss/gradient reconstruction. All 12 interactive quota/cap combinations matched the actual Python sampler. The loss and reference-weight examples were checked, all 65 links resolved, and the page rendered in headless Chrome and was visually inspected. A subsequent real-data pass executed the production split helper, datamodule setup, sampler, accumulation planner, and collation to obtain the measured counts and tensors in sections 5–8. No production training or new empirical performance experiment is claimed.</p>
+<details><summary>Source fingerprints for the measured data-path snapshot</summary><p class="small">SHA-256 of the files used for the split/setup/sampler/collate audit. Input data were read from the configured local paths; these source fingerprints are not hashes of the parquet contents.</p><table><thead><tr><th>Source</th><th>SHA-256</th></tr></thead><tbody><tr><td>config/config_ribounmix_multidataset.yaml</td><td class="hash">fb5163a71b2a9a4ea26761373f6cbd731980d1096245a54c8f9fa47b2ec95553</td></tr><tr><td>config/dataset_config/weighted_hek_riboseq_codon_replicas.yaml</td><td class="hash">e44b76eb81869950d208d5ee0c5ba283c1abba9c7c2f45659e3a8bf2a9261db3</td></tr><tr><td>main_ribounmix_multidataset.py</td><td class="hash">f80ab31fd03010478f806fad5b4d383becfc15b9e22a82a419dd7b8325568845</td></tr><tr><td>Dataloaders/RiboUnmixMultiDataset/RiboUnmixMultiDatasetDataModule.py</td><td class="hash">5d139c371539face81c2fd04d59d7a2ec1e6aa0572e378088fc25d4ef5a9eae4</td></tr><tr><td>Dataloaders/RiboUnmixMultiDataset/RiboUnmixMultiDataset.py</td><td class="hash">0f5c382e75c5f7ad2862e034cd8e173e778cff54db18bc5c50950169150b901b</td></tr></tbody></table></details>
+<p class="small">This page contains its own styling, equations, and interactive example; it needs no internet connection or third-party JavaScript. Source links work when the file remains in this repository's Docs directory. Equations use ordinary HTML text so they remain readable offline and in print.</p>
+</section>
+<footer>RiboUnmix · Training mechanics and scientific interpretation · 15 September 2026<br><button type="button" onclick="window.print()">Print / save as PDF</button></footer>
+</main>
+<script>
+"use strict";
+const toyGroups = [
+  {id:"t1",length:9,datasets:["A","B"]},
+  {id:"t2",length:7,datasets:["A","C"]},
+  {id:"t3",length:5,datasets:["B","C"]},
+  {id:"t4",length:4,datasets:["A","B","C"]},
+  {id:"t5",length:3,datasets:["A"]}
+];
+function packExample(quota, cap) {
+  const logical = [];
+  let batch = [], counts = {A:0,B:0,C:0};
+  for (const group of toyGroups.filter(g => g.datasets.length >= 2)) {
+    if (batch.length && group.datasets.some(d => counts[d] + 1 > quota)) {
+      logical.push({groups:batch,counts:{...counts}});
+      batch = []; counts = {A:0,B:0,C:0};
+    }
+    batch.push(group); group.datasets.forEach(d => counts[d]++);
+  }
+  if (batch.length) logical.push({groups:batch,counts:{...counts}});
+  return logical.map(item => {
+    const chunks = []; let chunk = [], rows = 0;
+    for (const group of item.groups) {
+      if (chunk.length && rows + group.datasets.length > cap) {
+        chunks.push(chunk); chunk = []; rows = 0;
+      }
+      chunk.push(group); rows += group.datasets.length;
+    }
+    if (chunk.length) chunks.push(chunk);
+    return {...item,chunks};
+  });
+}
+function renderExample() {
+  const quota = Number(document.getElementById("quota").value);
+  const cap = Number(document.getElementById("cap").value);
+  const logical = packExample(quota,cap);
+  document.getElementById("batch-results").innerHTML = logical.map((item,index) => {
+    const rows = item.groups.reduce((sum,g) => sum + g.datasets.length,0);
+    return `<div class="batch"><strong>Logical batch ${index+1}: ${item.groups.length} transcripts · ${rows} pair rows</strong>
+      <div class="small">Dataset counts: A=${item.counts.A}, B=${item.counts.B}, C=${item.counts.C}</div>
+      ${item.chunks.map((chunk,j) => `<div class="chunk">Forward ${j+1}: ${chunk.map(g => `<span class="pill">${g.id}: ${g.datasets.join("+")}</span>`).join(" ")}
+      <br><span class="small">${chunk.reduce((sum,g) => sum+g.datasets.length,0)} observed rows; ${chunk.length} unique biological sequences; backward fraction ${chunk.length}/${item.groups.length} of this logical loss (before 1/A accumulation).</span></div>`).join("")}</div>`;
+  }).join("") + `<p class="small">Epoch total: 4 eligible transcripts, 9 observed pairs, ${logical.length} logical batches. t5 is excluded. Reference evaluations and replica counts do not add pair rows.</p>`;
+}
+document.getElementById("quota").addEventListener("change",renderExample);
+document.getElementById("cap").addEventListener("change",renderExample);
+renderExample();
+</script>
+</body>
+</html>

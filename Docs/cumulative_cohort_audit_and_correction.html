@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cumulative experiment: transcript audit and corrected cohorts</title>
+  <style>
+    :root{--ink:#193348;--blue:#267eab;--green:#006d50;--line:#dbe5eb;--muted:#526779}
+    *{box-sizing:border-box}body{margin:0;background:#f2f6f8;color:var(--ink);font:16px/1.65 system-ui,sans-serif}
+    main{max-width:1120px;margin:auto;padding:35px 25px 60px}h1{font-size:clamp(2rem,4vw,3rem);line-height:1.15;letter-spacing:-.03em}
+    h2{font-size:1.55rem;line-height:1.3}h3{font-size:1.1rem}section{background:white;padding:28px;border:1px solid var(--line);border-radius:12px;margin:23px 0}
+    a{color:#176893;text-underline-offset:3px}p{margin:13px 0}.muted,figcaption{color:var(--muted)}.note{padding:16px 20px;border-left:4px solid var(--blue);background:#eef6fa}
+    .caution{border-color:#d17820;background:#fff7ed}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.card{background:#f2f6f8;padding:20px;border-radius:9px}.number{font-size:2rem;font-weight:750;color:var(--green)}
+    .table{overflow:auto}table{width:100%;border-collapse:collapse;font-size:.9rem}th,td{padding:10px 12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}th{background:#f2f6f8}
+    .flow{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}.flow div{border:1px solid var(--line);border-top:4px solid var(--green);padding:18px;border-radius:8px}.flow strong{display:block;margin-bottom:8px}
+    figure{margin:22px 0}img{width:100%;height:auto}figcaption{font-size:.92rem;margin-top:10px}pre{background:#193348;color:#e9f3f7;padding:18px;border-radius:8px;overflow:auto;font-size:.86rem}code{font-size:.9em;overflow-wrap:anywhere}li{margin:8px 0}
+    nav{display:flex;flex-wrap:wrap;gap:10px}nav a{background:white;padding:8px 12px;border:1px solid var(--line);border-radius:7px;text-decoration:none;font-size:.9rem}
+    @media(max-width:720px){main{padding:20px 13px}section{padding:20px 16px}.grid,.flow{grid-template-columns:1fr}}@media print{body{background:white;font-size:11pt}main{padding:0}section{border:0;padding:12px 0}nav{display:none}figure{break-inside:avoid}}
+  </style>
+</head>
+<body><main>
+  <header>
+    <p class="muted">RiboUnmix · Cohort correction · Audited 2026-09-16 · Seed 42</p>
+    <h1>Keep transcripts fixed when adding datasets</h1>
+    <p>The legacy cumulative experiment changed training and validation membership as N increased. The existing models have now been re-evaluated on identical real test observations, and a separate experiment setup fixes all three transcript folds across every dataset count.</p>
+    <p class="note caution"><strong>The original setup did not fully control the intended experiment.</strong> A common sequence-only test set supports L<sub>bio</sub> comparisons, but does not make observed validation cohorts or training cohorts identical. This should have been checked before interpreting across-N observed-profile curves.</p>
+    <nav><a href="#audit">What happened</a><a href="#evaluation">Corrected evaluation</a><a href="#training">Corrected training</a><a href="#claims">Research interpretation</a><a href="#run">Run and refresh</a></nav>
+  </header>
+
+  <section id="audit">
+    <h2>1. What was coherent, and what changed?</h2>
+    <p>The earlier splitter first held out 1,771 common test sequences. At each N it then found transcripts supported by at least two selected datasets and sampled a new validation fold, leaving the remainder for training. This increased usable training coverage as datasets entered, but it also changed which transcripts were used for fitting and checkpoint selection.</p>
+    <div class="table"><table>
+      <thead><tr><th>Control</th><th>Legacy cumulative runs</th><th>Consequence</th></tr></thead>
+      <tbody>
+        <tr><td>Within one model</td><td>Train, validation and test IDs are disjoint.</td><td>No transcript-level train/validation/test overlap was found within a model.</td></tr>
+        <tr><td>Ranking policies at the same N</td><td>Identical dataset membership, fold assignments and training-only reliability references.</td><td>Within-N policy comparisons retain matched inputs.</td></tr>
+        <tr><td>Training and validation across N</td><td>Folds were resampled; both membership and transcript roles changed.</td><td>Across-N differences include a training-cohort and checkpoint-selection-cohort confound.</td></tr>
+        <tr><td>Validation across datasets within N</td><td>One nominal ID pool, intersected with each dataset's usable observed rows.</td><td>Dataset PCC means can average different transcripts even within the same model.</td></tr>
+        <tr><td>Common test across N</td><td>The same 1,771 test IDs stayed out of every training and validation fold.</td><td>Existing checkpoints can be evaluated on a common observed subset of this held-out set.</td></tr>
+      </tbody>
+    </table></div>
+    <h3>A concrete example: N=2 to N=40</h3>
+    <div class="table"><table>
+      <thead><tr><th>Original role at N=2</th><th>Training at N=40</th><th>Validation at N=40</th></tr></thead>
+      <tbody><tr><td>Training: 11,568 transcripts</td><td>10,438</td><td>1,130</td></tr><tr><td>Validation: 1,285 transcripts</td><td><strong>1,146</strong></td><td>139</td></tr></tbody>
+    </table></div>
+    <p>Therefore, restricting existing validation logs to the same nominal IDs would not solve the problem: many validation transcripts from a smaller-N run were training examples in a larger-N run. TensorBoard dataset means also cannot be filtered back to transcript-level intersections.</p>
+    <p>At N=40, the nominal validation pool has 1,565 transcripts, but the effective per-dataset observations range from 1,134 to 1,406; only 1,018 are observed in every one of those 40 datasets. A common transcript ID list alone does not guarantee a common evaluated cohort.</p>
+    <p><strong>The four-panel experiment differs:</strong> it already has 1,593 common validation IDs and 1,593 common test IDs, excluded from every panel's training fold. No training/validation role swapping occurs across panels. Its training eligibility is panel-specific and its effective per-dataset observed coverage still varies.</p>
+    <p class="muted">Sources: <a href="../results/cumulative_stability_seed42/experiment_manifest.json">legacy cumulative folds</a> · <a href="../results/cumulative_stability_seed42/fixed_observed_evaluation/split_audit.csv">fold audit</a> · <a href="../results/cumulative_stability_seed42/fixed_observed_evaluation/training_role_changes.csv">adjacent role changes</a> · <a href="../results/four_panel_stability_seed42/experiment_manifest.json">four-panel folds</a>.</p>
+  </section>
+
+  <section id="evaluation">
+    <h2>2. Existing checkpoints: evaluate identical observations</h2>
+    <div class="grid">
+      <div class="card"><div class="number">704</div>Identical held-out transcripts, observed in all 114 configured datasets.</div>
+      <div class="card"><div class="number">24 / 35</div>Completed selected checkpoints re-evaluated in this snapshot.</div>
+      <div class="card"><div class="number">242,880</div>Transcript–dataset pairs evaluated across those 24 models.</div>
+    </div>
+    <ol>
+      <li>Start from the original common test IDs, which were never used for training or checkpoint selection in any of these runs.</li>
+      <li>Intersect with usable positive observations in <strong>all 114 configured datasets</strong>, including datasets whose runs are unfinished. The cohort stays fixed when later results arrive.</li>
+      <li>Load each original best-validation-loss checkpoint and its saved configuration. Use real replicate profiles; the observed target is their arithmetic mean. The original sequence-only export's dummy targets are not used.</li>
+      <li>For each dataset, calculate PCC(μ, observed) and PCC(L<sub>bio</sub>, observed) on exactly the same 704 transcripts and CDS masks. Average transcripts equally. Dataset ranking never weights the evaluation metric.</li>
+      <li>Show individual dataset curves. Aggregate views additionally distinguish all N dataset identities from the fixed best-two identities, Patel and Calviello.</li>
+    </ol>
+    <figure>
+      <img src="../results/cumulative_stability_seed42/fixed_observed_evaluation/fixed_observed_fit.svg" alt="Fixed-observation mu and Lbio PCC for all selected datasets and the two best datasets">
+      <figcaption>On the fixed best-two observations under equal weighting, N=2→40 changes μ PCC from 0.545 to 0.532 while L<sub>bio</sub> PCC changes from 0.444 to 0.369, so similar observation fit can coexist with a shared component that agrees less with those observations.</figcaption>
+    </figure>
+    <p>At N=40, fixed-cohort μ PCC under equal weighting ranges from <strong>0.307 for Riepe to 0.665 for Sharma</strong>. This spread remains after matching transcript identities; it is not explained solely by different transcript cohorts.</p>
+    <p>The production PCC convention assigns zero to near-constant profiles. The cohort selects broadly observed transcripts, so its absolute PCC values should not be compared directly with the earlier unmatched validation means as evidence of improved modeling.</p>
+    <p class="note"><strong>This repairs the evaluation comparison.</strong> The weights in an existing checkpoint still reflect its original training cohort. A corrected evaluation cannot retroactively remove that training-design confound.</p>
+    <p><a href="../results/cumulative_stability_seed42/fixed_observed_evaluation/analysis_report.html">Open the corrected report with every dataset's curve →</a> · <a href="../results/cumulative_stability_seed42/fixed_observed_evaluation/cohort_manifest.json">Exact fixed test IDs and rules</a>.</p>
+  </section>
+
+  <section id="training">
+    <h2>3. Fresh training: assign each transcript once</h2>
+    <div class="flow" role="group" aria-label="Corrected cumulative cohort construction">
+      <div><strong>1 · Complete observations</strong>Intersect sequence-eligible, usable transcript IDs across all 114 datasets: <b>7,142 transcripts</b>.</div>
+      <div><strong>2 · One seed-42 split</strong>Partition once into <b>5,714 train</b>, <b>714 validation</b> and <b>714 test</b>, stratified by stored reliability and conserved-stalling-site category.</div>
+      <div><strong>3 · Add dataset rows</strong>For N=2, 5, 10, 20, 40, 80, 114, take the top-N datasets while preserving those exact transcript IDs and roles.</div>
+    </div>
+    <p>All observations and all replicates of a transcript inherit its fold. A training group contains that transcript's observations in every selected dataset: N measured rows per transcript. Lower-ranked datasets add rows to these existing transcript groups. Neither new transcripts nor reassigned validation transcripts enter training.</p>
+    <div class="table"><table>
+      <thead><tr><th>Quantity</th><th>N=2</th><th>N=40</th><th>N=114</th></tr></thead>
+      <tbody>
+        <tr><td>Training transcript IDs</td><td>5,714</td><td>The same 5,714</td><td>The same 5,714</td></tr>
+        <tr><td>Training transcript–dataset pairs</td><td>11,428</td><td>228,560</td><td>651,396</td></tr>
+        <tr><td>Validation IDs in each dataset</td><td>714</td><td>The same 714</td><td>The same 714</td></tr>
+        <tr><td>Test IDs in each dataset</td><td>714</td><td>The same 714</td><td>The same 714</td></tr>
+      </tbody>
+    </table></div>
+    <p>The model architecture, replica loss, optimizer settings and five reference policies follow the existing experiment. There are <strong>35 fresh trainings with one seed</strong>. Each N starts a new model; no previous checkpoint supplies initialization.</p>
+    <p>Local reliability parameters are fitted using the 5,714 training transcripts only. The setup audit checked all 271 dataset/prefix reference entries: each reused dataset has identical fitted reliability parameters across N, and zero held-out rows are used for fitting them.</p>
+    <p>The reference policies remain equal, ranked_p1, reverse_p1, ranked_p3 and reverse_p3, with q=(116−rank)/115 and π proportional to q<sup>p</sup>. Reverse permutes the same weights within the selected prefix. π centers gamma; local reliability weights separately weight the observation loss.</p>
+    <p class="note caution"><strong>Scope:</strong> this complete-case experiment studies transcripts observed across the full collection. It uses fewer training transcripts than the legacy coverage-oriented setup. The new 714-transcript test fold belongs to these fresh runs; it is distinct from the 704-transcript cohort used to re-evaluate old checkpoints.</p>
+    <p>For broader coverage later, a separate experiment can assign global transcript roles once and allow additional training transcripts as observations become available. That answers a broader data-expansion question. The complete-case design above directly controls transcript membership for the current dataset-addition question.</p>
+    <p class="muted">Implementation: <a href="../Utils/cumulative_fixed_cohort.py">complete-cohort construction</a> · <a href="../run_cumulative_fixed_cohort.py">training entry point</a> · <a href="../results/cumulative_stability_fixed_cohort_seed42/inputs/split.json">prepared split</a> · <a href="../results/cumulative_stability_fixed_cohort_seed42/design_report.html">prepared design and reference weights</a>.</p>
+  </section>
+
+  <section id="claims">
+    <h2>4. What this means for the model narrative</h2>
+    <ul>
+      <li><strong>μ fit and L<sub>bio</sub> agreement answer different questions.</strong> Dataset-specific correction can retain observed-profile fit while the shared profile changes. A larger PCC(μ,y)−PCC(L<sub>bio</sub>,y) gap identifies a larger fitted shape contribution; it does not establish that gamma recovered exclusively technical bias.</li>
+      <li><strong>Matched evaluation still shows modest policy differences.</strong> At N=40 on the best-two observations, L<sub>bio</sub> PCC is 0.369 for equal, 0.375 for ranked_p1 and 0.372 for reverse_p1; μ PCC is 0.532, 0.536 and 0.545 respectively. These partial results do not show an overwhelming or uniform ranking advantage.</li>
+      <li><strong>The corrected training tests the intended controlled question.</strong> Compare paired adjacent-N L<sub>bio</sub> stability, accumulated drift from N=2, profile variance and observed fit on fixed targets. Equal-weight stability is not required to fall monotonically as N grows: incoming data can also improve estimation.</li>
+      <li><strong>Direction and concentration need separate contrasts.</strong> Ranked versus reverse at the same exponent holds dataset-weight concentration constant. Ranked versus equal changes both concentration and assignment to quality ranks.</li>
+      <li><strong>One seed supports conditional evidence.</strong> Many transcripts improve precision for this fitted collection of models; they are not independent training repetitions. Biological correctness requires independent evidence, and the transcript scope used to compute the global QC ranking still needs verification.</li>
+    </ul>
+    <p>The defensible target claim is that a quality-based reference preserves an informative shared profile under controlled dataset additions while retaining useful dataset-level observation fit. The corrected experiment makes that claim testable; its result remains empirical.</p>
+  </section>
+
+  <section id="run">
+    <h2>5. Run and refresh</h2>
+    <p><strong>Re-evaluate completed legacy checkpoints:</strong> rerunning skips cached evaluations with matching checkpoint, configuration, cohort, numerical code and observation hashes.</p>
+    <pre>python analyses/reevaluate_cumulative_fixed_observations.py
+python analyses/analyze_cumulative_reference_weight_stability.py</pre>
+    <h3>The two existing analysis scripts remain useful</h3>
+    <p><a href="../analyses/analyze_cumulative_reference_weight_stability.py">Cumulative analysis</a> compares L<sub>bio</sub> on common held-out sequences and now displays the cached fixed-observation test figure directly, with the original validation curves in an expandable diagnostic section. Its default still reads the legacy runs; pass the corrected experiment root to analyze fresh runs.</p>
+    <p><a href="../analyses/analyze_four_panel_stability.py">Four-panel analysis</a> compares L<sub>bio</sub> on common held-out sequences across all six panel pairs. It now explicitly audits common validation/test roles and reports panel-specific training coverage. Its logged validation scores average different observation collections across panels; the cumulative test re-evaluation does not evaluate the panel checkpoints.</p>
+    <p>Both scripts run on CPU, read saved artifacts and export fold audits. Neither changes training membership or runs new checkpoint inference. Common held-out sequences make their L<sub>bio</sub> metrics comparable; identical training transcripts are an additional experimental control.</p>
+    <p><strong>Submit corrected fresh training on the cluster:</strong></p>
+    <pre>sbatch run_cumulative_fixed_cohort_univie.slurm</pre>
+    <p>The first array worker builds the new setup from the dataset YAML and ranking TSV; other workers reuse it. The GPU launcher uses <code>--account=csunivie --partition=p_csunivie_gres</code>, a 35-task array and at most two concurrent tasks. This audit prepared the setup locally; it did not submit cluster jobs or retrain the models.</p>
+    <p>Generate the setup on the training machine. If the locally prepared output directory was copied to the cluster, choose an unused cluster output root so saved absolute paths are generated there:</p>
+    <pre>sbatch --export=ALL,FIXED_COHORT_ROOT="$PWD/results/cumulative_stability_fixed_cohort_seed42_cluster" run_cumulative_fixed_cohort_univie.slurm</pre>
+    <p><strong>Analyze the corrected experiment as it finishes</strong> (replace the root if a different output directory was selected):</p>
+    <pre>python analyses/analyze_cumulative_reference_weight_stability.py --experiment-root results/cumulative_stability_fixed_cohort_seed42
+python analyses/reevaluate_cumulative_fixed_observations.py --experiment-root results/cumulative_stability_fixed_cohort_seed42</pre>
+    <p>The first command analyzes the shared-profile exports and validation logs. The second runs inference against the real common test observations for per-dataset μ and L<sub>bio</sub> PCC. Existing experiment manifests and trained checkpoints remain the source of the legacy analysis.</p>
+    <p><a href="stability_experiments_methodology.html">Full ranking, loss and batch methodology</a> · <a href="stability_component_evidence.html">Component interpretation and gamma experiments</a>.</p>
+  </section>
+</main></body></html>

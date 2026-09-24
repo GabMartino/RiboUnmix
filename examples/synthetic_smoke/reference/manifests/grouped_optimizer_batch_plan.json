@@ -1,0 +1,146 @@
+{
+  "batch_statistics": {
+    "dataset_pair_rows_per_microbatch": [
+      [
+        8,
+        8
+      ],
+      [
+        8,
+        8
+      ],
+      [
+        8,
+        8
+      ],
+      [
+        8,
+        8
+      ],
+      [
+        8,
+        8
+      ],
+      [
+        8,
+        8
+      ]
+    ],
+    "datasets_per_transcript_group": [
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2
+    ],
+    "eligible_transcript_groups": 48,
+    "iteration_index": 0,
+    "maximum_group_size": 2,
+    "maximum_unique_transcripts_per_microbatch": 8,
+    "mean_group_size": 2.0,
+    "mean_unique_transcripts_per_microbatch": 8.0,
+    "median_group_size": 2.0,
+    "median_unique_transcripts_per_microbatch": 8.0,
+    "minimum_group_size": 2,
+    "minimum_unique_transcripts_per_microbatch": 8,
+    "number_of_microbatches": 6,
+    "pair_rows_per_microbatch": [
+      16,
+      16,
+      16,
+      16,
+      16,
+      16
+    ],
+    "per_dataset_pair_capacity": 8,
+    "physical_pair_capacity": 16,
+    "positive_pair_rows": 96,
+    "selected_dataset_ids": [
+      0,
+      5
+    ],
+    "transcripts_admitted": 48,
+    "transcripts_considered": 48,
+    "transcripts_excluded_for_insufficient_support": 0,
+    "transcripts_with_positive_k0": 0,
+    "transcripts_with_positive_k1": 0,
+    "transcripts_with_positive_k2_or_more": 48,
+    "unique_transcripts_per_microbatch": [
+      8,
+      8,
+      8,
+      8,
+      8,
+      8
+    ]
+  },
+  "plan": {
+    "accumulation_clamped_at_maximum": false,
+    "accumulation_statistic": "median",
+    "configured_target_unique_transcripts": 8,
+    "effective_local_target_unique_transcripts": 8,
+    "enabled": true,
+    "estimated_global_pair_rows_per_optimizer_step": 16.0,
+    "estimated_global_unique_transcripts_per_optimizer_step": 8.0,
+    "estimated_optimizer_steps_per_epoch": 6,
+    "estimated_pair_rows_per_optimizer_step": 16.0,
+    "estimated_unique_transcripts_per_microbatch": 8.0,
+    "estimated_unique_transcripts_per_optimizer_step": 8.0,
+    "expected_optimizer_steps_from_transcript_target": 6,
+    "microbatches_per_epoch_per_rank": 6,
+    "optimizer_step_expectation_ratio": 1.0,
+    "per_dataset_pair_microbatch_size": 8,
+    "physical_pair_microbatch_size": 16,
+    "resolved_accumulate_grad_batches": 1,
+    "selected_dataset_count": 2,
+    "target_scope": "per_rank",
+    "world_size": 1
+  },
+  "selected_datasets": [
+    "artificial_bias_5prime_aa",
+    "artificial_bias_3prime_cc"
+  ]
+}

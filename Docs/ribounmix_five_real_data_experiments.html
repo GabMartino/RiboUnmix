@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>RiboUnmix — Five Real-data Validation Experiments</title>
+<script>
+window.MathJax = {
+  tex: { inlineMath: [['\\(','\\)']], displayMath: [['\\[','\\]']], processEscapes: true },
+  svg: { fontCache: 'global' }
+};
+</script>
+<script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
+<style>
+:root{--ink:#17212b;--muted:#5b6875;--line:#dce3e8;--soft:#f7f9fb;--green:#eaf5ef;--purple:#f0ebf8;--blue:#eaf2fb;--gold:#fff5dc;--rose:#faecef;--accent:#215f4b}
+*{box-sizing:border-box} body{margin:0;font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:var(--ink);line-height:1.62;background:#fff}.page{max-width:1100px;margin:0 auto;padding:54px 34px 90px}h1,h2,h3,h4{line-height:1.22;margin-top:1.55em;margin-bottom:.55em}h1{font-size:2.35rem;margin-top:0;letter-spacing:-.03em}h2{font-size:1.65rem;border-bottom:1px solid var(--line);padding-bottom:.38rem}h3{font-size:1.22rem}p{margin:.7em 0}.subtitle{font-size:1.12rem;color:var(--muted);max-width:860px;margin-bottom:1.6rem}.hero{background:linear-gradient(135deg,var(--green),#fff 62%);border:1px solid #cfe7d8;border-radius:16px;padding:24px 26px;margin:20px 0 28px}.box{border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin:18px 0}.green{background:var(--green)}.purple{background:var(--purple)}.blue{background:var(--blue)}.gold{background:var(--gold)}.rose{background:var(--rose)}.callout{border-left:4px solid var(--accent);padding:10px 16px;margin:18px 0;background:var(--soft)}.toc{background:var(--soft);border:1px solid var(--line);border-radius:12px;padding:18px 22px;margin:20px 0 30px}.toc a{color:#245f87;text-decoration:none}.toc ol{margin:.35rem 0 .1rem 1.3rem;padding:0}table{width:100%;border-collapse:collapse;margin:16px 0 24px;font-size:.96rem}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:var(--soft);text-align:left}ul,ol{padding-left:1.45rem}li{margin:.26rem 0}.exp{margin-top:46px;scroll-margin-top:20px}.tag{display:inline-block;padding:.2rem .55rem;border-radius:999px;font-size:.82rem;font-weight:650;margin-right:.35rem;background:var(--soft);border:1px solid var(--line);color:#394958}.footer{margin-top:52px;padding-top:18px;border-top:1px solid var(--line);color:var(--muted);font-size:.9rem}@media(max-width:800px){.page{padding:32px 18px 60px}h1{font-size:1.9rem}}
+</style>
+</head>
+<body>
+<div style="padding:10px 18px;background:#eaf4fb;border-bottom:1px solid #bdd7e8;text-align:center;font:600 14px/1.4 system-ui,sans-serif">For current code, launch, resume, and artifact conventions, read the <a href="project_model_onboarding.html">project onboarding and safe-handoff guide</a>.</div>
+<div class="page">
+<h1>RiboUnmix: five real-data experiments for validating the shared signal</h1>
+<p class="subtitle">A detailed experimental plan for testing whether the shared profile \(L_t\) learned from 114 heterogeneous Ribo-seq datasets is reproducible, depleted of dataset-specific observation effects, and enriched for independently expected translation biology.</p>
+
+<div class="hero"><strong>Central validation goal.</strong> The real-data experiments should not claim that \(L_t\) is the true biological profile by construction. Instead, they should test whether \(L_t\) behaves as a <em>more biologically reliable shared representation</em> than the raw experimental profiles: reproducible across independent dataset collections, depleted of dataset-specific technical signatures, and enriched for conserved translation-related structure.
+\[
+\boxed{L_t\text{ is useful if it is reproducible, technically decontaminated, and biologically informative.}}
+\]
+</div>
+
+<div class="toc"><strong>Selected experiments</strong><ol>
+<li><a href="#exp1">Independent-panel convergence of \(L_t\)</a></li>
+<li><a href="#exp2">Unsupervised dataset-specific \(\gamma\) fingerprints</a></li>
+<li><a href="#exp3">Association of \(\gamma\) with data-derived QC characteristics</a></li>
+<li><a href="#exp5">Biological motif metaprofiles in \(L_t\)</a></li>
+<li><a href="#exp8">Stability of \(L_t\) as the number and diversity of datasets increase</a></li>
+</ol></div>
+
+<h2>Conceptual framework</h2>
+<p>For transcript \(t\), dataset \(d\), codon position \(i\), and replicate \(r\), the model describes the expected measured profile through</p>
+\[
+Y_{dtri}\sim \operatorname{NB2}(\mu_{dti},\alpha_{dti}),\qquad
+\mu_{dti}=S_{dt}L_{ti}\gamma_{dti}.
+\]
+<p>Here \(L_{ti}\) is the dataset-independent sequence-dependent component, whereas \(\gamma_{dti}\) is the dataset-specific multiplicative observation component. With \(g_{dti}=\log\gamma_{dti}\),</p>
+\[
+\log\frac{\mu_{dti}}{S_{dt}}=\log L_{ti}+g_{dti}.
+\]
+<p>The fixed-reference constraints define a stable decomposition but do not prove biological truth. The real-data section must therefore test several independent predictions that should hold if this decomposition is scientifically meaningful.</p>
+
+<table><thead><tr><th>Property</th><th>Expected behavior</th><th>Experiment</th></tr></thead><tbody>
+<tr><td>Reproducibility</td><td>Independent groups of experiments should recover similar \(L_t\)</td><td>1</td></tr>
+<tr><td>Technical specificity</td><td>\(\gamma_d\) should contain structured dataset-specific sequence signatures</td><td>2</td></tr>
+<tr><td>External QC consistency</td><td>Properties of \(\gamma_d\) should associate with independently measured dataset characteristics</td><td>3</td></tr>
+<tr><td>Biological enrichment</td><td>Known translation-associated motifs should generate reproducible signatures in \(L_t\)</td><td>5</td></tr>
+<tr><td>Convergence with evidence</td><td>The stability of \(L_t\) should improve as more heterogeneous datasets are used</td><td>8</td></tr>
+</tbody></table>
+
+<div class="callout"><strong>Interpretation caveat.</strong> Since the 114 datasets may differ in both protocol and biological condition, \(\gamma_d\) should initially be called a <em>dataset-specific observation effect</em>, not automatically a technical bias. Genuine condition-specific biology can also be dataset specific. Technical interpretation is strongest where learned signatures align with known protocol variables or recognizable library-processing effects.</div>
+
+<section id="exp1" class="exp">
+<h2>Experiment 1 — Independent-panel convergence of the shared representation</h2>
+<span class="tag">Primary validation</span><span class="tag">Metadata-light</span><span class="tag">Cross-model reproducibility</span>
+<h3>Scientific question</h3>
+<p>If \(L_t\) captures a stable shared sequence-dependent translation representation rather than peculiarities of a particular collection of datasets, do completely independent groups of Ribo-seq experiments lead to the same inferred \(L_t\)?</p>
+<h3>Design</h3>
+<p>Partition the 114 datasets into four disjoint panels</p>
+\[
+\mathcal D^{(1)},\mathcal D^{(2)},\mathcal D^{(3)},\mathcal D^{(4)},\qquad
+\mathcal D^{(a)}\cap\mathcal D^{(b)}=\varnothing\quad(a\neq b),
+\]
+<p>with approximate sizes \(29,29,28,28\). Balance the panels using observable properties such as log read depth, positional coverage, number of eligible transcripts, and replica agreement where available. Train four independent models, yielding</p>
+\[
+L_t^{(1)},\quad L_t^{(2)},\quad L_t^{(3)},\quad L_t^{(4)}.
+\]
+<p>All four models must use the same held-out transcript IDs. For the primary comparison, use uniform fixed-reference weights within each panel:</p>
+\[
+\pi_d=\frac{1}{|\mathcal D^{(k)}|},\qquad d\in\mathcal D^{(k)}.
+\]
+<p>The transcript-dataset reliability weights \(w_{dt}\) remain part of the training loss and are conceptually distinct from \(\pi_d\).</p>
+<div class="box"><strong>What “disjoint” means operationally.</strong> The split is
+stricter than unique dataset names. Datasets inferred to come from the same
+publication/source family (the <code>author_year</code> prefix, unless an explicit
+<code>source_identifier</code> is available) are an indivisible assignment unit.
+Thus all conditions and replicates from one source occur in exactly one panel:
+\[
+s(d)=s(d')\;\Longrightarrow\;p(d)=p(d').
+\]
+The launcher asserts both dataset-level disjointness and source-family-level
+disjointness before training. With the current 114 datasets this keeps 85 source
+families intact while still producing exact panel sizes \(29,29,28,28\).</div>
+<p>For the leakage-free experiment, each dataset's reliability references
+(depth scale \(\tau_d\) and raw-score normalization median) are fitted using only
+that panel's training transcript IDs, then frozen when weighting validation and
+test rows. Held-out rows therefore cannot influence \(w_{dt}\).</p>
+<h3>Primary metric</h3>
+<p>For every held-out transcript and panel pair \((a,b)\), compute</p>
+\[
+\rho_t^{(a,b)}=\operatorname{PCC}\!\left(L_t^{(a)},L_t^{(b)}\right).
+\]
+<p>Also report Spearman correlation and mean-one RMSE. There are six panel-pair comparisons.</p>
+<h3>Essential controls</h3>
+<ul><li><strong>Shared-only model:</strong> \(\gamma=1\).</li><li><strong>Direct sequence-to-profile baseline:</strong> matched backbone without the decomposition.</li><li><strong>Common test set:</strong> all comparisons use exactly the same transcripts.</li><li><strong>Balanced panels:</strong> avoid confounding panel identity with overall experimental quality.</li></ul>
+<h3>Central hypothesis</h3>
+\[
+\boxed{
+\operatorname{PCC}(L_{\mathrm{full}}^{(a)},L_{\mathrm{full}}^{(b)})
+>
+\operatorname{PCC}(L_{\gamma=1}^{(a)},L_{\gamma=1}^{(b)})
+}
+\]
+<div class="box green"><strong>Interpretation of a positive result.</strong> Distinct experimental collections converge toward the same sequence-dependent latent profile once dataset-specific structure can be allocated to \(\gamma\). This is one of the strongest metadata-free arguments that \(L\) is not tied to a particular experimental panel.</div>
+<h3>Recommended outputs</h3><ol><li>Panel-quality balance plots.</li><li>Violin/box plots of all six per-transcript agreement distributions.</li><li>Full model versus \(\gamma=1\) versus direct baseline.</li><li>Representative held-out transcripts with the four inferred \(L_t\) curves overlaid.</li></ol>
+<h3>Failure modes</h3><ul><li>Low convergence restricted to sparse transcripts suggests a measurement-reliability limit.</li><li>Low convergence globally suggests excessive dependence on reference-panel composition.</li><li>No improvement over \(\gamma=1\) suggests that the observation branch is not materially improving shared-signal recovery.</li></ul>
+</section>
+
+<section id="exp2" class="exp">
+<h2>Experiment 2 — Unsupervised dataset-specific \(\gamma\) fingerprints</h2>
+<span class="tag">Interpretability</span><span class="tag">Metadata-free discovery</span><span class="tag">Observation signatures</span>
+<h3>Scientific question</h3>
+<p>Does the dataset-specific branch discover reproducible and interpretable sequence-dependent observation signatures even when protocol metadata are not provided to the model?</p>
+<h3>Core idea</h3>
+<p>For each dataset \(d\), summarize \(g_{dti}=\log\gamma_{dti}\) according to predefined sequence features around the modeled footprint/ribosome position. This converts millions of positional corrections into a compact dataset-level fingerprint.</p>
+<h3>Feature families</h3>
+<ul><li>nucleotide identity near inferred 5' footprint ends;</li><li>nucleotide identity near inferred 3' footprint ends;</li><li>terminal dinucleotides;</li><li>local GC and AU fractions;</li><li>codon identity around A-, P-, and E-site positions;</li><li>amino-acid identity and local sequence composition windows.</li></ul>
+<h3>Dataset-level effect scores</h3>
+<p>For binary feature \(F_k\), one useful statistic is</p>
+\[
+B_{dk}=\mathbb E[g_{dti}\mid F_k=1]-\mathbb E[g_{dti}\mid F_k=0].
+\]
+<p>For a categorical nucleotide feature,</p>
+\[
+B_{d,p,n}=\mathbb E[g_{dti}\mid \text{nucleotide }n\text{ occurs at offset }p].
+\]
+<p>Flatten these summaries into \(\mathbf B_d\), and stack all datasets into</p>
+\[
+\mathbf B\in\mathbb R^{114\times K}.
+\]
+<h3>Analysis</h3>
+<ul><li>Hierarchically cluster datasets using \(\mathbf B_d\).</li><li>Use PCA/UMAP only as secondary visualization.</li><li>Plot a dataset-by-signature heatmap.</li><li>Overlay available metadata only after training.</li><li>Leave missing metadata as missing annotations rather than excluding those datasets.</li></ul>
+<h3>Validation with partial metadata</h3>
+<p>If a subset of datasets has known nuclease, adapter, laboratory, publication, or related protocol annotations, test whether these labels are predictable from \(\gamma\)-fingerprints despite never being supplied during training.</p>
+<div class="box purple"><strong>Strong interpretation.</strong> If experiments sharing known protocol features cluster through \(\gamma\), the observation branch is recovering structured experimental signatures rather than absorbing arbitrary nuisance degrees of freedom.</div>
+<h3>Critical control</h3>
+<p>Extract analogous fingerprints from \(L\). Protocol-associated signatures should be substantially weaker in \(L\) than in \(\gamma\):</p>
+\[
+\boxed{\text{protocol predictability from }\gamma > \text{protocol predictability from }L.}
+\]
+<h3>Recommended figure</h3>
+<p>A clustered 114-row heatmap with sequence-signature columns and metadata annotation bars. A companion panel can display the strongest learned motif effects for representative datasets.</p>
+</section>
+
+<section id="exp3" class="exp">
+<h2>Experiment 3 — Association of learned observation effects with data-derived QC</h2>
+<span class="tag">External validation</span><span class="tag">Protocol metadata not required</span>
+<h3>Scientific question</h3>
+<p>Are the learned dataset-specific effects associated with independently measurable properties of the experimental data?</p>
+<h3>Dataset-level QC features</h3>
+<p>Examples include</p>
+\[
+Q_d^{\mathrm{depth}}=\operatorname{median}_t D_{dt},\qquad
+Q_d^{\mathrm{coverage}}=\operatorname{median}_t C_{dt},
+\]
+\[
+Q_d^{\mathrm{rep}}=\operatorname{median}_t\operatorname{PCC}(Y_{dt1},Y_{dt2}),
+\]
+\[
+Q_d^{\mathrm{zero}}=\mathbb E_t\left[\frac{\#\{i:Y_{dti}=0\}}{L_t}\right].
+\]
+<p>Where available, also quantify frame periodicity, start/stop metagene quality, footprint-length distribution, total reads, and transcript support.</p>
+<h3>Gamma and dispersion summaries</h3>
+\[
+G_d^{\mathrm{abs}}=\mathbb E_{t,i}[|g_{dti}|],\qquad
+G_d^{\mathrm{var}}=\operatorname{Var}_{t,i}(g_{dti}),
+\]
+\[
+G_d^{\mathrm{motif}}=\|\mathbf B_d\|_2,\qquad
+A_d=\mathbb E_{t,i}[\log\alpha_{dti}].
+\]
+<h3>Tests</h3>
+<ul><li>Spearman associations between QC variables and gamma/dispersion summaries.</li><li>Robust multi-variable regression.</li><li>Partial correlations, e.g. testing depth while controlling coverage.</li><li>Stratified analyses to detect whether associations are driven only by the lowest-quality datasets.</li></ul>
+<div class="box blue"><strong>Separate stochastic reliability from systematic bias.</strong> Low depth may increase uncertainty or learned dispersion without producing a large systematic \(\gamma\). Conversely, a deep dataset can have a strong sequence-selective technical effect. This distinction is scientifically useful rather than a nuisance.</div>
+<h3>Recommended figure</h3>
+<p>A compact rank-correlation matrix and selected scatterplots linking dataset QC measures to gamma magnitude, motif-signature strength, and mean dispersion, with uncertainty intervals across the 114 datasets.</p>
+</section>
+
+<section id="exp5" class="exp">
+<h2>Experiment 5 — Biological motif metaprofiles in the shared representation</h2>
+<span class="tag">Biological validation</span><span class="tag">Predefined motifs</span><span class="tag">Position-resolved</span>
+<h3>Scientific question</h3>
+<p>Does \(L_t\) retain reproducible sequence signatures independently expected from translation biology?</p>
+<h3>Correct biological target</h3>
+<p>Since \(L_t\) is normalized within a transcript, it should not be validated as an absolute translation-efficiency or protein-abundance predictor. The appropriate target is within-transcript positional translation structure.</p>
+<h3>Predefine motif families</h3>
+<ul><li>polyproline and consecutive-proline motifs;</li><li>A-, P-, and E-site codons;</li><li>positively charged nascent-peptide windows;</li><li>specific elongation-associated amino-acid contexts;</li><li>termination-proximal occupancy;</li><li>collision-prone sequence contexts when sufficiently well supported.</li></ul>
+<h3>Metaprofile construction</h3>
+<p>For motif \(m\) centered at position \(i\), define</p>
+\[
+M_L^{(m)}(k)=\mathbb E[L_{t,i+k}\mid m\text{ occurs at }i],\qquad -k_{\max}\le k\le k_{\max}.
+\]
+<p>Analogously calculate \(M_Y^{(m)}(k)\) and \(M_\gamma^{(m)}(k)\).</p>
+<h3>Critical robustness test</h3>
+<p>Compute the biological metaprofiles independently from all four models trained in Experiment 1:</p>
+\[
+M_{L^{(1)}}^{(m)},\quad M_{L^{(2)}}^{(m)},\quad M_{L^{(3)}}^{(m)},\quad M_{L^{(4)}}^{(m)}.
+\]
+<p>A motif becomes substantially more convincing if its positional signature is recovered from four disjoint experimental panels.</p>
+<h3>Biological-versus-technical partitioning</h3>
+<p>For a predefined biological motif \(m_{\mathrm{bio}}\), the desirable pattern is</p>
+\[
+\text{strong, reproducible effect in }L,\qquad \text{weak or heterogeneous effect in }\gamma.
+\]
+<p>For a footprint-end sequence preference \(m_{\mathrm{tech}}\), the desirable pattern is approximately the reverse:</p>
+\[
+\text{weak shared effect in }L,\qquad \text{strong dataset-dependent effect in }\gamma.
+\]
+<div class="box gold"><strong>Ideal qualitative result.</strong> Raw Ribo-seq contains both conserved translation-associated structure and experiment-specific sequence preferences. RiboUnmix enriches the former in \(L\) and the latter in \(\gamma\).</div>
+<h3>Optional codon-level validation</h3>
+<p>Estimate a codon-specific shared effect, for example</p>
+\[
+E_c=\mathbb E[L_{ti}\mid c\text{ occupies a chosen ribosomal site}],
+\]
+<p>and compare it with an independent codon-decoding proxy such as tRNA adaptation. This is a plausibility test rather than an exact mechanistic identity because ribosome occupancy depends on local context and traffic.</p>
+<h3>Recommended figure</h3>
+<ol><li>One or two predefined biological motif metaprofiles.</li><li>The same metaprofiles across the four independent-panel models.</li><li>A technical footprint-end signature localized predominantly in \(\gamma\).</li><li>Optional codon-effect comparison with an external biological proxy.</li></ol>
+</section>
+
+<section id="exp8" class="exp">
+<h2>Experiment 8 — Stability of \(L_t\) as the number and diversity of datasets increase</h2>
+<span class="tag">Scaling behavior</span><span class="tag">Random subsets</span><span class="tag">Multi-view evidence</span>
+<h3>Scientific question</h3>
+<p>Does the inferred shared representation become more stable as the model receives more heterogeneous experimental views?</p>
+<h3>Design</h3>
+<p>Choose dataset-panel sizes such as</p>
+\[
+N\in\{2,5,10,20,40,80,114\}.
+\]
+<p>For every \(N<114\), sample multiple independent subsets</p>
+\[
+\mathcal D_N^{(1)},\ldots,\mathcal D_N^{(K)}.
+\]
+<p>Use the same quality-aware sampling infrastructure as Experiment 1. Multiple subsets are essential because a single subset would confound dataset count with dataset identity.</p>
+<h3>Primary stability statistic</h3>
+\[
+R_N=\mathbb E_{a<b}\mathbb E_t\left[\operatorname{PCC}\left(L_t^{(N,a)},L_t^{(N,b)}\right)\right].
+\]
+<p>Report the complete per-transcript distribution and uncertainty across dataset subsets.</p>
+<h3>Secondary reference statistic</h3>
+\[
+R_N^{(114)}=\mathbb E_{a,t}\left[\operatorname{PCC}\left(L_t^{(N,a)},L_t^{(114)}\right)\right].
+\]
+<p>This is useful but secondary because the 114-dataset solution is not ground truth.</p>
+<h3>Main prediction</h3>
+\[
+\boxed{N\uparrow\quad\Longrightarrow\quad R_N\uparrow\quad\Longrightarrow\quad\text{eventual plateau}.}
+\]
+<h3>Diversity versus number</h3>
+<p>After Experiment 2 defines the dataset fingerprint \(\mathbf B_d\), define</p>
+\[
+\Delta(d,e)=\|\mathbf B_d-\mathbf B_e\|_2.
+\]
+<p>For a dataset subset \(\mathcal D\),</p>
+\[
+\Delta(\mathcal D)=\frac{2}{|\mathcal D|(|\mathcal D|-1)}\sum_{d<e,\;d,e\in\mathcal D}\Delta(d,e).
+\]
+<p>Then ask, at fixed \(N\), whether experimentally more diverse subsets yield a more stable \(L\):</p>
+\[
+\Delta(\mathcal D_N)\uparrow\quad\Rightarrow\quad\text{higher cross-subset agreement of }L.
+\]
+<div class="box rose"><strong>Why this is stronger than a simple data-size result.</strong> If only \(N\) matters, more data improve estimation. If observation diversity additionally predicts stability, the experiment supports the deeper RiboUnmix idea that distinct measurement processes provide complementary information for separating shared and dataset-specific structure.</div>
+<h3>Controls</h3>
+<ul><li>multiple dataset-subset seeds;</li><li>fixed held-out transcript IDs where possible;</li><li>uniform \(\pi_d\) within each subset for the primary analysis;</li><li>unchanged local reliability weighting \(w_{dt}\);</li><li>report transcript support at every \(N\);</li><li>do not interpret the 114-dataset solution as ground truth.</li></ul>
+</section>
+
+<h2>How the five experiments reinforce one another</h2>
+<p>The experiments should be presented as one triangulation argument:</p>
+\[
+\boxed{
+\begin{array}{ccccc}
+\text{different panels}&\Rightarrow&\text{same }L&\Rightarrow&\text{reproducibility}\\[1.5mm]
+\gamma&\Rightarrow&\text{dataset fingerprints}&\Rightarrow&\text{observation specificity}\\[1.5mm]
+\gamma+\text{QC}&\Rightarrow&\text{independent associations}&\Rightarrow&\text{external validation}\\[1.5mm]
+L+\text{motifs}&\Rightarrow&\text{translation signatures}&\Rightarrow&\text{biological plausibility}\\[1.5mm]
+N\uparrow&\Rightarrow&\text{stability}\uparrow&\Rightarrow&\text{evidence accumulation}
+\end{array}}
+\]
+<p>No single experiment proves that \(L\) is biological truth. Together, they test independent consequences that should simultaneously hold if \(L\) is a more reliable shared representation of sequence-dependent translation dynamics.</p>
+
+<h2>Recommended real-data paper structure</h2>
+<ol><li><strong>Dataset collection and evaluation protocol.</strong> Describe the 114 datasets, missing metadata, profile harmonization, replicas, quality summaries, and held-out transcripts.</li><li><strong>The shared representation converges across independent dataset panels.</strong> Experiment 1.</li><li><strong>Dataset-specific corrections reveal latent experimental signatures.</strong> Experiment 2.</li><li><strong>Observation effects track independent dataset-quality characteristics.</strong> Experiment 3.</li><li><strong>The shared representation preserves conserved translation signatures.</strong> Experiment 5.</li><li><strong>Shared-profile stability increases with experimental evidence and diversity.</strong> Experiment 8.</li></ol>
+
+<h2>Claims supported by different outcomes</h2>
+<table><thead><tr><th>Observed result</th><th>Safe conclusion</th><th>Do not claim</th></tr></thead><tbody>
+<tr><td>High cross-panel \(L\) agreement</td><td>\(L\) is reproducible across different experimental collections</td><td>\(L\) is necessarily the true biological profile</td></tr>
+<tr><td>\(\gamma\) predicts known protocol annotations</td><td>\(\gamma\) captures protocol-associated observation structure</td><td>Every component of \(\gamma\) is technical</td></tr>
+<tr><td>\(\gamma\) associates with QC properties</td><td>Learned dataset effects relate to independently measurable experiment characteristics</td><td>QC explains the complete learned correction</td></tr>
+<tr><td>Known biological motifs are reproducible in \(L\)</td><td>\(L\) retains established translation-related sequence signals</td><td>A few motifs validate every position of \(L\)</td></tr>
+<tr><td>Stability rises with \(N\) and/or diversity</td><td>Additional heterogeneous evidence improves robustness of the shared representation</td><td>Dataset count alone guarantees biological identifiability</td></tr>
+</tbody></table>
+
+<h2>Suggested headline result</h2>
+<div class="hero"><em>Models trained on disjoint collections of heterogeneous Ribo-seq experiments converge toward similar shared sequence-dependent profiles. Dataset-specific observation factors reveal interpretable footprint-sequence signatures and associate with independent experimental quality characteristics, while the shared representation preserves conserved translation-related positional signals. The reproducibility of this shared representation increases as additional and more diverse experimental views are incorporated.</em><p>This would validate the learned decomposition itself, rather than relying only on reconstruction accuracy.</p></div>
+
+<div class="footer">RiboUnmix real-data experimental plan — selected experiments 1, 2, 3, 5, and 8. Math equations are rendered using MathJax 3.</div>
+</div></body></html>

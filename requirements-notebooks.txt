@@ -1,0 +1,6 @@
+# Notebook tooling; core runtime dependencies are shared with training.
+-r requirements.txt
+ipykernel>=6.29,<7
+jupyterlab>=4.2,<5
+nbclient>=0.10,<1
+nbformat>=5.10,<6

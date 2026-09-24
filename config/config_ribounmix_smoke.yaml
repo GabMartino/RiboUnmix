@@ -1,0 +1,87 @@
+defaults:
+  - config_ribounmix_synthetic
+  - override dataset_config: synthetic_smoke
+  - _self_
+
+name: ribounmix_synthetic_smoke
+
+experiment:
+  from_checkpoint: false
+  train: true
+  predict: true
+  dataset:
+    - artificial_bias_5prime_aa
+    - artificial_bias_3prime_cc
+  seed: 42
+
+prediction:
+  checkpoint_variants:
+    - best_val_loss
+
+split:
+  master_dataset_universe: all
+  validation_frac: 0.25
+  validation_weight_bins: 4
+
+paths:
+  sequences_path: "examples/synthetic_smoke/data/sequences.parquet"
+  checkpoints: "outputs/synthetic_smoke/checkpoints"
+  logs: "outputs/synthetic_smoke/logs"
+  results: "outputs/synthetic_smoke/results"
+
+data:
+  batch_size: 8
+  max_cds_codons: 240
+  num_workers: 0
+  predict_num_workers: 0
+  multiprocessing_context: null
+  pin_memory: false
+  prefetch_factor: null
+
+training:
+  execution_microbatching:
+    max_pair_rows_per_forward: 16
+    max_padded_codon_tokens_per_forward: 4000
+    max_transcript_groups_per_forward: 8
+  grouped_optimizer_batch:
+    target_unique_transcripts_per_optimizer_step: 8
+    max_accumulate_grad_batches: 8
+
+model:
+  biological_params:
+    hidden_size: 16
+    num_layers: 1
+  dataset_bias_params:
+    dataset_embeddings_size: 8
+    codon_embeddings_size: 4
+    nucleotide_embeddings_size: 2
+    amino_acid_embeddings_size: 4
+    context_gru_hidden_size: 8
+    context_gru_num_layers: 1
+    context_gru_precision: inherit
+    dataset_multiplicative_allocation_bias_submodule_params:
+      hidden_size: 16
+      dropout: 0.0
+    dataset_log_sigma_submodule_params:
+      dataset_embedding_size: 4
+      hidden_size: 16
+      dropout: 0.0
+
+trainer:
+  devices: 1
+  accelerator: cpu
+  precision: 32-true
+  max_epochs: 2
+  log_every_n_steps: 1
+  sync_dist_logs: false
+
+callbacks:
+  early_stopping_patience: 2
+  save_best_pcc_checkpoint: false
+
+metrics:
+  log_validation_transcript_mu_pcc_distribution: false
+  log_example_plot: false
+
+synthetic_ground_truth:
+  enabled: false

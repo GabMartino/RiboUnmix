@@ -1,0 +1,317 @@
+dataset_config:
+  _name_: synthetic_smoke
+  dataset_path:
+    artificial_bias_5prime_aa: examples/synthetic_smoke/data/artificial_bias_5prime_aa.parquet
+    artificial_bias_3prime_cc: examples/synthetic_smoke/data/artificial_bias_3prime_cc.parquet
+name: ribounmix_synthetic_smoke
+experiment:
+  from_checkpoint: false
+  train: true
+  predict: true
+  dataset:
+  - artificial_bias_5prime_aa
+  - artificial_bias_3prime_cc
+  seed: 42
+prediction:
+  checkpoint_variants:
+  - best_val_loss
+split:
+  master_dataset_universe: all
+  validation_frac: 0.25
+  validation_weight_bins: 4
+paths:
+  sequences_path: examples/synthetic_smoke/data/sequences.parquet
+  checkpoints: outputs/synthetic_smoke/checkpoints
+  logs: outputs/synthetic_smoke/logs
+  results: outputs/synthetic_smoke/results
+  encodings:
+    nt: Datasets/encodings/nt_encoding.yaml
+    codon_to_aa: Datasets/encodings/codon2aa.yaml
+    codon: Datasets/encodings/codon_encoding.yaml
+    aa: Datasets/encodings/aa_encoding.yaml
+    datasets: Datasets/encodings/synthetic_dataset_encoding.yaml
+data:
+  batch_size: 8
+  max_cds_codons: 240
+  num_workers: 0
+  predict_num_workers: 0
+  multiprocessing_context: null
+  train_sampling_strategy: transcript_grouped_multidataset_pairs
+  minimum_positive_datasets_per_transcript: 2
+  pin_memory: false
+  prefetch_factor: null
+  dataset_quality_ranking:
+    path: ''
+    dataset_column: dataset
+    rank_column: quality_rank
+    strict: false
+training:
+  execution_microbatching:
+    enabled: true
+    gradient_clip_val: 1.0
+    gradient_clip_algorithm: norm
+    max_pair_rows_per_forward: 16
+    max_padded_codon_tokens_per_forward: 4000
+    max_transcript_groups_per_forward: 8
+  grouped_optimizer_batch:
+    enabled: true
+    target_unique_transcripts_per_optimizer_step: 8
+    auto_accumulate_grad_batches: true
+    accumulation_statistic: median
+    max_accumulate_grad_batches: 8
+    target_scope: per_rank
+    log_batch_structure: true
+    resolved:
+      enabled: true
+      configured_target_unique_transcripts: 8
+      effective_local_target_unique_transcripts: 8
+      target_scope: per_rank
+      world_size: 1
+      accumulation_statistic: median
+      estimated_unique_transcripts_per_microbatch: 8.0
+      resolved_accumulate_grad_batches: 1
+      estimated_unique_transcripts_per_optimizer_step: 8.0
+      estimated_global_unique_transcripts_per_optimizer_step: 8.0
+      estimated_pair_rows_per_optimizer_step: 16.0
+      microbatches_per_epoch_per_rank: 6
+      estimated_optimizer_steps_per_epoch: 6
+      expected_optimizer_steps_from_transcript_target: 6
+      optimizer_step_expectation_ratio: 1.0
+      accumulation_clamped_at_maximum: false
+      physical_pair_microbatch_size: 16
+      per_dataset_pair_microbatch_size: 8
+      selected_dataset_count: 2
+      estimated_global_pair_rows_per_optimizer_step: 16.0
+      batch_statistics:
+        iteration_index: 0
+        number_of_microbatches: 6
+        eligible_transcript_groups: 48
+        physical_pair_capacity: 16
+        pair_rows_per_microbatch:
+        - 16
+        - 16
+        - 16
+        - 16
+        - 16
+        - 16
+        unique_transcripts_per_microbatch:
+        - 8
+        - 8
+        - 8
+        - 8
+        - 8
+        - 8
+        datasets_per_transcript_group:
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        - 2
+        minimum_group_size: 2
+        median_group_size: 2.0
+        mean_group_size: 2.0
+        maximum_group_size: 2
+        minimum_unique_transcripts_per_microbatch: 8
+        median_unique_transcripts_per_microbatch: 8.0
+        mean_unique_transcripts_per_microbatch: 8.0
+        maximum_unique_transcripts_per_microbatch: 8
+        selected_dataset_ids:
+        - 0
+        - 5
+        per_dataset_pair_capacity: 8
+        dataset_pair_rows_per_microbatch:
+        - - 8
+          - 8
+        - - 8
+          - 8
+        - - 8
+          - 8
+        - - 8
+          - 8
+        - - 8
+          - 8
+        - - 8
+          - 8
+        transcripts_considered: 48
+        transcripts_with_positive_k0: 0
+        transcripts_with_positive_k1: 0
+        transcripts_with_positive_k2_or_more: 48
+        transcripts_admitted: 48
+        transcripts_excluded_for_insufficient_support: 0
+        positive_pair_rows: 96
+model:
+  additional_sequence_features:
+    exo:
+      dimension: 3
+      route: none
+      scale: 1.0
+    gmp:
+      dimension: 3
+      route: none
+      scale: 1.0
+    tmp:
+      dimension: 3
+      route: none
+      scale: 1.0
+    openen:
+      dimension: 3
+      route: none
+      scale: 1.0
+    tAI_profile_codon:
+      dimension: 1
+      route: none
+      scale: 1.0
+      missing_values:
+      - -1000.0
+      fill_value: 0.0
+    fra:
+      dimension: 3
+      route: none
+      scale: 1.0
+  init_gamma: 1.0
+  mass_conservation: false
+  alpha_mode: learned
+  fixed_alpha: 0.1
+  gamma_centering:
+    mode: fixed_reference
+    dataset_constant_scale_gauge: geometric_mean_one
+    reference:
+      dataset_names: null
+      weighting: equal
+      quality_rank_power: 1.0
+      chunk_size: 32
+      minimum_datasets: 2
+  biological_params:
+    input_size: 97
+    hidden_size: 16
+    num_layers: 1
+    dropout: 0.0
+    init_local_hazard_factor: 1.0
+    init_local_hazard_weight_std: 0.01
+  dataset_bias_params:
+    position_features:
+    - rel_pos
+    - start_window
+    - stop_window
+    position_edge_tau: 5.0
+    position_scale: 5000.0
+    num_datasets: 11
+    dataset_embeddings_size: 8
+    num_codons: 64
+    codon_embeddings_size: 4
+    raw_log_gamma_bound: 8.0
+    use_nucleotide_amino_acid_embeddings: true
+    nucleotide_embeddings_size: 2
+    amino_acid_embeddings_size: 4
+    context_gru_hidden_size: 8
+    context_gru_num_layers: 1
+    context_gru_dropout: 0.0
+    dataset_multiplicative_allocation_bias_submodule_params:
+      hidden_size: 16
+      dropout: 0.0
+    dataset_log_sigma_submodule_params:
+      dataset_embedding_size: 4
+      hidden_size: 16
+      dropout: 0.0
+      init_log_sigma: 0.2
+    context_gru_precision: inherit
+loss:
+  experiment_mode: standard_nb
+  replica_nb_weight: 1.0
+  consensus_raw_pcc_weight: 0.5
+  consensus_nb_vst_pcc_weight: 0.5
+  gamma_reg_weight: 0.0
+  sample_reduction: transcript_balanced
+  eps: 1.0e-08
+  nb_log_alpha_min: -5.0
+  nb_log_alpha_max: 1.0
+  nb_mean_gradient_beta: 0.0
+  nb_mean_gradient_max_weight: null
+  nb_sequence_reduction: length_tempered
+  nb_length_temper_gamma: 0.75
+  nb_length_temper_ref: 1000.0
+  nb_length_temper_min_weight: 0.5
+  nb_length_temper_max_weight: 2.0
+  min_pcc_target_var: 1.0e-06
+  pcc_detach_alpha: true
+  pcc_prediction_floor: 0.0
+optim:
+  lr_biological: 0.0005
+  lr_rest: 0.001
+  alpha_learning_rate_scale: 0.1
+  weight_decay_bio: 0.01
+  weight_decay_rest: 0.01
+  scheduler:
+    monitor: val_loss
+    mode: min
+    factor: 0.99
+    patience: 5
+    min_lr: 1.0e-06
+trainer:
+  devices: 1
+  accelerator: cpu
+  precision: 32-true
+  num_sanity_val_steps: 0
+  use_distributed_sampler: false
+  accumulate_grad_batches: 1
+  max_epochs: 2
+  log_every_n_steps: 1
+  sync_dist_logs: false
+  gradient_clip_val: null
+  gradient_clip_algorithm: norm
+callbacks:
+  early_stopping_patience: 2
+  save_best_pcc_checkpoint: false
+metrics:
+  log_train_per_dataset_metrics: false
+  log_validation_transcript_mu_pcc_distribution: false
+  log_example_plot: false
+  example_plot_max_datasets: 2
+synthetic_ground_truth:
+  enabled: false
+  latent_path: Datasets/Synthetic_data/artificial_ground_truth_kinetics_target_mean_one.parquet
+  observed_path: Datasets/data/weighted_synthetic/20_per_codon/artificial_ground_truth.parquet
+  drop_terminal_position: true

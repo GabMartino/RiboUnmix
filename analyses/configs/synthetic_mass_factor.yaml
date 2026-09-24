@@ -1,0 +1,70 @@
+paths:
+  results_root: results/riboai_synthetic_experiments
+  occupancy: Datasets/Synthetic_data/artificial_ground_truth_tasep_occupancy_replicates.parquet
+  bias_root: Datasets/Synthetic_data/bias_profile
+  weighted_observation_root: Datasets/data/weighted_synthetic
+  output_dir: analyses/artifacts/synthetic/mass_factor
+
+run_selection:
+  checkpoint_variant: best_pcc
+  checkpoint_selection_metric: val_mu_pcc
+  training_seed: 42
+  include_within_depth_cumulative: true
+  include_cross_depth_reference_sensitivity: true
+  exclude_single_dataset_runs: true
+
+evaluation:
+  split: validation
+  independent_test_available: false
+  saved_model_mask_name: mask
+  remove_synthetic_terminal_entry: true
+  boundary_trim_codons_each_end: 10
+  observed_zero_filtering: false
+  primary_normalization: arithmetic_mean_one_on_reported_evaluation_mask
+  decoder_identity_mask: saved_full_model_mask
+  reported_identity_mask: reported_evaluation_mask
+
+oracle:
+  occupancy_definition: two_trajectory_consensus
+  occupancy_replica_samples:
+    - replicate_1_mean_psite_occupancy
+    - replicate_2_mean_psite_occupancy
+  bias_definition: one_plus_added_bias
+  construct_from_sampled_counts: false
+
+model_constraints:
+  raw_log_gamma_bound_from_run_config: true
+  expected_raw_log_gamma_bound: 8.0
+  likelihood_mean_floor_from_run_config: true
+  expected_likelihood_mean_floor: 1.0e-8
+
+bootstrap:
+  seed: 20260918
+  replicates: 300
+  confidence_level: 0.95
+  cluster: transcript
+  hierarchical_panel_or_seed_bootstrap: unavailable_one_panel_chain_and_one_training_seed
+
+tolerances:
+  mean_one: 2.0e-6
+  within_log_gamma_center_full_model_mask: 2.0e-6
+  cross_dataset_log_gamma_center: 2.0e-5
+  oracle_centering: 2.0e-12
+  mass_inequality: 2.0e-10
+  mass_decomposition: 2.0e-12
+  h_construction: 2.0e-10
+  decoder_product: 1.0e-4
+  decoder_product_scaled: 2.0e-6
+  decoder_ratio_full_model_mask: 5.0e-6
+  raw_bound_proximity: 1.0e-6
+
+figures:
+  representative_run:
+    family: within_depth
+    depth: 20_per_codon
+    n_datasets: 10
+    reference_weighting: equal
+  representative_severity: reference
+  representative_quantiles: [0.1, 0.5, 0.9]
+  png_dpi: 600
+  maximum_scatter_points: 100000
