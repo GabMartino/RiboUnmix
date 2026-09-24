@@ -32,7 +32,7 @@ run_queue() {
         # We explicitly enforce trainer.devices=[0] here because to this isolated process,
         # its assigned GPU is always index 0.
         # We pipe the output to a unique log file so the outputs don't interleave in the terminal.
-        python main_ribo_queueing_modeling_multi_dataset.py \
+        python main_ribounmix_multidataset.py \
             experiment.dataset="['$DS']" \
             split.master_dataset_universe="['$DS']" \
             'trainer.devices=[0]' \

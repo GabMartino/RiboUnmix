@@ -30,7 +30,7 @@ module load python/3.11
 PROJECT_DIR="${PROJECT_DIR:-${SLURM_SUBMIT_DIR:-$(pwd)}}"
 VENV_PATH="${VENV_PATH:-${PROJECT_DIR}/../venvs/queuing_ribo_venv}"
 
-if [[ ! -f "${PROJECT_DIR}/main_ribo_queueing_modeling_multi_dataset.py" ]]; then
+if [[ ! -f "${PROJECT_DIR}/main_ribounmix_multidataset.py" ]]; then
     echo "PROJECT_DIR is not the QueueingRiboAI repository: ${PROJECT_DIR}" >&2
     exit 2
 fi
@@ -94,7 +94,7 @@ DATASET_COUNT_REQUEST="${DATASET_COUNTS[COUNT_INDEX]}"
 QUALITY_RANK_POWER="${QUALITY_RANK_POWERS[POWER_INDEX]}"
 
 # Model and loss settings not explicitly overridden below are inherited from
-# config/config_riboai_queuing_multidataset.yaml.
+# config/config_ribounmix_multidataset.yaml.
 SEED="${SEED:-42}"
 BATCH_SIZE="${BATCH_SIZE:-2}"
 TRAIN_SAMPLING_STRATEGY="${TRAIN_SAMPLING_STRATEGY:-transcript_grouped_multidataset_pairs}"
@@ -285,7 +285,7 @@ fi
 
 COMMAND=(
     srun --ntasks=2 --kill-on-bad-exit=1 --wait=60 \
-    python main_ribo_queueing_modeling_multi_dataset.py
+    python main_ribounmix_multidataset.py
     "experiment.dataset=${DATASET_OVERRIDE}"
     split.master_dataset_universe=all
     "model.gamma_centering.reference.quality_rank_power=${QUALITY_RANK_POWER}"

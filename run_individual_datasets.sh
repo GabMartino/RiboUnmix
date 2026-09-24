@@ -30,7 +30,7 @@ run_queue() {
 
         LOG_FILE="run_log_GPU${gpu_id}_${DS}.txt"
 
-        python main_ribo_queueing_modeling_multi_dataset.py \
+        python main_ribounmix_multidataset.py \
             experiment.dataset="['$DS']" \
             split.master_dataset_universe="['$DS']" \
             trainer.devices=[0] \

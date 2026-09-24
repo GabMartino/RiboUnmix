@@ -17,7 +17,7 @@ set -euo pipefail
 module load python/3.11
 source ../venvs/queuing_ribo_venv/bin/activate
 
-srun python main_ribo_queueing_modeling_multi_dataset.py \
+srun python main_ribounmix_multidataset.py \
     trainer.devices=[0,1,2,3] \
     training.execution_microbatching.enabled=false \
     data.batch_size=16 \

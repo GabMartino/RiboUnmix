@@ -18,7 +18,7 @@ module load python/3.11
 PROJECT_DIR="${PROJECT_DIR:-${SLURM_SUBMIT_DIR:-$(pwd)}}"
 VENV_PATH="${VENV_PATH:-${PROJECT_DIR}/../venvs/queuing_ribo_venv}"
 
-if [[ ! -f "${PROJECT_DIR}/main_ribo_queueing_modeling_multi_dataset.py" ]]; then
+if [[ ! -f "${PROJECT_DIR}/main_ribounmix_multidataset.py" ]]; then
     echo "PROJECT_DIR is not the QueueingRiboAI repository: ${PROJECT_DIR}" >&2
     exit 2
 fi
@@ -188,7 +188,7 @@ run_queue() {
 
         echo "[queue ${queue_id}] Starting ${dataset_name}; log=${log_file}"
         CUDA_VISIBLE_DEVICES="${visible_gpu}" \
-            python main_ribo_queueing_modeling_multi_dataset.py \
+            python main_ribounmix_multidataset.py \
                 experiment.dataset="['${dataset_name}']" \
                 split.master_dataset_universe="${SPLIT_MASTER_DATASET_UNIVERSE}" \
                 experiment.seed="${SEED}" \

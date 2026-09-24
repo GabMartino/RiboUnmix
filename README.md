@@ -1,11 +1,10 @@
-# RiboAI Queueing
+# RiboUnmix
 
 ## Overview
 
-This repository implements a queue-inspired, physics-aware neural model for
-ribosome profiling signals (Ribo-seq). The current model separates a
-dataset-invariant biological profile (`L_bio`) from dataset-specific
-multiplicative (`gamma`) corrections. Gamma is the
+RiboUnmix is a neural framework for decomposing heterogeneous ribosome
+profiling (Ribo-seq) signals into a dataset-invariant shared profile (`L_bio`)
+and dataset-specific multiplicative (`gamma`) corrections. Gamma is the
 exponential of its centered log-score, so it is strictly positive on valid
 positions and remains unbounded above. The dataset head uses
 dataset, codon-context, and position features; it does not consume `L_bio`.
@@ -16,6 +15,14 @@ experiments.
 Training, validation, prediction, checkpointing, and logging use PyTorch
 Lightning. Hydra controls the model, data, split, optimizer, and runtime
 configuration.
+
+The public repository is
+[`GabMartino/RiboUnmix`](https://github.com/GabMartino/RiboUnmix). Historical
+Python import paths and entrypoint filenames containing `RiboAI`, `Queueing`,
+or `Queuing` are available only as deprecated compatibility adapters. Existing
+checkpoints and frozen experiment manifests refer to them directly. Historical
+artifact directories and run identifiers are immutable provenance and are
+therefore not renamed.
 
 ## Model
 
@@ -40,18 +47,18 @@ absolute transcript abundance.
 
 Further model notes, including gradients, diagnostics, invariances, and
 limitations, are in
-[Docs/queueing_model.md](Docs/queueing_model.md). A longer historical
+[Docs/ribounmix_model.md](Docs/ribounmix_model.md). A longer historical
 identifiability analysis is in
 [`memory documents/modeling_mathematical_analysis_and_identifiability.md`](memory%20documents/modeling_mathematical_analysis_and_identifiability.md).
 
 ## Repository Layout
 
 ```text
-main_ribo_queueing_modeling_multi_dataset.py   Hydra training entry point
+main_ribounmix_multidataset.py   Hydra training entry point
 config/                                       Runtime and dataset configuration
-Dataloaders/RiboAIQueuingMultiDataset/         Parquet loading and batching
-Models/RiboQueuingModel/                       Biological and dataset branches
-Models/RiboQueuingModelLighningModule.py       Losses, metrics, and prediction IO
+Dataloaders/RiboUnmixMultiDataset/         Parquet loading and batching
+Models/RiboUnmixModel/                       Biological and dataset branches
+Models/RiboUnmixLightningModule.py       Losses, metrics, and prediction IO
 Datasets/                                      Encodings and local data assets
 results/                                       Analysis scripts and generated results
 tests/                                         Model invariance and forward checks
@@ -77,7 +84,7 @@ hardware.
 ## Data Configuration
 
 The default configuration is
-[`config/config_riboai_queuing_multidataset.yaml`](config/config_riboai_queuing_multidataset.yaml).
+[`config/config_ribounmix_multidataset.yaml`](config/config_ribounmix_multidataset.yaml).
 It selects `weighted_hek_riboseq_codon_replicas` and expects:
 
 - Sequence features at
@@ -99,13 +106,13 @@ and can carry every biological replica as a padded `[replica, position]` tensor.
 Run the two-dataset default experiment:
 
 ```bash
-python main_ribo_queueing_modeling_multi_dataset.py
+python main_ribounmix_multidataset.py
 ```
 
 Run one registered dataset:
 
 ```bash
-python main_ribo_queueing_modeling_multi_dataset.py \
+python main_ribounmix_multidataset.py \
   experiment.dataset="['kutay_2021']" \
   split.master_dataset_universe="['kutay_2021']" \
   'trainer.devices=[0]'
@@ -114,18 +121,18 @@ python main_ribo_queueing_modeling_multi_dataset.py \
 Run prediction from a checkpoint without training:
 
 ```bash
-python main_ribo_queueing_modeling_multi_dataset.py \
+python main_ribounmix_multidataset.py \
   experiment.from_checkpoint=true \
   experiment.train=false \
   experiment.predict=true
 ```
 
-Runtime artifacts are written below `checkpoints/riboai_queueing`,
-`logs/riboai_queueing`, and `results/riboai_queueing` unless `paths.*` is
+Runtime artifacts are written below `checkpoints/ribounmix`,
+`logs/ribounmix`, and `results/ribounmix` unless `paths.*` is
 overridden. Inspect logs with:
 
 ```bash
-tensorboard --logdir logs/riboai_queueing
+tensorboard --logdir logs/ribounmix
 ```
 
 The Slurm launchers use the same nested Hydra keys as the main configuration.
@@ -141,18 +148,18 @@ python analyse_TE_correlation.py path/to/predictions.parquet \
   --output results/te_correlations.csv
 ```
 
-Render per-transcript profile plots from an explicit prediction file:
+For the article's synthetic, benchmarking, Exp8 and four-panel experiments, use
+the [analysis index and regeneration commands](results/README.md). For example,
+generate the compact reproducibility figure from a completed four-panel run:
 
 ```bash
-python results/visualize_profiles.py path/to/predictions.parquet \
-  --limit 10 \
-  --output-dir results/profile_plots
+python analyses/create_four_panel_reproducibility_figure.py \
+  --run-root results/my_panels_a100_b32_20260906_114323
 ```
 
-With no positional path, `visualize_profiles.py` uses the most recently modified
-run under the selected experiment. Other scripts in `results/` aggregate model
-metrics, compare single-dataset and mixed runs, and inspect learned biological
-signals.
+Legacy and superseded top-level analyses are preserved in
+`results/_archive/2026-09-11_article_cleanup/`, with an inventory and restore
+instructions. Experiment data and saved results remain in their original folders.
 
 ## Verification
 
